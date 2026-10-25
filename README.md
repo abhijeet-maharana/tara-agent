@@ -58,6 +58,17 @@ Requirements: Node ≥ 22.13, Claude Code installed and logged in (`claude` then
    ```
 5. Projects that use MCP servers from their `.mcp.json` must have them approved for headless runs. Put `"enableAllProjectMcpServers": true` (or `enabledMcpjsonServers`) in that repo's `.claude/settings.local.json`, then check with `claude mcp list` from the repo.
 
+### Run as a dedicated user (recommended)
+
+Scheduled jobs often read untrusted text (web pages, chat channels, email), and a job that gets talked into something runs with the rights of the user tara-agent runs as. On an always-on machine, give it its own user:
+
+1. `sudo useradd --create-home --user-group tara` (no sudo, no docker group), then install Claude Code and log in as that user: `sudo -iu tara`, install, `claude`, `/login`.
+2. Give it the project repos and nothing else. The setup that works well: a shared group with ACLs on the repo directories (`setfacl -m g:tara:rwx,d:g:tara:rwx` on every directory, default ACLs included), so files either side creates stay writable for both. If you sync code with Mutagen, create the session with `--default-group-beta=tara`; synced files are staged elsewhere and don't inherit ACLs.
+3. Keep secrets out: remove the group's access to `.env` files and session/key files in the repos, and keep your home directory closed (`setfacl -m u:tara:--x ~` lets it pass through to the repos only).
+4. Put the Slack tokens in a root-only `/etc/tara-agent.env` and install [`deploy/systemd/tara-agent-dedicated-user.service`](deploy/systemd/tara-agent-dedicated-user.service) as a system unit.
+
+The agent then can't use your sudo, docker group, browser profile files, other projects or secrets, and can't edit tara-agent itself.
+
 **Moving from another bot on the same Slack app:** with Socket Mode, Slack splits events across every connection of one app. Stop the old bot before starting tara-agent with the same tokens.
 
 ## Configuration

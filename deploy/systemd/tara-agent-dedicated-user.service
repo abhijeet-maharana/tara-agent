@@ -1,0 +1,34 @@
+# System unit that runs tara-agent as its own unprivileged user (recommended on a shared or
+# always-on machine: Claude then can't use your sudo, docker group, browser profile files or secrets).
+# See README "Run as a dedicated user". Adjust the paths below, then:
+#   sudo cp deploy/systemd/tara-agent-dedicated-user.service /etc/systemd/system/tara-agent.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now tara-agent
+#   journalctl -u tara-agent -f
+[Unit]
+Description=tara-agent (Slack threads and schedules for Claude Code)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tara
+Group=tara
+# Group-writable files, so the repo owner and tara can both edit what the other creates.
+UMask=0002
+# Where the tara-agent checkout lives (tara needs read access only).
+WorkingDirectory=/opt/tara-agent
+# SLACK_BOT_TOKEN, SLACK_APP_TOKEN, optional ANTHROPIC_API_KEY / TARA_HTTP_TOKEN.
+# Root-only (chmod 600): systemd reads it before switching to tara.
+EnvironmentFile=/etc/tara-agent.env
+Environment=PATH=/home/tara/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/node dist/index.js --config /home/tara/.config/tara-agent/config.yaml
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+KillMode=mixed
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
