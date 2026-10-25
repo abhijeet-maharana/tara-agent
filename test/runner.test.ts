@@ -13,7 +13,7 @@ describe('parseStreamLine', () => {
   const events = readFileSync(fixture, 'utf8').split('\n').flatMap(parseStreamLine);
 
   it('extracts init, tool, rate limit and result events', () => {
-    expect(events.map((e) => e.kind)).toEqual(['init', 'tool', 'rate_limit', 'result']);
+    expect(events.map((e) => e.kind)).toEqual(['init', 'tool', 'rate_limit', 'tool_result', 'result']);
     expect(events[0]).toEqual({
       kind: 'init',
       sessionId: '11111111-2222-4333-8444-555555555555',
@@ -21,19 +21,45 @@ describe('parseStreamLine', () => {
     });
     expect(events[1]).toEqual({
       kind: 'tool',
+      id: 'toolu_1',
       name: 'Bash',
       status: 'Bash: List files in current directory',
     });
+    expect(events[3]).toEqual({ kind: 'tool_result', id: 'toolu_1', isError: false });
     expect(events[2]).toMatchObject({
       rateLimit: { status: 'allowed', window: 'five_hour', utilization: 0.02 },
     });
   });
 
   it('reads the result with usage and cost', () => {
-    const result = events[3] as Extract<StreamEvent, { kind: 'result' }>;
+    const result = events[4] as Extract<StreamEvent, { kind: 'result' }>;
     expect(result).toMatchObject({ isError: false, text: 'done', numTurns: 2, permissionDenials: [] });
     expect(result.usage).toEqual({ input: 4, output: 77, cacheRead: 37611, cacheCreation: 14122 });
     expect(result.costUsd).toBeCloseTo(0.0032, 4);
+  });
+
+  it('reads text deltas and text block starts, tagged with their sub-agent parent', () => {
+    const delta = (text: string, parent: string | null) =>
+      JSON.stringify({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } },
+        parent_tool_use_id: parent,
+      });
+    expect(parseStreamLine(delta('Hel', null))).toEqual([{ kind: 'text', text: 'Hel' }]);
+    expect(parseStreamLine(delta('sub', 'toolu_9'))).toEqual([
+      { kind: 'text', text: 'sub', parent: 'toolu_9' },
+    ]);
+    const start = JSON.stringify({
+      type: 'stream_event',
+      event: { type: 'content_block_start', index: 1, content_block: { type: 'text', text: '' } },
+      parent_tool_use_id: null,
+    });
+    expect(parseStreamLine(start)).toEqual([{ kind: 'text_start' }]);
+    const toolStart = JSON.stringify({
+      type: 'stream_event',
+      event: { type: 'content_block_start', content_block: { type: 'tool_use' } },
+    });
+    expect(parseStreamLine(toolStart)).toEqual([]);
   });
 
   it('ignores junk and unknown events', () => {
@@ -151,7 +177,7 @@ describe('runClaude', () => {
       toolCalls: 1,
     });
     expect(o.rateLimit?.utilization).toBe(0.02);
-    expect(events.map((e) => e.kind)).toEqual(['init', 'tool', 'rate_limit', 'result']);
+    expect(events.map((e) => e.kind)).toEqual(['init', 'tool', 'rate_limit', 'tool_result', 'result']);
   });
 
   it('sends the prompt on stdin', async () => {

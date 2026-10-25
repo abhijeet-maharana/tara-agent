@@ -3,25 +3,16 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import type { HostConfig, Project } from '../src/config/schema.js';
+import type { Project } from '../src/config/schema.js';
 import { startHttpServer } from '../src/http/server.js';
 import type { RunOptions, RunOutcome } from '../src/runner/run.js';
+import { buildDigest } from '../src/scheduler/health.js';
 import { Scheduler } from '../src/scheduler/scheduler.js';
 import type { ScriptResult } from '../src/scheduler/script.js';
-import { Store } from '../src/store/store.js';
-import { FakeChat } from './fakes.js';
+import { Store, type StoredRun } from '../src/store/store.js';
+import { FakeChat, testHost } from './fakes.js';
 
-const host: HostConfig = {
-  projects: [],
-  concurrency: 2,
-  claude: { bin: 'claude', chatTimeoutMinutes: 20 },
-  stateDir: '/tmp',
-  statusIntervalSeconds: 0,
-  jobConcurrency: 1,
-  catchUpHours: 6,
-  timezone: 'UTC',
-  http: { enabled: false, bind: '127.0.0.1', port: 0 },
-};
+const host = testHost({ concurrency: 2, catchUpHours: 6, claude: { bin: 'claude', chatTimeoutMinutes: 20 } });
 
 function makeProject(jobs: object[], env: object = {}): Project {
   const dir = mkdtempSync(path.join(tmpdir(), 'tara-sched-'));
@@ -84,7 +75,7 @@ function setup(opts: {
       calls.push(o);
       callTimes.push(Date.now());
       o.onEvent?.({ kind: 'init', sessionId: 'sid', model: 'claude-haiku-5-5' });
-      o.onEvent?.({ kind: 'tool', name: 'Bash', status: 'Bash: curl' });
+      o.onEvent?.({ kind: 'tool', id: 't1', name: 'Bash', status: 'Bash: curl' });
       return ok(replies.shift() ?? 'Headline\n---\nDetails here');
     },
   });
@@ -345,5 +336,63 @@ describe('HTTP API', () => {
     expect((await call('/health')).status).toBe(401);
     expect((await call('/health', { headers: { authorization: 'Bearer s3cret' } })).status).toBe(200);
     await close();
+  });
+});
+
+describe('health digest', () => {
+  const run = (o: Partial<StoredRun>): StoredRun => ({
+    id: 1,
+    kind: 'job',
+    project: 'shop',
+    jobId: 'sla',
+    startedAt: Date.parse('2026-10-25T05:00:00Z'),
+    endedAt: Date.parse('2026-10-25T05:02:00Z'),
+    status: 'ok',
+    ...o,
+  });
+
+  it('stays quiet when nothing ran or was missed', () => {
+    expect(buildDigest({ project: 'shop', runs: [], missed: [], timeZone: 'UTC' })).toBeNull();
+  });
+
+  it('summarises runs, problems, missed slots and usage', () => {
+    const digest = buildDigest({
+      project: 'shop',
+      timeZone: 'UTC',
+      runs: [
+        run({ rateLimitUtilization: 0.41, inputTokens: 1000, outputTokens: 500, cacheReadTokens: 2_000_000 }),
+        run({ status: 'silent' }),
+        run({ status: 'failed', jobId: 'ads', error: 'Portal login expired\nmore' }),
+        run({ kind: 'chat', jobId: undefined }),
+      ],
+      missed: [{ id: 'labels', name: 'Labels', slots: [Date.parse('2026-10-25T00:00:00Z')] }],
+    });
+    expect(digest?.headline).toBe(
+      '⚠️ *Daily health · shop* · last 24h: 3 job runs (1 ok, 1 silent, 1 with problems), 1 chat turns · *1 missed* · peak 5h usage 41%',
+    );
+    expect(digest?.details).toContain('• `ads` failed at Sun 05:00: Portal login expired');
+    expect(digest?.details).toContain('• `labels` Labels: Sun 00:00');
+    expect(digest?.details).toContain('1.5k tokens in/out, 2.00M cache reads');
+  });
+
+  it('finds slots that were never claimed (downtime) but not slots that ran', async () => {
+    let now = Date.parse('2026-10-25T00:30:00Z');
+    const store = new Store(':memory:', () => now);
+    const ctx = setup({ jobs: [{ ...baseJob, cron: '0 */6 * * *', catchUp: false }], store, now: () => now });
+    ctx.scheduler.start(); // first seen 00:30
+    await ctx.scheduler.stop();
+    now = Date.parse('2026-10-25T13:00:00Z');
+    store.claimSlot('shop:sla', Date.parse('2026-10-25T06:00:00Z')); // 06:00 ran, 12:00 was missed
+    const later = setup({
+      jobs: [{ ...baseJob, cron: '0 */6 * * *', catchUp: false }],
+      store,
+      now: () => now,
+    });
+    later.scheduler.start();
+    await later.scheduler.idle();
+    const digest = later.scheduler.digest('shop');
+    expect(digest?.headline).toContain('*1 missed*');
+    expect(digest?.details).toContain('• `sla` SLA Report: Sun 12:00');
+    await later.scheduler.stop();
   });
 });

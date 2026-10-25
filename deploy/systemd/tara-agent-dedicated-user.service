@@ -21,7 +21,8 @@ WorkingDirectory=/opt/tara-agent
 # Root-only (chmod 600): systemd reads it before switching to tara.
 EnvironmentFile=/etc/tara-agent.env
 Environment=PATH=/home/tara/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/bin/node dist/index.js --config /home/tara/.config/tara-agent/config.yaml
+# node:sqlite is still flagged experimental on Node 22/24; tara-agent pins its use, so hide the notice.
+ExecStart=/usr/bin/node --disable-warning=ExperimentalWarning dist/index.js --config /home/tara/.config/tara-agent/config.yaml
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=20

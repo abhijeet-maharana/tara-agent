@@ -7,14 +7,14 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { describe, expect, it } from 'vitest';
 import { Bridge, type RunContext, wantsPermissionPrompts } from '../src/bridge/bridge.js';
-import type { HostConfig, Project, ProjectConfig } from '../src/config/schema.js';
+import type { Project, ProjectConfig } from '../src/config/schema.js';
 import { startHttpServer } from '../src/http/server.js';
 import { buildClaudeArgs } from '../src/runner/args.js';
 import type { RunOptions, RunOutcome } from '../src/runner/run.js';
 import type { Scheduler } from '../src/scheduler/scheduler.js';
 import { type IncomingMessage, SessionManager } from '../src/sessions/manager.js';
 import { Store } from '../src/store/store.js';
-import { FakeChat } from './fakes.js';
+import { FakeChat, testHost } from './fakes.js';
 
 const silent = { info() {}, warn() {}, error() {} };
 
@@ -273,17 +273,11 @@ describe('a decision resumes the session', () => {
   it('runs the next turn in the same thread with the decision as the prompt', async () => {
     const { bridge, store, chat, project: p } = setup();
     const calls: RunOptions[] = [];
-    const host: HostConfig = {
-      projects: [],
+    const host = testHost({
       concurrency: 1,
-      claude: { bin: 'claude', chatTimeoutMinutes: 5 },
-      stateDir: '/tmp',
-      statusIntervalSeconds: 0,
-      jobConcurrency: 1,
       catchUpHours: 0,
-      timezone: 'UTC',
-      http: { enabled: false, bind: '127.0.0.1', port: 0 },
-    };
+      claude: { bin: 'claude', chatTimeoutMinutes: 5 },
+    });
     const outcome = (text: string): RunOutcome => ({
       status: 'ok',
       text,

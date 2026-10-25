@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S node --disable-warning=ExperimentalWarning
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -111,6 +111,7 @@ async function serve(configFlag: string | undefined) {
     log,
     onMessage: (msg) => manager?.handle(msg) ?? Promise.resolve(),
     onButton: (tap) => bridge?.handleButton(tap) ?? Promise.resolve(),
+    streaming: host.streaming,
   });
   // tara's MCP tools reach tara-agent through the local API, so they need it.
   if (host.http.enabled) {

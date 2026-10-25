@@ -5,9 +5,10 @@ import { buildClaudeArgs } from '../runner/args.js';
 import { buildChildEnv } from '../runner/env.js';
 import type { Runner, RunOutcome } from '../runner/run.js';
 import type { JobControl } from '../scheduler/scheduler.js';
-import { formatDuration, splitMessage, toSlackMrkdwn } from '../slack/format.js';
+import { formatDuration, splitMessage } from '../slack/format.js';
+import { EditReply, type StreamPort, StreamReply, type TurnReply } from '../slack/reply.js';
 import type { SessionRow, Store } from '../store/store.js';
-import { KeyedQueue, Semaphore, Throttle } from '../util/concurrency.js';
+import { KeyedQueue, Semaphore } from '../util/concurrency.js';
 
 /** The chat platform as the session manager sees it. Slack implements it; tests fake it. */
 export interface ChatPort {
@@ -19,6 +20,8 @@ export interface ChatPort {
   postBlocks(channel: string, threadTs: string, text: string, blocks: SlackBlock[]): Promise<string>;
   /** Uploads a local file into a thread. */
   uploadFile(channel: string, threadTs: string, filePath: string, comment?: string): Promise<void>;
+  /** Native message streaming, when the platform has it. */
+  stream?: StreamPort;
   react(channel: string, ts: string, emoji: string): Promise<void>;
   unreact(channel: string, ts: string, emoji: string): Promise<void>;
 }
@@ -59,7 +62,7 @@ export interface ManagerDeps {
 
 const BASE_PROMPT = `You are running headless for a Slack thread, through tara-agent.
 - People read your replies in Slack, often on a phone: lead with the answer, keep it short, use bullets, avoid wide tables.
-- Only your final message is posted to the thread. Text between tool calls is not shown.
+- Your text appears in the thread as you write it, including notes between tool calls, so keep those to a word or two and put the answer at the end.
 - Each message starts with the sender's Slack mention, e.g. "<@U123>: ...". Several people may share a thread.
 - You cannot ask questions mid-turn. If you need input, end your turn with the question.`;
 
@@ -69,7 +72,8 @@ const HELP = `*Thread commands*
 • \`!stop\` stop the running turn
 • \`!status\` show session, model and queue
 • \`!jobs\` list this channel's scheduled jobs
-• \`!run <job-id>\` run a job now (it posts its own thread)`;
+• \`!run <job-id>\` run a job now (it posts its own thread)
+• \`!health\` the last 24 hours: runs, problems, missed slots, usage`;
 
 export const threadKey = (channel: string, threadTs: string) => `${channel}:${threadTs}`;
 
@@ -164,6 +168,13 @@ export class SessionManager {
         );
         return void (await reply(`*Jobs* (next run, ${timeZone})\n${lines.join('\n')}`));
       }
+      case 'health': {
+        const digest = this.deps.jobs?.digest(project.config.name);
+        if (!digest) return void (await reply('Nothing ran or was missed in the last 24 hours.'));
+        await reply(digest.headline);
+        for (const chunk of splitMessage(digest.details)) await reply(chunk);
+        return;
+      }
       case 'run': {
         if (!this.deps.jobs) return void (await reply('Scheduling is not enabled.'));
         if (!arg) return void (await reply('Usage: `!run <job-id>` (see `!jobs`)'));
@@ -194,20 +205,25 @@ export class SessionManager {
   private async turn(project: Project, key: string, msg: IncomingMessage): Promise<void> {
     const { chat, store, host } = this.deps;
     const name = project.config.name;
-    const statusTs = await chat.post(
-      msg.channel,
-      msg.threadTs,
-      this.slots.busy ? '⏳ Waiting for a free slot…' : '⏳ Working…',
-    );
+    const intervalMs = host.statusIntervalSeconds * 1000;
+    const streaming = chat.stream && !chat.stream.disabled;
+    const reply: TurnReply = streaming
+      ? new StreamReply(
+          chat,
+          chat.stream as StreamPort,
+          msg.channel,
+          msg.threadTs,
+          msg.user,
+          this.slots.busy,
+          Math.min(intervalMs, 1000),
+        )
+      : new EditReply(chat, msg.channel, msg.threadTs, this.slots.busy, intervalMs);
     await chat.react(msg.channel, msg.ts, 'eyes').catch(() => {});
     const release = await this.slots.acquire();
+    reply.working();
     const controller = new AbortController();
     this.running.set(key, controller);
     const startedAt = this.now();
-    const steps: string[] = [];
-    const status = new Throttle<string>(host.statusIntervalSeconds * 1000, (text) =>
-      chat.update(msg.channel, statusTs, text),
-    );
 
     let session = store.getSession(key) ?? this.freshSession(project, key);
     store.saveSession(session);
@@ -234,6 +250,7 @@ export class SessionManager {
           allowedTools: project.config.allowedTools,
           mcpConfig: bridged?.mcpConfigPath,
           permissionPrompts,
+          partialMessages: Boolean(streaming),
         }),
         cwd: project.dir,
         env: buildChildEnv(this.env, project.config.billing),
@@ -244,10 +261,13 @@ export class SessionManager {
           if (event.kind === 'init' && !session.started) {
             session = { ...session, started: true };
             store.saveSession(session);
-          } else if (event.kind === 'tool') {
-            steps.push(event.status);
-            status.push(`⏳ Working · step ${steps.length}\n> ${event.status}`);
           }
+          // Sub-agents work out of sight; their parent "Agent" step stands for them.
+          if ('parent' in event && event.parent) return;
+          if (event.kind === 'tool') reply.toolStart(event.id, event.status);
+          else if (event.kind === 'tool_result') reply.toolEnd(event.id, !event.isError);
+          else if (event.kind === 'text_start') reply.textBreak();
+          else if (event.kind === 'text') reply.text(event.text);
         },
       });
     } catch (err) {
@@ -266,9 +286,8 @@ export class SessionManager {
       release();
     }
 
-    await status.flush();
     try {
-      await this.report(project, key, msg, statusTs, outcome);
+      await this.report(project, key, msg, reply, outcome);
     } catch (err) {
       this.log.error(`[${name}] failed to post result: ${(err as Error).message}`);
     }
@@ -295,9 +314,8 @@ export class SessionManager {
     );
   }
 
-  private async report(project: Project, key: string, msg: IncomingMessage, statusTs: string, o: RunOutcome) {
+  private async report(project: Project, key: string, msg: IncomingMessage, reply: TurnReply, o: RunOutcome) {
     const { chat, store } = this.deps;
-    const post = (text: string) => chat.post(msg.channel, msg.threadTs, text);
     const meta = [
       formatDuration(o.durationMs),
       `${o.toolCalls} ${o.toolCalls === 1 ? 'step' : 'steps'}`,
@@ -343,17 +361,14 @@ export class SessionManager {
       }
     }
 
-    await chat.update(msg.channel, statusTs, summary);
-    if (o.status === 'ok') {
-      for (const chunk of splitMessage(toSlackMrkdwn(o.text.trim() || '_(no text reply)_')))
-        await post(chunk);
-    }
-    if (o.permissionDenials.length > 0) {
-      await post(
-        `⚠️ Blocked by permission mode \`${project.config.permissionMode}\`: ${o.permissionDenials.join(', ')}. ` +
-          'Allow them with `allowedTools` in `.tara/config.json`.',
-      );
-    }
+    const notes =
+      o.permissionDenials.length > 0
+        ? [
+            `⚠️ Blocked by permission mode \`${project.config.permissionMode}\`: ${o.permissionDenials.join(', ')}. ` +
+              'Allow them with `allowedTools` in `.tara/config.json`.',
+          ]
+        : [];
+    await reply.finish({ summary, ok: o.status === 'ok', answer: o.text, notes });
     await chat.unreact(msg.channel, msg.ts, 'eyes').catch(() => {});
     await chat.react(msg.channel, msg.ts, reaction).catch(() => {});
   }

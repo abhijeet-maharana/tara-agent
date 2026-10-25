@@ -9,9 +9,13 @@ features:
   bot_user:
     display_name: tara
     always_online: true
+  # "Agents & AI Apps": lets replies stream natively (live task card + text as it is written).
+  assistant_view:
+    assistant_description: Claude Code sessions in Slack threads
 oauth_config:
   scopes:
     bot:
+      - assistant:write
       - channels:history
       - groups:history
       - chat:write

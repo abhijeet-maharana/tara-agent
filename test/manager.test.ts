@@ -1,21 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import type { HostConfig, Project, ProjectConfig } from '../src/config/schema.js';
+import type { Project, ProjectConfig } from '../src/config/schema.js';
 import type { RunOptions, RunOutcome } from '../src/runner/run.js';
 import { type IncomingMessage, SessionManager } from '../src/sessions/manager.js';
 import { Store } from '../src/store/store.js';
-import { FakeChat } from './fakes.js';
+import { FakeChat, testHost } from './fakes.js';
 
-const host: HostConfig = {
-  projects: ['/repo'],
-  concurrency: 2,
-  claude: { bin: 'claude', chatTimeoutMinutes: 20 },
-  stateDir: '/tmp',
-  statusIntervalSeconds: 0,
-  jobConcurrency: 1,
-  catchUpHours: 6,
-  timezone: 'UTC',
-  http: { enabled: false, bind: '127.0.0.1', port: 0 },
-};
+const host = testHost({ concurrency: 2, catchUpHours: 6, claude: { bin: 'claude', chatTimeoutMinutes: 20 } });
 
 function project(overrides: Partial<ProjectConfig> = {}): Project {
   return {
@@ -62,7 +52,7 @@ function setup(opts: { project?: Project; outcomes?: RunOutcome[]; env?: NodeJS.
     run: async (options) => {
       calls.push(options);
       options.onEvent?.({ kind: 'init', sessionId: 'sid-1', model: 'claude-sonnet-5-5' });
-      options.onEvent?.({ kind: 'tool', name: 'Bash', status: 'Bash: npm test' });
+      options.onEvent?.({ kind: 'tool', id: 't1', name: 'Bash', status: 'Bash: npm test' });
       return outcomes.shift() ?? ok();
     },
   });
@@ -121,6 +111,25 @@ describe('SessionManager', () => {
     await manager.handle(msg('!new'));
     expect(store.getSession('C1:100.1')).toBeUndefined();
     expect(chat.texts().some((t) => t.includes('Session cleared'))).toBe(true);
+  });
+
+  it('shows the health digest on !health', async () => {
+    const chat = new FakeChat('bot.');
+    const manager = new SessionManager({
+      projects: [project()],
+      host,
+      store: new Store(':memory:'),
+      chat,
+      log: { info() {}, warn() {}, error() {} },
+      run: async () => ok(),
+      jobs: {
+        list: () => [],
+        trigger: () => 'unknown',
+        digest: () => ({ headline: '🩺 all good', details: '*Usage*\n• 1k tokens' }),
+      },
+    });
+    await manager.handle(msg('!health'));
+    expect(chat.texts()).toEqual(['🩺 all good', '*Usage*\n• 1k tokens']);
   });
 
   it('shows status and help', async () => {

@@ -18,7 +18,13 @@ export interface RateLimit {
 
 export type StreamEvent =
   | { kind: 'init'; sessionId: string; model: string }
-  | { kind: 'tool'; name: string; status: string }
+  /** `parent` is set for calls made inside a sub-agent (Task/Agent tool). */
+  | { kind: 'tool'; id: string; name: string; status: string; parent?: string }
+  | { kind: 'tool_result'; id: string; isError: boolean; parent?: string }
+  /** A piece of Claude's text as it is written (needs `--include-partial-messages`). */
+  | { kind: 'text'; text: string; parent?: string }
+  /** A new text block starts (e.g. after tool calls). */
+  | { kind: 'text_start'; parent?: string }
   | { kind: 'rate_limit'; rateLimit: RateLimit }
   | {
       kind: 'result';
@@ -118,6 +124,7 @@ export function parseStreamLine(line: string): StreamEvent[] {
     return [];
   }
   if (!isObject(e)) return [];
+  const parent = str(e.parent_tool_use_id) ?? undefined;
 
   switch (e.type) {
     case 'system':
@@ -130,8 +137,34 @@ export function parseStreamLine(line: string): StreamEvent[] {
         .filter((c): c is Json => isObject(c) && c.type === 'tool_use')
         .map((c) => {
           const name = str(c.name) ?? 'tool';
-          return { kind: 'tool', name, status: describeTool(name, c.input) };
+          return { kind: 'tool', id: str(c.id) ?? '', name, status: describeTool(name, c.input), parent };
         });
+    }
+    case 'user': {
+      const content = isObject(e.message) && Array.isArray(e.message.content) ? e.message.content : [];
+      return content
+        .filter((c): c is Json => isObject(c) && c.type === 'tool_result')
+        .map((c) => ({
+          kind: 'tool_result',
+          id: str(c.tool_use_id) ?? '',
+          isError: c.is_error === true,
+          parent,
+        }));
+    }
+    case 'stream_event': {
+      const ev = isObject(e.event) ? e.event : {};
+      if (
+        ev.type === 'content_block_start' &&
+        isObject(ev.content_block) &&
+        ev.content_block.type === 'text'
+      ) {
+        return [{ kind: 'text_start', parent }];
+      }
+      if (ev.type === 'content_block_delta' && isObject(ev.delta) && ev.delta.type === 'text_delta') {
+        const text = str(ev.delta.text);
+        return text ? [{ kind: 'text', text, parent }] : [];
+      }
+      return [];
     }
     case 'rate_limit_event': {
       const rateLimit = parseRateLimit(e.rate_limit_info);

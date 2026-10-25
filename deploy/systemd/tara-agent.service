@@ -15,7 +15,7 @@ WorkingDirectory=%h/Projects/tara-agent
 EnvironmentFile=%h/.config/tara-agent/env
 # PATH must reach node and the claude CLI (native installer puts it in ~/.local/bin)
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/bin/env node dist/index.js
+ExecStart=/usr/bin/env node --disable-warning=ExperimentalWarning dist/index.js
 Restart=on-failure
 RestartSec=10
 # Let running turns post "Stopped" before the process is killed

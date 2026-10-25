@@ -26,6 +26,11 @@ export const hostConfigSchema = z.object({
     .default({ bin: 'claude', chatTimeoutMinutes: 20 }),
   /** Where the SQLite state lives. Defaults to `~/.local/state/tara-agent`. */
   stateDir: z.string().optional(),
+  /**
+   * Stream replies into Slack threads as Claude writes them, with a live task card (needs the Slack
+   * app's "Agents & AI Apps" feature; falls back to an edited status message without it).
+   */
+  streaming: z.boolean().default(true),
   /** Minimum gap between edits of the live status message. */
   statusIntervalSeconds: z.number().min(1).default(5),
   /** Max scheduled jobs running at once (separate from chat). */
@@ -34,6 +39,14 @@ export const hostConfigSchema = z.object({
   catchUpHours: z.number().min(0).default(6),
   /** Default timezone for job schedules and for times shown in Slack. Defaults to the host's. */
   timezone: z.string().default(Intl.DateTimeFormat().resolvedOptions().timeZone),
+  /** Daily code-only health summary per project channel (runs, failures, missed slots, usage). */
+  healthDigest: z
+    .object({
+      enabled: z.boolean().default(true),
+      /** Cron expression in the host `timezone`. */
+      cron: z.string().default('0 9 * * *'),
+    })
+    .default({ enabled: true, cron: '0 9 * * *' }),
   /** Local control API (jobs, runs, health). Set TARA_HTTP_TOKEN to require a bearer token. */
   http: z
     .object({

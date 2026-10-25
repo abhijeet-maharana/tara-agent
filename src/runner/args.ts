@@ -16,11 +16,14 @@ export interface ClaudeArgsInput {
   mcpConfig?: string;
   /** Route permission prompts to tara's Slack buttons. */
   permissionPrompts?: boolean;
+  /** Emit text as it is written (`stream_event` deltas), for live streaming into Slack. */
+  partialMessages?: boolean;
 }
 
 /** Arguments for one headless turn. The prompt itself goes to stdin. */
 export function buildClaudeArgs(input: ClaudeArgsInput): string[] {
   const args = ['-p', '--output-format', 'stream-json', '--verbose'];
+  if (input.partialMessages) args.push('--include-partial-messages');
   args.push('--permission-mode', input.permissionMode);
   if (input.model) args.push('--model', input.model);
   args.push(input.resume ? '--resume' : '--session-id', input.sessionId);

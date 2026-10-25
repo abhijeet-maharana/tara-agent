@@ -45,7 +45,7 @@ export function buildJobPrompt(job: JobConfig, script?: ScriptResult): string {
   if (job.skills.length > 0) {
     parts.push(
       `Skills for this job: ${job.skills.map((s) => `\`${s}\``).join(', ')}. ` +
-        'Read each one from your skills library before you start, and follow it.',
+        'Load each one before you start (the Skill tool, or its SKILL.md) and follow it.',
     );
   }
   return parts.join('\n\n');

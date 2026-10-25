@@ -2,6 +2,7 @@ import { createReadStream } from 'node:fs';
 import path from 'node:path';
 import { App, type BlockAction, type ButtonAction, LogLevel } from '@slack/bolt';
 import type { ChatPort, IncomingMessage, Logger } from '../sessions/manager.js';
+import { StreamError, type StreamPort } from './reply.js';
 
 /** A tap on one of tara's buttons (action ids start with `tara:`). */
 export interface ButtonTap {
@@ -18,6 +19,8 @@ export interface SlackOptions {
   log: Logger;
   onMessage: (msg: IncomingMessage) => Promise<void>;
   onButton?: (tap: ButtonTap) => Promise<void>;
+  /** Stream replies natively (Slack's "Agents & AI Apps" feature); default true. */
+  streaming?: boolean;
 }
 
 /** Slack sends &, < and > escaped. Mentions and links (`<@U1>`, `<https://…>`) stay as they are. */
@@ -71,6 +74,38 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
   });
 
   let botUserId: string | undefined;
+  let teamId: string | undefined;
+
+  /** Calls a streaming method, turning Slack errors into StreamError with Slack's error code. */
+  const streamCall = async (method: string, args: Record<string, unknown>) => {
+    try {
+      return await app.client.apiCall(method, args);
+    } catch (err) {
+      const code = (err as { data?: { error?: string } }).data?.error ?? (err as Error).message;
+      throw new StreamError(code);
+    }
+  };
+  const stream: StreamPort = {
+    disabled: options.streaming === false,
+    async start(channel, threadTs, recipientUserId) {
+      const res = await streamCall('chat.startStream', {
+        channel,
+        thread_ts: threadTs,
+        recipient_user_id: recipientUserId,
+        ...(teamId ? { recipient_team_id: teamId } : {}),
+        task_display_mode: 'plan',
+      });
+      const ts = (res as { ts?: string }).ts;
+      if (!ts) throw new StreamError('no_stream_ts');
+      return ts;
+    },
+    async append(channel, ts, chunks) {
+      await streamCall('chat.appendStream', { channel, ts, chunks });
+    },
+    async stop(channel, ts) {
+      await streamCall('chat.stopStream', { channel, ts });
+    },
+  };
 
   app.message(async ({ message }) => {
     const incoming = toIncoming(message as SlackMessageEvent, botUserId);
@@ -102,6 +137,7 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
   });
 
   const chat: ChatPort = {
+    stream,
     async post(channel, threadTs, text) {
       const res = await app.client.chat.postMessage({
         channel,
@@ -144,6 +180,7 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
     async start() {
       const auth = await app.client.auth.test();
       botUserId = auth.user_id;
+      teamId = auth.team_id;
       await app.start();
       options.log.info(`Slack connected as ${auth.user} (${auth.team})`);
     },

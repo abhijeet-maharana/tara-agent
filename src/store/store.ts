@@ -275,6 +275,14 @@ export class Store {
     return result.changes > 0;
   }
 
+  /** Slots of a job claimed in [from, to], for spotting missed runs. */
+  claimedSlots(jobKey: string, from: number, to: number): Set<number> {
+    const rows = this.db
+      .prepare('SELECT slot FROM job_claims WHERE job_key = ? AND slot BETWEEN ? AND ?')
+      .all(jobKey, from, to) as { slot: number }[];
+    return new Set(rows.map((r) => r.slot));
+  }
+
   finishSlot(jobKey: string, slot: number, status: string): void {
     this.db
       .prepare('UPDATE job_claims SET status = ? WHERE job_key = ? AND slot = ?')

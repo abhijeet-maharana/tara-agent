@@ -6,8 +6,10 @@ import { JOBS_FILE, loadJobs } from '../config/load.js';
 import type { HostConfig, Project, ScheduledJob } from '../config/schema.js';
 import type { Runner } from '../runner/run.js';
 import type { ChatPort, Logger } from '../sessions/manager.js';
+import { splitMessage } from '../slack/format.js';
 import type { Store } from '../store/store.js';
 import { Locks, Semaphore } from '../util/concurrency.js';
+import { buildDigest, type MissedJob } from './health.js';
 import { type JobStatus, type JobTrigger, runJob } from './job-runner.js';
 import type { runScript } from './script.js';
 
@@ -30,6 +32,8 @@ export interface JobInfo {
 export interface JobControl {
   list(project: string): JobInfo[];
   trigger(project: string, id: string, by: string): 'started' | 'unknown' | 'running';
+  /** The last 24 hours of one project, or null when nothing ran or was missed. */
+  digest(project: string): { headline: string; details: string } | null;
 }
 
 export interface SchedulerDeps {
@@ -68,6 +72,7 @@ export class Scheduler implements JobControl {
   private readonly inflight = new Set<Promise<unknown>>();
   private readonly now: () => number;
   private poller: NodeJS.Timeout | undefined;
+  private healthCron: Cron | undefined;
 
   constructor(private readonly deps: SchedulerDeps) {
     this.slots = new Semaphore(deps.host.jobConcurrency);
@@ -79,11 +84,16 @@ export class Scheduler implements JobControl {
     for (const project of this.deps.projects) this.reload(project, { catchUp: true });
     this.poller = setInterval(() => this.checkFiles(), this.deps.reloadIntervalMs ?? 30_000);
     this.poller.unref();
+    const { healthDigest, timezone } = this.deps.host;
+    if (healthDigest.enabled) {
+      this.healthCron = new Cron(healthDigest.cron, { timezone, catch: true }, () => this.postDigests());
+    }
   }
 
   /** Stops scheduling and aborts running jobs; resolves when they have wound down. */
   async stop(): Promise<void> {
     if (this.poller) clearInterval(this.poller);
+    this.healthCron?.stop();
     for (const entry of this.entries.values()) this.stopEntry(entry);
     this.entries.clear();
     this.controller.abort();
@@ -111,6 +121,49 @@ export class Scheduler implements JobControl {
         };
       })
       .sort((a, b) => (a.nextRun?.getTime() ?? Infinity) - (b.nextRun?.getTime() ?? Infinity));
+  }
+
+  digest(project: string): { headline: string; details: string } | null {
+    const now = this.now();
+    const from = now - 24 * 3_600_000;
+    // A slot needs a few minutes to be claimed (it may wait for a job slot or a lock).
+    const until = now - 10 * 60_000;
+    const missed: MissedJob[] = [];
+    for (const [key, { scheduled, clock, cron }] of this.entries) {
+      if (scheduled.project.config.name !== project || !cron) continue;
+      const since = Math.max(from, this.deps.store.firstSeen(key));
+      const claimed = this.deps.store.claimedSlots(key, since, until);
+      const slots: number[] = [];
+      for (
+        let next = clock.nextRun(new Date(since));
+        next && next.getTime() <= until && slots.length < 500;
+      ) {
+        if (!claimed.has(next.getTime())) slots.push(next.getTime());
+        next = clock.nextRun(next);
+      }
+      if (slots.length) missed.push({ id: scheduled.job.id, name: scheduled.job.name, slots });
+    }
+    return buildDigest({
+      project,
+      runs: this.deps.store.runsSince(from).filter((r) => r.project === project),
+      missed,
+      timeZone: this.deps.host.timezone,
+    });
+  }
+
+  /** Posts each project's digest in its channel: headline as a new message, details in its thread. */
+  async postDigests(): Promise<void> {
+    for (const project of this.deps.projects) {
+      const digest = this.digest(project.config.name);
+      if (!digest) continue;
+      try {
+        const ts = await this.deps.chat.post(project.config.slackChannel, undefined, digest.headline);
+        for (const chunk of splitMessage(digest.details))
+          await this.deps.chat.post(project.config.slackChannel, ts, chunk);
+      } catch (err) {
+        this.deps.log.error(`[${project.config.name}] health digest not posted: ${(err as Error).message}`);
+      }
+    }
   }
 
   /** Re-reads every project's job file now (normally polled every 30 s). */

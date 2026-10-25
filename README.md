@@ -27,7 +27,7 @@ Slack thread ──► tara-agent ──► claude -p --resume <session>   (cwd 
 
 - Each Slack channel maps to one project repo.
 - A new message starts a Claude Code session, and replies in its thread resume it. Sessions survive restarts.
-- While Claude works, one status message updates with the current step. The answer is posted when the turn ends.
+- The reply streams into the thread like Slack's own AI apps: a live task card (each tool call ticks off as it finishes) and Claude's text typed out below it. Without Slack's "Agents & AI Apps" feature it falls back to one status message that updates, then the answer.
 
 ## Quick start
 
@@ -36,7 +36,7 @@ Requirements: Node ≥ 22.13, Claude Code installed and logged in (`claude` then
 1. **Slack app:** create it from [`deploy/slack-app-manifest.yaml`](deploy/slack-app-manifest.yaml), then invite the bot to your project channels.
 2. **Install:**
    ```sh
-   git clone https://github.com/<you>/tara-agent && cd tara-agent
+   git clone https://github.com/abhijeet-maharana/tara-agent && cd tara-agent
    npm ci && npm run build
    ```
 3. **Host config:** copy [`examples/config.yaml`](examples/config.yaml) to `~/.config/tara-agent/config.yaml` and list your project paths.
@@ -82,11 +82,13 @@ The agent then can't use your sudo, docker group, browser profile files, other p
 | `claude.bin` | `claude` | CLI path |
 | `claude.chatTimeoutMinutes` | `20` | Per-turn time limit |
 | `stateDir` | `~/.local/state/tara-agent` | SQLite state (sessions, run history) |
-| `statusIntervalSeconds` | `5` | Min gap between status-message edits |
+| `streaming` | `true` | Stream replies natively (task card + live text). Needs the Slack app's "Agents & AI Apps" feature and the `assistant:write` scope; without them tara-agent switches to edited messages by itself |
+| `statusIntervalSeconds` | `5` | Min gap between status-message edits in the fallback mode |
 | `jobConcurrency` | `1` | Max scheduled jobs at once (chat has its own limit) |
 | `catchUpHours` | `6` | After downtime, run a job's latest missed slot if it is at most this old (`0` = never) |
 | `timezone` | host's | Default timezone for job schedules and times shown in Slack |
-| `http` | `127.0.0.1:4100` | Local control API (`enabled`, `bind`, `port`); set `TARA_HTTP_TOKEN` to require a bearer token |
+| `healthDigest` | on, `0 9 * * *` | Daily summary per project channel (`enabled`, `cron` in `timezone`): runs, problems, missed slots, peak 5-hour usage. Silent for projects with nothing to report |
+| `http` | `127.0.0.1:4100` | Local control API (`enabled`, `bind`, `port`); set `TARA_HTTP_TOKEN` to require a bearer token. Also needed by the approval/file tools |
 
 **Project** (`<repo>/.tara/config.json`, committed in that repo)
 
@@ -186,6 +188,7 @@ For dashboards and scripts on the same host (`127.0.0.1:4100` by default):
 | `!status` | Show project, model, session and queue |
 | `!jobs` | List this channel's jobs with their next run |
 | `!run <job-id>` | Run a job now (it posts its own thread) |
+| `!health` | The last 24 hours: runs, problems, missed slots, usage |
 
 ## Security
 
@@ -193,6 +196,15 @@ For dashboards and scripts on the same host (`127.0.0.1:4100` by default):
 - The default `permissionMode: default` only runs tools listed in `allowedTools`. Anything else is blocked and reported in the thread.
 - `bypassPermissions` runs everything without asking. Use it only in private channels you control, and limit `allowedUsers`.
 - Credentials are stripped from the CLI's environment unless a project opts into API billing.
+
+More in [`docs/security.md`](docs/security.md).
+
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md): modules and the flow of a chat turn, a job and an approval
+- [`docs/security.md`](docs/security.md): threat model and the dedicated-user setup
+- [`docs/plan.md`](docs/plan.md): design notes and roadmap
+- [`CHANGELOG.md`](CHANGELOG.md), [`CONTRIBUTING.md`](CONTRIBUTING.md)
 
 ## Development
 
