@@ -3,14 +3,16 @@ import type { HostConfig, Project } from '../config/schema.js';
 import { buildClaudeArgs } from '../runner/args.js';
 import { buildChildEnv } from '../runner/env.js';
 import type { Runner, RunOutcome } from '../runner/run.js';
+import type { JobControl } from '../scheduler/scheduler.js';
 import { formatDuration, splitMessage, toSlackMrkdwn } from '../slack/format.js';
 import type { SessionRow, Store } from '../store/store.js';
 import { KeyedQueue, Semaphore, Throttle } from '../util/concurrency.js';
 
 /** The chat platform as the session manager sees it. Slack implements it; tests fake it. */
 export interface ChatPort {
-  /** Posts into a thread and returns the new message's ts. */
-  post(channel: string, threadTs: string, text: string): Promise<string>;
+  /** Posts into a thread (or top-level when `threadTs` is undefined) and returns the new message's ts. */
+  post(channel: string, threadTs: string | undefined, text: string): Promise<string>;
+  delete(channel: string, ts: string): Promise<void>;
   update(channel: string, ts: string, text: string): Promise<void>;
   react(channel: string, ts: string, emoji: string): Promise<void>;
   unreact(channel: string, ts: string, emoji: string): Promise<void>;
@@ -37,6 +39,8 @@ export interface ManagerDeps {
   store: Store;
   chat: ChatPort;
   run: Runner;
+  /** Scheduler, for `!jobs` and `!run`. */
+  jobs?: JobControl;
   env?: NodeJS.ProcessEnv;
   log?: Logger;
   newSessionId?: () => string;
@@ -53,7 +57,9 @@ const HELP = `*Thread commands*
 • \`!new\` forget this thread's session; the next message starts fresh
 • \`!model <name>\` switch model for this thread (e.g. \`opus\`, \`sonnet\`, \`haiku\`)
 • \`!stop\` stop the running turn
-• \`!status\` show session, model and queue`;
+• \`!status\` show session, model and queue
+• \`!jobs\` list this channel's scheduled jobs
+• \`!run <job-id>\` run a job now (it posts its own thread)`;
 
 export const threadKey = (channel: string, threadTs: string) => `${channel}:${threadTs}`;
 
@@ -132,6 +138,33 @@ export class SessionManager {
             `*Permissions:* ${project.config.permissionMode}`,
           ].join('\n'),
         ));
+      }
+      case 'jobs': {
+        const jobs = this.deps.jobs?.list(project.config.name) ?? [];
+        if (jobs.length === 0) return void (await reply('No scheduled jobs for this channel.'));
+        const timeZone = this.deps.host.timezone;
+        const when = (d?: Date) =>
+          d
+            ? d.toLocaleString('en-GB', { timeZone, weekday: 'short', hour: '2-digit', minute: '2-digit' })
+            : 'off';
+        const lines = jobs.map(
+          (j) =>
+            `• \`${j.id}\` ${j.running ? '🔄 ' : j.enabled ? '' : '⏸ '}${j.name} · ${when(j.nextRun)} · ${j.model}` +
+            (j.lastStatus ? ` · last: ${j.lastStatus}` : ''),
+        );
+        return void (await reply(`*Jobs* (next run, ${timeZone})\n${lines.join('\n')}`));
+      }
+      case 'run': {
+        if (!this.deps.jobs) return void (await reply('Scheduling is not enabled.'));
+        if (!arg) return void (await reply('Usage: `!run <job-id>` (see `!jobs`)'));
+        const result = this.deps.jobs.trigger(project.config.name, arg, msg.user);
+        const text =
+          result === 'started'
+            ? `▶️ Started \`${arg}\`. It posts its own thread in this channel.`
+            : result === 'running'
+              ? `\`${arg}\` is already running.`
+              : `No job \`${arg}\` here. See \`!jobs\`.`;
+        return void (await reply(text));
       }
       default:
         return void (await reply(HELP));

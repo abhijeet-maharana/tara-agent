@@ -84,6 +84,9 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
       });
       return res.ts as string;
     },
+    async delete(channel, ts) {
+      await app.client.chat.delete({ channel, ts });
+    },
     async update(channel, ts, text) {
       await app.client.chat.update({ channel, ts, text });
     },

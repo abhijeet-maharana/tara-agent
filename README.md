@@ -1,8 +1,8 @@
 # tara-agent
 
-Self-hosted gateway that turns **Slack threads** (and soon **cron schedules**) into real **Claude Code** sessions on your own machine, across as many project repos as you like.
+Self-hosted gateway that turns **Slack threads** and **cron schedules** into real **Claude Code** sessions on your own machine, across as many project repos as you like.
 
-> **Status:** early development. Slack thread chat works. Scheduled jobs and approval buttons are next. See [docs/plan.md](docs/plan.md).
+> **Status:** early development, running in production for one small business. Slack threads and scheduled jobs work; approval buttons are next. See [docs/plan.md](docs/plan.md).
 
 ## Why
 
@@ -72,6 +72,10 @@ Requirements: Node ≥ 22.13, Claude Code installed and logged in (`claude` then
 | `claude.chatTimeoutMinutes` | `20` | Per-turn time limit |
 | `stateDir` | `~/.local/state/tara-agent` | SQLite state (sessions, run history) |
 | `statusIntervalSeconds` | `5` | Min gap between status-message edits |
+| `jobConcurrency` | `1` | Max scheduled jobs at once (chat has its own limit) |
+| `catchUpHours` | `6` | After downtime, run a job's latest missed slot if it is at most this old (`0` = never) |
+| `timezone` | host's | Default timezone for job schedules and times shown in Slack |
+| `http` | `127.0.0.1:4100` | Local control API (`enabled`, `bind`, `port`); set `TARA_HTTP_TOKEN` to require a bearer token |
 
 **Project** (`<repo>/.tara/config.json`, committed in that repo)
 
@@ -86,6 +90,69 @@ Requirements: Node ≥ 22.13, Claude Code installed and logged in (`claude` then
 | `allowedUsers` | `[]` (everyone in the channel) | Slack user IDs allowed to talk to the bot |
 | `billing` | `subscription` | `api` runs the CLI with `ANTHROPIC_API_KEY` |
 
+## Scheduled jobs
+
+Each repo can declare jobs in `.tara/jobs.json` (reloaded within 30 s of a change):
+
+```json
+{
+  "env": { "DATA_DIR": "~/data" },
+  "jobs": [
+    {
+      "id": "daily-sla-report",
+      "name": "Daily SLA report",
+      "cron": "15 5 * * *",
+      "tz": "UTC",
+      "prompt": "Check yesterday's late orders and summarise them.",
+      "skills": ["order-sla-report"],
+      "preScript": "scripts/sla-gate.py",
+      "model": "haiku",
+      "locks": ["chrome"]
+    }
+  ]
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `id`, `name`, `cron` | required | Slug for `!run`, display name, cron expression (5 or 6 fields) |
+| `tz` | host `timezone` | Timezone of `cron` |
+| `prompt` | required unless `agent: false` | What Claude should do |
+| `skills` | `[]` | Skills named in the prompt so Claude reads them first |
+| `preScript` | none | Runs first, from the repo root (`.py` → python3, `.sh` → bash) |
+| `agent` | `true` | `false`: the script is the job; its stdout is posted as-is |
+| `model` | `sonnet` | Model for this job |
+| `locks` | `[]` | Named locks held for the run, e.g. `["chrome"]` |
+| `timeoutMinutes` | `30` | Per-run limit (script and model each) |
+| `catchUp` | `true` | Run the latest missed slot after downtime |
+| `channel` | project channel | Where the job posts |
+| `env` | `{}` | Extra environment for the script and the CLI (`~/` expanded); merged over the file-level `env` |
+| `enabled` | `true` | `false` keeps the job listed but never scheduled |
+
+**How a run goes.** The pre-script runs first. Empty output, or a last line of `{"wakeAgent": false}`, ends the run silently. Otherwise its output (or its error) is put in front of the prompt as a `## Script Output` block. Claude's reply goes to Slack: the headline (before a `---` line) as a new message in the channel, the details in its thread. A reply of `[SILENT]` posts nothing, and a first line of `[CRON_FAILURE]` marks the run failed. Replying in a job's thread continues that session, so a job can ask for approval and act on your answer. These conventions match Hermes Agent's, so Hermes jobs run unchanged.
+
+**Every slot runs at most once**, even across restarts (claimed in SQLite). A job added while tara-agent was down never runs for its past slots.
+
+**Moving from Hermes Agent:**
+```sh
+tara-agent import-hermes --from ~/.hermes/cron/jobs.json --out <repo>/.tara/jobs.json \
+  --env REPO_ROOT=~/Projects/my-repo   # map container paths your scripts expect
+```
+Hermes' cron default model becomes `--default-model` (`haiku`), browser-capable jobs get the `chrome` lock, and schedules stay in UTC.
+
+## Local API
+
+For dashboards and scripts on the same host (`127.0.0.1:4100` by default):
+
+| Call | Does |
+|---|---|
+| `GET /health` | Uptime and job counts |
+| `GET /jobs?project=<name>` | Jobs with next run, last status and error |
+| `POST /jobs/<project>/<id>/run` `{"by": "who"}` | Run a job now |
+| `GET /jobs/<project>/<id>/runs?limit=15` | Run history |
+| `GET /runs/<id>` | One run, with Claude's reply and the script output |
+| `POST /reload` | Re-read every `.tara/jobs.json` now |
+
 ## Thread commands
 
 | Command | Effect |
@@ -94,6 +161,8 @@ Requirements: Node ≥ 22.13, Claude Code installed and logged in (`claude` then
 | `!model <name>` | Switch model for this thread |
 | `!stop` | Stop the running turn |
 | `!status` | Show project, model, session and queue |
+| `!jobs` | List this channel's jobs with their next run |
+| `!run <job-id>` | Run a job now (it posts its own thread) |
 
 ## Security
 

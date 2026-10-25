@@ -1,6 +1,6 @@
 # tara-agent: plan
 
-> **Status:** approved 2026-10-25. P0 and P1 done; running live on the author's home server for 3 project channels since 2026-10-25. Next: P2 scheduler.
+> **Status:** approved 2026-10-25. P0–P2 done; running live on the author's home server for 3 project channels and 58 jobs since 2026-10-25. Next: P3 approval buttons.
 
 **One line:** a self-hosted gateway that turns Slack threads and cron schedules into real Claude Code sessions on your own machine. It works across many project repos and stays within Anthropic's terms by running the official `claude` CLI.
 
@@ -224,3 +224,4 @@ tara-agent/
 |---|---|
 | P0 Scaffold | ✅ package, tsconfig, Biome, vitest, CI (typecheck, lint, test, build on Node 22/24) + gitleaks, MIT, README, `.gitignore`, Slack manifest, systemd unit, examples |
 | P1 Runner + Slack threads | ✅ runner, stream-json parser, env stripping, SQLite store, session manager (`!new`, `!model`, `!stop`, `!status`), Slack adapter. 70 unit tests; verified with the real CLI and live in Slack (thread reply, reactions, usage capture). Accepts messages people post through an app with a user token (they carry `bot_id` + `user`) |
+| P2 Scheduler | ✅ `.tara/jobs.json` (zod-validated, hot reload), croner, SQLite slot claims (exactly once), catch-up only for slots after a job was first seen, `jobConcurrency` + named locks, pre-scripts with Hermes' contract (wake gate, `## Script Output`, `[SILENT]`, `[CRON_FAILURE]`), headline/details delivery, replies resume job sessions, `!jobs` / `!run`, `import-hermes`, `validate`, local HTTP API (moved up from P4). 110 tests |

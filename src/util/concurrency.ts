@@ -103,3 +103,28 @@ export class Throttle<T> {
     this.inflight = this.inflight.then(() => this.send(pending.value).catch(() => {}));
   }
 }
+
+/** Named mutexes (e.g. "chrome"). Acquired in sorted order, so two holders of overlapping sets can't deadlock. */
+export class Locks {
+  private readonly locks = new Map<string, Semaphore>();
+
+  /** Names among `names` that someone holds right now. */
+  held(names: string[]): string[] {
+    return names.filter((n) => this.locks.get(n)?.busy);
+  }
+
+  async acquire(names: string[]): Promise<() => void> {
+    const releases: Array<() => void> = [];
+    for (const name of [...new Set(names)].sort()) {
+      let lock = this.locks.get(name);
+      if (!lock) {
+        lock = new Semaphore(1);
+        this.locks.set(name, lock);
+      }
+      releases.push(await lock.acquire());
+    }
+    return () => {
+      for (const release of releases.reverse()) release();
+    };
+  }
+}

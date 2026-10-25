@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 import { execFileSync } from 'node:child_process';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
-import { DEFAULT_HOST_CONFIG, expandHome, loadHostConfig, loadProjects } from './config/load.js';
+import { DEFAULT_HOST_CONFIG, expandHome, loadHostConfig, loadJobs, loadProjects } from './config/load.js';
+import { startHttpServer } from './http/server.js';
+import { convertHermesJobs } from './import-hermes.js';
 import { runClaude } from './runner/run.js';
+import { Scheduler } from './scheduler/scheduler.js';
 import { type Logger, SessionManager } from './sessions/manager.js';
 import { createSlackGateway } from './slack/app.js';
 import { Store } from './store/store.js';
@@ -13,6 +17,13 @@ const log: Logger = {
   warn: (m) => console.warn(m),
   error: (m) => console.error(m),
 };
+
+const USAGE = `Usage:
+  tara-agent [--config <file>]               run the gateway
+  tara-agent validate [--config <file>]      check host, project and job config, then exit
+  tara-agent import-hermes --from <hermes jobs json> --out <repo>/.tara/jobs.json
+      [--scripts-dir .agents/hermes/cron/scripts] [--default-model haiku] [--tz UTC]
+      [--env KEY=VALUE ...] [--force]`;
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -28,12 +39,57 @@ function claudeVersion(bin: string): string {
   }
 }
 
-async function main() {
-  const { values } = parseArgs({ options: { config: { type: 'string', short: 'c' } } });
-  const configPath = path.resolve(expandHome(values.config ?? DEFAULT_HOST_CONFIG));
-
-  const host = loadHostConfig(configPath);
+function loadAll(configFlag: string | undefined) {
+  const host = loadHostConfig(path.resolve(expandHome(configFlag ?? DEFAULT_HOST_CONFIG)));
   const projects = loadProjects(host);
+  return { host, projects };
+}
+
+function validate(configFlag: string | undefined): void {
+  const { host, projects } = loadAll(configFlag);
+  for (const p of projects) {
+    const jobs = loadJobs(p);
+    const enabled = jobs.filter((j) => j.job.enabled).length;
+    log.info(`✓ ${p.config.name} (${p.dir}): ${enabled}/${jobs.length} jobs enabled`);
+  }
+  log.info(`✓ config OK (timezone ${host.timezone}, jobConcurrency ${host.jobConcurrency})`);
+}
+
+function importHermes(args: string[]): void {
+  const { values } = parseArgs({
+    args,
+    options: {
+      from: { type: 'string' },
+      out: { type: 'string' },
+      'scripts-dir': { type: 'string', default: '.agents/hermes/cron/scripts' },
+      'default-model': { type: 'string', default: 'haiku' },
+      tz: { type: 'string', default: 'UTC' },
+      env: { type: 'string', multiple: true, default: [] },
+      force: { type: 'boolean', default: false },
+    },
+  });
+  if (!values.from || !values.out) throw new Error(USAGE);
+  const out = path.resolve(expandHome(values.out));
+  if (existsSync(out) && !values.force) throw new Error(`${out} exists; pass --force to overwrite it`);
+  const env = Object.fromEntries(
+    (values.env ?? []).map((pair) => {
+      const i = pair.indexOf('=');
+      if (i < 1) throw new Error(`--env expects KEY=VALUE, got "${pair}"`);
+      return [pair.slice(0, i), pair.slice(i + 1)];
+    }),
+  );
+  const result = convertHermesJobs(JSON.parse(readFileSync(path.resolve(expandHome(values.from)), 'utf8')), {
+    scriptsDir: values['scripts-dir'] as string,
+    defaultModel: values['default-model'] as string,
+    tz: values.tz as string,
+    env,
+  });
+  writeFileSync(out, `${JSON.stringify(result, null, 2)}\n`);
+  log.info(`Wrote ${result.jobs.length} jobs to ${out}`);
+}
+
+async function serve(configFlag: string | undefined) {
+  const { host, projects } = loadAll(configFlag);
   log.info(`Claude Code: ${claudeVersion(host.claude.bin)}`);
   for (const p of projects) {
     const { name, slackChannel, permissionMode, chatModel, billing } = p.config;
@@ -53,8 +109,28 @@ async function main() {
     log,
     onMessage: (msg) => manager?.handle(msg) ?? Promise.resolve(),
   });
-  manager = new SessionManager({ projects, host, store, chat: slack.chat, run: runClaude, log });
+  const scheduler = new Scheduler({ projects, host, store, chat: slack.chat, run: runClaude, log });
+  manager = new SessionManager({
+    projects,
+    host,
+    store,
+    chat: slack.chat,
+    run: runClaude,
+    jobs: scheduler,
+    log,
+  });
   await slack.start();
+  scheduler.start();
+  const http = host.http.enabled
+    ? await startHttpServer({
+        ...host.http,
+        token: process.env.TARA_HTTP_TOKEN || undefined,
+        scheduler,
+        store,
+        projects: projects.map((p) => p.config.name),
+        log,
+      })
+    : undefined;
 
   let stopping = false;
   const shutdown = async (signal: string) => {
@@ -62,15 +138,32 @@ async function main() {
     stopping = true;
     log.info(`${signal}: stopping`);
     manager?.stopAll();
+    http?.close();
     await slack.stop().catch(() => {});
-    // Give stopped turns a moment to post their "Stopped" status before the DB closes.
+    // Give stopped turns and jobs a moment to post their "Stopped" status before the DB closes.
+    const exit = setTimeout(() => {
+      store.close();
+      process.exit(0);
+    }, 8_000);
+    await scheduler.stop().catch(() => {});
+    clearTimeout(exit);
     setTimeout(() => {
       store.close();
       process.exit(0);
-    }, 3_000).unref();
+    }, 1_000).unref();
   };
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
+}
+
+async function main() {
+  const [command, ...rest] = process.argv.slice(2);
+  if (command === 'import-hermes') return importHermes(rest);
+  if (command === '--help' || command === 'help') return void log.info(USAGE);
+  const args = command === 'validate' ? rest : process.argv.slice(2);
+  const { values } = parseArgs({ args, options: { config: { type: 'string', short: 'c' } } });
+  if (command === 'validate') return validate(values.config);
+  await serve(values.config);
 }
 
 main().catch((err: Error) => {

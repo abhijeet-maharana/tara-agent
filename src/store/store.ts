@@ -30,7 +30,17 @@ export interface RunRecord {
   toolCalls?: number;
   rateLimitUtilization?: number;
   error?: string;
+  /** Final reply text (jobs only), capped. */
+  output?: string;
+  /** Pre-run script output (jobs only), capped. */
+  scriptOutput?: string;
 }
+
+export interface StoredRun extends RunRecord {
+  id: number;
+}
+
+const OUTPUT_CAP = 20_000;
 
 const MIGRATIONS = [
   `CREATE TABLE sessions (
@@ -63,7 +73,47 @@ const MIGRATIONS = [
      error                 TEXT
    );
    CREATE INDEX runs_started ON runs (started_at);`,
+  `CREATE TABLE job_claims (
+     job_key    TEXT NOT NULL,
+     slot       INTEGER NOT NULL,
+     status     TEXT NOT NULL,
+     claimed_at INTEGER NOT NULL,
+     PRIMARY KEY (job_key, slot)
+   );
+   CREATE TABLE job_seen (
+     job_key    TEXT PRIMARY KEY,
+     first_seen INTEGER NOT NULL
+   );`,
+  `ALTER TABLE runs ADD COLUMN output TEXT;
+   ALTER TABLE runs ADD COLUMN script_output TEXT;
+   CREATE INDEX runs_job ON runs (project, job_id, started_at);`,
 ];
+
+function toRun(r: Record<string, unknown>): StoredRun {
+  const opt = <T>(v: unknown) => (v ?? undefined) as T | undefined;
+  return {
+    id: r.id as number,
+    kind: r.kind as RunRecord['kind'],
+    project: r.project as string,
+    jobId: opt(r.job_id),
+    threadKey: opt(r.thread_key),
+    sessionId: opt(r.session_id),
+    model: opt(r.model),
+    startedAt: r.started_at as number,
+    endedAt: r.ended_at as number,
+    status: r.status as string,
+    costUsd: opt(r.cost_usd),
+    inputTokens: opt(r.input_tokens),
+    outputTokens: opt(r.output_tokens),
+    cacheReadTokens: opt(r.cache_read_tokens),
+    cacheCreationTokens: opt(r.cache_creation_tokens),
+    toolCalls: opt(r.tool_calls),
+    rateLimitUtilization: opt(r.rate_limit_util),
+    error: opt(r.error),
+    output: opt(r.output),
+    scriptOutput: opt(r.script_output),
+  };
+}
 
 /** SQLite state: sessions and run history. Lives outside every project repo. */
 export class Store {
@@ -131,13 +181,14 @@ export class Store {
     this.db.prepare('DELETE FROM sessions WHERE thread_key = ?').run(threadKey);
   }
 
-  recordRun(r: RunRecord): void {
-    this.db
+  /** Stores a finished run and returns its id. */
+  recordRun(r: RunRecord): number {
+    const result = this.db
       .prepare(
         `INSERT INTO runs (kind, project, job_id, thread_key, session_id, model, started_at, ended_at, status,
            cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, tool_calls,
-           rate_limit_util, error)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           rate_limit_util, error, output, script_output)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         r.kind,
@@ -157,32 +208,64 @@ export class Store {
         r.toolCalls ?? null,
         r.rateLimitUtilization ?? null,
         r.error ?? null,
+        r.output?.slice(0, OUTPUT_CAP) ?? null,
+        r.scriptOutput?.slice(0, OUTPUT_CAP) ?? null,
       );
+    return Number(result.lastInsertRowid);
   }
 
-  runsSince(since: number): RunRecord[] {
+  runsSince(since: number): StoredRun[] {
+    const rows = this.db.prepare('SELECT * FROM runs WHERE started_at >= ? ORDER BY started_at').all(since);
+    return (rows as Record<string, unknown>[]).map(toRun);
+  }
+
+  /** A job's runs, newest first. */
+  jobRuns(project: string, jobId: string, limit: number): StoredRun[] {
     const rows = this.db
-      .prepare('SELECT * FROM runs WHERE started_at >= ? ORDER BY started_at')
-      .all(since) as Record<string, unknown>[];
-    return rows.map((r) => ({
-      kind: r.kind as RunRecord['kind'],
-      project: r.project as string,
-      jobId: (r.job_id as string | null) ?? undefined,
-      threadKey: (r.thread_key as string | null) ?? undefined,
-      sessionId: (r.session_id as string | null) ?? undefined,
-      model: (r.model as string | null) ?? undefined,
-      startedAt: r.started_at as number,
-      endedAt: r.ended_at as number,
-      status: r.status as string,
-      costUsd: (r.cost_usd as number | null) ?? undefined,
-      inputTokens: (r.input_tokens as number | null) ?? undefined,
-      outputTokens: (r.output_tokens as number | null) ?? undefined,
-      cacheReadTokens: (r.cache_read_tokens as number | null) ?? undefined,
-      cacheCreationTokens: (r.cache_creation_tokens as number | null) ?? undefined,
-      toolCalls: (r.tool_calls as number | null) ?? undefined,
-      rateLimitUtilization: (r.rate_limit_util as number | null) ?? undefined,
-      error: (r.error as string | null) ?? undefined,
-    }));
+      .prepare('SELECT * FROM runs WHERE project = ? AND job_id = ? ORDER BY started_at DESC LIMIT ?')
+      .all(project, jobId, limit);
+    return (rows as Record<string, unknown>[]).map(toRun);
+  }
+
+  getRun(id: number): StoredRun | undefined {
+    const row = this.db.prepare('SELECT * FROM runs WHERE id = ?').get(id);
+    return row ? toRun(row as Record<string, unknown>) : undefined;
+  }
+
+  /**
+   * Claims one scheduled slot of a job. Returns false when it was already claimed (by an earlier run or
+   * a previous process), so every slot runs at most once.
+   */
+  claimSlot(jobKey: string, slot: number): boolean {
+    const result = this.db
+      .prepare(
+        `INSERT INTO job_claims (job_key, slot, status, claimed_at) VALUES (?, ?, 'running', ?)
+         ON CONFLICT (job_key, slot) DO NOTHING`,
+      )
+      .run(jobKey, slot, this.now());
+    return result.changes > 0;
+  }
+
+  finishSlot(jobKey: string, slot: number, status: string): void {
+    this.db
+      .prepare('UPDATE job_claims SET status = ? WHERE job_key = ? AND slot = ?')
+      .run(status, jobKey, slot);
+  }
+
+  /** When this job was first scheduled on this host. Recorded on the first call. */
+  firstSeen(jobKey: string): number {
+    this.db
+      .prepare('INSERT INTO job_seen (job_key, first_seen) VALUES (?, ?) ON CONFLICT (job_key) DO NOTHING')
+      .run(jobKey, this.now());
+    const row = this.db.prepare('SELECT first_seen FROM job_seen WHERE job_key = ?').get(jobKey) as {
+      first_seen: number;
+    };
+    return row.first_seen;
+  }
+
+  /** Most recent run of a job, if any. */
+  lastJobRun(project: string, jobId: string): StoredRun | undefined {
+    return this.jobRuns(project, jobId, 1)[0];
   }
 
   close(): void {

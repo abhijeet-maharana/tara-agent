@@ -19,6 +19,20 @@ export const hostConfigSchema = z.object({
   stateDir: z.string().optional(),
   /** Minimum gap between edits of the live status message. */
   statusIntervalSeconds: z.number().min(1).default(5),
+  /** Max scheduled jobs running at once (separate from chat). */
+  jobConcurrency: z.number().int().min(1).max(8).default(1),
+  /** After downtime, run a job's most recent missed slot if it is at most this old. 0 disables catch-up. */
+  catchUpHours: z.number().min(0).default(6),
+  /** Default timezone for job schedules and for times shown in Slack. Defaults to the host's. */
+  timezone: z.string().default(Intl.DateTimeFormat().resolvedOptions().timeZone),
+  /** Local control API (jobs, runs, health). Set TARA_HTTP_TOKEN to require a bearer token. */
+  http: z
+    .object({
+      enabled: z.boolean().default(true),
+      bind: z.string().default('127.0.0.1'),
+      port: z.number().int().min(1).max(65535).default(4100),
+    })
+    .default({ enabled: true, bind: '127.0.0.1', port: 4100 }),
 });
 
 /** `<repo>/.tara/config.json`: committed in the project repo. */
@@ -40,7 +54,62 @@ export const projectConfigSchema = z.object({
   billing: z.enum(['subscription', 'api']).default('subscription'),
 });
 
+const jobIdPattern = /^[a-z0-9][a-z0-9-]*$/;
+
+/** One scheduled job in `<repo>/.tara/jobs.json`. */
+export const jobSchema = z
+  .object({
+    id: z.string().regex(jobIdPattern, 'lowercase letters, digits and dashes'),
+    name: z.string().min(1),
+    /** Cron expression (5 or 6 fields). */
+    cron: z.string().min(1),
+    /** IANA timezone for `cron`. Defaults to the host timezone. */
+    tz: z.string().optional(),
+    /** What to do. Optional only for script-only jobs (`agent: false`). */
+    prompt: z.string().optional(),
+    /** Skills the job should follow; named in the prompt so Claude reads them first. */
+    skills: z.array(z.string()).default([]),
+    /**
+     * Runs before the model, in the repo root (`.py` with python3, `.sh` with bash, else executed).
+     * Empty stdout or a last line of `{"wakeAgent": false}` = silent run. Otherwise its output (or its
+     * error) is put in front of the prompt.
+     */
+    preScript: z.string().optional(),
+    /** false = the script is the job: its stdout is posted as-is and no model runs. */
+    agent: z.boolean().default(true),
+    model: z.string().min(1).default('sonnet'),
+    /** Named locks held for the whole run, e.g. ["chrome"] for jobs that drive the shared browser. */
+    locks: z.array(z.string()).default([]),
+    timeoutMinutes: z.number().positive().default(30),
+    /** Run the most recent missed slot after downtime (see host `catchUpHours`). */
+    catchUp: z.boolean().default(true),
+    /** Slack channel for this job's threads. Defaults to the project channel. */
+    channel: z.string().optional(),
+    /** Extra environment for the script and the CLI. `~/` is expanded. */
+    env: z.record(z.string(), z.string()).default({}),
+    allowedTools: z.array(z.string()).optional(),
+    enabled: z.boolean().default(true),
+  })
+  .refine((j) => j.prompt || !j.agent, { message: 'prompt is required unless agent is false' })
+  .refine((j) => j.preScript || j.agent, { message: 'a job with agent: false needs a preScript' });
+
+/** `<repo>/.tara/jobs.json`. */
+export const jobsFileSchema = z.object({
+  /** Environment shared by every job in this repo. `~/` is expanded. */
+  env: z.record(z.string(), z.string()).default({}),
+  jobs: z.array(jobSchema).superRefine((jobs, ctx) => {
+    const seen = new Set<string>();
+    for (const [i, j] of jobs.entries()) {
+      if (seen.has(j.id))
+        ctx.addIssue({ code: 'custom', path: [i, 'id'], message: `duplicate job id "${j.id}"` });
+      seen.add(j.id);
+    }
+  }),
+});
+
 export type HostConfig = z.infer<typeof hostConfigSchema>;
+export type JobConfig = z.infer<typeof jobSchema>;
+export type JobsFile = z.infer<typeof jobsFileSchema>;
 export type ProjectConfig = z.infer<typeof projectConfigSchema>;
 export type PermissionMode = (typeof permissionModes)[number];
 
@@ -49,4 +118,11 @@ export interface Project {
   config: ProjectConfig;
   /** Contents of `systemPromptFile`, if set. */
   systemPrompt?: string;
+}
+
+/** A job with its project and fully merged environment. */
+export interface ScheduledJob {
+  project: Project;
+  job: JobConfig;
+  env: Record<string, string>;
 }

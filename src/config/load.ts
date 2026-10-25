@@ -3,10 +3,18 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import type { z } from 'zod';
-import { type HostConfig, hostConfigSchema, type Project, projectConfigSchema } from './schema.js';
+import {
+  type HostConfig,
+  hostConfigSchema,
+  jobsFileSchema,
+  type Project,
+  projectConfigSchema,
+  type ScheduledJob,
+} from './schema.js';
 
 export const DEFAULT_HOST_CONFIG = path.join(homedir(), '.config', 'tara-agent', 'config.yaml');
 export const PROJECT_CONFIG = path.join('.tara', 'config.json');
+export const JOBS_FILE = path.join('.tara', 'jobs.json');
 
 export function expandHome(p: string): string {
   return p === '~' || p.startsWith('~/') ? path.join(homedir(), p.slice(1)) : p;
@@ -65,4 +73,26 @@ export function loadProjects(host: HostConfig): Project[] {
     }
   }
   return projects;
+}
+
+/** Jobs of one project, or none when it has no `.tara/jobs.json`. Throws on an invalid file. */
+export function loadJobs(project: Project): ScheduledJob[] {
+  const file = path.join(project.dir, JOBS_FILE);
+  let text: string;
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw err;
+  }
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`Invalid JSON in ${file}: ${(err as Error).message}`);
+  }
+  const jobsFile = parseWith(jobsFileSchema, json, file);
+  const expand = (env: Record<string, string>) =>
+    Object.fromEntries(Object.entries(env).map(([k, v]) => [k, expandHome(v)]));
+  return jobsFile.jobs.map((job) => ({ project, job, env: { ...expand(jobsFile.env), ...expand(job.env) } }));
 }

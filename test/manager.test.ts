@@ -10,6 +10,10 @@ const host: HostConfig = {
   claude: { bin: 'claude', chatTimeoutMinutes: 20 },
   stateDir: '/tmp',
   statusIntervalSeconds: 0,
+  jobConcurrency: 1,
+  catchUpHours: 6,
+  timezone: 'UTC',
+  http: { enabled: false, bind: '127.0.0.1', port: 0 },
 };
 
 function project(overrides: Partial<ProjectConfig> = {}): Project {
@@ -34,10 +38,14 @@ class FakeChat implements ChatPort {
   updates: { ts: string; text: string }[] = [];
   reactions: string[] = [];
   private n = 0;
-  async post(_channel: string, thread: string, text: string) {
+  deleted: string[] = [];
+  async post(_channel: string, thread: string | undefined, text: string) {
     const ts = `bot.${++this.n}`;
-    this.posts.push({ thread, text, ts });
+    this.posts.push({ thread: thread ?? '', text, ts });
     return ts;
+  }
+  async delete(_channel: string, ts: string) {
+    this.deleted.push(ts);
   }
   async update(_channel: string, ts: string, text: string) {
     this.updates.push({ ts, text });
