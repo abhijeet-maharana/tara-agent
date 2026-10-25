@@ -1,15 +1,20 @@
 #!/usr/bin/env -S node --disable-warning=ExperimentalWarning
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { hostname } from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
+import { Approvals } from './approvals/approvals.js';
 import { Bridge } from './bridge/bridge.js';
 import { DEFAULT_HOST_CONFIG, expandHome, loadHostConfig, loadJobs, loadProjects } from './config/load.js';
 import { startHttpServer } from './http/server.js';
 import { convertHermesJobs } from './import-hermes.js';
-import { runClaude } from './runner/run.js';
+import { resolveRunAs } from './runner/as-user.js';
+import { type Runner, runClaude } from './runner/run.js';
 import { sweepScratch } from './runner/workspace.js';
+import { QueueWorker } from './scheduler/queues.js';
 import { Scheduler } from './scheduler/scheduler.js';
+import { runScript } from './scheduler/script.js';
 import { type Logger, SessionManager } from './sessions/manager.js';
 import { createSlackGateway } from './slack/app.js';
 import { Store } from './store/store.js';
@@ -25,7 +30,9 @@ const USAGE = `Usage:
   tara-agent validate [--config <file>]      check host, project and job config, then exit
   tara-agent import-hermes --from <hermes jobs json> --out <repo>/.tara/jobs.json
       [--scripts-dir .agents/hermes/cron/scripts] [--default-model haiku] [--tz UTC]
-      [--env KEY=VALUE ...] [--force]`;
+      [--env KEY=VALUE ...] [--force]
+  tara-agent import-tasks --from <tasks.json> [--config <file>]
+      add the open tasks of an older JSON task board to the inbox (P0 urgent, P1 decide, P2/P3 later)`;
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -33,11 +40,15 @@ function requireEnv(name: string): string {
   return value;
 }
 
-function claudeVersion(bin: string): string {
+/** Checks the CLI starts, as the user runs will use (`claude.runAs`, through sudo). */
+function claudeVersion(bin: string, runAs?: string): string {
+  const [cmd, args] = runAs ? ['sudo', ['-n', '-u', runAs, '--', bin, '--version']] : [bin, ['--version']];
   try {
-    return execFileSync(bin, ['--version'], { encoding: 'utf8', timeout: 15_000 }).trim();
+    return execFileSync(cmd as string, args as string[], { encoding: 'utf8', timeout: 15_000 }).trim();
   } catch {
-    throw new Error(`Cannot run "${bin} --version". Install Claude Code and log in as this user.`);
+    throw new Error(
+      `Cannot run "${bin} --version"${runAs ? ` as ${runAs} (check the sudoers rule)` : ''}. Install Claude Code and log in as ${runAs ?? 'this user'}.`,
+    );
   }
 }
 
@@ -55,6 +66,37 @@ function validate(configFlag: string | undefined): void {
     log.info(`✓ ${p.config.name} (${p.dir}): ${enabled}/${jobs.length} jobs enabled`);
   }
   log.info(`✓ config OK (timezone ${host.timezone}, jobConcurrency ${host.jobConcurrency})`);
+}
+
+/** One-off move of an older JSON task board (`[{title, priority: P0-P3, area, key?, …}]`) into the inbox. */
+function importTasks(args: string[]): void {
+  const { values } = parseArgs({ args, options: { from: { type: 'string' }, config: { type: 'string' } } });
+  if (!values.from) throw new Error(USAGE);
+  const { host, projects } = loadAll(values.config);
+  const names = projects.map((p) => p.config.name);
+  const store = new Store(path.join(host.stateDir as string, 'tara.db'));
+  const level = { P0: 'urgent', P1: 'decide', P2: 'later', P3: 'later' } as const;
+  const old = JSON.parse(readFileSync(path.resolve(expandHome(values.from)), 'utf8')) as Array<
+    Record<string, string | undefined>
+  >;
+  let added = 0;
+  for (const t of old) {
+    if (t.status !== 'open' || !t.title || !t.area || !names.includes(t.area)) continue;
+    store.addTask({
+      project: t.area,
+      title: t.title,
+      level: level[t.priority as keyof typeof level] ?? 'later',
+      key: t.key,
+      details: t.details,
+      source: t.source,
+      link: t.link,
+      dueAt: t.dueAt ? Date.parse(t.dueAt) : undefined,
+      createdAt: t.createdAt ? Date.parse(t.createdAt) : undefined,
+    });
+    added++;
+  }
+  store.close();
+  log.info(`Imported ${added} open tasks (${old.length - added} skipped: done or unknown project)`);
 }
 
 function importHermes(args: string[]): void {
@@ -92,7 +134,7 @@ function importHermes(args: string[]): void {
 
 async function serve(configFlag: string | undefined) {
   const { host, projects } = loadAll(configFlag);
-  log.info(`Claude Code: ${claudeVersion(host.claude.bin)}`);
+  log.info(`Claude Code: ${claudeVersion(host.claude.bin, host.claude.runAs)}`);
   for (const p of projects) {
     const { name, slackChannel, permissionMode, chatModel, billing } = p.config;
     log.info(`Project ${name}: ${p.dir} → ${slackChannel} (${permissionMode}, ${chatModel}, ${billing})`);
@@ -104,6 +146,9 @@ async function serve(configFlag: string | undefined) {
   }
 
   const store = new Store(path.join(host.stateDir as string, 'tara.db'));
+  const runAs = host.claude.runAs ? resolveRunAs(host.claude.runAs) : undefined;
+  if (runAs) log.info(`Claude runs as ${runAs.user} (${runAs.home})`);
+  const run: Runner = runAs ? (o) => runClaude({ ...o, runAs }) : runClaude;
   let manager: SessionManager | undefined;
   let bridge: Bridge | undefined;
   const slack = createSlackGateway({
@@ -117,26 +162,46 @@ async function serve(configFlag: string | undefined) {
         : (bridge?.handleButton(tap) ?? Promise.resolve()),
     streaming: host.streaming,
   });
+  const approvals = new Approvals({
+    store,
+    chat: slack.chat,
+    log,
+    projects,
+    timeZone: host.timezone,
+    sealKey: process.env.APPROVAL_SEAL_KEY || undefined,
+  });
+  if (!process.env.APPROVAL_SEAL_KEY) log.warn('APPROVAL_SEAL_KEY is not set: approved items are not sealed');
   // tara's MCP tools reach tara-agent through the local API, so they need it.
   if (host.http.enabled) {
     bridge = new Bridge({
       apiUrl: `http://${host.http.bind === '0.0.0.0' ? '127.0.0.1' : host.http.bind}:${host.http.port}`,
       chat: slack.chat,
       store,
+      approvals,
       log,
       projects,
       timeZone: host.timezone,
+      shareGid: runAs?.gid,
     });
   } else {
     log.warn('http is disabled: approval buttons, permission prompts and send_file are off');
   }
-  const scheduler = new Scheduler({ projects, host, store, chat: slack.chat, run: runClaude, bridge, log });
+  const scheduler = new Scheduler({
+    projects,
+    host,
+    store,
+    chat: slack.chat,
+    run,
+    runScript: runAs ? (s, cwd, env, ms, signal) => runScript(s, cwd, env, ms, signal, runAs) : undefined,
+    bridge,
+    log,
+  });
   manager = new SessionManager({
     projects,
     host,
     store,
     chat: slack.chat,
-    run: runClaude,
+    run,
     jobs: scheduler,
     bridge,
     log,
@@ -145,6 +210,16 @@ async function serve(configFlag: string | undefined) {
     bridge.onDecision = (msg) => (manager as SessionManager).handle(msg);
     bridge.jobs = scheduler;
   }
+  approvals.onChat = (msg) => (manager as SessionManager).handle(msg);
+  approvals.onJob = (project, jobId, r) => scheduler.resume(project, jobId, r);
+  const queues = new QueueWorker({
+    projects,
+    store,
+    log,
+    jobs: scheduler,
+    timeZone: host.timezone,
+    onFinished: (item) => approvals.notify(item, 'finished'),
+  });
   // HTTP first: when tara-agent takes over a port, the hand-over gap is as short as possible.
   const http = host.http.enabled
     ? await startHttpServer({
@@ -153,18 +228,22 @@ async function serve(configFlag: string | undefined) {
         scheduler,
         store,
         bridge,
+        approvals,
+        adminToken: process.env.TARA_ADMIN_TOKEN || undefined,
         projects: projects.map((p) => p.config.name),
         dashboard: {
           projects,
           timeZone: host.timezone,
           agentName: host.agentName,
           slackUrl: slack.workspaceUrl,
+          hostName: hostname(),
         },
         log,
       })
     : undefined;
   await slack.start();
   scheduler.start();
+  queues.start();
 
   // Scratch folders of sessions not used for `scratchDays` (runner/workspace.ts).
   const sweep = () => {
@@ -187,6 +266,7 @@ async function serve(configFlag: string | undefined) {
       store.close();
       process.exit(0);
     }, 8_000);
+    queues.stop();
     await scheduler.stop().catch(() => {});
     clearTimeout(exit);
     setTimeout(() => {
@@ -201,6 +281,7 @@ async function serve(configFlag: string | undefined) {
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
   if (command === 'import-hermes') return importHermes(rest);
+  if (command === 'import-tasks') return importTasks(rest);
   if (command === '--help' || command === 'help') return void log.info(USAGE);
   const args = command === 'validate' ? rest : process.argv.slice(2);
   const { values } = parseArgs({ args, options: { config: { type: 'string', short: 'c' } } });

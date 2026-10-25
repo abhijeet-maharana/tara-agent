@@ -1,4 +1,5 @@
 import type { JobConfig } from '../config/schema.js';
+import type { Item } from '../store/store.js';
 import type { ScriptResult } from './script.js';
 
 /**
@@ -7,7 +8,7 @@ import type { ScriptResult } from './script.js';
  */
 export const JOB_SYSTEM_PROMPT = `You are running a scheduled job unattended, through tara-agent. Nobody is watching live.
 - Do the whole job now. Never wait for input mid-turn.
-- If the job needs a human decision (an approval), finish with the exact proposal and ask for a reply of approve or reject. Replies in the job's Slack thread resume this session.
+- If the job needs a human decision, call \`request_approval\` with the exact proposal and end your turn; the decision continues this run later. Drafts that go out later go through \`propose_item\`.
 - If there is nothing worth reporting, reply with exactly [SILENT] and nothing will be posted.
 - If the job failed, start your reply with a line containing only [CRON_FAILURE], then the evidence.
 - Reply format: a headline of 1–6 lines (shown in the channel), then a line containing only ---, then the full details (posted in the thread). Use Slack mrkdwn and keep it phone-friendly.
@@ -66,8 +67,14 @@ export function foldersNote(folders: RunFolders): string {
 }
 
 /** The user prompt for one run: script data first (as Hermes does), then the job prompt, its skills and folders. */
-export function buildJobPrompt(job: JobConfig, script?: ScriptResult, folders?: RunFolders): string {
+export function buildJobPrompt(
+  job: JobConfig,
+  script?: ScriptResult,
+  folders?: RunFolders,
+  items?: Item[],
+): string {
   const parts: string[] = [];
+  if (items?.length) parts.push(approvedItemsBlock(items));
   if (script) {
     const [heading, intro] = script.ok
       ? [
@@ -125,4 +132,25 @@ export function splitHeadline(text: string): { headline: string; details: string
     firstBreak > 0 && firstBreak <= HEADLINE_MAX ? firstBreak : trimmed.lastIndexOf('\n', HEADLINE_MAX);
   const at = cut > 0 ? cut : HEADLINE_MAX;
   return { headline: trimmed.slice(0, at).trim(), details: trimmed.slice(at).trim() };
+}
+
+/** What a queue hands its executor job: exactly these approved items, as a person approved them. */
+export function approvedItemsBlock(items: Item[]): string {
+  const list = items.map((i) => ({
+    id: i.id,
+    kind: i.kind,
+    key: i.key,
+    title: i.title,
+    window: i.window,
+    fields: Object.fromEntries(i.fields.map((f) => [f.key, f.value])),
+    // What each field is, when its key doesn't say (e.g. a form question behind `q3`).
+    labels: Object.fromEntries(i.fields.filter((f) => f.label !== f.key).map((f) => [f.key, f.label])),
+    note: i.reply,
+  }));
+  return `## Approved items
+A person approved exactly these ${items.length === 1 ? 'item' : `${items.length} items`} (with any edits). Handle them in order and nothing else. Report each one with \`finish_item\` as soon as it is done (done with the result, or failed with why); an item you don't report is marked failed and never runs again.
+
+\`\`\`json
+${JSON.stringify(list, null, 2)}
+\`\`\``;
 }

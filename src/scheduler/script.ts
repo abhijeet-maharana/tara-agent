@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
+import { asUser, type RunAs, signalGroup } from '../runner/as-user.js';
 
 export interface ScriptResult {
   ok: boolean;
@@ -30,6 +31,7 @@ export function runScript(
   env: NodeJS.ProcessEnv,
   timeoutMs: number,
   signal?: AbortSignal,
+  runAs?: RunAs,
 ): Promise<ScriptResult> {
   return new Promise((resolve) => {
     const { bin, args } = command(path.isAbsolute(script) ? script : path.join(cwd, script));
@@ -37,15 +39,17 @@ export function runScript(
     let stderr = '';
     let timedOut = false;
     let spawnError: Error | undefined;
-    const child = spawn(bin, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    const cmd = runAs ? asUser(bin, args, env, runAs) : { bin, args, env };
+    const child = spawn(cmd.bin, cmd.args, {
+      cwd,
+      env: cmd.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,
+    });
 
     const killGroup = (sig: NodeJS.Signals) => {
       if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
-      try {
-        process.kill(-child.pid, sig);
-      } catch {
-        child.kill(sig);
-      }
+      signalGroup(child.pid, sig, runAs);
     };
     const stop = () => {
       killGroup('SIGTERM');

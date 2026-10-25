@@ -10,7 +10,7 @@ import { esc, md } from '../src/http/dashboard.js';
 import { startHttpServer } from '../src/http/server.js';
 import { firstPrompt, parseTranscript, transcriptPath } from '../src/http/transcript.js';
 import type { Scheduler } from '../src/scheduler/scheduler.js';
-import { Store } from '../src/store/store.js';
+import { Store, type Task } from '../src/store/store.js';
 
 const SID = '11111111-2222-4333-8444-555555555555';
 const lines = [
@@ -102,6 +102,7 @@ describe('dashboard pages', () => {
       allowedUsers: [],
       billing: 'subscription',
       selfImprove: true,
+      title: 'Shop',
       dashboardUrl: 'https://shop.example/board',
     },
   };
@@ -156,6 +157,10 @@ describe('dashboard pages', () => {
         },
       ],
       digest: () => null,
+      plannedRuns: (_p: string, _from: number, to: number) =>
+        to > Date.parse('2026-10-26T05:00:00Z')
+          ? [{ id: 'sla', starts: [Date.parse('2026-10-26T05:00:00Z')] }]
+          : [],
     } as unknown as Scheduler;
     const server = await startHttpServer({
       bind: '127.0.0.1',
@@ -197,13 +202,64 @@ describe('dashboard pages', () => {
     expect((await html('/?project=shop')).body).toContain(`href="/sessions/${SID}"`);
   });
 
-  it('puts failing jobs first on the home page, with the project dashboard link', async () => {
+  it('puts urgent tasks and failing jobs first on the home page, with the dashboard switcher', async () => {
+    store.addTask({ project: 'shop', title: 'Enter the <OTP>', level: 'urgent', key: 'otp:portal' });
     const r = await html('/');
     expect(r.body).toContain('Needs attention');
-    expect(r.body).toMatch(/SLA Report<\/b> failed/);
+    expect(r.body).toContain('Enter the &lt;OTP&gt;');
+    expect(r.body).toMatch(/SLA Report<\/a> failed/);
     expect(r.body).toContain('data-action="run" data-job="shop/sla"');
-    expect(r.body).toContain('href="https://shop.example/board"');
+    expect(r.body).toContain('class="switch" href="https://shop.example/board"');
+    expect(r.body).toContain('<span>Shop</span>'); // project title, not its name
     expect(r.body).toContain('href="/runs/2"'); // "Just ran"
+    expect(r.body).not.toContain('prefers-color-scheme');
+  });
+
+  it('keeps one open task per key, and Done / Reopen work through the API', async () => {
+    const post = (p: string, body: unknown = {}) =>
+      fetch(base + p, { method: 'POST', body: JSON.stringify(body) }).then(
+        (x) => x.json() as Promise<{ task: Task; tasks: Task[]; error?: string }>,
+      );
+    const a = await post('/inbox', {
+      project: 'shop',
+      title: 'Log in to the portal',
+      level: 'urgent',
+      key: 'login:portal',
+    });
+    const b = await post('/inbox', {
+      project: 'shop',
+      title: 'Log in to the portal (2 jobs blocked)',
+      level: 'urgent',
+      key: 'login:portal',
+    });
+    expect(b.task.id).toBe(a.task.id);
+    expect(b.task.title).toContain('2 jobs blocked');
+    expect((await post('/inbox', { project: 'shop', title: 'x', level: 'soon' })).error).toMatch(/level/);
+    expect((await post('/inbox', { project: 'nope', title: 'x', level: 'later' })).error).toMatch(
+      /Unknown project/,
+    );
+
+    const page = (await html('/inbox')).body;
+    expect(page).toContain('Log in to the portal (2 jobs blocked)');
+    expect(page).toContain(`data-task="${a.task.id}"`);
+
+    expect((await post(`/inbox/${a.task.id}/done`)).task.doneAt).toBeGreaterThan(0);
+    const open = (await fetch(`${base}/inbox?project=shop`).then((x) => x.json())) as {
+      tasks: Array<{ id: string }>;
+    };
+    expect(open.tasks.map((t) => t.id)).not.toContain(a.task.id);
+    expect((await post(`/inbox/${a.task.id}/reopen`)).task.doneAt).toBeUndefined();
+    expect((await post('/inbox/close', { project: 'shop', key: 'login:portal' })).tasks).toHaveLength(1);
+  });
+
+  it('shows the schedule and an HTML 404 for unknown pages', async () => {
+    const r = await html('/schedule');
+    expect(r.body).toContain('Timeline');
+    expect(r.body).toContain('href="/schedule?day=');
+    const missing = await html('/nope');
+    expect(missing.status).toBe(404);
+    expect(missing.type).toContain('text/html');
+    expect(missing.body).toContain('Not found');
   });
 
   it('shows a transcript with tool calls folded and a Slack thread link', async () => {
@@ -228,7 +284,13 @@ describe('dashboard pages', () => {
   it('still answers JSON to tools on the same paths', async () => {
     const r = await fetch(`${base}/jobs?project=shop`);
     expect(r.headers.get('content-type')).toContain('application/json');
-    expect(((await r.json()) as { jobs: Array<{ id: string }> }).jobs[0]?.id).toBe('sla');
+    const { jobs } = (await r.json()) as { jobs: Array<{ id: string; upcoming?: string[] }> };
+    expect(jobs[0]?.id).toBe('sla');
+    expect(jobs[0]?.upcoming).toBeUndefined();
+    const planned = (await fetch(`${base}/jobs?project=shop&upcoming=7`).then((x) => x.json())) as {
+      jobs: Array<{ upcoming?: string[] }>;
+    };
+    expect(planned.jobs[0]?.upcoming).toEqual(['2026-10-26T05:00:00.000Z']);
   });
 
   it('refuses clients outside allowFrom', async () => {

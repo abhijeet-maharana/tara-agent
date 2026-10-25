@@ -17,7 +17,6 @@ export interface ClaudeArgsInput {
   model?: string;
   /** `--effort` level; omitted uses the model's default. */
   effort?: string;
-  appendSystemPrompt?: string;
   allowedTools?: string[];
   /** MCP config file with tara's server (added to the repo's own `.mcp.json` servers). */
   mcpConfig?: string;
@@ -27,7 +26,7 @@ export interface ClaudeArgsInput {
   partialMessages?: boolean;
 }
 
-/** Arguments for one headless turn. The prompt itself goes to stdin. */
+/** Arguments for one headless turn. The prompt goes to stdin and the system prompt in a file (runClaude). */
 export function buildClaudeArgs(input: ClaudeArgsInput): string[] {
   const args = ['-p', '--output-format', 'stream-json', '--verbose'];
   if (input.partialMessages) args.push('--include-partial-messages');
@@ -35,7 +34,6 @@ export function buildClaudeArgs(input: ClaudeArgsInput): string[] {
   if (input.model) args.push('--model', input.model);
   if (input.effort) args.push('--effort', input.effort);
   args.push(input.resume ? '--resume' : '--session-id', input.sessionId);
-  if (input.appendSystemPrompt) args.push('--append-system-prompt', input.appendSystemPrompt);
   if (input.mcpConfig) {
     args.push('--mcp-config', input.mcpConfig);
     if (input.permissionPrompts) args.push('--permission-prompt-tool', TARA_PERMISSION_TOOL);

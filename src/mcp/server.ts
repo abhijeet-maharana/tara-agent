@@ -5,6 +5,8 @@
  *   request_approval  Slack buttons; the tap comes back as the next message ("USER DECISION …")
  *   send_file         upload a file into the thread
  *   permission        Allow/Deny buttons for tool calls (only when the run asks for prompts)
+ *   add_task, list_tasks, complete_task   the project's inbox (what only a person can do)
+ *   propose_item, list_items, finish_item   approval cards for drafts that run later through a queue
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -60,6 +62,11 @@ server.registerTool(
         .max(5)
         .optional()
         .describe('Button labels, first = the recommended choice. Default: Approve, Reject.'),
+      kind: z
+        .string()
+        .max(40)
+        .optional()
+        .describe('What sort of decision, so scripts can find it (e.g. "post-topic"). Default "decision".'),
     },
   },
   async (args) => {
@@ -93,6 +100,202 @@ server.registerTool(
       return text(`Posted ${name} to the Slack thread.`);
     } catch (err) {
       return text(`Could not send the file: ${(err as Error).message}`, true);
+    }
+  },
+);
+
+const field = z.object({
+  key: z.string().min(1).max(60).describe('Stable name, e.g. "note"'),
+  label: z.string().min(1).max(80).describe('What the person sees, e.g. "Connection note"'),
+  type: z.enum(['text', 'textarea', 'list']).default('textarea'),
+  value: z.union([z.string(), z.array(z.string())]),
+  maxLength: z.number().int().positive().optional().describe('Characters allowed (checked on every edit)'),
+  required: z.boolean().optional(),
+  readOnly: z.boolean().optional().describe('Shown but not editable, e.g. the recipient'),
+});
+
+server.registerTool(
+  'propose_item',
+  {
+    title: 'Propose a draft for approval',
+    description:
+      'Leave a draft that should go out later (a LinkedIn note, an email, an application, a post) as an ' +
+      'approval card. The person approves, edits or rejects it on the Approvals page; approved items run later ' +
+      'through the given queue (see .tara/queues.json), at its time, one at a time, by its executor. Do not send ' +
+      'the draft yourself. Proposing the same `key` again replaces the pending card (also after a revise request).',
+    inputSchema: {
+      kind: z.string().min(1).max(40).describe('What it is, e.g. "linkedin-outreach", "email", "post"'),
+      key: z.string().min(1).max(120).describe('Stable id of the thing, e.g. "outreach:acme-jane"'),
+      title: z.string().min(1).max(200).describe('One line: who/what, e.g. "Jane Doe, CTO at Acme (EU)"'),
+      body: z.string().max(8000).optional().describe('Context the person needs to decide (markdown)'),
+      fields: z.array(field).max(40).optional().describe('The editable draft: what the executor will send'),
+      media: z
+        .array(
+          z.object({
+            type: z.enum(['image', 'video', 'file']),
+            url: z.string(),
+            caption: z.string().optional(),
+          }),
+        )
+        .max(20)
+        .optional(),
+      checks: z
+        .array(z.object({ text: z.string(), blocking: z.boolean() }))
+        .max(20)
+        .optional()
+        .describe('Problems you already know of; blocking ones stop approval until fixed'),
+      queue: z.string().min(1).describe('Queue that runs it once approved'),
+      window: z.string().optional().describe("Window key in the queue's config, e.g. a region like EU"),
+      runAfter: z.string().optional().describe('ISO time it must not run before'),
+    },
+  },
+  async ({ runAfter, ...args }) => {
+    try {
+      const at = runAfter ? Date.parse(runAfter) : undefined;
+      if (at !== undefined && Number.isNaN(at)) return text('runAfter is not an ISO time', true);
+      const { id, checks } = await api<{ id: string; checks: Array<{ text: string; blocking: boolean }> }>(
+        '/internal/item',
+        { ...args, runAfter: at },
+      );
+      const blocking = checks.filter((c) => c.blocking);
+      return text(
+        `Card ${id} is waiting for approval.${
+          blocking.length
+            ? ` It cannot be approved yet: ${blocking.map((c) => c.text).join('; ')}. Fix and propose again with the same key.`
+            : ''
+        }`,
+      );
+    } catch (err) {
+      return text(`Could not propose the item: ${(err as Error).message}`, true);
+    }
+  },
+);
+
+server.registerTool(
+  'list_items',
+  {
+    title: "List this project's approval cards",
+    description:
+      'Approval cards of this project: waiting, approved (scheduled) and running by default. Check before proposing ' +
+      'so you update a card (same key) instead of adding a duplicate.',
+    inputSchema: {
+      status: z
+        .string()
+        .optional()
+        .describe('Comma list: pending, approved, running, done, failed, rejected, expired'),
+      kind: z.string().optional(),
+    },
+  },
+  async ({ status, kind }) => {
+    try {
+      const q = new URLSearchParams({ ...(status && { status }), ...(kind && { kind }) });
+      const { items } = await api<{ items: unknown[] }>(`/internal/items${q.size ? `?${q}` : ''}`);
+      return text(JSON.stringify(items));
+    } catch (err) {
+      return text(`Could not list items: ${(err as Error).message}`, true);
+    }
+  },
+);
+
+server.registerTool(
+  'finish_item',
+  {
+    title: 'Report an approved item',
+    description:
+      'Report the result of one approved item you were given under "## Approved items": done (with what happened, ' +
+      'e.g. the URL) or failed (with why). Report every item, as soon as it is done. An item you never report is ' +
+      'marked failed and is not run again.',
+    inputSchema: {
+      id: z.string().min(1),
+      status: z.enum(['done', 'failed']),
+      result: z.string().max(4000).optional(),
+    },
+  },
+  async (args) => {
+    try {
+      await api('/internal/item-done', args);
+      return text(`Reported ${args.id} as ${args.status}.`);
+    } catch (err) {
+      return text(`Could not report the item: ${(err as Error).message}`, true);
+    }
+  },
+);
+
+server.registerTool(
+  'add_task',
+  {
+    title: 'Add a task to the inbox',
+    description:
+      "Leave a task in this project's inbox on the dashboard when something needs a person: a login, OTP or " +
+      'captcha that blocks a job, a decision or draft to review, a failure you could not fix. Adding the same ' +
+      '`key` again updates the open task instead of making a duplicate, so use one stable key per root cause.',
+    inputSchema: {
+      title: z.string().min(1).max(160).describe('What to do, imperative, with the number that matters'),
+      level: z
+        .enum(['urgent', 'decide', 'later'])
+        .describe(
+          'urgent: money, customers or jobs blocked today (login/OTP, SLA, a failure you could not recover). ' +
+            'decide: something to look at and choose (not an approval card). later: recommendations, follow-ups.',
+        ),
+      key: z
+        .string()
+        .min(1)
+        .max(120)
+        .describe('Stable dedupe key, `<job-or-skill>:<period-or-entity>`, e.g. "flipkart-login:seller-hub"'),
+      details: z.string().max(4000).optional().describe('1-5 lines: exactly what to do'),
+      link: z.string().url().optional().describe('Where to do it: Slack thread or page URL'),
+      source: z.string().max(80).optional().describe('Job id or skill that adds it'),
+      dueAt: z.string().optional().describe('ISO time it must be done by'),
+    },
+  },
+  async (args) => {
+    try {
+      const { task } = await api<{ task: { id: string } }>('/internal/task', args);
+      return text(`Task in the inbox (id ${task.id}). Close it with complete_task once it is resolved.`);
+    } catch (err) {
+      return text(`Could not add the task: ${(err as Error).message}`, true);
+    }
+  },
+);
+
+server.registerTool(
+  'list_tasks',
+  {
+    title: "List this project's open inbox tasks",
+    description:
+      "Open tasks in this project's inbox, with id, key, level and title. Check before adding one.",
+    inputSchema: {},
+  },
+  async () => {
+    try {
+      const { tasks } = await api<{ tasks: Array<Record<string, unknown>> }>('/internal/tasks');
+      return text(
+        JSON.stringify(tasks.map(({ id, key, level, title, source }) => ({ id, key, level, title, source }))),
+      );
+    } catch (err) {
+      return text(`Could not list tasks: ${(err as Error).message}`, true);
+    }
+  },
+);
+
+server.registerTool(
+  'complete_task',
+  {
+    title: 'Mark an inbox task done',
+    description:
+      'Close a task once it is resolved: the person approved or rejected, or you fixed it yourself. Pass its key ' +
+      '(closes the open task with that key) or its id.',
+    inputSchema: {
+      key: z.string().min(1).optional().describe('The key the task was added with'),
+      id: z.string().min(1).optional().describe('Task id from list_tasks'),
+    },
+  },
+  async (args) => {
+    try {
+      const { tasks } = await api<{ tasks: unknown[] }>('/internal/task-done', args);
+      return text(tasks.length ? `Closed ${tasks.length} task(s).` : 'No open task matched.');
+    } catch (err) {
+      return text(`Could not close the task: ${(err as Error).message}`, true);
     }
   },
 );

@@ -91,7 +91,8 @@ The agent then can't use your sudo, docker group, browser profile files, other p
 | `catchUpHours` | `6` | After downtime, run a job's latest missed slot if it is at most this old (`0` = never) |
 | `timezone` | host's | Default timezone for job schedules and times shown in Slack |
 | `healthDigest` | on, `0 9 * * *` | Daily summary per project channel (`enabled`, `cron` in `timezone`): runs, problems, missed slots, peak 5-hour usage. Silent for projects with nothing to report |
-| `http` | `127.0.0.1:4100` | Local API and dashboard (`enabled`, `bind`, `port`, `allowFrom`); set `TARA_HTTP_TOKEN` to require a bearer token for the API. Also needed by the approval/file tools |
+| `claude.runAs` | none | Run Claude and pre-run scripts as this OS user through sudo, so they can't read tara-agent's database or keys ([docs/security.md](docs/security.md#split-users-approvals)) |
+| `http` | `127.0.0.1:4100` | Local API and dashboard (`enabled`, `bind`, `port`, `allowFrom`); set `TARA_HTTP_TOKEN` to require a bearer token for the API and the pages (open a page once with `?token=…` to sign a browser in). Also needed by the MCP tools |
 | `http.allowFrom` | `127.0.0.0/8`, `::1/128` | CIDR ranges that may connect at all. Transcripts hold everything Claude saw, so when you bind beyond localhost keep this to a trusted network, e.g. add `100.64.0.0/10` and `fd7a:115c:a1e0::/48` for Tailscale |
 | `http.fallback` | none | URL that gets every request for a path tara-agent doesn't serve, streamed through unchanged. Lets tara-agent take over a port from another service while that service's callers move |
 
@@ -108,7 +109,8 @@ The agent then can't use your sudo, docker group, browser profile files, other p
 | `owner` | none | Slack user ID that live streams of jobs started from the API or a dashboard go to (`!run` streams to whoever typed it; scheduled runs don't stream) |
 | `allowedUsers` | `[]` (everyone in the channel) | Slack user IDs allowed to talk to the bot |
 | `billing` | `subscription` | `api` runs the CLI with `ANTHROPIC_API_KEY` |
-| `dashboardUrl` | none | The project's own web dashboard, if it has one; the tara-agent dashboard links to it from Home |
+| `title` | `name` | How the dashboard names the project, e.g. "Job Search" for `remote-job` |
+| `dashboardUrl` | none | The project's own web dashboard, if it has one; it appears in the dashboard's "Dashboards" switcher |
 | `scratchDir` | `<stateDir>/scratch/<name>` | Parent of the per-session scratch folders, relative to the repo. Keep it out of git (see [Files](#files)) |
 | `jobDataDir` | `<stateDir>/job-data/<name>` | Parent of the per-job data folders, relative to the repo |
 | `selfImprove` | `true` | After a job run or chat turn with trouble, resume its session once so Claude can fix the skill it followed (see "Self-improving jobs and chats" under [Scheduled jobs](#scheduled-jobs)) |
@@ -191,20 +193,25 @@ Every run gets tara's own MCP server (next to the repo's `.mcp.json` servers) wi
 | `request_approval` | Claude posts the proposal with buttons (default **Approve / Reject**, up to 5 options) and ends its turn. A tap updates the card ("✅ Approve, chosen by @you at 14:02") and resumes the same session with `USER DECISION on "<title>": <option>`. Replying in words works too. Taps are recorded once (a double tap or a second person can't decide twice) and survive restarts. |
 | `send_file` | Uploads a screenshot, PDF, CSV or image into the thread. Only files inside the project or the temp directory, resolved through symlinks, up to 100 MB. |
 | `permission` | Chat turns outside `bypassPermissions`/`dontAsk`: when Claude wants a tool your `allowedTools` don't cover, the thread gets **Allow / Deny** buttons and the call waits (denied after 10 minutes). Scheduled jobs never wait on a prompt. |
+| `propose_item` / `list_items` / `finish_item` | **Approval cards for drafts that go out later** (a message, an email, an application, a post): each is a card on the Approvals page, approved, edited or rejected by a person, then run at its queue's time by the queue's executor, which reports each item with `finish_item`. Proposing the same `key` again replaces the waiting card. |
+| `add_task` / `list_tasks` / `complete_task` | The project's **inbox** on the dashboard: Claude leaves a task when something needs a person and can wait (a login or OTP that blocks a job, a draft to review, a failure it could not fix), with a stable `key` so a re-run updates the open task instead of adding another, and closes it once resolved. A run only sees and closes its own project's tasks. |
 
 The tools reach tara-agent through its local API with a per-run token, written to a mode-600 config file, so the token never appears on a command line. This needs `http.enabled` (the default).
 
 ## Dashboard
 
-Open the HTTP address in a browser (e.g. `http://my-server:4100` on your tailnet). Dark by default, light when the system asks for it, and usable on a phone (the sidebar becomes a menu).
+Open the HTTP address in a browser (e.g. `http://my-server:4100` on your tailnet). Dark, and usable on a phone (the sidebar becomes a menu). Project dashboards can share the look: see [docs/dashboard-look.md](docs/dashboard-look.md).
 
-- **Home** (`/`): what is running now, failing and paused jobs with **Run again** / **Resume**, the next scheduled runs, the latest runs ("did work", "nothing to do", "failed"…), and one card per project with its health and a link to the project's own `dashboardUrl`. Refreshes every minute.
-- **Jobs** (`/jobs`): every job of every project, failing first, filterable by project and state (failing, paused, running) and searchable. Each card has the schedule in plain English, next and last run, the last 10 runs as coloured squares, the failure streak and last error, **Run now** (streams to the project `owner`), **Pause** / **Resume**, and details with the skills, pre-run script, model and run history.
-- **Run** (`/runs/<id>`): one run's status, error, Claude's reply and the pre-run script's output.
-- **Sessions** (`/sessions`): every Slack thread and job run tara-agent started, newest first, filterable by project and chat/job, with model, status, duration and tokens. Old `/?project=…` links still land here.
-- **Session** (`/sessions/<id>`): the full transcript, read from Claude Code's own session file: prompts, Claude's replies, and every tool call folded with its input and result (job pre-script output folded too), plus a link to the Slack thread.
+- **Home** (`/`): what is running now, then **Needs attention** (urgent inbox tasks with **Done**, failing jobs with **Run now**, paused jobs with **Resume**), the next scheduled runs and the latest runs ("did work", "nothing to do", "failed"…). Refreshes every minute.
+- **Approvals** (`/approvals`): every card waiting for a person, from every project. A paused run's decision (`request_approval`, also in Slack) continues that run as its job. A draft (`propose_item`) shows its editable fields with character counts and its checks; approve (one, or "Approve all N" of a kind), approve and run now, revise (Jarvis makes a new version) or reject. Tabs: Waiting, Scheduled (approved, with when each goes out), Done (30 days). Deciding needs the browser unlocked once on `/unlock` with `TARA_ADMIN_TOKEN`, from another device than the server.
+- **Inbox** (`/inbox`): every project's open tasks as Urgent / Decide / Later, with **Done** (and Undo), **+ Add task**, and the tasks done today with **Reopen**.
+- **Jobs** (`/jobs`): every job of every project, failing first, filterable by project and state (failing, running, paused) and searchable. Each card has the schedule in plain English, next and last run, the last 10 runs as coloured squares, the failure streak and last error, **Run now** (streams to the project `owner`), **Pause** / **Resume**, and details with the skills, the script that runs first, model and run history.
+- **Schedule** (`/schedule`): one day (today and the next six) of every job as a timeline with each job's usual length (click it to change `durationMinutes`), the runs that already happened, jobs that overlap or start back to back, and free windows.
+- **Run** (`/runs/<id>`): one run's status, error, Claude's reply and what the pre-run script found, with **Run now**.
+- **Sessions** (`/sessions`): every Slack thread and job run tara-agent started, newest first, filterable by project and chat/job. Old `/?project=…` links still land here.
+- **Session** (`/sessions/<id>`): the full transcript, read from Claude Code's own session file: prompts, Claude's replies, and every tool call folded with its input and result, plus a link to the Slack thread.
 
-Every action asks for confirmation first. The same paths answer JSON to tools; browsers get HTML. Only sessions of the user tara-agent runs as are listed.
+The sidebar's **Dashboards** list links every project's own `dashboardUrl`. Every action asks for confirmation first. The same paths answer JSON to tools; browsers get HTML. Only sessions of the user tara-agent runs as are listed.
 
 ## Local API
 
@@ -213,13 +220,49 @@ For dashboards and scripts on the same host (`127.0.0.1:4100` by default):
 | Call | Does |
 |---|---|
 | `GET /health` | Uptime and job counts |
-| `GET /jobs?project=<name>` | Jobs with next run, last status and error |
+| `GET /jobs?project=<name>` | Jobs with next run, last status and error; `&upcoming=7` adds each job's start times for the next 7 days |
 | `POST /jobs/<project>/<id>/run` `{"by": "who"}` | Run a job now |
 | `POST /jobs/<project>/<id>/pause` | Stop a job's schedule: sets `"enabled": false` in the repo's `.tara/jobs.json` and reloads at once. Returns `{"ok": true, "enabled": false}` |
 | `POST /jobs/<project>/<id>/resume` | Put it back on its schedule (removes the `enabled` key, so a pause + resume leaves the file as it was). Returns `{"ok": true, "enabled": true}` |
 | `GET /jobs/<project>/<id>/runs?limit=15` | Run history |
 | `GET /runs/<id>` | One run, with Claude's reply and the script output |
+| `POST /jobs/<project>/<id>/duration` `{"minutes": 20}` | Set the job's usual length (`durationMinutes`) |
 | `POST /reload` | Re-read every `.tara/jobs.json` now |
+| `GET /inbox?project=<name>` | Open tasks, most urgent first; `&done=24` gives the ones done in the last 24 hours instead |
+| `POST /inbox` `{project, title, level, key?, details?, source?, link?, dueAt?}` | Add a task (`level`: `urgent`, `decide` or `later`); the same `key` updates the open task |
+| `POST /inbox/close` `{project, key}` or `{project, suffix}` | Close the open task with that key, or every open task whose key ends in `:<suffix>` |
+| `POST /inbox/<id>/done`, `/reopen` | Mark a task done or open again |
+| `GET /schedule?day=YYYY-MM-DD&project=<name>` | One day's planned runs, overlaps, tight gaps and free windows |
+| `GET /schedule/conflicts?days=7` | Overlapping and back-to-back jobs for the next days |
+| `GET /items?project=&status=&kind=` | Approval items (`status`: comma list of pending, approved, running, done, failed, rejected, expired, cancelled) |
+| `GET /items/<id>` | One item, with its seal |
+| `POST /items` `{project, kind, key?, title, body?, fields?, media?, checks?, queue, window?, runAfter?}` | Propose a draft (e.g. a project server proposing the next follow-up); it still needs a person |
+| `GET /queues?project=<p>&upcoming=<n>` | A project's queues with their next slot times and the kind that went last (for a content calendar) |
+| `POST /items/<id>/withdraw` `{reason?}` | A project server taking back a card still waiting (the thing was posted by hand); it ends cancelled and the hook is told |
+| `POST /items/<id>/report` `{status, result?}` | A project server reporting an item of its `external` queue: done, failed, or waiting with a status line |
+| `POST /items/<id>/decide` `{option, fields?, reply?, runNow?}`, `POST /items/bulk` `{ids, option}`, `POST /items/<id>/cancel` | Human only: the unlock cookie, from another device |
+
+## Queues
+
+Approved drafts run through queues declared in `<repo>/.tara/queues.json`:
+
+```json
+{ "queues": {
+  "linkedin": { "executor": { "job": "linkedin-sender" }, "batch": 5,
+    "windows": { "EU": { "tz": "Europe/Berlin", "days": "tue-thu", "from": "10:00", "to": "12:00" } },
+    "caps": { "perDay": 12, "perWeek": 40 }, "gapMinutes": 3 },
+  "email":    { "executor": { "url": "http://127.0.0.1:4002/api/send" }, "caps": { "perDay": 10 } },
+  "content":  { "executor": { "job": "publisher" }, "slots": "30 18 * * 1,3,5", "alternate": ["image-post", "reel"] } } }
+```
+
+- One batch at a time per queue (plus the usual `jobConcurrency` and job `locks`), oldest approval first.
+- `windows`: an item runs only while its window (`window` on the item, e.g. a region) is open, else any window. `slots`: one batch per cron slot instead, taking turns between the `alternate` kinds. "Approve & run now" skips windows and slots.
+- `caps` (per day in the queue's `tz`, per rolling week) and `gapMinutes` between runs.
+- A **job executor** gets the items in its prompt under "## Approved items" (each item's `fields` by key, plus `labels` for fields whose key doesn't say what they are, e.g. a form question behind `q3`) and reports each with `finish_item`; a **URL executor** gets one POST `{item}` per item (with its `seal`) and answers `{status: "done"|"failed", result}`, or `{status: "later", result, retryAt?}` when it can't take the item yet (a daily cap, a pause): the item goes back to approved until `retryAt` (default an hour), with the reason shown under Scheduled, and doesn't count against the caps. An item that is never reported ends as failed and is not run again, so nothing goes out twice.
+- An **external** queue (`"executor": {"external": true}`) is never run by tara-agent: the project's own server runs its approved items on its own schedule and reports each with `POST /items/<id>/report` `{status: "done"|"failed"|"waiting", result}` (waiting sets the line shown under Scheduled). Windows still show when an item is expected to go. A cancelled item is told to the project's hook at once, so it can stop.
+- **Options on a draft:** the first option (default Approve) seals the item and queues it. Any other option closes it: a negative one (Reject, Skip, No…) as `rejected`, anything else (e.g. "Applied by hand") as `done`. Revise keeps it pending and sends the request to Jarvis, whose new version replaces the card (same `key`). A card holds up to 40 fields.
+- A project's `approvals.validateUrl` (in `.tara/config.json`) is asked for its own checks on every proposed or edited item (POST `{kind, key, fields}` → `{checks: [{text, blocking}]}`); blocking checks stop approval. Pending items expire after `approvals.expireDays` (7).
+- A project's `approvals.hookUrl` gets POST `{event: "decided" | "finished", item}` whenever one of its items is decided or finishes (done, failed, or failed because unreported), so its server can do its side (log a send, drop a draft). The header `x-tara-signature` is the HMAC-SHA256 of the body with `APPROVAL_SEAL_KEY`; a server without the key can instead read the item back with `GET /items/<id>` before acting. Best effort: a server that is down misses it, so it should also catch up on its own.
 
 ## Thread commands
 

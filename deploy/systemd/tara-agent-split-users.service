@@ -1,0 +1,32 @@
+# tara-agent as its own user (tara-agent), with Claude and pre-run scripts as another (tara), so runs
+# can't read tara-agent's database or the approvals keys (docs/security.md "Split users").
+# Set up by deploy/split-users.sh, which also writes the sudoers rule this needs.
+[Unit]
+Description=tara-agent (Slack threads and schedules for Claude Code)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tara-agent
+Group=tara-agent
+SupplementaryGroups=tara
+# Group-writable files, so the repo owner and the run user can both edit what the other creates.
+UMask=0002
+WorkingDirectory=/home/abhijeet/Projects/tara-agent
+# SLACK_BOT_TOKEN, SLACK_APP_TOKEN, TARA_ADMIN_TOKEN, APPROVAL_SEAL_KEY (root-only file).
+EnvironmentFile=/etc/tara-agent.env
+Environment=PATH=/home/tara/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Transcripts are read from the run user's Claude folder (the dashboard's session pages).
+Environment=CLAUDE_CONFIG_DIR=/home/tara/.claude
+ExecStart=/usr/bin/node --disable-warning=ExperimentalWarning dist/index.js --config /etc/tara-agent/config.yaml
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+KillMode=mixed
+# No NoNewPrivileges: runs start through sudo (to the run user only, see /etc/sudoers.d/tara-agent).
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

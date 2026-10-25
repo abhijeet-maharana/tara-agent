@@ -7,7 +7,7 @@ import type { HostConfig, Project, ScheduledJob } from '../config/schema.js';
 import type { Runner } from '../runner/run.js';
 import type { ChatPort, Logger } from '../sessions/manager.js';
 import { splitMessage } from '../slack/format.js';
-import type { Store } from '../store/store.js';
+import type { Item, Store } from '../store/store.js';
 import { Locks, Semaphore } from '../util/concurrency.js';
 import { buildDigest, type MissedJob } from './health.js';
 import { type JobStatus, type JobTrigger, runJob } from './job-runner.js';
@@ -18,7 +18,8 @@ export interface JobInfo {
   name: string;
   enabled: boolean;
   running: boolean;
-  cron: string;
+  /** Unset: runs only from a queue or by hand. */
+  cron?: string;
   tz: string;
   skills: string[];
   model: string;
@@ -66,8 +67,8 @@ interface Entry {
   scheduled: ScheduledJob;
   /** Fires the job; absent for disabled jobs. */
   cron?: Cron;
-  /** Paused copy used only for date maths (previous/next slot). */
-  clock: Cron;
+  /** Paused copy used only for date maths (previous/next slot); absent for queue-only jobs. */
+  clock?: Cron;
 }
 
 const jobKey = (project: string, id: string) => `${project}:${id}`;
@@ -145,7 +146,7 @@ export class Scheduler implements JobControl {
     const until = now - 10 * 60_000;
     const missed: MissedJob[] = [];
     for (const [key, { scheduled, clock, cron }] of this.entries) {
-      if (scheduled.project.config.name !== project || !cron) continue;
+      if (scheduled.project.config.name !== project || !cron || !clock) continue;
       const since = Math.max(from, this.deps.store.firstSeen(key));
       const claimed = this.deps.store.claimedSlots(key, since, until);
       const slots: number[] = [];
@@ -182,6 +183,11 @@ export class Scheduler implements JobControl {
   }
 
   /** Re-reads every project's job file now (normally polled every 30 s). */
+  /** Whether a job exists and is on (not paused). */
+  enabled(project: string, id: string): boolean {
+    return this.entries.get(jobKey(project, id))?.scheduled.job.enabled === true;
+  }
+
   reloadAll(): void {
     for (const project of this.deps.projects) this.reload(project, { catchUp: false });
   }
@@ -191,20 +197,40 @@ export class Scheduler implements JobControl {
    * of truth) and reloads that project so the change takes effect at once.
    */
   setEnabled(project: string, id: string, enabled: boolean): 'ok' | 'unknown' {
+    return this.editJob(project, id, (job) => {
+      // A missing `enabled` means on, so resuming removes the key: a pause + resume leaves the file as it was.
+      const changed = enabled ? 'enabled' in job : job.enabled !== false;
+      if (enabled) delete job.enabled;
+      else job.enabled = false;
+      return changed;
+    });
+  }
+
+  /** Sets a job's typical run time (`durationMinutes`), which the schedule view uses. */
+  setDuration(project: string, id: string, minutes: number): 'ok' | 'unknown' {
+    return this.editJob(project, id, (job) => {
+      const changed = job.durationMinutes !== minutes;
+      job.durationMinutes = minutes;
+      return changed;
+    });
+  }
+
+  /** Changes one job in the project's jobs file (the source of truth) and reloads that project at once. */
+  private editJob(
+    project: string,
+    id: string,
+    edit: (job: { id?: string; enabled?: boolean; durationMinutes?: number }) => boolean,
+  ): 'ok' | 'unknown' {
     const owner = this.deps.projects.find((p) => p.config.name === project);
     if (!owner) return 'unknown';
     const file = path.join(owner.dir, JOBS_FILE);
     if (!existsSync(file)) return 'unknown';
     const doc = JSON.parse(readFileSync(file, 'utf8')) as {
-      jobs?: Array<{ id?: string; enabled?: boolean }>;
+      jobs?: Array<{ id?: string; enabled?: boolean; durationMinutes?: number }>;
     };
     const job = doc.jobs?.find((j) => j.id === id);
     if (!job) return 'unknown';
-    // A missing `enabled` means on, so resuming removes the key: a pause + resume leaves the file as it was.
-    const changed = enabled ? 'enabled' in job : job.enabled !== false;
-    if (changed) {
-      if (enabled) delete job.enabled;
-      else job.enabled = false;
+    if (edit(job)) {
       // Written the way these files are kept (2-space JSON), so nothing else in them changes.
       const tmp = `${file}.tmp-${process.pid}`;
       writeFileSync(tmp, `${JSON.stringify(doc, null, 2)}\n`);
@@ -212,6 +238,26 @@ export class Scheduler implements JobControl {
     }
     this.reload(owner, { catchUp: false });
     return 'ok';
+  }
+
+  /** Start times of a project's enabled jobs in [from, to); more than `limit` means the job runs too often to plan. */
+  plannedRuns(
+    project: string,
+    from: number,
+    to: number,
+    limit: number,
+  ): Array<{ id: string; starts: number[] }> {
+    return [...this.entries.values()]
+      .filter((e) => e.scheduled.project.config.name === project && e.scheduled.job.enabled)
+      .map(({ scheduled: { job }, clock }) => {
+        const starts: number[] = [];
+        let next = clock?.nextRun(new Date(from - 1));
+        while (clock && next && next.getTime() < to && starts.length <= limit) {
+          starts.push(next.getTime());
+          next = clock.nextRun(next);
+        }
+        return { id: job.id, starts };
+      });
   }
 
   trigger(
@@ -235,7 +281,8 @@ export class Scheduler implements JobControl {
     try {
       jobs = loadJobs(project);
       for (const { job } of jobs)
-        new Cron(job.cron, { paused: true, timezone: job.tz ?? this.deps.host.timezone }).stop();
+        if (job.cron)
+          new Cron(job.cron, { paused: true, timezone: job.tz ?? this.deps.host.timezone }).stop();
     } catch (err) {
       const message = (err as Error).message;
       this.deps.log.error(`[${name}] jobs not reloaded: ${message}`);
@@ -259,10 +306,10 @@ export class Scheduler implements JobControl {
       const { job } = scheduled;
       const key = jobKey(name, job.id);
       const timezone = job.tz ?? this.deps.host.timezone;
-      const clock = new Cron(job.cron, { paused: true, timezone });
+      const clock = job.cron ? new Cron(job.cron, { paused: true, timezone }) : undefined;
       const entry: Entry = { scheduled, clock };
       this.entries.set(key, entry);
-      if (!job.enabled) continue;
+      if (!job.enabled || !job.cron || !clock) continue;
       const firstSeen = this.deps.store.firstSeen(key);
       entry.cron = new Cron(job.cron, { timezone, catch: true }, () => {
         const slot = this.slotAtOrBefore(clock, this.now() + 1_000);
@@ -270,8 +317,11 @@ export class Scheduler implements JobControl {
       });
       if (opts.catchUp) this.catchUp(scheduled, clock, firstSeen);
     }
-    const enabled = jobs.filter((j) => j.job.enabled).length;
-    this.deps.log.info(`[${name}] ${enabled}/${jobs.length} jobs scheduled`);
+    const scheduled = jobs.filter((j) => j.job.enabled && j.job.cron).length;
+    const fromQueues = jobs.filter((j) => !j.job.cron).length;
+    this.deps.log.info(
+      `[${name}] ${scheduled}/${jobs.length} jobs scheduled${fromQueues ? ` (${fromQueues} run from queues)` : ''}`,
+    );
   }
 
   private catchUp(scheduled: ScheduledJob, clock: Cron, firstSeen: number): void {
@@ -298,9 +348,39 @@ export class Scheduler implements JobControl {
     this.launch(scheduled, trigger, (status) => this.deps.store.finishSlot(key, slot, status));
   }
 
-  private launch(scheduled: ScheduledJob, trigger: JobTrigger, done?: (status: JobStatus) => void): void {
+  /**
+   * Continues a job's session after a decision on its approval card, as that job (its slot, locks,
+   * prompt and timeout), once any run of it in progress has finished.
+   */
+  async resume(
+    project: string,
+    id: string,
+    r: { threadTs: string; text: string; by: string },
+  ): Promise<JobStatus | 'unknown'> {
+    return this.whenFree(project, id, { kind: 'resume', ...r });
+  }
+
+  /** Runs a job with approved queue items in its prompt; resolves when the run has ended. */
+  async runQueue(project: string, id: string, queue: string, items: Item[]): Promise<JobStatus | 'unknown'> {
+    return this.whenFree(project, id, { kind: 'queue', queue, items });
+  }
+
+  private async whenFree(project: string, id: string, trigger: JobTrigger): Promise<JobStatus | 'unknown'> {
+    const key = jobKey(project, id);
+    while (this.running.has(key)) await new Promise((r) => setTimeout(r, 2_000));
+    const entry = this.entries.get(key);
+    if (!entry) return 'unknown';
+    return this.launch(entry.scheduled, trigger);
+  }
+
+  private launch(
+    scheduled: ScheduledJob,
+    trigger: JobTrigger,
+    done?: (status: JobStatus) => void,
+  ): Promise<JobStatus> {
     const key = jobKey(scheduled.project.config.name, scheduled.job.id);
     this.running.add(key);
+    let result: JobStatus = 'error';
     const task = runJob(
       {
         host: this.deps.host,
@@ -320,13 +400,17 @@ export class Scheduler implements JobControl {
       trigger,
       this.controller.signal,
     )
-      .then((status) => done?.(status))
+      .then((status) => {
+        result = status;
+        done?.(status);
+      })
       .catch((err: Error) => this.deps.log.error(`[${key}] ${err.message}`))
       .finally(() => {
         this.running.delete(key);
         this.inflight.delete(task);
       });
     this.inflight.add(task);
+    return task.then(() => result);
   }
 
   private checkFiles(): void {
@@ -346,7 +430,7 @@ export class Scheduler implements JobControl {
 
   private stopEntry(entry: Entry): void {
     entry.cron?.stop();
-    entry.clock.stop();
+    entry.clock?.stop();
   }
 
   /** For tests: resolves when every launched job has finished. */

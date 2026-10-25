@@ -1,15 +1,15 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, chownSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ApprovalError, type Approvals, type ProposeInput } from '../approvals/approvals.js';
 import type { PermissionMode, Project } from '../config/schema.js';
 import { describeTool } from '../runner/stream.js';
 import type { JobControl } from '../scheduler/scheduler.js';
 import type { ChatPort, IncomingMessage, Logger, SlackBlock } from '../sessions/manager.js';
 import type { ButtonTap } from '../slack/app.js';
-import { splitMessage, toSlackMrkdwn } from '../slack/format.js';
-import type { Store } from '../store/store.js';
+import { ITEM_STATUSES, type ItemStatus, type Store } from '../store/store.js';
 
 /** One Claude run that may call tara's MCP tools: where its thread is and what it may ask for. */
 export interface RunContext {
@@ -21,6 +21,10 @@ export interface RunContext {
   permissionPrompts: boolean;
   /** Who is talking (chat turns): jobs Claude starts are run in their name. */
   user?: string;
+  /** The job this run belongs to (its decisions continue the run as that job). */
+  jobId?: string;
+  /** Approved items this run was given by a queue; only these can be reported with `finish_item`. */
+  items?: string[];
 }
 
 export interface RunHandle {
@@ -57,29 +61,32 @@ export const JOB_TOOLS_PROMPT = `- To run one of this channel's scheduled jobs n
 
 /** Appended to the system prompt of every run that has tara's MCP tools. */
 export const BRIDGE_PROMPT = `Slack tools (tara MCP server):
-- Before anything that needs a human decision (spending money; changing prices, listings, ads, orders or data; publishing; sending messages to other people), call \`request_approval\` with the exact proposal and numbers, then end your turn without acting. The answer arrives as your next message, starting with "USER DECISION", or as a normal reply.
-- To share a screenshot, PDF, CSV or image, save it inside the project (e.g. .scratch/) and call \`send_file\`.`;
+- Before anything that needs a human decision (spending money; changing prices, listings, ads, orders or data; publishing; sending messages to other people), call \`request_approval\` with the exact proposal and numbers, then end your turn without acting. It becomes a card on the Approvals page and in this thread; the answer arrives as your next message, starting with "USER DECISION", and you continue from there.
+- Drafts that should go out later (messages, emails, applications, posts) go through \`propose_item\` with the queue that sends them: one card each, approved or edited on the Approvals page, then run at the queue's time. Never send them yourself.
+- To share a screenshot, PDF, CSV or image, save it inside the project (e.g. .scratch/) and call \`send_file\`.
+- When something only a person can do blocks you (a login, an OTP, a captcha, a call, a failure you could not fix), call \`add_task\` with a stable \`key\`; call \`complete_task\` with that key once it is resolved. Never add a task to ask for an approval.`;
 
 /** Modes in which Claude never asks, so there is nothing to route to buttons. */
 const NEVER_ASKS: PermissionMode[] = ['bypassPermissions', 'dontAsk'];
 export const wantsPermissionPrompts = (mode: PermissionMode) => !NEVER_ASKS.includes(mode);
 
 const MAX_FILE_BYTES = 100 * 1024 * 1024;
-const SECTION_MAX = 2_800;
-const DEFAULT_OPTIONS = ['Approve', 'Reject'];
-const NEGATIVE = /^(reject|deny|no|cancel|stop|decline)/i;
 
 export interface BridgeDeps {
   /** tara-agent's local API, as the MCP server reaches it. */
   apiUrl: string;
   chat: ChatPort;
   store: Store;
+  /** Approval items (request_approval, propose_item, finish_item). */
+  approvals: Approvals;
   log: Logger;
   projects: Project[];
   timeZone: string;
   permissionTimeoutMs?: number;
   /** Built MCP server entry point (dist/mcp/server.js). */
   mcpServerPath?: string;
+  /** With `claude.runAs`: the run user's group, which must read the MCP config. */
+  shareGid?: number;
   now?: () => number;
   newId?: () => string;
 }
@@ -104,11 +111,19 @@ export class Bridge {
   constructor(private readonly deps: BridgeDeps) {
     this.now = deps.now ?? Date.now;
     this.newId = deps.newId ?? randomUUID;
+    // Decisions on chat cards continue the thread the way a typed reply would.
+    deps.approvals.onChat ??= (msg) => this.onDecision?.(msg) ?? Promise.resolve();
   }
 
   /** Registers a run and writes its MCP config (mode 600; the token never appears on a command line). */
   open(ctx: RunContext): RunHandle {
-    this.configDir ??= mkdtempSync(path.join(tmpdir(), 'tara-mcp-'));
+    if (!this.configDir) {
+      this.configDir = mkdtempSync(path.join(tmpdir(), 'tara-mcp-'));
+      if (this.deps.shareGid !== undefined) {
+        chownSync(this.configDir, process.getuid?.() ?? -1, this.deps.shareGid);
+        chmodSync(this.configDir, 0o750);
+      }
+    }
     const token = randomBytes(24).toString('hex');
     const file = path.join(this.configDir, `${token.slice(0, 16)}.json`);
     const server = this.deps.mcpServerPath ?? fileURLToPath(new URL('../mcp/server.js', import.meta.url));
@@ -127,6 +142,10 @@ export class Bridge {
       },
     };
     writeFileSync(file, JSON.stringify(config), { mode: 0o600 });
+    if (this.deps.shareGid !== undefined) {
+      chownSync(file, process.getuid?.() ?? -1, this.deps.shareGid);
+      chmodSync(file, 0o640);
+    }
     this.runs.set(token, ctx);
     return {
       mcpConfigPath: file,
@@ -146,53 +165,62 @@ export class Bridge {
 
   async requestApproval(
     token: string | undefined,
-    input: { title: string; details: string; options?: string[] },
+    input: { title: string; details: string; options?: string[]; kind?: string },
   ): Promise<{ id: string; options: string[] }> {
     const ctx = this.run(token);
-    const title = input.title.trim().slice(0, 150);
-    const options = (input.options?.length ? input.options : DEFAULT_OPTIONS)
-      .map((o) => o.trim().slice(0, 75))
-      .filter(Boolean)
-      .slice(0, 5);
-    if (!title || options.length < 2) throw new BridgeError(400, 'Need a title and at least 2 options');
+    return this.deps.approvals.requestDecision(ctx, input).catch(asBridgeError);
+  }
 
-    let details = toSlackMrkdwn(input.details.trim());
-    if (details.length > SECTION_MAX) {
-      // Too long for one block: post it in full first, then the buttons under it.
-      for (const chunk of splitMessage(details)) await this.deps.chat.post(ctx.channel, ctx.threadTs, chunk);
-      details = '_Full proposal above._';
-    }
-    const id = this.newId();
-    this.deps.store.createApproval({
-      id,
-      project: ctx.project.config.name,
-      channel: ctx.channel,
-      threadTs: ctx.threadTs,
-      title,
-      options,
-    });
-    const blocks: SlackBlock[] = [
-      { type: 'section', text: { type: 'mrkdwn', text: `*🟡 Approval needed: ${title}*\n${details}` } },
-      {
-        type: 'actions',
-        elements: options.map((option, i) => ({
-          type: 'button',
-          text: { type: 'plain_text', text: option },
-          action_id: `tara:approval:${i}`,
-          value: id,
-          ...(i === 0 ? { style: 'primary' } : NEGATIVE.test(option) ? { style: 'danger' } : {}),
-        })),
-      },
-      { type: 'context', elements: [{ type: 'mrkdwn', text: 'Or reply in this thread with changes.' }] },
-    ];
-    const ts = await this.deps.chat.postBlocks(
-      ctx.channel,
-      ctx.threadTs,
-      `Approval needed: ${title}`,
-      blocks,
-    );
-    this.deps.store.setApprovalMessage(id, ts);
-    return { id, options };
+  /** A draft for later, as an approval card of this run's project. */
+  async proposeItem(
+    token: string | undefined,
+    input: ProposeInput,
+  ): Promise<{ id: string; checks: unknown[] }> {
+    const ctx = this.run(token);
+    const item = await this.deps.approvals
+      .propose(ctx.project, input, {
+        channel: ctx.channel,
+        threadTs: ctx.threadTs,
+        jobId: ctx.jobId,
+        source: ctx.jobId ?? (ctx.kind === 'chat' ? 'chat' : undefined),
+      })
+      .catch(asBridgeError);
+    return { id: item.id, checks: item.checks };
+  }
+
+  /** The executor's report on one item it was given. */
+  finishItem(token: string | undefined, input: { id: string; status: 'done' | 'failed'; result?: string }) {
+    const ctx = this.run(token);
+    if (!ctx.items?.includes(input.id))
+      throw new BridgeError(403, `Item ${input.id} was not given to this run`);
+    const item = this.deps.store.finishItem(input.id, input.status, input.result);
+    if (!item) throw new BridgeError(409, `Item ${input.id} is not running (already reported?)`);
+    this.deps.approvals.notify(item, 'finished');
+    return { id: item.id, status: item.status };
+  }
+
+  /** This project's items, for checking before proposing again. */
+  listItems(token: string | undefined, filter: { status?: string; kind?: string }) {
+    const ctx = this.run(token);
+    const statuses = filter.status
+      ? filter.status
+          .split(',')
+          .filter((s): s is ItemStatus => (ITEM_STATUSES as readonly string[]).includes(s))
+      : (['pending', 'approved', 'running'] as ItemStatus[]);
+    return this.deps.store
+      .items({ project: ctx.project.config.name, kind: filter.kind, statuses, limit: 200 })
+      .map(({ id, kind, key, title, status, queue, window, decision, reply, result }) => ({
+        id,
+        kind,
+        key,
+        title,
+        status,
+        queue,
+        window,
+        decision,
+        reply,
+        result,
+      }));
   }
 
   async sendFile(
@@ -339,31 +367,16 @@ export class Bridge {
   }
 
   private async approvalTapped(tap: ButtonTap): Promise<void> {
-    const row = this.deps.store.getApproval(tap.value);
-    const option = row?.options[Number(tap.actionId.split(':')[2])];
-    if (!row || !option) return;
-    if (!this.allowed(row.project, tap.user)) {
-      this.deps.log.warn(`[${row.project}] approval tap by ${tap.user} ignored (not in allowedUsers)`);
+    const item = this.deps.store.getItem(tap.value);
+    const option = item?.options[Number(tap.actionId.split(':')[2])];
+    if (!item || !option) return;
+    if (!this.allowed(item.project, tap.user)) {
+      this.deps.log.warn(`[${item.project}] approval tap by ${tap.user} ignored (not in allowedUsers)`);
       return;
     }
-    if (!this.deps.store.decideApproval(row.id, option, tap.user)) return; // someone already decided
-    const when = this.time();
-    const icon = NEGATIVE.test(option) ? '❌' : '✅';
-    await this.deps.chat
-      .update(tap.channel, tap.messageTs, `${row.title}: ${option}`, [
-        { type: 'section', text: { type: 'mrkdwn', text: `*${row.title}*` } },
-        {
-          type: 'context',
-          elements: [{ type: 'mrkdwn', text: `${icon} *${option}*, chosen by <@${tap.user}> at ${when}` }],
-        },
-      ])
-      .catch((err: Error) => this.deps.log.warn(`could not update approval message: ${err.message}`));
-    await this.onDecision?.({
-      channel: row.channel,
-      threadTs: row.threadTs,
-      ts: tap.messageTs,
-      user: tap.user,
-      text: `USER DECISION on "${row.title}": ${option} (tapped at ${when})`,
+    await this.deps.approvals.decide(item.id, { option, by: tap.user, via: 'slack' }).catch((err: Error) => {
+      // Already decided (a double tap, or the dashboard first): nothing to do.
+      if (!(err instanceof ApprovalError && err.status === 409)) throw err;
     });
   }
 
@@ -396,4 +409,10 @@ export class Bridge {
       ])
       .catch((err: Error) => this.deps.log.warn(`could not update permission message: ${err.message}`));
   }
+}
+
+/** Approval errors keep their HTTP status on the way back to the MCP server. */
+function asBridgeError(err: unknown): never {
+  if (err instanceof ApprovalError) throw new BridgeError(err.status, err.message);
+  throw err;
 }

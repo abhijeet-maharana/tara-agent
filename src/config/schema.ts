@@ -29,6 +29,11 @@ export const hostConfigSchema = z.object({
       chatTimeoutMinutes: z.number().positive().default(20),
       /** Effort for every run (`--effort`); unset uses each model's default. */
       effort: z.enum(['low', 'medium', 'high', 'xhigh']).optional(),
+      /**
+       * Run Claude and pre-run scripts as this OS user (through sudo), so they can't read tara-agent's
+       * database or secrets. See docs/security.md.
+       */
+      runAs: z.string().optional(),
     })
     .default({ bin: 'claude', chatTimeoutMinutes: 20 }),
   /** Where the SQLite state lives. Defaults to `~/.local/state/tara-agent`. */
@@ -79,6 +84,8 @@ export const projectConfigSchema = z.object({
     .string()
     .min(1)
     .regex(/^[a-z0-9][a-z0-9-]*$/, 'lowercase letters, digits and dashes'),
+  /** How the dashboard names the project ("Job Search" for `remote-job`). Defaults to `name`. */
+  title: z.string().min(1).max(40).optional(),
   slackChannel: z.string().regex(/^[CG][A-Z0-9]+$/, 'a Slack channel ID such as C0123456789'),
   permissionMode: z.enum(permissionModes).default('default'),
   chatModel: z.string().min(1).default('sonnet'),
@@ -100,6 +107,23 @@ export const projectConfigSchema = z.object({
   billing: z.enum(['subscription', 'api']).default('subscription'),
   /** The project's own web dashboard, if it has one; the tara-agent dashboard links to it. */
   dashboardUrl: z.string().url().optional(),
+  /** Approval items (the Approvals page). */
+  approvals: z
+    .object({
+      /**
+       * Checks the project's own rules (lengths, banned words…) on every proposed or edited item:
+       * POST {kind, key, fields} → {checks: [{text, blocking}]}. A blocking check stops approval.
+       */
+      validateUrl: z.string().url().optional(),
+      /**
+       * Told when an item of this project is decided or finished: POST {event, item}, signed with
+       * APPROVAL_SEAL_KEY (HMAC-SHA256 of the body in `x-tara-signature`).
+       */
+      hookUrl: z.string().url().optional(),
+      /** Pending items expire after this many days (default 7). */
+      expireDays: z.number().positive().optional(),
+    })
+    .optional(),
   /**
    * After a job run that had trouble (failed, errored, timed out, or several tool errors), resume
    * its session once and let Claude fix the skill or instruction file it followed, so the same
@@ -122,8 +146,11 @@ export const jobSchema = z
   .object({
     id: z.string().regex(jobIdPattern, 'lowercase letters, digits and dashes'),
     name: z.string().min(1),
-    /** Cron expression (5 or 6 fields). */
-    cron: z.string().min(1),
+    /**
+     * Cron expression (5 or 6 fields). Leave it out for a job that runs only when a queue hands it
+     * approved items (`.tara/queues.json`) or when started by hand.
+     */
+    cron: z.string().min(1).optional(),
     /** IANA timezone for `cron`. Defaults to the file's `tz`, then the host timezone. */
     tz: z.string().optional(),
     /** Typical run time, for schedule planning tools (overlap checks, calendars). tara doesn't use it. */
@@ -155,6 +182,61 @@ export const jobSchema = z
   })
   .refine((j) => j.prompt || !j.agent, { message: 'prompt is required unless agent is false' })
   .refine((j) => j.preScript || j.agent, { message: 'a job with agent: false needs a preScript' });
+
+const hhmm = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'HH:MM');
+const days = z
+  .string()
+  .regex(
+    /^(mon|tue|wed|thu|fri|sat|sun)(-(mon|tue|wed|thu|fri|sat|sun))?(,(mon|tue|wed|thu|fri|sat|sun)(-(mon|tue|wed|thu|fri|sat|sun))?)*$/,
+    'e.g. "mon-fri" or "tue,thu"',
+  );
+
+/** A time window approved items may run in, in its own timezone (e.g. the recipient's morning). */
+export const queueWindowSchema = z.object({
+  tz: z.string().optional(),
+  days: days.default('mon-sun'),
+  from: hhmm,
+  to: hhmm,
+});
+
+/** One queue in `<repo>/.tara/queues.json`: how approved items of a kind run, one at a time. */
+export const queueSchema = z
+  .object({
+    /**
+     * Who runs the items: a job (gets them in its prompt), a URL (gets a POST per item, sealed), or
+     * `external`: the project's own server runs them on its own schedule and reports each one
+     * (`POST /items/<id>/report`); tara-agent never starts them.
+     */
+    executor: z.union([
+      z.object({ job: z.string().regex(jobIdPattern) }),
+      z.object({ url: z.string().url() }),
+      z.object({ external: z.literal(true) }),
+    ]),
+    /** Items given to one job run. */
+    batch: z.number().int().positive().default(1),
+    /** Items run only while their window (the item's `window`, or any) is open. */
+    windows: z.record(z.string(), queueWindowSchema).optional(),
+    /** Instead of windows: one batch per cron slot. */
+    slots: z.string().optional(),
+    /** With slots: take turns between these kinds (oldest approval first within a kind). */
+    alternate: z.array(z.string()).optional(),
+    caps: z
+      .object({
+        perDay: z.number().int().positive().optional(),
+        perWeek: z.number().int().positive().optional(),
+      })
+      .default({}),
+    /** Minutes between two runs of this queue. */
+    gapMinutes: z.number().nonnegative().default(0),
+    /** Timezone for slots, window defaults and the cap day. Defaults to the jobs file `tz`, then the host. */
+    tz: z.string().optional(),
+  })
+  .refine((q) => !(q.windows && q.slots), { message: 'use windows or slots, not both' });
+
+export const queuesFileSchema = z.object({ queues: z.record(z.string().regex(jobIdPattern), queueSchema) });
+
+export type QueueWindow = z.infer<typeof queueWindowSchema>;
+export type QueueConfig = z.infer<typeof queueSchema>;
 
 /** `<repo>/.tara/jobs.json`. */
 export const jobsFileSchema = z.object({

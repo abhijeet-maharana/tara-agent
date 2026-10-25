@@ -1,5 +1,9 @@
 import { spawn } from 'node:child_process';
+import { chmodSync, chownSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { createInterface } from 'node:readline';
+import { asUser, type RunAs, signalGroup } from './as-user.js';
 import { parseStreamLine, type RateLimit, type StreamEvent, type TokenUsage } from './stream.js';
 
 export interface RunOptions {
@@ -8,9 +12,16 @@ export interface RunOptions {
   cwd: string;
   env: NodeJS.ProcessEnv;
   prompt: string;
+  /**
+   * Appended to Claude's system prompt. It goes in a file (`--append-system-prompt-file`), never on
+   * the command line, where it would fill sudo's log on every run and show in `ps`.
+   */
+  systemPrompt?: string;
   timeoutMs: number;
   signal?: AbortSignal;
   onEvent?: (event: StreamEvent) => void;
+  /** Run as another OS user (host `claude.runAs`). */
+  runAs?: RunAs;
 }
 
 export type RunStatus = 'ok' | 'error' | 'timeout' | 'limit' | 'aborted';
@@ -36,6 +47,27 @@ const KILL_GRACE_MS = 5_000;
 const STDERR_TAIL = 4_000;
 const LIMIT_TEXT = /usage limit|rate limit|out of extra usage/i;
 
+/** Writes the system prompt where only this process and the run's user can read it; removed after the run. */
+function systemPromptFile(text: string, runAs: RunAs | undefined): { file: string; dispose: () => void } {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tara-prompt-'));
+  const file = path.join(dir, 'system-prompt.md');
+  writeFileSync(file, text, { mode: 0o600 });
+  if (runAs) {
+    chownSync(dir, process.getuid?.() ?? -1, runAs.gid);
+    chownSync(file, process.getuid?.() ?? -1, runAs.gid);
+    chmodSync(dir, 0o750);
+    chmodSync(file, 0o640);
+  }
+  return { file, dispose: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+/** Adds the file flag before `--allowedTools`, which is variadic and must stay last. */
+function withSystemPromptFile(args: string[], file: string): string[] {
+  const at = args.indexOf('--allowedTools');
+  const flag = ['--append-system-prompt-file', file];
+  return at === -1 ? [...args, ...flag] : [...args.slice(0, at), ...flag, ...args.slice(at)];
+}
+
 /** Runs one headless `claude -p` turn and resolves when the process exits. Never rejects. */
 export const runClaude: Runner = (options) =>
   new Promise((resolve) => {
@@ -48,21 +80,22 @@ export const runClaude: Runner = (options) =>
     let stopReason: 'timeout' | 'aborted' | undefined;
     let spawnError: Error | undefined;
 
+    const prompt = options.systemPrompt ? systemPromptFile(options.systemPrompt, options.runAs) : undefined;
+    const args = prompt ? withSystemPromptFile(options.args, prompt.file) : options.args;
     // Own process group, so a timeout also stops whatever the CLI started (shells, MCP servers).
-    const child = spawn(options.bin, options.args, {
+    const cmd = options.runAs
+      ? asUser(options.bin, args, options.env, options.runAs)
+      : { bin: options.bin, args, env: options.env };
+    const child = spawn(cmd.bin, cmd.args, {
       cwd: options.cwd,
-      env: options.env,
+      env: cmd.env,
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: true,
     });
 
     const killGroup = (signal: NodeJS.Signals) => {
       if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
-      try {
-        process.kill(-child.pid, signal);
-      } catch {
-        child.kill(signal);
-      }
+      signalGroup(child.pid, signal, options.runAs);
     };
     const stop = (reason: 'timeout' | 'aborted') => {
       stopReason ??= reason;
@@ -102,6 +135,7 @@ export const runClaude: Runner = (options) =>
 
     child.on('close', (code) => {
       clearTimeout(timer);
+      prompt?.dispose();
       options.signal?.removeEventListener('abort', onAbort);
 
       const base = {

@@ -9,12 +9,15 @@ import {
   jobsFileSchema,
   type Project,
   projectConfigSchema,
+  type QueueConfig,
+  queuesFileSchema,
   type ScheduledJob,
 } from './schema.js';
 
 export const DEFAULT_HOST_CONFIG = path.join(homedir(), '.config', 'tara-agent', 'config.yaml');
 export const PROJECT_CONFIG = path.join('.tara', 'config.json');
 export const JOBS_FILE = path.join('.tara', 'jobs.json');
+export const QUEUES_FILE = path.join('.tara', 'queues.json');
 
 export function expandHome(p: string): string {
   return p === '~' || p.startsWith('~/') ? path.join(homedir(), p.slice(1)) : p;
@@ -99,4 +102,23 @@ export function loadJobs(project: Project): ScheduledJob[] {
     job: { ...job, tz: job.tz ?? jobsFile.tz },
     env: { ...expand(jobsFile.env), ...expand(job.env) },
   }));
+}
+
+/** Queues of one project, or none when it has no `.tara/queues.json`. Throws on an invalid file. */
+export function loadQueues(project: Project): Record<string, QueueConfig> {
+  const file = path.join(project.dir, QUEUES_FILE);
+  let text: string;
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {};
+    throw err;
+  }
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`Invalid JSON in ${file}: ${(err as Error).message}`);
+  }
+  return parseWith(queuesFileSchema, json, file).queues;
 }

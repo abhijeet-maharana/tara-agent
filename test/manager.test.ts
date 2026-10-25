@@ -86,8 +86,8 @@ describe('SessionManager', () => {
     );
     expect(calls[1]?.prompt).toBe('<@U1>: and then?');
     expect(calls[0]?.cwd).toBe('/repo');
-    expect(calls[0]?.args.join(' ')).toContain('Project rules.');
-    expect(calls[0]?.args.join(' ')).toContain('Your name is tara.');
+    expect(calls[0]?.systemPrompt).toContain('Project rules.');
+    expect(calls[0]?.systemPrompt).toContain('Your name is tara.');
     expect(calls[0]?.env).toEqual({ PATH: '/bin', TARA_SCRATCH: '/tmp/scratch/shop/chat-sid-1' });
 
     expect(chat.texts()).toContain('*Answer*');
@@ -193,7 +193,7 @@ describe('SessionManager', () => {
       const [turn, learn, next] = calls as [RunOptions, RunOptions, RunOptions];
       expect(learn.args).toEqual(expect.arrayContaining(['--resume', 'sid-1', '--model', 'sonnet']));
       // Same system prompt as the turn, so the cached prompt is reused.
-      const sys = (o: RunOptions) => o.args[o.args.indexOf('--append-system-prompt') + 1];
+      const sys = (o: RunOptions) => o.systemPrompt;
       expect(sys(learn)).toBe(sys(turn));
       expect(learn.prompt).toContain('it ended with an error: boom');
       expect(learn.env).toEqual(turn.env);

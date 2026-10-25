@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { describe, expect, it } from 'vitest';
+import { Approvals } from '../src/approvals/approvals.js';
 import { Bridge, type RunContext, wantsPermissionPrompts } from '../src/bridge/bridge.js';
 import type { Project, ProjectConfig } from '../src/config/schema.js';
 import { startHttpServer } from '../src/http/server.js';
@@ -40,16 +41,20 @@ function setup(p = project()) {
   const chat = new FakeChat('ts');
   const store = new Store(':memory:');
   let n = 0;
+  const now = () => Date.parse('2026-10-25T08:30:00Z');
+  const newId = () => `id${++n}`;
+  const approvals = new Approvals({ store, chat, log: silent, projects: [p], timeZone: 'UTC', now, newId });
   const bridge = new Bridge({
     apiUrl: 'http://127.0.0.1:1',
     chat,
     store,
+    approvals,
     log: silent,
     projects: [p],
     timeZone: 'UTC',
     permissionTimeoutMs: 200,
-    now: () => Date.parse('2026-10-25T08:30:00Z'),
-    newId: () => `id${++n}`,
+    now,
+    newId,
   });
   const decisions: IncomingMessage[] = [];
   bridge.onDecision = async (m) => void decisions.push(m);
@@ -114,14 +119,18 @@ describe('approvals', () => {
       ['tara:approval:0', 'id1', 'primary'],
       ['tara:approval:1', 'id1', 'danger'],
     ]);
-    expect(store.getApproval('id1')).toMatchObject({ status: 'pending', messageTs: 'ts1' });
+    expect(store.getItem('id1')).toMatchObject({
+      status: 'pending',
+      messageTs: 'ts1',
+      body: '**Saves** ₹1,240/week',
+    });
 
     const tap = { actionId: 'tara:approval:0', value: 'id1', user: 'U1', channel: 'C1', messageTs: 'ts1' };
     await bridge.handleButton(tap);
     await bridge.handleButton({ ...tap, actionId: 'tara:approval:1', user: 'U2' }); // too late: already decided
 
-    expect(store.getApproval('id1')).toMatchObject({
-      status: 'decided',
+    expect(store.getItem('id1')).toMatchObject({
+      status: 'done',
       decision: 'Approve',
       decidedBy: 'U1',
     });
@@ -161,7 +170,7 @@ describe('approvals', () => {
       channel: 'C1',
       messageTs: 'ts1',
     });
-    expect(store.getApproval('id1')?.status).toBe('pending');
+    expect(store.getItem('id1')?.status).toBe('pending');
     expect(decisions).toHaveLength(0);
   });
 
@@ -361,7 +370,17 @@ describe('MCP server end to end', () => {
     await client.connect(transport);
     try {
       const { tools } = await client.listTools();
-      expect(tools.map((t) => t.name).sort()).toEqual(['permission', 'request_approval', 'send_file']);
+      expect(tools.map((t) => t.name).sort()).toEqual([
+        'add_task',
+        'complete_task',
+        'finish_item',
+        'list_items',
+        'list_tasks',
+        'permission',
+        'propose_item',
+        'request_approval',
+        'send_file',
+      ]);
 
       const result = await client.callTool({
         name: 'request_approval',

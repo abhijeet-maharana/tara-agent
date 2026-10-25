@@ -9,7 +9,7 @@ import { type LearnRequest, learnFromRun, troubleReasons } from '../sessions/lea
 import { type ChatPort, type Logger, threadKey } from '../sessions/manager.js';
 import { formatDuration, splitMessage, toSlackMrkdwn } from '../slack/format.js';
 import { StreamReply } from '../slack/reply.js';
-import type { RunRecord, Store } from '../store/store.js';
+import type { Item, RunRecord, Store } from '../store/store.js';
 import { type Locks, type Semaphore, Throttle } from '../util/concurrency.js';
 import {
   buildJobPrompt,
@@ -26,7 +26,11 @@ export type JobTrigger =
   | { kind: 'schedule' }
   | { kind: 'catch-up' }
   /** `thread`: the chat message that asked for the run; the run then happens in its thread. */
-  | { kind: 'manual'; by: string; thread?: { channel: string; ts: string } };
+  | { kind: 'manual'; by: string; thread?: { channel: string; ts: string } }
+  /** A decision on the run's approval card: the same session continues in its thread. */
+  | { kind: 'resume'; by: string; threadTs: string; text: string }
+  /** Approved items from one of the project's queues, handed to this (executor) job. */
+  | { kind: 'queue'; queue: string; items: Item[] };
 
 const REACTIONS: Record<JobStatus, string> = {
   ok: 'white_check_mark',
@@ -72,6 +76,9 @@ function triggerLabel(trigger: JobTrigger): string {
   if (trigger.kind === 'manual') {
     return ` (run by ${/^[UW][A-Z0-9]+$/.test(trigger.by) ? `<@${trigger.by}>` : trigger.by})`;
   }
+  if (trigger.kind === 'resume') return ' (continuing after your decision)';
+  if (trigger.kind === 'queue')
+    return ` (${trigger.items.length} approved ${trigger.items.length === 1 ? 'item' : 'items'})`;
   return '';
 }
 
@@ -94,7 +101,9 @@ export async function runJob(
   // Asked for in chat: run inside that message's thread instead of posting a new channel message.
   const requestTs =
     trigger.kind === 'manual' && trigger.thread?.channel === channel ? trigger.thread.ts : undefined;
-  const postMain = (text: string) => chat.post(channel, requestTs, text);
+  // The thread the run posts in: the requester's message, or (continuing) the job's earlier thread.
+  const inThread = trigger.kind === 'resume' ? trigger.threadTs : requestTs;
+  const postMain = (text: string) => chat.post(channel, inThread, text);
   if (requestTs) await chat.react(channel, requestTs, 'eyes').catch(() => {});
 
   const releaseSlot = await deps.slots.acquire();
@@ -135,7 +144,8 @@ export async function runJob(
       return record('error', { error: (err as Error).message });
     }
 
-    if (job.preScript) {
+    // A queue already decided what to run, and a continued run is past its gate.
+    if (job.preScript && trigger.kind !== 'resume' && trigger.kind !== 'queue') {
       script = await (deps.runScript ?? runScript)(job.preScript, project.dir, env, timeoutMs, signal);
       if (signal?.aborted) return record('aborted');
       if (script.ok && (!script.output.trim() || !parseWakeGate(script.output))) {
@@ -161,9 +171,14 @@ export async function runJob(
     // The job's thread: the requester's message, or a new channel message. The status line (⏳ → ✅
     // with the headline) is that channel message, or the first reply in the requester's thread.
     const statusTs = await postMain(`⏳ ${title}`);
-    const rootTs = requestTs ?? statusTs;
+    const rootTs = inThread ?? statusTs;
     const key = threadKey(channel, rootTs);
-    let session = {
+    const earlier = trigger.kind === 'resume' ? store.getSession(key) : undefined;
+    if (trigger.kind === 'resume' && !earlier?.started) {
+      await chat.update(channel, statusTs, `❌ ${title}: the run's session is gone, so it can't continue`);
+      return record('error', { error: 'no session to continue' });
+    }
+    let session = earlier ?? {
       threadKey: key,
       project: project.config.name,
       sessionId: (deps.newSessionId ?? randomUUID)(),
@@ -194,6 +209,8 @@ export async function runJob(
       threadTs: rootTs,
       kind: 'job',
       permissionPrompts: false,
+      jobId: job.id,
+      items: trigger.kind === 'queue' ? trigger.items.map((i) => i.id) : undefined,
     };
     const bridged = deps.bridge?.open(bridgeContext);
     const appendSystemPrompt = [
@@ -210,18 +227,21 @@ export async function runJob(
         bin: deps.host.claude.bin,
         args: buildClaudeArgs({
           sessionId: session.sessionId,
-          resume: false,
+          resume: trigger.kind === 'resume',
           permissionMode: project.config.permissionMode,
-          model: job.model,
+          model: session.model,
           effort: deps.host.claude.effort,
-          appendSystemPrompt,
           allowedTools,
           mcpConfig: bridged?.mcpConfigPath,
           partialMessages: Boolean(live),
         }),
         cwd: project.dir,
         env,
-        prompt: buildJobPrompt(job, script, folders),
+        systemPrompt: appendSystemPrompt,
+        prompt:
+          trigger.kind === 'resume'
+            ? trigger.text
+            : buildJobPrompt(job, script, folders, trigger.kind === 'queue' ? trigger.items : undefined),
         timeoutMs,
         signal,
         onEvent: (event) => {
@@ -301,7 +321,7 @@ export async function runJob(
 
     if (isSilentReply(outcome.text)) {
       await live?.discard();
-      if (requestTs) {
+      if (inThread) {
         // The requester's thread stays (and its session, for follow-up questions).
         await chat.update(channel, statusTs, `🔇 ${title} · nothing to report`);
       } else {
@@ -310,7 +330,7 @@ export async function runJob(
           .catch(() => chat.update(channel, rootTs, `🔇 ${title} · nothing to report`));
         store.deleteSession(key);
       }
-      learnIf(undefined, requestTs);
+      learnIf(undefined, inThread);
       return record('silent', { ...usage, output: outcome.text });
     }
 

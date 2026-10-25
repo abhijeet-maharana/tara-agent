@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { buildClaudeArgs } from '../src/runner/args.js';
@@ -96,7 +96,6 @@ describe('buildClaudeArgs', () => {
       resume: false,
       permissionMode: 'default',
       model: 'opus',
-      appendSystemPrompt: 'be brief',
       allowedTools: ['Read', 'Bash(npm test:*)'],
     });
     expect(args).toEqual([
@@ -110,8 +109,6 @@ describe('buildClaudeArgs', () => {
       'opus',
       '--session-id',
       'abc',
-      '--append-system-prompt',
-      'be brief',
       '--allowedTools',
       'Read',
       'Bash(npm test:*)',
@@ -196,6 +193,19 @@ describe('runClaude', () => {
   it('sends the prompt on stdin', async () => {
     const o = await run('echo').outcome;
     expect(JSON.parse(o.text)).toMatchObject({ prompt: 'hello', args: ['-p'] });
+  });
+
+  it('passes the system prompt in a file, before the variadic tools, and removes it after', async () => {
+    const o = await run('echo', {
+      args: [fakeClaude, '-p', '--allowedTools', 'Read'],
+      systemPrompt: 'be brief',
+    }).outcome;
+    const { args } = JSON.parse(o.text) as { args: string[] };
+    const at = args.indexOf('--append-system-prompt-file');
+    expect(args.slice(0, at)).toEqual(['-p']);
+    expect(args.slice(at + 2)).toEqual(['--allowedTools', 'Read']);
+    expect(args.join(' ')).not.toContain('be brief');
+    expect(existsSync(args[at + 1] as string)).toBe(false);
   });
 
   it('reports a crash with the stderr tail', async () => {

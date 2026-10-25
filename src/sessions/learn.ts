@@ -46,7 +46,7 @@ export interface LearnRequest {
   project: Project;
   sessionId: string;
   model: string;
-  /** Exactly what the run passed to `--append-system-prompt`. */
+  /** Exactly the system prompt the run had (passed to Claude in a file). */
   appendSystemPrompt: string;
   /** The run's bridge context, reopened so the turn sees the same tools; omit if the run had none. */
   bridge?: RunContext;
@@ -77,13 +77,13 @@ export async function learnFromRun(deps: LearnDeps, req: LearnRequest): Promise<
         permissionMode: req.project.config.permissionMode,
         model: req.model,
         effort: deps.host.claude.effort,
-        appendSystemPrompt: req.appendSystemPrompt,
         allowedTools: req.allowedTools,
         mcpConfig: bridged?.mcpConfigPath,
         permissionPrompts: req.bridge?.permissionPrompts,
       }),
       cwd: req.project.dir,
       env: req.env,
+      systemPrompt: req.appendSystemPrompt,
       prompt: learnPrompt(req.reasons),
       timeoutMs: LEARN_TIMEOUT_MS,
     });

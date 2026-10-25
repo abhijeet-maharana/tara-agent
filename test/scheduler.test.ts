@@ -130,8 +130,8 @@ describe('Scheduler', () => {
     expect(call.args).toEqual(expect.arrayContaining(['--model', 'haiku', '--session-id', 'sid']));
     // No host effort set: the model's default applies.
     expect(call.args).not.toContain('--effort');
-    expect(call.args.join(' ')).toContain('unattended');
-    expect(call.args.join(' ')).toContain('Project rules.');
+    expect(call.systemPrompt).toContain('unattended');
+    expect(call.systemPrompt).toContain('Project rules.');
     // Its own scratch folder and the job's data folder, as env and as absolute paths in the prompt.
     expect(call.env.TARA_SCRATCH).toBe('/tmp/scratch/shop/sla-sid');
     expect(call.env.TARA_JOB_DATA).toBe('/tmp/job-data/shop/sla');
@@ -202,7 +202,7 @@ describe('Scheduler', () => {
       expect(learn.args).toEqual(expect.arrayContaining(['--resume', 'sid', '--model', 'haiku']));
       expect(learn.args).not.toContain('--mcp-config');
       // Same system prompt as the job, so the cached prompt is reused.
-      const sys = (o: RunOptions) => o.args[o.args.indexOf('--append-system-prompt') + 1];
+      const sys = (o: RunOptions) => o.systemPrompt;
       expect(sys(learn)).toBe(sys(job));
       expect(learn.prompt).toContain('it reported a failure: Save button not found');
       expect(learn.prompt).toContain('Reply with exactly NONE');

@@ -346,7 +346,6 @@ export class SessionManager {
           permissionMode: project.config.permissionMode,
           model: session.model,
           effort: host.claude.effort,
-          appendSystemPrompt,
           allowedTools: project.config.allowedTools,
           mcpConfig: bridged?.mcpConfigPath,
           permissionPrompts,
@@ -355,6 +354,7 @@ export class SessionManager {
         cwd: project.dir,
         env,
         prompt,
+        systemPrompt: appendSystemPrompt,
         timeoutMs: host.claude.chatTimeoutMinutes * 60_000,
         signal: controller.signal,
         onEvent: (event) => {
