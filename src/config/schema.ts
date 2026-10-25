@@ -100,8 +100,10 @@ export const jobSchema = z
     name: z.string().min(1),
     /** Cron expression (5 or 6 fields). */
     cron: z.string().min(1),
-    /** IANA timezone for `cron`. Defaults to the host timezone. */
+    /** IANA timezone for `cron`. Defaults to the file's `tz`, then the host timezone. */
     tz: z.string().optional(),
+    /** Typical run time, for schedule planning tools (overlap checks, calendars). tara doesn't use it. */
+    durationMinutes: z.number().positive().optional(),
     /** What to do. Optional only for script-only jobs (`agent: false`). */
     prompt: z.string().optional(),
     /** Skills the job should follow; named in the prompt so Claude reads them first. */
@@ -132,6 +134,8 @@ export const jobSchema = z
 
 /** `<repo>/.tara/jobs.json`. */
 export const jobsFileSchema = z.object({
+  /** IANA timezone for every job's `cron` that doesn't set its own `tz`. Defaults to the host timezone. */
+  tz: z.string().optional(),
   /** Environment shared by every job in this repo. `~/` is expanded. */
   env: z.record(z.string(), z.string()).default({}),
   jobs: z.array(jobSchema).superRefine((jobs, ctx) => {

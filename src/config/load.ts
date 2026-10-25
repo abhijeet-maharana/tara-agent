@@ -94,5 +94,9 @@ export function loadJobs(project: Project): ScheduledJob[] {
   const jobsFile = parseWith(jobsFileSchema, json, file);
   const expand = (env: Record<string, string>) =>
     Object.fromEntries(Object.entries(env).map(([k, v]) => [k, expandHome(v)]));
-  return jobsFile.jobs.map((job) => ({ project, job, env: { ...expand(jobsFile.env), ...expand(job.env) } }));
+  return jobsFile.jobs.map((job) => ({
+    project,
+    job: { ...job, tz: job.tz ?? jobsFile.tz },
+    env: { ...expand(jobsFile.env), ...expand(job.env) },
+  }));
 }

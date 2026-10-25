@@ -112,13 +112,14 @@ Each repo can declare jobs in `.tara/jobs.json` (reloaded within 30 s of a chang
 
 ```json
 {
+  "tz": "Asia/Kolkata",
   "env": { "DATA_DIR": "~/data" },
   "jobs": [
     {
       "id": "daily-sla-report",
       "name": "Daily SLA report",
-      "cron": "15 5 * * *",
-      "tz": "UTC",
+      "cron": "45 10 * * *",
+      "durationMinutes": 5,
       "prompt": "Check yesterday's late orders and summarise them.",
       "skills": ["order-sla-report"],
       "preScript": "scripts/sla-gate.py",
@@ -132,7 +133,8 @@ Each repo can declare jobs in `.tara/jobs.json` (reloaded within 30 s of a chang
 | Key | Default | Meaning |
 |---|---|---|
 | `id`, `name`, `cron` | required | Slug for `!run`, display name, cron expression (5 or 6 fields) |
-| `tz` | host `timezone` | Timezone of `cron` |
+| `tz` | file-level `tz`, else host `timezone` | Timezone of `cron` (set it once at the top of the file) |
+| `durationMinutes` | none | Typical run time, for schedule planning tools; tara doesn't use it |
 | `prompt` | required unless `agent: false` | What Claude should do |
 | `skills` | `[]` | Skills named in the prompt so Claude reads them first |
 | `preScript` | none | Runs first, from the repo root (`.py` → python3, `.sh` → bash) |

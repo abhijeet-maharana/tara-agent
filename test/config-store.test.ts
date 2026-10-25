@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { loadHostConfig, loadProject, loadProjects } from '../src/config/load.js';
+import { loadHostConfig, loadJobs, loadProject, loadProjects } from '../src/config/load.js';
 import { Store } from '../src/store/store.js';
 
 function tempDir(): string {
@@ -73,6 +73,25 @@ describe('loadProject', () => {
       })(),
     );
     expect(() => loadProjects(host)).toThrow(/same slackChannel/);
+  });
+});
+
+describe('loadJobs', () => {
+  it('uses the file tz unless a job sets its own', () => {
+    const dir = makeProject({ name: 'shop', slackChannel: 'C0123ABC' });
+    writeFileSync(
+      path.join(dir, '.tara', 'jobs.json'),
+      JSON.stringify({
+        tz: 'Asia/Kolkata',
+        jobs: [
+          { id: 'a', name: 'A', cron: '0 9 * * *', prompt: 'a', durationMinutes: 5 },
+          { id: 'b', name: 'B', cron: '0 9 * * *', prompt: 'b', tz: 'UTC' },
+        ],
+      }),
+    );
+    const [a, b] = loadJobs(loadProject(dir));
+    expect(a?.job).toMatchObject({ tz: 'Asia/Kolkata', durationMinutes: 5 });
+    expect(b?.job.tz).toBe('UTC');
   });
 });
 

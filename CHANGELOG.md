@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `jobs.json` takes a file-level `tz` for every job that doesn't set its own, and an optional `durationMinutes` per job for planning tools.
+
 ## 0.1.0 (2026-10-25)
 
 First release.
