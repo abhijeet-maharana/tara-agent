@@ -1,0 +1,26 @@
+# systemd user unit. Install:
+#   mkdir -p ~/.config/systemd/user && cp deploy/systemd/tara-agent.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now tara-agent
+#   loginctl enable-linger "$USER"   # keep it running while you're logged out
+# Logs: journalctl --user -u tara-agent -f
+[Unit]
+Description=tara-agent (Slack threads and schedules for Claude Code)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/tara-agent
+# SLACK_BOT_TOKEN, SLACK_APP_TOKEN, optional ANTHROPIC_API_KEY
+EnvironmentFile=%h/.config/tara-agent/env
+# PATH must reach node and the claude CLI (native installer puts it in ~/.local/bin)
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env node dist/index.js
+Restart=on-failure
+RestartSec=10
+# Let running turns post "Stopped" before the process is killed
+TimeoutStopSec=15
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

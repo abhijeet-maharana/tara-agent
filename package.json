@@ -1,0 +1,36 @@
+{
+  "name": "tara-agent",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Self-hosted gateway that turns Slack threads and cron schedules into real Claude Code sessions on your own machine.",
+  "license": "MIT",
+  "author": "Abhijeet Maharana",
+  "type": "module",
+  "bin": {
+    "tara-agent": "dist/index.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@slack/bolt": "^5.1.0",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.6.3",
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  }
+}

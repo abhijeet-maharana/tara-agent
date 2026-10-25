@@ -1,0 +1,9 @@
+# ~/.config/tara-agent/config.yaml
+projects:
+  - ~/Projects/my-shop
+  - ~/Projects/side-project
+concurrency: 2
+claude:
+  bin: claude
+  chatTimeoutMinutes: 20
+statusIntervalSeconds: 5

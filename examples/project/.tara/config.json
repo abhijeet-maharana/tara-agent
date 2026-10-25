@@ -1,0 +1,10 @@
+{
+  "name": "my-shop",
+  "slackChannel": "C0123456789",
+  "permissionMode": "default",
+  "chatModel": "sonnet",
+  "allowedTools": ["Read", "Grep", "Glob", "Bash(npm test:*)", "Bash(git status:*)"],
+  "systemPromptFile": ".tara/system-prompt.md",
+  "allowedUsers": [],
+  "billing": "subscription"
+}
