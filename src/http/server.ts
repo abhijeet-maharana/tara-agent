@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { type Bridge, BridgeError } from '../bridge/bridge.js';
 import type { Scheduler } from '../scheduler/scheduler.js';
 import type { Logger } from '../sessions/manager.js';
 import type { Store } from '../store/store.js';
@@ -10,6 +11,8 @@ export interface HttpOptions {
   token?: string;
   scheduler: Scheduler;
   store: Store;
+  /** Serves `/internal/*` for tara's MCP server (authenticated by the run token, not `token`). */
+  bridge?: Bridge;
   projects: string[];
   log: Logger;
   now?: () => number;
@@ -49,6 +52,11 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
  *   GET  /jobs/<project>/<id>/runs?limit=15
  *   GET  /runs/<id>
  *   POST /reload                       re-read every .tara/jobs.json now
+ * and, for tara's own MCP server (header `x-tara-run: <run token>`):
+ *   POST /internal/approval            {title, details, options?}
+ *   POST /internal/file                {path, comment?}
+ *   POST /internal/permission          {tool_name, input}  → {id}
+ *   GET  /internal/permission/<id>?wait=45                 → {decision | null}
  */
 export function startHttpServer(options: HttpOptions): Promise<Server> {
   const started = (options.now ?? Date.now)();
@@ -118,16 +126,59 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
     throw new HttpError(404, 'Not found');
   };
 
+  const internal = async (req: IncomingMessage): Promise<unknown> => {
+    const bridge = options.bridge;
+    if (!bridge) throw new HttpError(404, 'MCP bridge is not enabled');
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+    const token = req.headers['x-tara-run'] as string | undefined;
+    const str = (v: unknown, name: string) => {
+      if (typeof v !== 'string' || !v.trim()) throw new HttpError(400, `"${name}" is required`);
+      return v;
+    };
+    if (req.method === 'POST' && parts[1] === 'approval' && parts.length === 2) {
+      const body = await readJson(req);
+      const options = Array.isArray(body.options)
+        ? body.options.filter((o) => typeof o === 'string')
+        : undefined;
+      return bridge.requestApproval(token, {
+        title: str(body.title, 'title'),
+        details: str(body.details, 'details'),
+        options,
+      });
+    }
+    if (req.method === 'POST' && parts[1] === 'file' && parts.length === 2) {
+      const body = await readJson(req);
+      const comment = typeof body.comment === 'string' ? body.comment : undefined;
+      return bridge.sendFile(token, { path: str(body.path, 'path'), comment });
+    }
+    if (req.method === 'POST' && parts[1] === 'permission' && parts.length === 2) {
+      const body = await readJson(req);
+      const input =
+        typeof body.input === 'object' && body.input !== null ? (body.input as Record<string, unknown>) : {};
+      return bridge.askPermission(token, { tool_name: str(body.tool_name, 'tool_name'), input });
+    }
+    if (req.method === 'GET' && parts[1] === 'permission' && parts.length === 3) {
+      const waitMs = Math.min(55, Math.max(0, Number(url.searchParams.get('wait')) || 0)) * 1000;
+      return { decision: (await bridge.waitPermission(token, parts[2] as string, waitMs)) ?? null };
+    }
+    throw new HttpError(404, 'Not found');
+  };
+
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
     let status = 200;
     let payload: unknown;
     try {
-      if (options.token && req.headers.authorization !== `Bearer ${options.token}`) {
-        throw new HttpError(401, 'Missing or wrong bearer token');
+      if (req.url?.startsWith('/internal/')) {
+        payload = await internal(req);
+      } else {
+        if (options.token && req.headers.authorization !== `Bearer ${options.token}`) {
+          throw new HttpError(401, 'Missing or wrong bearer token');
+        }
+        payload = await route(req);
       }
-      payload = await route(req);
     } catch (err) {
-      status = err instanceof HttpError ? err.status : 500;
+      status = err instanceof HttpError || err instanceof BridgeError ? err.status : 500;
       payload = { error: (err as Error).message };
       if (status === 500) options.log.error(`http ${req.method} ${req.url}: ${(err as Error).stack ?? err}`);
     }

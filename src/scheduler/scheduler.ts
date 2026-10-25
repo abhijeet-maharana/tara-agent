@@ -1,6 +1,7 @@
 import { statSync } from 'node:fs';
 import path from 'node:path';
 import { Cron } from 'croner';
+import type { Bridge } from '../bridge/bridge.js';
 import { JOBS_FILE, loadJobs } from '../config/load.js';
 import type { HostConfig, Project, ScheduledJob } from '../config/schema.js';
 import type { Runner } from '../runner/run.js';
@@ -40,6 +41,7 @@ export interface SchedulerDeps {
   log: Logger;
   env?: NodeJS.ProcessEnv;
   runScript?: typeof runScript;
+  bridge?: Bridge;
   newSessionId?: () => string;
   now?: () => number;
   /** How often job files are checked for changes. */
@@ -209,6 +211,7 @@ export class Scheduler implements JobControl {
         locks: this.locks,
         env: this.deps.env,
         runScript: this.deps.runScript,
+        bridge: this.deps.bridge,
         newSessionId: this.deps.newSessionId,
         now: this.deps.now,
       },

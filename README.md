@@ -2,7 +2,7 @@
 
 Self-hosted gateway that turns **Slack threads** and **cron schedules** into real **Claude Code** sessions on your own machine, across as many project repos as you like.
 
-> **Status:** early development, running in production for one small business. Slack threads and scheduled jobs work; approval buttons are next. See [docs/plan.md](docs/plan.md).
+> **Status:** early development, running in production for one small business. Slack threads, scheduled jobs, approval buttons and Slack permission prompts work. See [docs/plan.md](docs/plan.md).
 
 ## Why
 
@@ -150,6 +150,18 @@ tara-agent import-hermes --from ~/.hermes/cron/jobs.json --out <repo>/.tara/jobs
   --env REPO_ROOT=~/Projects/my-repo   # map container paths your scripts expect
 ```
 Hermes' cron default model becomes `--default-model` (`haiku`), browser-capable jobs get the `chrome` lock, and schedules stay in UTC.
+
+## Approvals, permission prompts and files
+
+Every run gets tara's own MCP server (next to the repo's `.mcp.json` servers) with these tools:
+
+| Tool | What happens |
+|---|---|
+| `request_approval` | Claude posts the proposal with buttons (default **Approve / Reject**, up to 5 options) and ends its turn. A tap updates the card ("✅ Approve, chosen by @you at 14:02") and resumes the same session with `USER DECISION on "<title>": <option>`. Replying in words works too. Taps are recorded once (a double tap or a second person can't decide twice) and survive restarts. |
+| `send_file` | Uploads a screenshot, PDF, CSV or image into the thread. Only files inside the project or the temp directory, resolved through symlinks, up to 100 MB. |
+| `permission` | Chat turns outside `bypassPermissions`/`dontAsk`: when Claude wants a tool your `allowedTools` don't cover, the thread gets **Allow / Deny** buttons and the call waits (denied after 10 minutes). Scheduled jobs never wait on a prompt. |
+
+The tools reach tara-agent through its local API with a per-run token, written to a mode-600 config file, so the token never appears on a command line. This needs `http.enabled` (the default).
 
 ## Local API
 

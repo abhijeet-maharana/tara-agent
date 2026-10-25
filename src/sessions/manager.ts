@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { BRIDGE_PROMPT, type Bridge, wantsPermissionPrompts } from '../bridge/bridge.js';
 import type { HostConfig, Project } from '../config/schema.js';
 import { buildClaudeArgs } from '../runner/args.js';
 import { buildChildEnv } from '../runner/env.js';
@@ -13,10 +14,17 @@ export interface ChatPort {
   /** Posts into a thread (or top-level when `threadTs` is undefined) and returns the new message's ts. */
   post(channel: string, threadTs: string | undefined, text: string): Promise<string>;
   delete(channel: string, ts: string): Promise<void>;
-  update(channel: string, ts: string, text: string): Promise<void>;
+  update(channel: string, ts: string, text: string, blocks?: SlackBlock[]): Promise<void>;
+  /** Posts a Block Kit message (text is the notification/fallback text). */
+  postBlocks(channel: string, threadTs: string, text: string, blocks: SlackBlock[]): Promise<string>;
+  /** Uploads a local file into a thread. */
+  uploadFile(channel: string, threadTs: string, filePath: string, comment?: string): Promise<void>;
   react(channel: string, ts: string, emoji: string): Promise<void>;
   unreact(channel: string, ts: string, emoji: string): Promise<void>;
 }
+
+/** A Slack Block Kit block, kept loose on purpose: only the bridge builds them. */
+export type SlackBlock = { type: string; block_id?: string; [key: string]: unknown };
 
 export interface IncomingMessage {
   channel: string;
@@ -41,6 +49,8 @@ export interface ManagerDeps {
   run: Runner;
   /** Scheduler, for `!jobs` and `!run`. */
   jobs?: JobControl;
+  /** Approval buttons, permission prompts and file uploads (tara's MCP tools). */
+  bridge?: Bridge;
   env?: NodeJS.ProcessEnv;
   log?: Logger;
   newSessionId?: () => string;
@@ -201,6 +211,14 @@ export class SessionManager {
 
     let session = store.getSession(key) ?? this.freshSession(project, key);
     store.saveSession(session);
+    const permissionPrompts = wantsPermissionPrompts(project.config.permissionMode);
+    const bridged = this.deps.bridge?.open({
+      project,
+      channel: msg.channel,
+      threadTs: msg.threadTs,
+      kind: 'chat',
+      permissionPrompts,
+    });
     let outcome: RunOutcome;
     try {
       outcome = await this.deps.run({
@@ -210,8 +228,12 @@ export class SessionManager {
           resume: session.started,
           permissionMode: project.config.permissionMode,
           model: session.model,
-          appendSystemPrompt: [BASE_PROMPT, project.systemPrompt].filter(Boolean).join('\n\n'),
+          appendSystemPrompt: [BASE_PROMPT, bridged && BRIDGE_PROMPT, project.systemPrompt]
+            .filter(Boolean)
+            .join('\n\n'),
           allowedTools: project.config.allowedTools,
+          mcpConfig: bridged?.mcpConfigPath,
+          permissionPrompts,
         }),
         cwd: project.dir,
         env: buildChildEnv(this.env, project.config.billing),
@@ -239,6 +261,7 @@ export class SessionManager {
         error: (err as Error).message,
       };
     } finally {
+      bridged?.dispose();
       this.running.delete(key);
       release();
     }

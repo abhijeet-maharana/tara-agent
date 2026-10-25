@@ -1,6 +1,15 @@
 import { z } from 'zod';
 
-export const permissionModes = ['default', 'acceptEdits', 'plan', 'bypassPermissions'] as const;
+/** Claude Code permission modes (`default` is the older name of `manual`). */
+export const permissionModes = [
+  'default',
+  'manual',
+  'auto',
+  'dontAsk',
+  'acceptEdits',
+  'plan',
+  'bypassPermissions',
+] as const;
 
 /** `~/.config/tara-agent/config.yaml`: host-level settings. Never committed; secrets come from env. */
 export const hostConfigSchema = z.object({

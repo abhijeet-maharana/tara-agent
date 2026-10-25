@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { HostConfig, Project, ProjectConfig } from '../src/config/schema.js';
 import type { RunOptions, RunOutcome } from '../src/runner/run.js';
-import { type ChatPort, type IncomingMessage, SessionManager } from '../src/sessions/manager.js';
+import { type IncomingMessage, SessionManager } from '../src/sessions/manager.js';
 import { Store } from '../src/store/store.js';
+import { FakeChat } from './fakes.js';
 
 const host: HostConfig = {
   projects: ['/repo'],
@@ -33,34 +34,6 @@ function project(overrides: Partial<ProjectConfig> = {}): Project {
   };
 }
 
-class FakeChat implements ChatPort {
-  posts: { thread: string; text: string; ts: string }[] = [];
-  updates: { ts: string; text: string }[] = [];
-  reactions: string[] = [];
-  private n = 0;
-  deleted: string[] = [];
-  async post(_channel: string, thread: string | undefined, text: string) {
-    const ts = `bot.${++this.n}`;
-    this.posts.push({ thread: thread ?? '', text, ts });
-    return ts;
-  }
-  async delete(_channel: string, ts: string) {
-    this.deleted.push(ts);
-  }
-  async update(_channel: string, ts: string, text: string) {
-    this.updates.push({ ts, text });
-  }
-  async react(_c: string, ts: string, emoji: string) {
-    this.reactions.push(`+${emoji}@${ts}`);
-  }
-  async unreact(_c: string, ts: string, emoji: string) {
-    this.reactions.push(`-${emoji}@${ts}`);
-  }
-  texts() {
-    return this.posts.map((p) => p.text);
-  }
-}
-
 const ok = (o: Partial<RunOutcome> = {}): RunOutcome => ({
   status: 'ok',
   text: '**Answer**',
@@ -73,7 +46,7 @@ const ok = (o: Partial<RunOutcome> = {}): RunOutcome => ({
 });
 
 function setup(opts: { project?: Project; outcomes?: RunOutcome[]; env?: NodeJS.ProcessEnv } = {}) {
-  const chat = new FakeChat();
+  const chat = new FakeChat('bot.');
   const store = new Store(':memory:');
   const calls: RunOptions[] = [];
   const outcomes = [...(opts.outcomes ?? [])];
@@ -196,7 +169,7 @@ describe('SessionManager', () => {
   });
 
   it('stops a running turn with !stop', async () => {
-    const chat = new FakeChat();
+    const chat = new FakeChat('bot.');
     const manager = new SessionManager({
       projects: [project()],
       host,

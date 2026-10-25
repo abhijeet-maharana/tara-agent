@@ -8,8 +8,8 @@ import { startHttpServer } from '../src/http/server.js';
 import type { RunOptions, RunOutcome } from '../src/runner/run.js';
 import { Scheduler } from '../src/scheduler/scheduler.js';
 import type { ScriptResult } from '../src/scheduler/script.js';
-import type { ChatPort } from '../src/sessions/manager.js';
 import { Store } from '../src/store/store.js';
+import { FakeChat } from './fakes.js';
 
 const host: HostConfig = {
   projects: [],
@@ -22,24 +22,6 @@ const host: HostConfig = {
   timezone: 'UTC',
   http: { enabled: false, bind: '127.0.0.1', port: 0 },
 };
-
-class FakeChat implements ChatPort {
-  log: string[] = [];
-  private n = 0;
-  async post(_c: string, thread: string | undefined, text: string) {
-    const ts = `ts${++this.n}`;
-    this.log.push(`post ${thread ?? 'top'} ${ts}: ${text}`);
-    return ts;
-  }
-  async update(_c: string, ts: string, text: string) {
-    this.log.push(`update ${ts}: ${text}`);
-  }
-  async delete(_c: string, ts: string) {
-    this.log.push(`delete ${ts}`);
-  }
-  async react() {}
-  async unreact() {}
-}
 
 function makeProject(jobs: object[], env: object = {}): Project {
   const dir = mkdtempSync(path.join(tmpdir(), 'tara-sched-'));
@@ -78,7 +60,7 @@ function setup(opts: {
   now?: () => number;
   store?: Store;
 }) {
-  const chat = new FakeChat();
+  const chat = new FakeChat('ts');
   const store = opts.store ?? new Store(':memory:', opts.now);
   const calls: RunOptions[] = [];
   const callTimes: number[] = [];

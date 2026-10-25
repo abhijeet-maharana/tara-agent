@@ -1,11 +1,23 @@
-import { App, LogLevel } from '@slack/bolt';
+import { createReadStream } from 'node:fs';
+import path from 'node:path';
+import { App, type BlockAction, type ButtonAction, LogLevel } from '@slack/bolt';
 import type { ChatPort, IncomingMessage, Logger } from '../sessions/manager.js';
+
+/** A tap on one of tara's buttons (action ids start with `tara:`). */
+export interface ButtonTap {
+  actionId: string;
+  value: string;
+  user: string;
+  channel: string;
+  messageTs: string;
+}
 
 export interface SlackOptions {
   botToken: string;
   appToken: string;
   log: Logger;
   onMessage: (msg: IncomingMessage) => Promise<void>;
+  onButton?: (tap: ButtonTap) => Promise<void>;
 }
 
 /** Slack sends &, < and > escaped. Mentions and links (`<@U1>`, `<https://…>`) stay as they are. */
@@ -69,6 +81,22 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
       .catch((err: Error) => options.log.error(`message handling failed: ${err.message}`));
   });
 
+  app.action<BlockAction<ButtonAction>>(/^tara:/, async ({ ack, body, action }) => {
+    await ack();
+    const channel = body.channel?.id;
+    const messageTs = body.message?.ts;
+    if (!channel || !messageTs || !options.onButton) return;
+    void options
+      .onButton({
+        actionId: action.action_id,
+        value: action.value ?? '',
+        user: body.user.id,
+        channel,
+        messageTs,
+      })
+      .catch((err: Error) => options.log.error(`button handling failed: ${err.message}`));
+  });
+
   app.error(async (err) => {
     options.log.error(`slack error: ${err.message}`);
   });
@@ -87,8 +115,21 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
     async delete(channel, ts) {
       await app.client.chat.delete({ channel, ts });
     },
-    async update(channel, ts, text) {
-      await app.client.chat.update({ channel, ts, text });
+    async update(channel, ts, text, blocks) {
+      await app.client.chat.update({ channel, ts, text, ...(blocks ? { blocks } : {}) });
+    },
+    async postBlocks(channel, threadTs, text, blocks) {
+      const res = await app.client.chat.postMessage({ channel, thread_ts: threadTs, text, blocks });
+      return res.ts as string;
+    },
+    async uploadFile(channel, threadTs, filePath, comment) {
+      await app.client.files.uploadV2({
+        channel_id: channel,
+        thread_ts: threadTs,
+        file: createReadStream(filePath),
+        filename: path.basename(filePath),
+        ...(comment ? { initial_comment: comment } : {}),
+      });
     },
     async react(channel, ts, emoji) {
       await app.client.reactions.add({ channel, timestamp: ts, name: emoji });

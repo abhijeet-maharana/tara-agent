@@ -1,6 +1,6 @@
 # tara-agent: plan
 
-> **Status:** approved 2026-10-25. P0–P2 done; running live on the author's home server for 3 project channels and 58 jobs since 2026-10-25. Next: P3 approval buttons.
+> **Status:** approved 2026-10-25. P0–P3 done; running live on the author's home server for 3 project channels and 58 jobs since 2026-10-25. Next: P4 polish and v0.1.0.
 
 **One line:** a self-hosted gateway that turns Slack threads and cron schedules into real Claude Code sessions on your own machine. It works across many project repos and stays within Anthropic's terms by running the official `claude` CLI.
 
@@ -226,3 +226,4 @@ tara-agent/
 | P1 Runner + Slack threads | ✅ runner, stream-json parser, env stripping, SQLite store, session manager (`!new`, `!model`, `!stop`, `!status`), Slack adapter. 70 unit tests; verified with the real CLI and live in Slack (thread reply, reactions, usage capture). Accepts messages people post through an app with a user token (they carry `bot_id` + `user`) |
 | P2 Scheduler | ✅ `.tara/jobs.json` (zod-validated, hot reload), croner, SQLite slot claims (exactly once), catch-up only for slots after a job was first seen, `jobConcurrency` + named locks, pre-scripts with Hermes' contract (wake gate, `## Script Output`, `[SILENT]`, `[CRON_FAILURE]`), headline/details delivery, replies resume job sessions, `!jobs` / `!run`, `import-hermes`, `validate`, local HTTP API (moved up from P4). 110 tests |
 | Hardening | ✅ (2026-10-25) runs as a dedicated unprivileged user on the author's server: system unit `deploy/systemd/tara-agent-dedicated-user.service`, root-only env file, repo access via group + default ACLs, secrets and the rest of the home dir unreachable, read-only access to its own code |
+| P3 Approvals + MCP | ✅ per-run tara MCP server (stdio, `src/mcp/server.ts`) → local API with a per-run token (mode-600 config, private tmp): `request_approval` (Block Kit buttons, SQLite-backed, decided once, tap resumes the session with `USER DECISION …`), `send_file` (realpath-checked, project or tmp only), `permission` via `--permission-prompt-tool` (Allow/Deny, 10-minute deny, chat only). Verified live: approve tap → resumed Opus turn → file created and uploaded. 124 tests incl. MCP server end to end |

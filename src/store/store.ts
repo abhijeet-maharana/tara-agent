@@ -87,7 +87,36 @@ const MIGRATIONS = [
   `ALTER TABLE runs ADD COLUMN output TEXT;
    ALTER TABLE runs ADD COLUMN script_output TEXT;
    CREATE INDEX runs_job ON runs (project, job_id, started_at);`,
+  `CREATE TABLE approvals (
+     id          TEXT PRIMARY KEY,
+     project     TEXT NOT NULL,
+     channel     TEXT NOT NULL,
+     thread_ts   TEXT NOT NULL,
+     message_ts  TEXT,
+     title       TEXT NOT NULL,
+     options     TEXT NOT NULL,
+     status      TEXT NOT NULL DEFAULT 'pending',
+     decided_by  TEXT,
+     decision    TEXT,
+     created_at  INTEGER NOT NULL,
+     decided_at  INTEGER
+   );`,
 ];
+
+export interface ApprovalRow {
+  id: string;
+  project: string;
+  channel: string;
+  threadTs: string;
+  messageTs?: string;
+  title: string;
+  options: string[];
+  status: 'pending' | 'decided';
+  decidedBy?: string;
+  decision?: string;
+  createdAt: number;
+  decidedAt?: number;
+}
 
 function toRun(r: Record<string, unknown>): StoredRun {
   const opt = <T>(v: unknown) => (v ?? undefined) as T | undefined;
@@ -266,6 +295,54 @@ export class Store {
   /** Most recent run of a job, if any. */
   lastJobRun(project: string, jobId: string): StoredRun | undefined {
     return this.jobRuns(project, jobId, 1)[0];
+  }
+
+  createApproval(
+    a: Pick<ApprovalRow, 'id' | 'project' | 'channel' | 'threadTs' | 'title' | 'options'>,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO approvals (id, project, channel, thread_ts, title, options, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(a.id, a.project, a.channel, a.threadTs, a.title, JSON.stringify(a.options), this.now());
+  }
+
+  setApprovalMessage(id: string, messageTs: string): void {
+    this.db.prepare('UPDATE approvals SET message_ts = ? WHERE id = ?').run(messageTs, id);
+  }
+
+  getApproval(id: string): ApprovalRow | undefined {
+    const r = this.db.prepare('SELECT * FROM approvals WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
+    if (!r) return undefined;
+    const opt = <T>(v: unknown) => (v ?? undefined) as T | undefined;
+    return {
+      id: r.id as string,
+      project: r.project as string,
+      channel: r.channel as string,
+      threadTs: r.thread_ts as string,
+      messageTs: opt(r.message_ts),
+      title: r.title as string,
+      options: JSON.parse(r.options as string) as string[],
+      status: r.status as ApprovalRow['status'],
+      decidedBy: opt(r.decided_by),
+      decision: opt(r.decision),
+      createdAt: r.created_at as number,
+      decidedAt: opt(r.decided_at),
+    };
+  }
+
+  /** Records the decision once. False when it was already decided (double tap, two people). */
+  decideApproval(id: string, decision: string, by: string): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE approvals SET status = 'decided', decision = ?, decided_by = ?, decided_at = ?
+         WHERE id = ? AND status = 'pending'`,
+      )
+      .run(decision, by, this.now(), id);
+    return result.changes > 0;
   }
 
   close(): void {

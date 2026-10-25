@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { BRIDGE_PROMPT, type Bridge } from '../bridge/bridge.js';
 import type { HostConfig, ScheduledJob } from '../config/schema.js';
 import { buildClaudeArgs } from '../runner/args.js';
 import { buildChildEnv } from '../runner/env.js';
@@ -30,6 +31,7 @@ export interface JobRunnerDeps {
   log: Logger;
   slots: Semaphore;
   locks: Locks;
+  bridge?: Bridge;
   env?: NodeJS.ProcessEnv;
   runScript?: typeof runScript;
   newSessionId?: () => string;
@@ -122,31 +124,44 @@ export async function runJob(
       chat.update(channel, rootTs, text),
     );
 
-    const outcome: RunOutcome = await deps.run({
-      bin: deps.host.claude.bin,
-      args: buildClaudeArgs({
-        sessionId: session.sessionId,
-        resume: false,
-        permissionMode: project.config.permissionMode,
-        model: job.model,
-        appendSystemPrompt: [JOB_SYSTEM_PROMPT, project.systemPrompt].filter(Boolean).join('\n\n'),
-        allowedTools: job.allowedTools ?? project.config.allowedTools,
-      }),
-      cwd: project.dir,
-      env,
-      prompt: buildJobPrompt(job, script),
-      timeoutMs,
-      signal,
-      onEvent: (event) => {
-        if (event.kind === 'init' && !session.started) {
-          session = { ...session, started: true };
-          store.saveSession(session);
-        } else if (event.kind === 'tool') {
-          steps++;
-          status.push(`⏳ ${title} · step ${steps}\n> ${event.status}`);
-        }
-      },
+    // Jobs get approval buttons and file uploads, never permission prompts: nobody is watching live.
+    const bridged = deps.bridge?.open({
+      project,
+      channel,
+      threadTs: rootTs,
+      kind: 'job',
+      permissionPrompts: false,
     });
+    const outcome: RunOutcome = await deps
+      .run({
+        bin: deps.host.claude.bin,
+        args: buildClaudeArgs({
+          sessionId: session.sessionId,
+          resume: false,
+          permissionMode: project.config.permissionMode,
+          model: job.model,
+          appendSystemPrompt: [JOB_SYSTEM_PROMPT, bridged && BRIDGE_PROMPT, project.systemPrompt]
+            .filter(Boolean)
+            .join('\n\n'),
+          allowedTools: job.allowedTools ?? project.config.allowedTools,
+          mcpConfig: bridged?.mcpConfigPath,
+        }),
+        cwd: project.dir,
+        env,
+        prompt: buildJobPrompt(job, script),
+        timeoutMs,
+        signal,
+        onEvent: (event) => {
+          if (event.kind === 'init' && !session.started) {
+            session = { ...session, started: true };
+            store.saveSession(session);
+          } else if (event.kind === 'tool') {
+            steps++;
+            status.push(`⏳ ${title} · step ${steps}\n> ${event.status}`);
+          }
+        },
+      })
+      .finally(() => bridged?.dispose());
     await status.flush();
 
     const usage = {

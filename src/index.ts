@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
+import { Bridge } from './bridge/bridge.js';
 import { DEFAULT_HOST_CONFIG, expandHome, loadHostConfig, loadJobs, loadProjects } from './config/load.js';
 import { startHttpServer } from './http/server.js';
 import { convertHermesJobs } from './import-hermes.js';
@@ -103,13 +104,28 @@ async function serve(configFlag: string | undefined) {
 
   const store = new Store(path.join(host.stateDir as string, 'tara.db'));
   let manager: SessionManager | undefined;
+  let bridge: Bridge | undefined;
   const slack = createSlackGateway({
     botToken: requireEnv('SLACK_BOT_TOKEN'),
     appToken: requireEnv('SLACK_APP_TOKEN'),
     log,
     onMessage: (msg) => manager?.handle(msg) ?? Promise.resolve(),
+    onButton: (tap) => bridge?.handleButton(tap) ?? Promise.resolve(),
   });
-  const scheduler = new Scheduler({ projects, host, store, chat: slack.chat, run: runClaude, log });
+  // tara's MCP tools reach tara-agent through the local API, so they need it.
+  if (host.http.enabled) {
+    bridge = new Bridge({
+      apiUrl: `http://${host.http.bind === '0.0.0.0' ? '127.0.0.1' : host.http.bind}:${host.http.port}`,
+      chat: slack.chat,
+      store,
+      log,
+      projects,
+      timeZone: host.timezone,
+    });
+  } else {
+    log.warn('http is disabled: approval buttons, permission prompts and send_file are off');
+  }
+  const scheduler = new Scheduler({ projects, host, store, chat: slack.chat, run: runClaude, bridge, log });
   manager = new SessionManager({
     projects,
     host,
@@ -117,8 +133,10 @@ async function serve(configFlag: string | undefined) {
     chat: slack.chat,
     run: runClaude,
     jobs: scheduler,
+    bridge,
     log,
   });
+  if (bridge) bridge.onDecision = (msg) => (manager as SessionManager).handle(msg);
   await slack.start();
   scheduler.start();
   const http = host.http.enabled
@@ -127,6 +145,7 @@ async function serve(configFlag: string | undefined) {
         token: process.env.TARA_HTTP_TOKEN || undefined,
         scheduler,
         store,
+        bridge,
         projects: projects.map((p) => p.config.name),
         log,
       })
