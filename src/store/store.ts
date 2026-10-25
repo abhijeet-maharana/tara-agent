@@ -40,6 +40,14 @@ export interface StoredRun extends RunRecord {
   id: number;
 }
 
+/** A session with when it was used and its latest run, for the dashboard. */
+export interface SessionOverview extends SessionRow {
+  createdAt: number;
+  updatedAt: number;
+  turns: number;
+  lastRun?: StoredRun;
+}
+
 const OUTPUT_CAP = 20_000;
 
 const MIGRATIONS = [
@@ -206,6 +214,41 @@ export class Store {
       .run(s.threadKey, s.project, s.sessionId, s.model, s.started ? 1 : 0, t, t);
   }
 
+  /** Sessions, most recently active first, each with its latest run. */
+  sessionsOverview(opts: { project?: string; sessionId?: string; limit?: number } = {}): SessionOverview[] {
+    const where: string[] = [];
+    const args: (string | number)[] = [];
+    if (opts.project) {
+      where.push('s.project = ?');
+      args.push(opts.project);
+    }
+    if (opts.sessionId) {
+      where.push('s.session_id = ?');
+      args.push(opts.sessionId);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT s.thread_key, s.project, s.session_id, s.model, s.started, s.created_at, s.updated_at,
+           (SELECT COUNT(*) FROM runs x WHERE x.thread_key = s.thread_key) AS turns,
+           (SELECT id FROM runs x WHERE x.thread_key = s.thread_key ORDER BY x.started_at DESC LIMIT 1) AS last_run_id
+         FROM sessions s ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+         ORDER BY COALESCE((SELECT MAX(x.started_at) FROM runs x WHERE x.thread_key = s.thread_key), s.updated_at) DESC
+         LIMIT ?`,
+      )
+      .all(...args, opts.limit ?? 200) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      threadKey: r.thread_key as string,
+      project: r.project as string,
+      sessionId: r.session_id as string,
+      model: r.model as string,
+      started: r.started === 1,
+      createdAt: r.created_at as number,
+      updatedAt: r.updated_at as number,
+      turns: r.turns as number,
+      lastRun: r.last_run_id ? this.getRun(r.last_run_id as number) : undefined,
+    }));
+  }
+
   deleteSession(threadKey: string): void {
     this.db.prepare('DELETE FROM sessions WHERE thread_key = ?').run(threadKey);
   }
@@ -262,16 +305,18 @@ export class Store {
   }
 
   /**
-   * Claims one scheduled slot of a job. Returns false when it was already claimed (by an earlier run or
-   * a previous process), so every slot runs at most once.
+   * Claims one scheduled slot of a job. Returns false when it was already claimed, so every slot runs
+   * at most once. Two exceptions may be claimed again: a run stopped by a shutdown (`aborted`), and a
+   * claim still `running` from before `retakeBefore` (its process died without finishing it).
    */
-  claimSlot(jobKey: string, slot: number): boolean {
+  claimSlot(jobKey: string, slot: number, retakeBefore = 0): boolean {
     const result = this.db
       .prepare(
         `INSERT INTO job_claims (job_key, slot, status, claimed_at) VALUES (?, ?, 'running', ?)
-         ON CONFLICT (job_key, slot) DO NOTHING`,
+         ON CONFLICT (job_key, slot) DO UPDATE SET status = 'running', claimed_at = excluded.claimed_at
+         WHERE job_claims.status = 'aborted' OR (job_claims.status = 'running' AND job_claims.claimed_at < ?)`,
       )
-      .run(jobKey, slot, this.now());
+      .run(jobKey, slot, this.now(), retakeBefore);
     return result.changes > 0;
   }
 

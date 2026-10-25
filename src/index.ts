@@ -144,8 +144,7 @@ async function serve(configFlag: string | undefined) {
     bridge.onDecision = (msg) => (manager as SessionManager).handle(msg);
     bridge.jobs = scheduler;
   }
-  await slack.start();
-  scheduler.start();
+  // HTTP first: when tara-agent takes over a port, the hand-over gap is as short as possible.
   const http = host.http.enabled
     ? await startHttpServer({
         ...host.http,
@@ -154,9 +153,12 @@ async function serve(configFlag: string | undefined) {
         store,
         bridge,
         projects: projects.map((p) => p.config.name),
+        dashboard: { projects, timeZone: host.timezone, slackUrl: slack.workspaceUrl },
         log,
       })
     : undefined;
+  await slack.start();
+  scheduler.start();
 
   let stopping = false;
   const shutdown = async (signal: string) => {

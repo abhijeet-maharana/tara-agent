@@ -53,8 +53,15 @@ export const hostConfigSchema = z.object({
       enabled: z.boolean().default(true),
       bind: z.string().default('127.0.0.1'),
       port: z.number().int().min(1).max(65535).default(4100),
+      /**
+       * CIDR ranges allowed to connect. Transcripts hold everything Claude saw, so when binding beyond
+       * localhost keep this to trusted networks, e.g. ["127.0.0.0/8", "::1/128", "100.64.0.0/10"] (Tailscale).
+       */
+      allowFrom: z.array(z.string()).default(['127.0.0.0/8', '::1/128']),
+      /** Pass requests for paths tara-agent doesn't serve to this URL (e.g. the port's previous owner). */
+      fallback: z.string().url().optional(),
     })
-    .default({ enabled: true, bind: '127.0.0.1', port: 4100 }),
+    .default({ enabled: true, bind: '127.0.0.1', port: 4100, allowFrom: ['127.0.0.0/8', '::1/128'] }),
 });
 
 /** `<repo>/.tara/config.json`: committed in the project repo. */

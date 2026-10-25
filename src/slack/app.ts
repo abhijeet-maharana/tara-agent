@@ -63,6 +63,8 @@ export function toIncoming(message: SlackMessageEvent, botUserId?: string): Inco
 
 export interface SlackGateway {
   chat: ChatPort;
+  /** The workspace URL (https://acme.slack.com/), known after start(). */
+  workspaceUrl(): string | undefined;
   start(): Promise<void>;
   stop(): Promise<void>;
 }
@@ -77,6 +79,7 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
 
   let botUserId: string | undefined;
   let teamId: string | undefined;
+  let workspaceUrl: string | undefined;
 
   /** Calls a streaming method, turning Slack errors into StreamError with Slack's error code. */
   const streamCall = async (method: string, args: Record<string, unknown>) => {
@@ -180,10 +183,12 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
 
   return {
     chat,
+    workspaceUrl: () => workspaceUrl,
     async start() {
       const auth = await app.client.auth.test();
       botUserId = auth.user_id;
       teamId = auth.team_id;
+      workspaceUrl = auth.url;
       await app.start();
       options.log.info(`Slack connected as ${auth.user} (${auth.team})`);
     },

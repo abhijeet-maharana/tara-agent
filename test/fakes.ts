@@ -61,7 +61,7 @@ export function testHost(overrides: Partial<HostConfig> = {}): HostConfig {
     ...hostConfigSchema.parse({ projects: ['/repo'], timezone: 'UTC' }),
     stateDir: '/tmp',
     statusIntervalSeconds: 0,
-    http: { enabled: false, bind: '127.0.0.1', port: 0 },
+    http: { enabled: false, bind: '127.0.0.1', port: 0, allowFrom: ['127.0.0.0/8'] },
     healthDigest: { enabled: false, cron: '0 9 * * *' },
     ...overrides,
   };

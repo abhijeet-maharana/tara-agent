@@ -1,8 +1,18 @@
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import {
+  createServer,
+  request as httpRequest,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from 'node:http';
 import { type Bridge, BridgeError } from '../bridge/bridge.js';
+import type { Project } from '../config/schema.js';
 import type { Scheduler } from '../scheduler/scheduler.js';
 import type { Logger } from '../sessions/manager.js';
 import type { Store } from '../store/store.js';
+import { allowList } from './access.js';
+import { jobsPage, runPage, sessionPage, sessionsPage } from './dashboard.js';
+import { readTranscript } from './transcript.js';
 
 export interface HttpOptions {
   bind: string;
@@ -16,6 +26,15 @@ export interface HttpOptions {
   projects: string[];
   log: Logger;
   now?: () => number;
+  /** Who may connect, as CIDR ranges. Unset: anyone who can reach `bind`. */
+  allowFrom?: string[];
+  /**
+   * Requests for paths tara-agent doesn't serve are passed through to this URL, e.g. the service that
+   * owned the port before (so its callers keep working while they move).
+   */
+  fallback?: string;
+  /** Enables the HTML pages (sessions, transcripts, jobs) for browsers. */
+  dashboard?: { projects: Project[]; timeZone: string; slackUrl?: () => string | undefined };
 }
 
 class HttpError extends Error {
@@ -59,6 +78,9 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
  *   GET  /internal/permission/<id>?wait=45                 → {decision | null}
  *   GET  /internal/jobs, POST /internal/run-job {id}        (chat turns only)
  */
+/** Paths tara-agent serves itself; with a fallback, everything else is passed through. */
+const OWN_PATH = /^\/(?:$|(?:health|reload|jobs|runs|sessions|internal)(?:\/|$))/;
+
 export function startHttpServer(options: HttpOptions): Promise<Server> {
   const started = (options.now ?? Date.now)();
   const knownProject = (name: string | null) => {
@@ -173,7 +195,92 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
     throw new HttpError(404, 'Not found');
   };
 
+  const allowed = options.allowFrom ? allowList(options.allowFrom) : () => true;
+
+  /** Browser pages; undefined when this request should get JSON instead. */
+  const page = (req: IncomingMessage): string | undefined => {
+    const dash = options.dashboard;
+    if (!dash || req.method !== 'GET' || !(req.headers.accept ?? '').includes('text/html')) return undefined;
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+    const ctx = { projects: dash.projects, timeZone: dash.timeZone, slackUrl: dash.slackUrl?.() };
+    const names = dash.projects.map((p) => p.config.name);
+    if (parts.length === 0) {
+      const project = url.searchParams.get('project') ?? undefined;
+      const jobNames = new Map(
+        names.flatMap((n) => options.scheduler.list(n).map((j) => [`${n}:${j.id}`, j.name] as const)),
+      );
+      return sessionsPage(ctx, options.store.sessionsOverview({ project, limit: 300 }), jobNames, {
+        project,
+        kind: url.searchParams.get('kind') ?? undefined,
+      });
+    }
+    if (parts[0] === 'sessions' && parts.length === 2) {
+      const id = parts[1] as string;
+      const session = options.store.sessionsOverview({ sessionId: id, limit: 1 })[0];
+      const dir = dash.projects.find((p) => p.config.name === session?.project)?.dir;
+      // Sessions whose thread was cleared are still on disk: look in every project.
+      const entries = dir
+        ? readTranscript(dir, id)
+        : dash.projects.map((p) => readTranscript(p.dir, id)).find(Boolean);
+      return sessionPage(ctx, session, id, entries);
+    }
+    if (parts[0] === 'jobs' && parts.length === 1) {
+      return jobsPage(ctx, new Map(names.map((n) => [n, options.scheduler.list(n)])));
+    }
+    if (parts[0] === 'runs' && parts.length === 2)
+      return runPage(ctx, options.store.getRun(Number(parts[1])));
+    return undefined;
+  };
+
+  const fallback = options.fallback ? new URL(options.fallback) : undefined;
+  /** Streams a request to the fallback service and its answer back. */
+  const passThrough = (req: IncomingMessage, res: ServerResponse) => {
+    const target = new URL(req.url ?? '/', fallback);
+    const upstream = httpRequest(
+      target,
+      {
+        method: req.method,
+        headers: {
+          ...req.headers,
+          host: target.host,
+          'x-forwarded-for': req.socket.remoteAddress ?? '',
+          'x-forwarded-host': req.headers.host ?? '',
+        },
+      },
+      (answer) => {
+        res.writeHead(answer.statusCode ?? 502, answer.headers);
+        answer.pipe(res);
+      },
+    );
+    upstream.on('error', (err) => {
+      options.log.warn(`fallback ${req.method} ${req.url}: ${err.message}`);
+      if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
+      res.end(`Fallback service unreachable: ${err.message}`);
+    });
+    req.pipe(upstream);
+  };
+
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
+    if (!allowed(req.socket.remoteAddress)) {
+      res.writeHead(403, { 'content-type': 'text/plain' });
+      res.end('Forbidden: not on the allowed networks');
+      return;
+    }
+    if (fallback && !OWN_PATH.test(new URL(req.url ?? '/', 'http://localhost').pathname)) {
+      passThrough(req, res);
+      return;
+    }
+    try {
+      const html = page(req);
+      if (html) {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+        res.end(html);
+        return;
+      }
+    } catch (err) {
+      options.log.error(`http page ${req.url}: ${(err as Error).stack ?? err}`);
+    }
     let status = 200;
     let payload: unknown;
     try {

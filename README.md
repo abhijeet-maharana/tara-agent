@@ -88,7 +88,9 @@ The agent then can't use your sudo, docker group, browser profile files, other p
 | `catchUpHours` | `6` | After downtime, run a job's latest missed slot if it is at most this old (`0` = never) |
 | `timezone` | host's | Default timezone for job schedules and times shown in Slack |
 | `healthDigest` | on, `0 9 * * *` | Daily summary per project channel (`enabled`, `cron` in `timezone`): runs, problems, missed slots, peak 5-hour usage. Silent for projects with nothing to report |
-| `http` | `127.0.0.1:4100` | Local control API (`enabled`, `bind`, `port`); set `TARA_HTTP_TOKEN` to require a bearer token. Also needed by the approval/file tools |
+| `http` | `127.0.0.1:4100` | Local API and dashboard (`enabled`, `bind`, `port`, `allowFrom`); set `TARA_HTTP_TOKEN` to require a bearer token for the API. Also needed by the approval/file tools |
+| `http.allowFrom` | `127.0.0.0/8`, `::1/128` | CIDR ranges that may connect at all. Transcripts hold everything Claude saw, so when you bind beyond localhost keep this to a trusted network, e.g. add `100.64.0.0/10` and `fd7a:115c:a1e0::/48` for Tailscale |
+| `http.fallback` | none | URL that gets every request for a path tara-agent doesn't serve, streamed through unchanged. Lets tara-agent take over a port from another service while that service's callers move |
 
 **Project** (`<repo>/.tara/config.json`, committed in that repo)
 
@@ -167,6 +169,16 @@ Every run gets tara's own MCP server (next to the repo's `.mcp.json` servers) wi
 | `permission` | Chat turns outside `bypassPermissions`/`dontAsk`: when Claude wants a tool your `allowedTools` don't cover, the thread gets **Allow / Deny** buttons and the call waits (denied after 10 minutes). Scheduled jobs never wait on a prompt. |
 
 The tools reach tara-agent through its local API with a per-run token, written to a mode-600 config file, so the token never appears on a command line. This needs `http.enabled` (the default).
+
+## Dashboard
+
+Open the HTTP address in a browser (e.g. `http://my-server:4100` on your tailnet):
+
+- **Sessions**: every Slack thread and job run tara-agent started, newest first, filterable by project and chat/job, with model, status, duration and tokens.
+- **Session**: the full transcript, read from Claude Code's own session file: prompts, Claude's replies, and every tool call folded with its input and result (job pre-script output folded too), plus a link to the Slack thread.
+- **Jobs**: each project's jobs with schedule, next run and last status, and a **Run now** button (it streams to the project `owner`).
+
+The same paths answer JSON to tools; browsers get HTML. Only sessions of the user tara-agent runs as are listed.
 
 ## Local API
 

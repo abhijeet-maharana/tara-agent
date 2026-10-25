@@ -77,12 +77,15 @@ export class Scheduler implements JobControl {
   private readonly controller = new AbortController();
   private readonly inflight = new Set<Promise<unknown>>();
   private readonly now: () => number;
+  /** Claims older than this belong to an earlier process. */
+  private readonly startedAt: number;
   private poller: NodeJS.Timeout | undefined;
   private healthCron: Cron | undefined;
 
   constructor(private readonly deps: SchedulerDeps) {
     this.slots = new Semaphore(deps.host.jobConcurrency);
     this.now = deps.now ?? Date.now;
+    this.startedAt = this.now();
   }
 
   /** Loads every project's jobs, runs missed slots, and starts watching the job files. */
@@ -257,7 +260,7 @@ export class Scheduler implements JobControl {
       this.deps.log.warn(`[${key}] still running; skipped slot ${new Date(slot).toISOString()}`);
       return;
     }
-    if (!this.deps.store.claimSlot(key, slot)) return;
+    if (!this.deps.store.claimSlot(key, slot, this.startedAt)) return;
     this.launch(scheduled, trigger, (status) => this.deps.store.finishSlot(key, slot, status));
   }
 

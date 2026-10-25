@@ -500,3 +500,42 @@ describe('a job run asked for in chat', () => {
     await scheduler.stop();
   });
 });
+
+describe('runs cut short by a restart', () => {
+  it('re-runs a slot that a shutdown aborted, once, on the next start', async () => {
+    let now = Date.parse('2026-10-25T09:00:00Z');
+    const store = new Store(':memory:', () => now);
+    const job = { ...baseJob, cron: '0 * * * *' };
+    const first = setup({ jobs: [job], store, now: () => now });
+    first.scheduler.start(); // first seen 09:00:00, so the 09:00 slot counts
+    await first.scheduler.stop();
+    now = Date.parse('2026-10-25T10:00:30Z');
+    store.claimSlot('shop:sla', Date.parse('2026-10-25T10:00:00Z'));
+    store.finishSlot('shop:sla', Date.parse('2026-10-25T10:00:00Z'), 'aborted'); // the restart killed it
+
+    now = Date.parse('2026-10-25T10:02:00Z');
+    const second = setup({ jobs: [job], store, now: () => now });
+    second.scheduler.start();
+    await second.scheduler.idle();
+    expect(second.calls).toHaveLength(1);
+    expect(second.chat.log[0]).toBe('post top ts1: ⏳ *SLA Report* (catch-up)');
+    await second.scheduler.stop();
+
+    const third = setup({ jobs: [job], store, now: () => now });
+    third.scheduler.start();
+    await third.scheduler.idle();
+    expect(third.calls).toHaveLength(0); // done now: not again
+    await third.scheduler.stop();
+  });
+
+  it('retakes a claim left running by a process that died, but never one from the current process', () => {
+    let now = 1_000;
+    const store = new Store(':memory:', () => now);
+    expect(store.claimSlot('k', 1)).toBe(true);
+    now = 2_000;
+    expect(store.claimSlot('k', 1, 1_500)).toBe(true); // claimed at 1000 < 1500: stale
+    expect(store.claimSlot('k', 1, 1_500)).toBe(false); // claimed at 2000: ours, still running
+    store.finishSlot('k', 1, 'ok');
+    expect(store.claimSlot('k', 1, 9_999)).toBe(false);
+  });
+});
