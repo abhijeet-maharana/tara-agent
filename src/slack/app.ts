@@ -13,6 +13,37 @@ export function decodeSlackText(text: string): string {
   return text.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 }
 
+/** The parts of a Slack message event the gateway looks at. */
+export interface SlackMessageEvent {
+  subtype?: string;
+  user?: string;
+  bot_id?: string;
+  channel: string;
+  ts: string;
+  thread_ts?: string;
+  text?: string;
+}
+
+/**
+ * Turns a message event into an IncomingMessage, or null when it should be ignored: edits, deletes,
+ * joins, our own posts and pure bot posts (no `user`). Messages a person posts through an app with a
+ * user token carry a `bot_id` but still have their `user`, so they count as that person.
+ */
+export function toIncoming(message: SlackMessageEvent, botUserId?: string): IncomingMessage | null {
+  if (message.subtype !== undefined && message.subtype !== 'file_share') return null;
+  if (!message.user || message.user === botUserId) return null;
+  const text = decodeSlackText(message.text ?? '')
+    .replace(botUserId ? new RegExp(`<@${botUserId}>\\s*`, 'g') : /$^/, '')
+    .trim();
+  return {
+    channel: message.channel,
+    threadTs: message.thread_ts || message.ts,
+    ts: message.ts,
+    user: message.user,
+    text,
+  };
+}
+
 export interface SlackGateway {
   chat: ChatPort;
   start(): Promise<void>;
@@ -30,23 +61,11 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
   let botUserId: string | undefined;
 
   app.message(async ({ message }) => {
-    // Plain user messages and file shares only; skip edits, deletes, joins and every bot (including us).
-    if (message.subtype !== undefined && message.subtype !== 'file_share') return;
-    if (!('user' in message) || !message.user || ('bot_id' in message && message.bot_id)) return;
-    if (message.user === botUserId) return;
-
-    const text = decodeSlackText(message.text ?? '')
-      .replace(botUserId ? new RegExp(`<@${botUserId}>\\s*`, 'g') : /$^/, '')
-      .trim();
+    const incoming = toIncoming(message as SlackMessageEvent, botUserId);
+    if (!incoming) return;
     // Don't block Bolt's listener on a whole Claude turn.
     void options
-      .onMessage({
-        channel: message.channel,
-        threadTs: ('thread_ts' in message && message.thread_ts) || message.ts,
-        ts: message.ts,
-        user: message.user,
-        text,
-      })
+      .onMessage(incoming)
       .catch((err: Error) => options.log.error(`message handling failed: ${err.message}`));
   });
 

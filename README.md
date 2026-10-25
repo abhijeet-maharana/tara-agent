@@ -44,6 +44,22 @@ Requirements: Node ≥ 22.13, Claude Code installed and logged in (`claude` then
 5. **Each project:** add `.tara/config.json` (see [`examples/project`](examples/project/.tara)).
 6. **Run it:** `node dist/index.js`, or as a service with [`deploy/systemd/tara-agent.service`](deploy/systemd/tara-agent.service).
 
+## Run on a server
+
+1. Get the code onto the server (`git clone`, or a file sync such as Mutagen that skips `node_modules` and `dist`), then `npm ci && npm run build` there.
+2. Log in to Claude Code as the service user: run `claude`, then `/login`.
+3. Write `~/.config/tara-agent/config.yaml` and `~/.config/tara-agent/env` (mode 600). If `claude` isn't on the service's PATH, set `claude.bin` to its full path.
+4. Install the unit:
+   ```sh
+   cp deploy/systemd/tara-agent.service ~/.config/systemd/user/
+   systemctl --user daemon-reload && systemctl --user enable --now tara-agent
+   loginctl enable-linger "$USER"
+   journalctl --user -u tara-agent -f
+   ```
+5. Projects that use MCP servers from their `.mcp.json` must have them approved for headless runs. Put `"enableAllProjectMcpServers": true` (or `enabledMcpjsonServers`) in that repo's `.claude/settings.local.json`, then check with `claude mcp list` from the repo.
+
+**Moving from another bot on the same Slack app:** with Socket Mode, Slack splits events across every connection of one app. Stop the old bot before starting tara-agent with the same tokens.
+
 ## Configuration
 
 **Host** (`~/.config/tara-agent/config.yaml`, never committed)

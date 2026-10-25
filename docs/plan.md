@@ -1,6 +1,6 @@
 # tara-agent: plan
 
-> **Status:** approved 2026-10-25. P0 done; P1 code done and tested against the real CLI; live Slack test pending (needs the test Slack app).
+> **Status:** approved 2026-10-25. P0 and P1 done; running live on the author's home server for 3 project channels since 2026-10-25. Next: P2 scheduler.
 
 **One line:** a self-hosted gateway that turns Slack threads and cron schedules into real Claude Code sessions on your own machine. It works across many project repos and stays within Anthropic's terms by running the official `claude` CLI.
 
@@ -223,4 +223,4 @@ tara-agent/
 | Phase | State |
 |---|---|
 | P0 Scaffold | ✅ package, tsconfig, Biome, vitest, CI (typecheck, lint, test, build on Node 22/24) + gitleaks, MIT, README, `.gitignore`, Slack manifest, systemd unit, examples |
-| P1 Runner + Slack threads | 🟡 runner, stream-json parser, env stripping, SQLite store, session manager (`!new`, `!model`, `!stop`, `!status`), Slack adapter. 60 unit tests; verified with the real `claude` CLI (new session, resume, permission denial, usage capture). Live Slack test pending |
+| P1 Runner + Slack threads | ✅ runner, stream-json parser, env stripping, SQLite store, session manager (`!new`, `!model`, `!stop`, `!status`), Slack adapter. 70 unit tests; verified with the real CLI and live in Slack (thread reply, reactions, usage capture). Accepts messages people post through an app with a user token (they carry `bot_id` + `user`) |
