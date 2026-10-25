@@ -220,6 +220,7 @@ export function itemInput(body: Record<string, unknown>): ProposeInput {
         type: m?.type === 'video' || m?.type === 'file' ? (m.type as 'video' | 'file') : ('image' as const),
         url: need(m?.url, 'media[].url'),
         caption: str(m?.caption),
+        poster: str(m?.poster),
       })),
   };
 }

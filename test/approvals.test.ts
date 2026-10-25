@@ -398,6 +398,12 @@ describe('decisions over HTTP', () => {
       queue: 'linkedin',
       fields: [note('hello')],
     });
+    await approvals.propose(project, {
+      kind: 'reel',
+      title: 'A reel',
+      queue: 'content',
+      media: [{ type: 'video', url: 'http://board/reel.mp4', poster: 'http://board/cover.jpg' }],
+    });
     const start = (decisionsFromLocal: boolean) =>
       startHttpServer({
         bind: '127.0.0.1',
@@ -449,6 +455,9 @@ describe('decisions over HTTP', () => {
       r.text(),
     );
     expect(page).toContain('Jane &lt;CTO&gt;');
+    expect(page).toContain(
+      '<video src="http://board/reel.mp4" poster="http://board/cover.jpg" controls playsinline preload="metadata"',
+    );
     expect(page).toContain('data-decide="Approve"');
     expect(page).not.toContain('can look but not decide');
 

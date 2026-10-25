@@ -262,6 +262,8 @@ export interface ItemMedia {
   type: 'image' | 'video' | 'file';
   url: string;
   caption?: string;
+  /** Videos: the still shown before play (e.g. a reel's cover). */
+  poster?: string;
 }
 
 /**

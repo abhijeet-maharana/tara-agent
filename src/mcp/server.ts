@@ -135,6 +135,7 @@ server.registerTool(
             type: z.enum(['image', 'video', 'file']),
             url: z.string(),
             caption: z.string().optional(),
+            poster: z.string().optional().describe('Videos: the still shown before play'),
           }),
         )
         .max(20)

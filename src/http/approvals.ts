@@ -115,7 +115,7 @@ document.addEventListener('change', (e) => {
 
 const CSS = `<style>
 .item .body{margin-top:8px;font-size:14px;overflow-wrap:anywhere}.item .body.long{max-height:220px;overflow:auto}
-.media{display:flex;gap:8px;overflow-x:auto;margin-top:10px}.media img,.media video{height:180px;border-radius:8px;border:1px solid var(--border);background:var(--bg)}
+.media{display:flex;gap:8px;overflow-x:auto;margin-top:10px;align-items:flex-start}.media img,.media video{height:180px;border-radius:8px;border:1px solid var(--border);background:var(--bg)}.media video{height:min(62vh,520px);max-width:100%;aspect-ratio:9/16;background:#000;object-fit:contain}
 .fieldset{display:grid;gap:10px;margin-top:12px}.fieldset .field{position:relative}
 .fieldset textarea{min-height:90px;width:100%;min-width:0}.fieldset input.input{width:100%;min-width:0}
 .count{position:absolute;right:8px;top:0;font-size:11px;color:var(--text-dim)}.count.over{color:var(--red);font-weight:600}
@@ -150,7 +150,7 @@ function mediaHtml(item: Item): string {
   return `<div class="media">${item.media
     .map((m) =>
       m.type === 'video'
-        ? `<video src="${esc(m.url)}" controls preload="none" title="${esc(m.caption ?? '')}"></video>`
+        ? `<video src="${esc(m.url)}"${m.poster ? ` poster="${esc(m.poster)}"` : ''} controls playsinline preload="metadata" title="${esc(m.caption ?? '')}"></video>`
         : m.type === 'file'
           ? `<a class="chip" href="${esc(m.url)}" target="_blank" rel="noopener noreferrer">📄 ${esc(m.caption ?? 'Open file')} ↗</a>`
           : `<a href="${esc(m.url)}" target="_blank" rel="noopener noreferrer"><img src="${esc(m.url)}" alt="${esc(m.caption ?? '')}" loading="lazy"></a>`,
