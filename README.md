@@ -78,6 +78,7 @@ The agent then can't use your sudo, docker group, browser profile files, other p
 | Key | Default | Meaning |
 |---|---|---|
 | `projects` | required | Paths of project repos |
+| `agentName` | `tara` | What the agent calls itself: Claude is told "Your name is …" in every run, and the dashboard shows it. The name on its Slack messages is the Slack app's bot name (App Home → Display name) |
 | `concurrency` | `2` | Max Claude sessions at once |
 | `claude.bin` | `claude` | CLI path |
 | `claude.chatTimeoutMinutes` | `20` | Per-turn time limit |

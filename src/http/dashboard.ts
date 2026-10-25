@@ -13,6 +13,8 @@ import { firstPrompt, parseTranscript, type TranscriptEntry, transcriptPath } fr
 export interface DashboardContext {
   projects: Project[];
   timeZone: string;
+  /** Shown in the header and page titles (host `agentName`). */
+  agentName: string;
   /** Slack workspace URL (https://acme.slack.com/), for thread links. */
   slackUrl?: string;
 }
@@ -83,7 +85,7 @@ function promptPreview(cwd: string, sessionId: string): string | undefined {
   }
 }
 
-function layout(title: string, active: string, body: string): string {
+function layout(ctx: DashboardContext, title: string, active: string, body: string): string {
   const nav = [
     ['/', 'Sessions'],
     ['/jobs', 'Jobs'],
@@ -92,7 +94,7 @@ function layout(title: string, active: string, body: string): string {
     .join('');
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(title)} · tara</title>
+<title>${esc(title)} · ${esc(ctx.agentName)}</title>
 <style>
 :root{--bg:#fafaf9;--fg:#1c1917;--muted:#78716c;--line:#e7e5e4;--card:#fff;--accent:#2563eb;--code:#f5f5f4;--ok:#15803d;--bad:#b91c1c;--warn:#a16207}
 @media (prefers-color-scheme:dark){:root{--bg:#0c0a09;--fg:#e7e5e4;--muted:#a8a29e;--line:#292524;--card:#1c1917;--accent:#60a5fa;--code:#292524;--ok:#4ade80;--bad:#f87171;--warn:#facc15}}
@@ -117,7 +119,7 @@ table{width:100%;border-collapse:collapse;font-size:14px}td,th{text-align:left;p
 button{font:inherit;font-size:13px;padding:4px 10px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
 button:disabled{opacity:.5}.slack{font-size:13px}
 @media (max-width:640px){td.hide,th.hide{display:none}}
-</style></head><body><header><b>tara</b><nav>${nav}</nav></header><main>${body}</main></body></html>`;
+</style></head><body><header><b>${esc(ctx.agentName)}</b><nav>${nav}</nav></header><main>${body}</main></body></html>`;
 }
 
 export function sessionsPage(
@@ -155,6 +157,7 @@ ${run ? `<span>${formatDuration(run.endedAt - run.startedAt)}</span>` : ''}${tok
     })
     .join('');
   return layout(
+    ctx,
     'Sessions',
     'Sessions',
     `<h1>Sessions</h1><div class="filters">${chips(
@@ -202,7 +205,7 @@ export function sessionPage(
   const body = entries?.length
     ? entries.map((e) => entryHtml(e, ctx.timeZone)).join('')
     : '<p class="muted">No transcript for this session on this host.</p>';
-  return layout('Session', 'Sessions', `<h1>Session</h1>${head}${body}`);
+  return layout(ctx, 'Session', 'Sessions', `<h1>Session</h1>${head}${body}`);
 }
 
 export function jobsPage(ctx: DashboardContext, jobs: Map<string, JobInfo[]>): string {
@@ -231,6 +234,7 @@ document.querySelectorAll('button[data-run]').forEach((b) => b.addEventListener(
 }));
 </script>`;
   return layout(
+    ctx,
     'Jobs',
     'Jobs',
     `<h1>Jobs</h1>${sections || '<p class="muted">No scheduled jobs.</p>'}<p class="muted">"Run now" posts in the job's Slack channel and streams live to the project owner.</p>${script}`,
@@ -238,8 +242,9 @@ document.querySelectorAll('button[data-run]').forEach((b) => b.addEventListener(
 }
 
 export function runPage(ctx: DashboardContext, run: StoredRun | undefined): string {
-  if (!run) return layout('Run', 'Jobs', '<h1>Run</h1><p class="muted">No such run.</p>');
+  if (!run) return layout(ctx, 'Run', 'Jobs', '<h1>Run</h1><p class="muted">No such run.</p>');
   return layout(
+    ctx,
     'Run',
     'Jobs',
     `<h1>${esc(run.jobId ?? 'Chat turn')}</h1><div class="meta"><span>${esc(run.project)}</span>${statusBadge(run.status)}

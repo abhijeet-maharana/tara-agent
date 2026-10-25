@@ -80,6 +80,7 @@ describe('SessionManager', () => {
     expect(calls[0]?.prompt).toBe('<@U1>: hello');
     expect(calls[0]?.cwd).toBe('/repo');
     expect(calls[0]?.args.join(' ')).toContain('Project rules.');
+    expect(calls[0]?.args.join(' ')).toContain('Your name is tara.');
     expect(calls[0]?.env).toEqual({ PATH: '/bin' });
 
     expect(chat.texts()).toContain('*Answer*');

@@ -12,6 +12,9 @@ export const JOB_SYSTEM_PROMPT = `You are running a scheduled job unattended, th
 - If the job failed, start your reply with a line containing only [CRON_FAILURE], then the evidence.
 - Reply format: a headline of 1–6 lines (shown in the channel), then a line containing only ---, then the full details (posted in the thread). Use Slack mrkdwn and keep it phone-friendly.`;
 
+/** First line of every run's system prompt, so Claude knows the name people call it by. */
+export const identityPrompt = (agentName: string) => `Your name is ${agentName}.`;
+
 /** False only when the script's last non-empty line is JSON `{"wakeAgent": false}`. */
 export function parseWakeGate(output: string): boolean {
   const lines = output.split('\n').filter((l) => l.trim());

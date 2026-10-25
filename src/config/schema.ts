@@ -13,6 +13,11 @@ export const permissionModes = [
 
 /** `~/.config/tara-agent/config.yaml`: host-level settings. Never committed; secrets come from env. */
 export const hostConfigSchema = z.object({
+  /**
+   * What the agent calls itself: told to Claude in every run and shown on the dashboard. The name
+   * people see on its Slack messages is the Slack app's bot name, set in the app's settings.
+   */
+  agentName: z.string().min(1).default('tara'),
   /** Project repo paths. Each repo describes itself in `.tara/config.json`. */
   projects: z.array(z.string().min(1)).min(1),
   /** Max Claude sessions running at once on this host. */

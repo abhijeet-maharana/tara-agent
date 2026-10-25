@@ -153,7 +153,12 @@ async function serve(configFlag: string | undefined) {
         store,
         bridge,
         projects: projects.map((p) => p.config.name),
-        dashboard: { projects, timeZone: host.timezone, slackUrl: slack.workspaceUrl },
+        dashboard: {
+          projects,
+          timeZone: host.timezone,
+          agentName: host.agentName,
+          slackUrl: slack.workspaceUrl,
+        },
         log,
       })
     : undefined;

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Host `agentName` (default `tara`): Claude is told its name in every run, and the dashboard shows it.
 - `jobs.json` takes a file-level `tz` for every job that doesn't set its own, and an optional `durationMinutes` per job for planning tools.
 
 ## 0.1.0 (2026-10-25)

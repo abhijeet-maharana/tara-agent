@@ -4,6 +4,7 @@ import type { HostConfig, Project } from '../config/schema.js';
 import { buildClaudeArgs } from '../runner/args.js';
 import { buildChildEnv } from '../runner/env.js';
 import type { Runner, RunOutcome } from '../runner/run.js';
+import { identityPrompt } from '../scheduler/prompt.js';
 import type { JobControl, JobInfo } from '../scheduler/scheduler.js';
 import type { ButtonTap } from '../slack/app.js';
 import { formatDuration, splitMessage } from '../slack/format.js';
@@ -320,6 +321,7 @@ export class SessionManager {
           permissionMode: project.config.permissionMode,
           model: session.model,
           appendSystemPrompt: [
+            identityPrompt(host.agentName),
             BASE_PROMPT,
             bridged && BRIDGE_PROMPT,
             bridged && this.deps.jobs && JOB_TOOLS_PROMPT,

@@ -147,7 +147,12 @@ describe('dashboard pages', () => {
       projects: ['shop'],
       log: { info() {}, warn() {}, error() {} },
       allowFrom: ['127.0.0.0/8'],
-      dashboard: { projects: [project], timeZone: 'UTC', slackUrl: () => 'https://acme.slack.com/' },
+      dashboard: {
+        projects: [project],
+        timeZone: 'UTC',
+        agentName: 'Jarvis',
+        slackUrl: () => 'https://acme.slack.com/',
+      },
     });
     base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     close = () => server.close();
@@ -170,6 +175,7 @@ describe('dashboard pages', () => {
     expect(r.body).toContain('check the &lt;b&gt;redis&lt;/b&gt; health');
     expect(r.body).toContain(`href="/sessions/${SID}"`);
     expect(r.body).not.toContain('<b>redis</b>');
+    expect(r.body).toContain('<header><b>Jarvis</b>');
   });
 
   it('shows a transcript with tool calls folded and a Slack thread link', async () => {

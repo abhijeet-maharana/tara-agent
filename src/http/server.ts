@@ -34,7 +34,12 @@ export interface HttpOptions {
    */
   fallback?: string;
   /** Enables the HTML pages (sessions, transcripts, jobs) for browsers. */
-  dashboard?: { projects: Project[]; timeZone: string; slackUrl?: () => string | undefined };
+  dashboard?: {
+    projects: Project[];
+    timeZone: string;
+    agentName: string;
+    slackUrl?: () => string | undefined;
+  };
 }
 
 class HttpError extends Error {
@@ -203,7 +208,12 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
     if (!dash || req.method !== 'GET' || !(req.headers.accept ?? '').includes('text/html')) return undefined;
     const url = new URL(req.url ?? '/', 'http://localhost');
     const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
-    const ctx = { projects: dash.projects, timeZone: dash.timeZone, slackUrl: dash.slackUrl?.() };
+    const ctx = {
+      projects: dash.projects,
+      timeZone: dash.timeZone,
+      agentName: dash.agentName,
+      slackUrl: dash.slackUrl?.(),
+    };
     const names = dash.projects.map((p) => p.config.name);
     if (parts.length === 0) {
       const project = url.searchParams.get('project') ?? undefined;

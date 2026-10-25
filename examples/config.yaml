@@ -1,4 +1,5 @@
 # ~/.config/tara-agent/config.yaml
+agentName: tara # what the agent calls itself; match the Slack app's bot name
 projects:
   - ~/Projects/my-shop
   - ~/Projects/side-project

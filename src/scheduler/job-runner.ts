@@ -12,6 +12,7 @@ import { type Locks, type Semaphore, Throttle } from '../util/concurrency.js';
 import {
   buildJobPrompt,
   cronFailure,
+  identityPrompt,
   isSilentReply,
   JOB_SYSTEM_PROMPT,
   parseWakeGate,
@@ -190,7 +191,13 @@ export async function runJob(
           resume: false,
           permissionMode: project.config.permissionMode,
           model: job.model,
-          appendSystemPrompt: [JOB_SYSTEM_PROMPT, bridged && BRIDGE_PROMPT, project.systemPrompt]
+          appendSystemPrompt: [
+            identityPrompt(deps.host.agentName),
+            JOB_SYSTEM_PROMPT,
+            identityPrompt,
+            bridged && BRIDGE_PROMPT,
+            project.systemPrompt,
+          ]
             .filter(Boolean)
             .join('\n\n'),
           allowedTools: job.allowedTools ?? project.config.allowedTools,
