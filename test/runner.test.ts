@@ -124,6 +124,19 @@ describe('buildClaudeArgs', () => {
     expect(args).not.toContain('--session-id');
     expect(args).not.toContain('--allowedTools');
   });
+
+  it('passes an effort level only when one is set', () => {
+    const args = buildClaudeArgs({
+      sessionId: 'abc',
+      resume: true,
+      permissionMode: 'default',
+      effort: 'high',
+    });
+    expect(args.join(' ')).toContain('--effort high');
+    expect(buildClaudeArgs({ sessionId: 'abc', resume: true, permissionMode: 'default' })).not.toContain(
+      '--effort',
+    );
+  });
 });
 
 describe('buildChildEnv', () => {

@@ -1,4 +1,4 @@
-import { statSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Cron } from 'croner';
 import type { Bridge } from '../bridge/bridge.js';
@@ -22,6 +22,10 @@ export interface JobInfo {
   tz: string;
   skills: string[];
   model: string;
+  /** Script run before the model, relative to the repo root. */
+  preScript?: string;
+  /** Typical run time from the jobs file. */
+  durationMinutes?: number;
   nextRun?: Date;
   lastStatus?: string;
   lastRunAt?: Date;
@@ -123,6 +127,8 @@ export class Scheduler implements JobControl {
           tz: job.tz ?? this.deps.host.timezone,
           skills: job.skills,
           model: job.model,
+          preScript: job.preScript,
+          durationMinutes: job.durationMinutes,
           nextRun: cron?.nextRun() ?? undefined,
           lastStatus: last?.status,
           lastRunAt: last ? new Date(last.startedAt) : undefined,
@@ -178,6 +184,34 @@ export class Scheduler implements JobControl {
   /** Re-reads every project's job file now (normally polled every 30 s). */
   reloadAll(): void {
     for (const project of this.deps.projects) this.reload(project, { catchUp: false });
+  }
+
+  /**
+   * Pauses or resumes a job: flips its `enabled` in the project's jobs file (which stays the source
+   * of truth) and reloads that project so the change takes effect at once.
+   */
+  setEnabled(project: string, id: string, enabled: boolean): 'ok' | 'unknown' {
+    const owner = this.deps.projects.find((p) => p.config.name === project);
+    if (!owner) return 'unknown';
+    const file = path.join(owner.dir, JOBS_FILE);
+    if (!existsSync(file)) return 'unknown';
+    const doc = JSON.parse(readFileSync(file, 'utf8')) as {
+      jobs?: Array<{ id?: string; enabled?: boolean }>;
+    };
+    const job = doc.jobs?.find((j) => j.id === id);
+    if (!job) return 'unknown';
+    // A missing `enabled` means on, so resuming removes the key: a pause + resume leaves the file as it was.
+    const changed = enabled ? 'enabled' in job : job.enabled !== false;
+    if (changed) {
+      if (enabled) delete job.enabled;
+      else job.enabled = false;
+      // Written the way these files are kept (2-space JSON), so nothing else in them changes.
+      const tmp = `${file}.tmp-${process.pid}`;
+      writeFileSync(tmp, `${JSON.stringify(doc, null, 2)}\n`);
+      renameSync(tmp, file);
+    }
+    this.reload(owner, { catchUp: false });
+    return 'ok';
   }
 
   trigger(

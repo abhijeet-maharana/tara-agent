@@ -82,7 +82,9 @@ The agent then can't use your sudo, docker group, browser profile files, other p
 | `concurrency` | `2` | Max Claude sessions at once |
 | `claude.bin` | `claude` | CLI path |
 | `claude.chatTimeoutMinutes` | `20` | Per-turn time limit |
-| `stateDir` | `~/.local/state/tara-agent` | SQLite state (sessions, run history) |
+| `claude.effort` | model's default | Effort for every run, passed as `--effort`: `low`, `medium`, `high` or `xhigh`. Learning turns use it too |
+| `stateDir` | `~/.local/state/tara-agent` | SQLite state (sessions, run history), and the default home of scratch and job data folders |
+| `scratchDays` | `3` | Days after its last use that a session's scratch folder is deleted (see [Files](#files)) |
 | `streaming` | `true` | Stream replies natively (task card + live text). Needs the Slack app's "Agents & AI Apps" feature and the `assistant:write` scope; without them tara-agent switches to edited messages by itself |
 | `statusIntervalSeconds` | `5` | Min gap between status-message edits in the fallback mode |
 | `jobConcurrency` | `1` | Max scheduled jobs at once (chat has its own limit) |
@@ -106,6 +108,10 @@ The agent then can't use your sudo, docker group, browser profile files, other p
 | `owner` | none | Slack user ID that live streams of jobs started from the API or a dashboard go to (`!run` streams to whoever typed it; scheduled runs don't stream) |
 | `allowedUsers` | `[]` (everyone in the channel) | Slack user IDs allowed to talk to the bot |
 | `billing` | `subscription` | `api` runs the CLI with `ANTHROPIC_API_KEY` |
+| `dashboardUrl` | none | The project's own web dashboard, if it has one; the tara-agent dashboard links to it from Home |
+| `scratchDir` | `<stateDir>/scratch/<name>` | Parent of the per-session scratch folders, relative to the repo. Keep it out of git (see [Files](#files)) |
+| `jobDataDir` | `<stateDir>/job-data/<name>` | Parent of the per-job data folders, relative to the repo |
+| `selfImprove` | `true` | After a job run or chat turn with trouble, resume its session once so Claude can fix the skill it followed (see "Self-improving jobs and chats" under [Scheduled jobs](#scheduled-jobs)) |
 
 ## Scheduled jobs
 
@@ -152,6 +158,8 @@ Each repo can declare jobs in `.tara/jobs.json` (reloaded within 30 s of a chang
 
 **How a run goes.** The pre-script runs first. Empty output, or a last line of `{"wakeAgent": false}`, ends the run silently. Otherwise its output (or its error) is put in front of the prompt as a `## Script Output` block. Claude's reply goes to Slack: the headline (before a `---` line) as a new message in the channel, the details in its thread. A reply of `[SILENT]` posts nothing, and a first line of `[CRON_FAILURE]` marks the run failed. Replying in a job's thread continues that session, so a job can ask for approval and act on your answer. These conventions match Hermes Agent's, so Hermes jobs run unchanged.
 
+**Self-improving jobs and chats.** When a job run or a chat turn had trouble (it failed, errored or timed out, or 2+ tool calls returned errors), tara-agent resumes the same session once (for a job after its locks are released; for a chat before the thread's next message is handled) and asks Claude to fix the instructions behind it: the skill's `SKILL.md` or another `.md` file the run used, never code, never a new skill. Claude replies `NONE` when nothing should change. A change is posted in the job's or chat's thread (`🔧 … learned from this run`) and listed under *Learned* in the daily health digest. The turn reuses the run's model, system prompt and tools, so the prompt cache still applies; clean runs, silent gate skips and usage-limit stops cost nothing extra. Learning turns are stored as runs of kind `learn` and never count in a job's history or as problems. Turn it off per project with `"selfImprove": false`.
+
 **Every slot runs at most once**, even across restarts (claimed in SQLite). A job added while tara-agent was down never runs for its past slots.
 
 **Moving from Hermes Agent:**
@@ -160,6 +168,19 @@ tara-agent import-hermes --from ~/.hermes/cron/jobs.json --out <repo>/.tara/jobs
   --env REPO_ROOT=~/Projects/my-repo   # map container paths your scripts expect
 ```
 Hermes' cron default model becomes `--default-model` (`haiku`), browser-capable jobs get the `chrome` lock, and schedules stay in UTC.
+
+## Files
+
+Temporary files from many runs used to pile up in one shared folder. Each run now gets its own folders, as environment variables and as absolute paths in its first message (the Write tool needs absolute paths):
+
+| Variable | What | Lifetime |
+|---|---|---|
+| `TARA_SCRATCH` | This session's scratch folder, `<scratchDir>/<job id or chat>-<session id>`: helper scripts, request bodies, downloads | Deleted `scratchDays` (3) after the session last used it. A chat thread keeps its folder while people keep replying |
+| `TARA_JOB_DATA` | The job's data folder, `<jobDataDir>/<job id>`: what the job needs on its next run. Pre-run scripts get it too | Never deleted |
+
+- A scratch folder is made only when the model runs, so runs the pre-script skips leave nothing behind.
+- The sweep (at start and hourly) deletes only folders tara-agent made (they hold a `.tara-scratch` marker); other files in `scratchDir` are left alone.
+- Claude is told to keep temporary files out of the repo, and to propose a script that would speed up every run instead of saving it: a saved script would run on every later run, so it should be reviewed code.
 
 ## Approvals, permission prompts and files
 
@@ -175,13 +196,15 @@ The tools reach tara-agent through its local API with a per-run token, written t
 
 ## Dashboard
 
-Open the HTTP address in a browser (e.g. `http://my-server:4100` on your tailnet):
+Open the HTTP address in a browser (e.g. `http://my-server:4100` on your tailnet). Dark by default, light when the system asks for it, and usable on a phone (the sidebar becomes a menu).
 
-- **Sessions**: every Slack thread and job run tara-agent started, newest first, filterable by project and chat/job, with model, status, duration and tokens.
-- **Session**: the full transcript, read from Claude Code's own session file: prompts, Claude's replies, and every tool call folded with its input and result (job pre-script output folded too), plus a link to the Slack thread.
-- **Jobs**: each project's jobs with schedule, next run and last status, and a **Run now** button (it streams to the project `owner`).
+- **Home** (`/`): what is running now, failing and paused jobs with **Run again** / **Resume**, the next scheduled runs, the latest runs ("did work", "nothing to do", "failed"…), and one card per project with its health and a link to the project's own `dashboardUrl`. Refreshes every minute.
+- **Jobs** (`/jobs`): every job of every project, failing first, filterable by project and state (failing, paused, running) and searchable. Each card has the schedule in plain English, next and last run, the last 10 runs as coloured squares, the failure streak and last error, **Run now** (streams to the project `owner`), **Pause** / **Resume**, and details with the skills, pre-run script, model and run history.
+- **Run** (`/runs/<id>`): one run's status, error, Claude's reply and the pre-run script's output.
+- **Sessions** (`/sessions`): every Slack thread and job run tara-agent started, newest first, filterable by project and chat/job, with model, status, duration and tokens. Old `/?project=…` links still land here.
+- **Session** (`/sessions/<id>`): the full transcript, read from Claude Code's own session file: prompts, Claude's replies, and every tool call folded with its input and result (job pre-script output folded too), plus a link to the Slack thread.
 
-The same paths answer JSON to tools; browsers get HTML. Only sessions of the user tara-agent runs as are listed.
+Every action asks for confirmation first. The same paths answer JSON to tools; browsers get HTML. Only sessions of the user tara-agent runs as are listed.
 
 ## Local API
 
@@ -192,6 +215,8 @@ For dashboards and scripts on the same host (`127.0.0.1:4100` by default):
 | `GET /health` | Uptime and job counts |
 | `GET /jobs?project=<name>` | Jobs with next run, last status and error |
 | `POST /jobs/<project>/<id>/run` `{"by": "who"}` | Run a job now |
+| `POST /jobs/<project>/<id>/pause` | Stop a job's schedule: sets `"enabled": false` in the repo's `.tara/jobs.json` and reloads at once. Returns `{"ok": true, "enabled": false}` |
+| `POST /jobs/<project>/<id>/resume` | Put it back on its schedule (removes the `enabled` key, so a pause + resume leaves the file as it was). Returns `{"ok": true, "enabled": true}` |
 | `GET /jobs/<project>/<id>/runs?limit=15` | Run history |
 | `GET /runs/<id>` | One run, with Claude's reply and the script output |
 | `POST /reload` | Re-read every `.tara/jobs.json` now |

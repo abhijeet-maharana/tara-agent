@@ -1,10 +1,17 @@
 import { randomUUID } from 'node:crypto';
-import { BRIDGE_PROMPT, type Bridge, JOB_TOOLS_PROMPT, wantsPermissionPrompts } from '../bridge/bridge.js';
+import {
+  BRIDGE_PROMPT,
+  type Bridge,
+  JOB_TOOLS_PROMPT,
+  type RunContext,
+  wantsPermissionPrompts,
+} from '../bridge/bridge.js';
 import type { HostConfig, Project } from '../config/schema.js';
 import { buildClaudeArgs } from '../runner/args.js';
 import { buildChildEnv } from '../runner/env.js';
 import type { Runner, RunOutcome } from '../runner/run.js';
-import { identityPrompt } from '../scheduler/prompt.js';
+import { sessionScratch } from '../runner/workspace.js';
+import { foldersNote, identityPrompt } from '../scheduler/prompt.js';
 import type { JobControl, JobInfo } from '../scheduler/scheduler.js';
 import type { ButtonTap } from '../slack/app.js';
 import { formatDuration, splitMessage } from '../slack/format.js';
@@ -12,6 +19,7 @@ import { EditReply, type StreamPort, StreamReply, type TurnReply } from '../slac
 import type { SessionRow, Store } from '../store/store.js';
 import { KeyedQueue, Semaphore } from '../util/concurrency.js';
 import { matchJob } from './job-match.js';
+import { learnFromRun, troubleReasons } from './learn.js';
 
 /** The chat platform as the session manager sees it. Slack implements it; tests fake it. */
 export interface ChatPort {
@@ -67,7 +75,8 @@ const BASE_PROMPT = `You are running headless for a Slack thread, through tara-a
 - People read your replies in Slack, often on a phone: lead with the answer, keep it short, use bullets, avoid wide tables.
 - Your text appears in the thread as you write it, including notes between tool calls, so keep those to a word or two and put the answer at the end.
 - Each message starts with the sender's Slack mention, e.g. "<@U123>: ...". Several people may share a thread.
-- You cannot ask questions mid-turn. If you need input, end your turn with the question.`;
+- You cannot ask questions mid-turn. If you need input, end your turn with the question.
+- Temporary files go in $TARA_SCRATCH (this conversation's own folder, deleted automatically later), never in the repo.`;
 
 const HELP = `*Thread commands*
 • \`!new\` forget this thread's session; the next message starts fresh
@@ -303,16 +312,32 @@ export class SessionManager {
     let session = store.getSession(key) ?? this.freshSession(project, key);
     store.saveSession(session);
     const permissionPrompts = wantsPermissionPrompts(project.config.permissionMode);
-    const bridged = this.deps.bridge?.open({
+    const bridgeContext: RunContext = {
       project,
       channel: msg.channel,
       threadTs: msg.threadTs,
       kind: 'chat',
       permissionPrompts,
       user: msg.user,
-    });
+    };
+    const bridged = this.deps.bridge?.open(bridgeContext);
+    const appendSystemPrompt = [
+      identityPrompt(host.agentName),
+      BASE_PROMPT,
+      bridged && BRIDGE_PROMPT,
+      bridged && this.deps.jobs && JOB_TOOLS_PROMPT,
+      project.systemPrompt,
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+    let env: NodeJS.ProcessEnv = {};
+    let toolErrors = 0;
     let outcome: RunOutcome;
     try {
+      const scratch = sessionScratch(project, host.stateDir as string, 'chat', session.sessionId);
+      env = { ...buildChildEnv(this.env, project.config.billing), TARA_SCRATCH: scratch };
+      // The first message of a session says where the folder is (the Write tool needs absolute paths).
+      const prompt = `<@${msg.user}>: ${msg.text}${session.started ? '' : `\n\n${foldersNote({ scratch })}`}`;
       outcome = await this.deps.run({
         bin: host.claude.bin,
         args: buildClaudeArgs({
@@ -320,23 +345,16 @@ export class SessionManager {
           resume: session.started,
           permissionMode: project.config.permissionMode,
           model: session.model,
-          appendSystemPrompt: [
-            identityPrompt(host.agentName),
-            BASE_PROMPT,
-            bridged && BRIDGE_PROMPT,
-            bridged && this.deps.jobs && JOB_TOOLS_PROMPT,
-            project.systemPrompt,
-          ]
-            .filter(Boolean)
-            .join('\n\n'),
+          effort: host.claude.effort,
+          appendSystemPrompt,
           allowedTools: project.config.allowedTools,
           mcpConfig: bridged?.mcpConfigPath,
           permissionPrompts,
           partialMessages: Boolean(streaming),
         }),
         cwd: project.dir,
-        env: buildChildEnv(this.env, project.config.billing),
-        prompt: `<@${msg.user}>: ${msg.text}`,
+        env,
+        prompt,
         timeoutMs: host.claude.chatTimeoutMinutes * 60_000,
         signal: controller.signal,
         onEvent: (event) => {
@@ -347,8 +365,10 @@ export class SessionManager {
           // Sub-agents work out of sight; their parent "Agent" step stands for them.
           if ('parent' in event && event.parent) return;
           if (event.kind === 'tool') reply.toolStart(event.id, event.status);
-          else if (event.kind === 'tool_result') reply.toolEnd(event.id, !event.isError);
-          else if (event.kind === 'text_start') reply.textBreak();
+          else if (event.kind === 'tool_result') {
+            if (event.isError) toolErrors++;
+            reply.toolEnd(event.id, !event.isError);
+          } else if (event.kind === 'text_start') reply.textBreak();
           else if (event.kind === 'text') reply.text(event.text);
         },
       });
@@ -394,6 +414,35 @@ export class SessionManager {
     this.log.info(
       `[${name}] turn ${outcome.status} in ${formatDuration(outcome.durationMs)} (${outcome.toolCalls} tools)`,
     );
+
+    // Learn from a turn that had trouble (selfImprove). Still inside this thread's queue, so the next
+    // message waits for it instead of resuming the same session at the same time.
+    // Only when the CLI really started the session (setup errors have nothing to learn from).
+    const reasons = project.config.selfImprove && session.started ? troubleReasons(outcome, toolErrors) : [];
+    if (reasons.length) {
+      const releaseLearn = await this.slots.acquire();
+      try {
+        await learnFromRun(
+          { host, store, chat, run: this.deps.run, log: this.log, bridge: this.deps.bridge, now: this.now },
+          {
+            project,
+            sessionId: outcome.sessionId ?? session.sessionId,
+            model: session.model,
+            appendSystemPrompt,
+            bridge: bridged ? bridgeContext : undefined,
+            allowedTools: project.config.allowedTools,
+            env,
+            reasons,
+            channel: msg.channel,
+            threadTs: msg.threadTs,
+            threadKey: key,
+            label: 'This conversation',
+          },
+        );
+      } finally {
+        releaseLearn();
+      }
+    }
   }
 
   private async report(project: Project, key: string, msg: IncomingMessage, reply: TurnReply, o: RunOutcome) {

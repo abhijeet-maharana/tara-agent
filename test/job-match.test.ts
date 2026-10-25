@@ -71,6 +71,7 @@ describe('"run <job name>" in chat', () => {
             allowedTools: [],
             allowedUsers: [],
             billing: 'subscription',
+            selfImprove: true,
           },
         },
       ],

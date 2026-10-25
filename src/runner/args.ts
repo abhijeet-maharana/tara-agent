@@ -15,6 +15,8 @@ export interface ClaudeArgsInput {
   resume: boolean;
   permissionMode: PermissionMode;
   model?: string;
+  /** `--effort` level; omitted uses the model's default. */
+  effort?: string;
   appendSystemPrompt?: string;
   allowedTools?: string[];
   /** MCP config file with tara's server (added to the repo's own `.mcp.json` servers). */
@@ -31,6 +33,7 @@ export function buildClaudeArgs(input: ClaudeArgsInput): string[] {
   if (input.partialMessages) args.push('--include-partial-messages');
   args.push('--permission-mode', input.permissionMode);
   if (input.model) args.push('--model', input.model);
+  if (input.effort) args.push('--effort', input.effort);
   args.push(input.resume ? '--resume' : '--session-id', input.sessionId);
   if (input.appendSystemPrompt) args.push('--append-system-prompt', input.appendSystemPrompt);
   if (input.mcpConfig) {

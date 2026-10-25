@@ -13,7 +13,8 @@ export interface SessionRow {
 }
 
 export interface RunRecord {
-  kind: 'chat' | 'job';
+  /** `learn`: the follow-up turn after a job run that had trouble (see `selfImprove`). */
+  kind: 'chat' | 'job' | 'learn';
   project: string;
   jobId?: string;
   threadKey?: string;
@@ -294,8 +295,18 @@ export class Store {
   /** A job's runs, newest first. */
   jobRuns(project: string, jobId: string, limit: number): StoredRun[] {
     const rows = this.db
-      .prepare('SELECT * FROM runs WHERE project = ? AND job_id = ? ORDER BY started_at DESC LIMIT ?')
+      .prepare(
+        "SELECT * FROM runs WHERE kind = 'job' AND project = ? AND job_id = ? ORDER BY started_at DESC LIMIT ?",
+      )
       .all(project, jobId, limit);
+    return (rows as Record<string, unknown>[]).map(toRun);
+  }
+
+  /** The latest job runs of every project, newest first. */
+  recentJobRuns(limit: number): StoredRun[] {
+    const rows = this.db
+      .prepare("SELECT * FROM runs WHERE kind = 'job' ORDER BY started_at DESC LIMIT ?")
+      .all(limit);
     return (rows as Record<string, unknown>[]).map(toRun);
   }
 

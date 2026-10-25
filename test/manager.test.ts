@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { Project, ProjectConfig } from '../src/config/schema.js';
+import type { HostConfig, Project, ProjectConfig } from '../src/config/schema.js';
 import type { RunOptions, RunOutcome } from '../src/runner/run.js';
 import { type IncomingMessage, SessionManager } from '../src/sessions/manager.js';
 import { Store } from '../src/store/store.js';
@@ -18,6 +18,7 @@ function project(overrides: Partial<ProjectConfig> = {}): Project {
       allowedTools: [],
       allowedUsers: [],
       billing: 'subscription',
+      selfImprove: true,
       ...overrides,
     },
     systemPrompt: 'Project rules.',
@@ -35,7 +36,9 @@ const ok = (o: Partial<RunOutcome> = {}): RunOutcome => ({
   ...o,
 });
 
-function setup(opts: { project?: Project; outcomes?: RunOutcome[]; env?: NodeJS.ProcessEnv } = {}) {
+function setup(
+  opts: { project?: Project; outcomes?: RunOutcome[]; env?: NodeJS.ProcessEnv; host?: HostConfig } = {},
+) {
   const chat = new FakeChat('bot.');
   const store = new Store(':memory:');
   const calls: RunOptions[] = [];
@@ -43,7 +46,7 @@ function setup(opts: { project?: Project; outcomes?: RunOutcome[]; env?: NodeJS.
   let ids = 0;
   const manager = new SessionManager({
     projects: [opts.project ?? project()],
-    host,
+    host: opts.host ?? host,
     store,
     chat,
     env: opts.env ?? { PATH: '/bin', CLAUDE_CODE_OAUTH_TOKEN: 'secret' },
@@ -77,17 +80,29 @@ describe('SessionManager', () => {
     expect(calls).toHaveLength(2);
     expect(calls[0]?.args).toEqual(expect.arrayContaining(['--session-id', 'sid-1', '--model', 'sonnet']));
     expect(calls[1]?.args).toEqual(expect.arrayContaining(['--resume', 'sid-1']));
-    expect(calls[0]?.prompt).toBe('<@U1>: hello');
+    // The first message of a session names its scratch folder; replies don't repeat it.
+    expect(calls[0]?.prompt).toMatch(
+      /^<@U1>: hello\n\nYour folders:\n- Scratch folder \(`\$TARA_SCRATCH`\): \/tmp\/scratch\/shop\/chat-sid-1\./,
+    );
+    expect(calls[1]?.prompt).toBe('<@U1>: and then?');
     expect(calls[0]?.cwd).toBe('/repo');
     expect(calls[0]?.args.join(' ')).toContain('Project rules.');
     expect(calls[0]?.args.join(' ')).toContain('Your name is tara.');
-    expect(calls[0]?.env).toEqual({ PATH: '/bin' });
+    expect(calls[0]?.env).toEqual({ PATH: '/bin', TARA_SCRATCH: '/tmp/scratch/shop/chat-sid-1' });
 
     expect(chat.texts()).toContain('*Answer*');
     expect(chat.updates.at(-1)?.text).toMatch(/^✅ Done · 3s · 1 step · claude-sonnet-5-5$/);
     expect(chat.reactions).toEqual(
       expect.arrayContaining(['+eyes@100.1', '-eyes@100.1', '+white_check_mark@100.1']),
     );
+  });
+
+  it('runs every turn at the host effort level when one is set', async () => {
+    const { calls, manager } = setup({
+      host: testHost({ claude: { bin: 'claude', chatTimeoutMinutes: 20, effort: 'high' } }),
+    });
+    await manager.handle(msg('hello'));
+    expect(calls[0]?.args.join(' ')).toContain('--effort high');
   });
 
   it('keeps separate sessions per thread', async () => {
@@ -160,6 +175,56 @@ describe('SessionManager', () => {
     expect(finals[0]).toMatch(/usage limit/);
     expect(finals[1]).toBe('❌ Failed: boom');
     expect(chat.texts()).not.toContain('*Answer*');
+  });
+
+  describe('selfImprove', () => {
+    it('learns after a turn with trouble, before the next message resumes the session', async () => {
+      const { chat, calls, manager } = setup({
+        outcomes: [
+          ok({ status: 'error', text: '', error: 'boom' }),
+          ok({ text: '.claude/skills/x/SKILL.md: new login step' }),
+          ok(),
+        ],
+      });
+      await manager.handle(msg('one'));
+      await manager.handle(msg('next', { ts: '100.2' }));
+
+      expect(calls).toHaveLength(3);
+      const [turn, learn, next] = calls as [RunOptions, RunOptions, RunOptions];
+      expect(learn.args).toEqual(expect.arrayContaining(['--resume', 'sid-1', '--model', 'sonnet']));
+      // Same system prompt as the turn, so the cached prompt is reused.
+      const sys = (o: RunOptions) => o.args[o.args.indexOf('--append-system-prompt') + 1];
+      expect(sys(learn)).toBe(sys(turn));
+      expect(learn.prompt).toContain('it ended with an error: boom');
+      expect(learn.env).toEqual(turn.env);
+      expect(next.prompt).toBe('<@U1>: next');
+      expect(chat.texts()).toContain(
+        '🔧 This conversation learned from this run (it ended with an error: boom):\n.claude/skills/x/SKILL.md: new login step',
+      );
+    });
+
+    it('skips clean turns, usage limits, stops, setup errors and projects that turn it off', async () => {
+      const clean = setup({ outcomes: [ok()] });
+      await clean.manager.handle(msg('hi'));
+      expect(clean.calls).toHaveLength(1);
+
+      const limited = setup({
+        outcomes: [ok({ status: 'limit', text: '', rateLimit: { status: 'rejected' } })],
+      });
+      await limited.manager.handle(msg('hi'));
+      expect(limited.calls).toHaveLength(1);
+
+      const stopped = setup({ outcomes: [ok({ status: 'aborted', text: '' })] });
+      await stopped.manager.handle(msg('hi'));
+      expect(stopped.calls).toHaveLength(1);
+
+      const off = setup({
+        project: project({ selfImprove: false }),
+        outcomes: [ok({ status: 'error', text: '', error: 'boom' })],
+      });
+      await off.manager.handle(msg('hi'));
+      expect(off.calls).toHaveLength(1);
+    });
   });
 
   it('drops a session the CLI no longer knows', async () => {

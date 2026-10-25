@@ -29,6 +29,7 @@ tara-agent is one Node process per host. It never calls the Anthropic API: every
 | `src/bridge/bridge.ts` | Per-run MCP config and token, approval buttons, permission prompts, file uploads |
 | `src/mcp/server.ts` | The stdio MCP server Claude starts: `request_approval`, `send_file`, `permission` |
 | `src/http/server.ts` | Local API for other tools, plus `/internal/*` for the MCP server |
+| `src/http/dashboard.ts` | Server-rendered dashboard (home, jobs, runs, sessions); `cron-text.ts` turns schedules into plain English |
 | `src/slack/` | Bolt app, mrkdwn conversion, message splitting |
 | `src/store/store.ts` | `node:sqlite` with numbered migrations |
 

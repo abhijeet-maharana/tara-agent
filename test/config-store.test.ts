@@ -53,6 +53,7 @@ describe('loadProject', () => {
       billing: 'subscription',
       allowedTools: [],
       allowedUsers: [],
+      selfImprove: true,
     });
     expect(project.systemPrompt).toBe('Be nice.');
   });

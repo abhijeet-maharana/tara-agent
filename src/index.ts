@@ -8,6 +8,7 @@ import { DEFAULT_HOST_CONFIG, expandHome, loadHostConfig, loadJobs, loadProjects
 import { startHttpServer } from './http/server.js';
 import { convertHermesJobs } from './import-hermes.js';
 import { runClaude } from './runner/run.js';
+import { sweepScratch } from './runner/workspace.js';
 import { Scheduler } from './scheduler/scheduler.js';
 import { type Logger, SessionManager } from './sessions/manager.js';
 import { createSlackGateway } from './slack/app.js';
@@ -164,6 +165,14 @@ async function serve(configFlag: string | undefined) {
     : undefined;
   await slack.start();
   scheduler.start();
+
+  // Scratch folders of sessions not used for `scratchDays` (runner/workspace.ts).
+  const sweep = () => {
+    const removed = sweepScratch(projects, host.stateDir as string, host.scratchDays);
+    if (removed) log.info(`Deleted ${removed} unused scratch ${removed === 1 ? 'folder' : 'folders'}`);
+  };
+  sweep();
+  setInterval(sweep, 3_600_000).unref();
 
   let stopping = false;
   const shutdown = async (signal: string) => {

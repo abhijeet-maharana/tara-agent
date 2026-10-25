@@ -1,5 +1,6 @@
 import { formatDuration } from '../slack/format.js';
 import type { StoredRun } from '../store/store.js';
+import { isNoLesson } from './prompt.js';
 
 /** A job's scheduled slots in the digest window that nobody claimed (tara-agent was down, say). */
 export interface MissedJob {
@@ -42,7 +43,9 @@ export function buildDigest({
 
   const jobs = runs.filter((r) => r.kind === 'job');
   const chats = runs.filter((r) => r.kind === 'chat');
-  const problems = runs.filter((r) => PROBLEMS.includes(r.status));
+  const problems = runs.filter((r) => r.kind !== 'learn' && PROBLEMS.includes(r.status));
+  // Learning turns that changed a skill or instruction file (selfImprove).
+  const lessons = runs.filter((r) => r.kind === 'learn' && r.status === 'ok' && !isNoLesson(r.output));
   const peak = Math.max(0, ...runs.map((r) => r.rateLimitUtilization ?? 0));
   const cost = runs.reduce((sum, r) => sum + (r.costUsd ?? 0), 0);
   const healthy = problems.length === 0 && missedSlots === 0;
@@ -51,7 +54,9 @@ export function buildDigest({
     `${healthy ? '🩺' : '⚠️'} *Daily health · ${project}* · last 24h: ` +
     `${jobs.length} job runs (${count(jobs, 'ok')} ok, ${count(jobs, 'silent')} silent` +
     `${problems.length ? `, ${problems.length} with problems` : ''}), ${chats.length} chat turns` +
-    `${missedSlots ? ` · *${missedSlots} missed*` : ''} · peak 5h usage ${Math.round(peak * 100)}%`;
+    `${missedSlots ? ` · *${missedSlots} missed*` : ''}` +
+    `${lessons.length ? ` · 🔧 ${lessons.length} skill ${lessons.length === 1 ? 'fix' : 'fixes'}` : ''}` +
+    ` · peak 5h usage ${Math.round(peak * 100)}%`;
 
   const when = (ms: number) =>
     new Date(ms).toLocaleString('en-GB', { timeZone, weekday: 'short', hour: '2-digit', minute: '2-digit' });
@@ -64,6 +69,14 @@ export function buildDigest({
           (r) =>
             `• \`${r.jobId ?? 'chat'}\` ${r.status} at ${when(r.startedAt)}: ${firstLine(r.error) || 'no error text'}`,
         )
+        .join('\n')}`,
+    );
+  }
+  if (lessons.length) {
+    sections.push(
+      `*Learned* (instructions fixed after a run with trouble)\n${lessons
+        .slice(-MAX_LISTED)
+        .map((r) => `• \`${r.jobId ?? 'chat'}\` at ${when(r.startedAt)}: ${firstLine(r.output)}`)
         .join('\n')}`,
     );
   }

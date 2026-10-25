@@ -10,7 +10,22 @@ export const JOB_SYSTEM_PROMPT = `You are running a scheduled job unattended, th
 - If the job needs a human decision (an approval), finish with the exact proposal and ask for a reply of approve or reject. Replies in the job's Slack thread resume this session.
 - If there is nothing worth reporting, reply with exactly [SILENT] and nothing will be posted.
 - If the job failed, start your reply with a line containing only [CRON_FAILURE], then the evidence.
-- Reply format: a headline of 1–6 lines (shown in the channel), then a line containing only ---, then the full details (posted in the thread). Use Slack mrkdwn and keep it phone-friendly.`;
+- Reply format: a headline of 1–6 lines (shown in the channel), then a line containing only ---, then the full details (posted in the thread). Use Slack mrkdwn and keep it phone-friendly.
+- Temporary files (helper scripts, request bodies, downloads) go in $TARA_SCRATCH, never in the repo; it is deleted automatically later. Data this job needs on its next run goes in $TARA_JOB_DATA. A script that would make every run faster is code: propose it in your reply instead of saving it.`;
+
+/** The follow-up turn after a job run that had trouble (`selfImprove`); `reasons` say what went wrong. */
+export function learnPrompt(reasons: string[]): string {
+  return `This run had trouble: ${reasons.join('; ')}.
+
+Before you stop: if a change to the instructions you followed would prevent this next time, make it now with the edit tools. That means the skill (its SKILL.md) or another instruction (.md) file this run used, not code. Keep it small and specific: a corrected selector or URL, a missing step, a known trap and how to get past it. If the skill has a version in its front matter, bump it.
+
+Do not repeat the task, open the browser or call other services. Do not create new skills or files.
+
+Reply with exactly NONE if nothing should change. Otherwise reply with one line per file you changed: \`<path>: <what changed>\`.`;
+}
+
+/** True when the learning turn changed nothing. */
+export const isNoLesson = (text: string | undefined) => !text?.trim() || /^\s*NONE\b/i.test(text);
 
 /** First line of every run's system prompt, so Claude knows the name people call it by. */
 export const identityPrompt = (agentName: string) => `Your name is ${agentName}.`;
@@ -32,8 +47,26 @@ export function parseWakeGate(output: string): boolean {
   }
 }
 
-/** The user prompt for one run: script data first (as Hermes does), then the job prompt and its skills. */
-export function buildJobPrompt(job: JobConfig, script?: ScriptResult): string {
+/** Absolute paths of a run's folders (runner/workspace.ts). */
+export interface RunFolders {
+  scratch: string;
+  jobData?: string;
+}
+
+/** Tells Claude where its folders are, since the Write tool needs absolute paths. */
+export function foldersNote(folders: RunFolders): string {
+  const lines = [
+    `- Scratch folder (\`$TARA_SCRATCH\`): ${folders.scratch}. Temporary files only; deleted automatically a few days after this session's last use.`,
+  ];
+  if (folders.jobData)
+    lines.push(
+      `- Job data folder (\`$TARA_JOB_DATA\`): ${folders.jobData}. Kept between runs, for data this job needs next time.`,
+    );
+  return `Your folders:\n${lines.join('\n')}`;
+}
+
+/** The user prompt for one run: script data first (as Hermes does), then the job prompt, its skills and folders. */
+export function buildJobPrompt(job: JobConfig, script?: ScriptResult, folders?: RunFolders): string {
   const parts: string[] = [];
   if (script) {
     const [heading, intro] = script.ok
@@ -51,6 +84,7 @@ export function buildJobPrompt(job: JobConfig, script?: ScriptResult): string {
         'Load each one before you start (the Skill tool, or its SKILL.md) and follow it.',
     );
   }
+  if (folders) parts.push(foldersNote(folders));
   return parts.join('\n\n');
 }
 

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Project } from '../src/config/schema.js';
 import { allowList } from '../src/http/access.js';
+import { cronText } from '../src/http/cron-text.js';
 import { esc, md } from '../src/http/dashboard.js';
 import { startHttpServer } from '../src/http/server.js';
 import { firstPrompt, parseTranscript, transcriptPath } from '../src/http/transcript.js';
@@ -64,6 +65,21 @@ describe('access and rendering', () => {
     expect(() => allowList(['nope/8'])).toThrow(/Not an IP range/);
   });
 
+  it('reads common cron expressions as plain English', () => {
+    expect(cronText('0 18 * * *', 'UTC', 'UTC')).toBe('Daily 6:00 PM');
+    expect(cronText('50 12,19 * * *')).toBe('Daily 12:50 PM & 7:50 PM');
+    expect(cronText('5 15 * * 1-5')).toBe('Mon–Fri 3:05 PM');
+    expect(cronText('30 18 * * 1,3,5')).toBe('Mon, Wed, Fri 6:30 PM');
+    expect(cronText('0 9 * * 1')).toBe('Every Mon 9:00 AM');
+    expect(cronText('0 0 * * 0')).toBe('Every Sun 12:00 AM');
+    expect(cronText('30 5 1 * *')).toBe('1st of the month, 5:30 AM');
+    expect(cronText('0 22 8-10 * *')).toBe('8th–10th of the month, 10:00 PM');
+    expect(cronText('0 9 * * *', 'Asia/Kolkata', 'UTC')).toBe('Daily 9:00 AM (Asia/Kolkata)');
+    expect(cronText('0 9 * * *', 'Asia/Kolkata', 'Asia/Calcutta')).toBe('Daily 9:00 AM');
+    expect(cronText('0 9 * * *', 'Europe/London', 'UTC')).toBe('Daily 9:00 AM (Europe/London)');
+    expect(cronText('*/5 * * * *')).toBe('*/5 * * * *');
+  });
+
   it('escapes everything and renders a little Markdown', () => {
     expect(esc('<script>"x"</script>')).toBe('&lt;script&gt;&quot;x&quot;&lt;/script&gt;');
     expect(md('**b** `c` <i>\n```\n<x>\n```')).toBe(
@@ -85,6 +101,8 @@ describe('dashboard pages', () => {
       allowedTools: [],
       allowedUsers: [],
       billing: 'subscription',
+      selfImprove: true,
+      dashboardUrl: 'https://shop.example/board',
     },
   };
   const store = new Store(':memory:');
@@ -169,13 +187,23 @@ describe('dashboard pages', () => {
       body: await r.text(),
     }));
 
-  it('lists sessions with their first prompt, escaped', async () => {
-    const r = await html('/');
+  it('lists sessions with their first prompt, escaped, and keeps the old /?project= links', async () => {
+    const r = await html('/sessions');
     expect(r.type).toContain('text/html');
     expect(r.body).toContain('check the &lt;b&gt;redis&lt;/b&gt; health');
     expect(r.body).toContain(`href="/sessions/${SID}"`);
     expect(r.body).not.toContain('<b>redis</b>');
-    expect(r.body).toContain('<header><b>Jarvis</b>');
+    expect(r.body).toContain('<span>Jarvis</span>');
+    expect((await html('/?project=shop')).body).toContain(`href="/sessions/${SID}"`);
+  });
+
+  it('puts failing jobs first on the home page, with the project dashboard link', async () => {
+    const r = await html('/');
+    expect(r.body).toContain('Needs attention');
+    expect(r.body).toMatch(/SLA Report<\/b> failed/);
+    expect(r.body).toContain('data-action="run" data-job="shop/sla"');
+    expect(r.body).toContain('href="https://shop.example/board"');
+    expect(r.body).toContain('href="/runs/2"'); // "Just ran"
   });
 
   it('shows a transcript with tool calls folded and a Slack thread link', async () => {
@@ -186,8 +214,12 @@ describe('dashboard pages', () => {
     expect(r.body).not.toContain('sub-agent chatter');
   });
 
-  it('lists jobs with Run now and shows a run', async () => {
-    expect((await html('/jobs')).body).toContain('data-run="shop/sla"');
+  it('lists jobs with Run now, Pause and a plain-English schedule, and shows a run', async () => {
+    const jobs = (await html('/jobs')).body;
+    expect(jobs).toContain('data-action="run" data-job="shop/sla"');
+    expect(jobs).toContain('data-action="pause" data-job="shop/sla"');
+    expect(jobs).toContain('Daily 5:00 AM');
+    expect(jobs).toContain('href="/runs/2"');
     const run = await html('/runs/2');
     expect(run.body).toContain('login expired');
     expect(run.body).toContain('Portal <b>down</b>');

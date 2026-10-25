@@ -102,6 +102,7 @@ describe('SessionManager with streaming', () => {
             allowedTools: [],
             allowedUsers: [],
             billing: 'subscription',
+            selfImprove: true,
           },
         },
       ],

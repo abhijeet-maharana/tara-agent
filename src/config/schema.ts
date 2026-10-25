@@ -27,10 +27,14 @@ export const hostConfigSchema = z.object({
       bin: z.string().default('claude'),
       /** Per-turn wall-clock limit for chat turns. */
       chatTimeoutMinutes: z.number().positive().default(20),
+      /** Effort for every run (`--effort`); unset uses each model's default. */
+      effort: z.enum(['low', 'medium', 'high', 'xhigh']).optional(),
     })
     .default({ bin: 'claude', chatTimeoutMinutes: 20 }),
   /** Where the SQLite state lives. Defaults to `~/.local/state/tara-agent`. */
   stateDir: z.string().optional(),
+  /** Days after its last use that a session's scratch folder (`TARA_SCRATCH`) is deleted. */
+  scratchDays: z.number().min(1).default(3),
   /**
    * Stream replies into Slack threads as Claude writes them, with a live task card (needs the Slack
    * app's "Agents & AI Apps" feature; falls back to an edited status message without it).
@@ -94,6 +98,21 @@ export const projectConfigSchema = z.object({
   allowedUsers: z.array(z.string()).default([]),
   /** `api` runs the CLI with ANTHROPIC_API_KEY instead of the host's Claude login. */
   billing: z.enum(['subscription', 'api']).default('subscription'),
+  /** The project's own web dashboard, if it has one; the tara-agent dashboard links to it. */
+  dashboardUrl: z.string().url().optional(),
+  /**
+   * After a job run that had trouble (failed, errored, timed out, or several tool errors), resume
+   * its session once and let Claude fix the skill or instruction file it followed, so the same
+   * problem doesn't happen twice. Clean runs cost nothing extra.
+   */
+  selfImprove: z.boolean().default(true),
+  /**
+   * Parent folder of the per-session scratch folders (`TARA_SCRATCH`), relative to the repo. Keep it
+   * out of git. Defaults to `<stateDir>/scratch/<name>`.
+   */
+  scratchDir: z.string().optional(),
+  /** Parent folder of the per-job data folders (`TARA_JOB_DATA`), relative to the repo. Defaults to `<stateDir>/job-data/<name>`. */
+  jobDataDir: z.string().optional(),
 });
 
 const jobIdPattern = /^[a-z0-9][a-z0-9-]*$/;

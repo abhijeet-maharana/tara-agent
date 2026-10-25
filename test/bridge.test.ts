@@ -30,6 +30,7 @@ function project(overrides: Partial<ProjectConfig> = {}): Project {
       allowedTools: [],
       allowedUsers: [],
       billing: 'subscription',
+      selfImprove: true,
       ...overrides,
     },
   };

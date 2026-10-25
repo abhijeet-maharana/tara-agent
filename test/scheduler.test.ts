@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -15,7 +15,7 @@ import { FakeChat, FakeStream, testHost } from './fakes.js';
 
 const host = testHost({ concurrency: 2, catchUpHours: 6, claude: { bin: 'claude', chatTimeoutMinutes: 20 } });
 
-function makeProject(jobs: object[], env: object = {}, owner?: string): Project {
+function makeProject(jobs: object[], env: object = {}, owner?: string, selfImprove = false): Project {
   const dir = mkdtempSync(path.join(tmpdir(), 'tara-sched-'));
   mkdirSync(path.join(dir, '.tara'));
   writeFileSync(path.join(dir, '.tara', 'jobs.json'), JSON.stringify({ env, jobs }));
@@ -29,6 +29,8 @@ function makeProject(jobs: object[], env: object = {}, owner?: string): Project 
       allowedTools: [],
       allowedUsers: [],
       billing: 'subscription',
+      // Off by default here so run counts stay exact; the selfImprove tests turn it on.
+      selfImprove,
       ...(owner ? { owner } : {}),
     },
     systemPrompt: 'Project rules.',
@@ -54,6 +56,9 @@ function setup(opts: {
   store?: Store;
   stream?: FakeStream;
   owner?: string;
+  selfImprove?: boolean;
+  /** Tool calls that fail in the first run. */
+  toolErrors?: number;
 }) {
   const chat = new FakeChat('ts');
   chat.stream = opts.stream;
@@ -62,7 +67,7 @@ function setup(opts: {
   const callTimes: number[] = [];
   const scripts: { script: string; env: NodeJS.ProcessEnv }[] = [];
   const replies = [...(opts.replies ?? [])];
-  const project = makeProject(opts.jobs, opts.env, opts.owner);
+  const project = makeProject(opts.jobs, opts.env, opts.owner, opts.selfImprove);
   const scheduler = new Scheduler({
     projects: [project],
     host,
@@ -82,6 +87,12 @@ function setup(opts: {
       o.onEvent?.({ kind: 'init', sessionId: 'sid', model: 'claude-haiku-5-5' });
       o.onEvent?.({ kind: 'tool', id: 't1', name: 'Bash', status: 'Bash: curl' });
       o.onEvent?.({ kind: 'tool_result', id: 't1', isError: false });
+      if (calls.length === 1) {
+        for (let i = 0; i < (opts.toolErrors ?? 0); i++) {
+          o.onEvent?.({ kind: 'tool', id: `e${i}`, name: 'Bash', status: 'Bash: click' });
+          o.onEvent?.({ kind: 'tool_result', id: `e${i}`, isError: true });
+        }
+      }
       const reply = replies.shift() ?? 'Headline\n---\nDetails here';
       o.onEvent?.({ kind: 'text_start' });
       o.onEvent?.({ kind: 'text', text: reply });
@@ -117,8 +128,17 @@ describe('Scheduler', () => {
     const call = calls[0] as RunOptions;
     expect(call.prompt).toMatch(/^## Script Output[\s\S]*Run the report\.[\s\S]*`sla-report`/);
     expect(call.args).toEqual(expect.arrayContaining(['--model', 'haiku', '--session-id', 'sid']));
+    // No host effort set: the model's default applies.
+    expect(call.args).not.toContain('--effort');
     expect(call.args.join(' ')).toContain('unattended');
     expect(call.args.join(' ')).toContain('Project rules.');
+    // Its own scratch folder and the job's data folder, as env and as absolute paths in the prompt.
+    expect(call.env.TARA_SCRATCH).toBe('/tmp/scratch/shop/sla-sid');
+    expect(call.env.TARA_JOB_DATA).toBe('/tmp/job-data/shop/sla');
+    expect(call.prompt).toContain('- Scratch folder (`$TARA_SCRATCH`): /tmp/scratch/shop/sla-sid.');
+    expect(call.prompt).toContain('- Job data folder (`$TARA_JOB_DATA`): /tmp/job-data/shop/sla.');
+    expect(scripts[0]?.env.TARA_JOB_DATA).toBe('/tmp/job-data/shop/sla');
+    expect(scripts[0]?.env.TARA_SCRATCH).toBeUndefined();
 
     expect(chat.log[0]).toBe('post top ts1: ⏳ *SLA Report* (run by <@U1>)');
     expect(chat.log.at(-2)).toBe(
@@ -164,6 +184,81 @@ describe('Scheduler', () => {
     ).toBe(true);
     expect(scheduler.list('shop')[0]?.lastStatus).toBe('failed');
     await scheduler.stop();
+  });
+
+  describe('selfImprove', () => {
+    it('resumes a failed run once to fix its skill, reports the change, and keeps it out of job history', async () => {
+      const { chat, calls, scheduler, store } = setup({
+        jobs: [baseJob],
+        selfImprove: true,
+        replies: ['[CRON_FAILURE]\nSave button not found', '.claude/skills/sla/SKILL.md: new Save selector'],
+      });
+      scheduler.start();
+      scheduler.trigger('shop', 'sla', 'U1');
+      await scheduler.idle();
+
+      expect(calls).toHaveLength(2);
+      const [job, learn] = calls as [RunOptions, RunOptions];
+      expect(learn.args).toEqual(expect.arrayContaining(['--resume', 'sid', '--model', 'haiku']));
+      expect(learn.args).not.toContain('--mcp-config');
+      // Same system prompt as the job, so the cached prompt is reused.
+      const sys = (o: RunOptions) => o.args[o.args.indexOf('--append-system-prompt') + 1];
+      expect(sys(learn)).toBe(sys(job));
+      expect(learn.prompt).toContain('it reported a failure: Save button not found');
+      expect(learn.prompt).toContain('Reply with exactly NONE');
+      expect(chat.log.at(-1)).toBe(
+        'post ts1 ts3: 🔧 *SLA Report* learned from this run (it reported a failure: Save button not found):\n.claude/skills/sla/SKILL.md: new Save selector',
+      );
+      expect(store.jobRuns('shop', 'sla', 10).map((r) => r.status)).toEqual(['failed']);
+      expect(store.runsSince(0).map((r) => r.kind)).toEqual(['job', 'learn']);
+      expect(scheduler.list('shop')[0]?.lastStatus).toBe('failed');
+      await scheduler.stop();
+    });
+
+    it('costs nothing extra for a clean run, and posts nothing when there is nothing to change', async () => {
+      const clean = setup({ jobs: [baseJob], selfImprove: true });
+      clean.scheduler.start();
+      clean.scheduler.trigger('shop', 'sla', 'U1');
+      await clean.scheduler.idle();
+      expect(clean.calls).toHaveLength(1);
+      await clean.scheduler.stop();
+
+      const none = setup({
+        jobs: [baseJob],
+        selfImprove: true,
+        replies: ['[CRON_FAILURE]\nPortal down', 'NONE'],
+      });
+      none.scheduler.start();
+      none.scheduler.trigger('shop', 'sla', 'U1');
+      await none.scheduler.idle();
+      expect(none.calls).toHaveLength(2);
+      expect(none.chat.log.some((l) => l.includes('🔧'))).toBe(false);
+      await none.scheduler.stop();
+    });
+
+    it('learns from tool errors in a silent run and reports in the channel, since its thread is gone', async () => {
+      const { chat, calls, scheduler } = setup({
+        jobs: [baseJob],
+        selfImprove: true,
+        toolErrors: 2,
+        replies: ['[SILENT]', 'SKILL.md: dismiss the cookie banner first'],
+      });
+      scheduler.start();
+      scheduler.trigger('shop', 'sla', 'U1');
+      await scheduler.idle();
+      expect(calls[1]?.prompt).toContain('2 tool calls returned errors');
+      expect(chat.log.at(-1)).toMatch(/^post top ts\d: 🔧 \*SLA Report\* learned from this run/);
+      await scheduler.stop();
+    });
+
+    it('stays off when the project turns it off', async () => {
+      const { calls, scheduler } = setup({ jobs: [baseJob], replies: ['[CRON_FAILURE]\nBroken'] });
+      scheduler.start();
+      scheduler.trigger('shop', 'sla', 'U1');
+      await scheduler.idle();
+      expect(calls).toHaveLength(1);
+      await scheduler.stop();
+    });
   });
 
   it('posts script output as-is for script-only jobs', async () => {
@@ -247,6 +342,32 @@ describe('Scheduler', () => {
     expect(list.map((j) => j.id)).toEqual(['soon', 'later', 'off']);
     expect(list[2]).toMatchObject({ enabled: false, nextRun: undefined });
     expect(scheduler.trigger('shop', 'nope', 'U1')).toBe('unknown');
+    await scheduler.stop();
+  });
+
+  it('pauses and resumes a job by flipping enabled in the jobs file, effective at once', async () => {
+    const { scheduler, project } = setup({ jobs: [baseJob, { ...baseJob, id: 'other' }] });
+    const file = path.join(project.dir, '.tara', 'jobs.json');
+    const original = `${JSON.stringify({ tz: 'UTC', jobs: [baseJob, { ...baseJob, id: 'other' }] }, null, 2)}\n`;
+    writeFileSync(file, original);
+    scheduler.start();
+
+    expect(scheduler.setEnabled('shop', 'sla', false)).toBe('ok');
+    expect(scheduler.list('shop').find((j) => j.id === 'sla')).toMatchObject({
+      enabled: false,
+      nextRun: undefined,
+    });
+    const paused = readFileSync(file, 'utf8');
+    expect(JSON.parse(paused).jobs[0].enabled).toBe(false);
+    expect(JSON.parse(paused).jobs[1].enabled).toBeUndefined();
+    expect(paused.replace(/,\n {6}"enabled": false/, '')).toBe(original);
+
+    expect(scheduler.setEnabled('shop', 'sla', true)).toBe('ok');
+    expect(scheduler.list('shop').find((j) => j.id === 'sla')?.nextRun).toBeInstanceOf(Date);
+    // Resuming drops the key again, so a pause + resume leaves the file exactly as it was.
+    expect(readFileSync(file, 'utf8')).toBe(original);
+    expect(scheduler.setEnabled('shop', 'nope', false)).toBe('unknown');
+    expect(scheduler.setEnabled('elsewhere', 'sla', false)).toBe('unknown');
     await scheduler.stop();
   });
 
@@ -340,6 +461,23 @@ describe('HTTP API', () => {
     await close();
   });
 
+  it('pauses and resumes over the API', async () => {
+    const { call, close, scheduler } = await api();
+    expect((await call('/jobs/shop/sla/pause', { method: 'POST' })).body).toEqual({
+      ok: true,
+      enabled: false,
+    });
+    expect(scheduler.list('shop')[0]?.enabled).toBe(false);
+    expect((await call('/jobs/shop/sla/resume', { method: 'POST' })).body).toEqual({
+      ok: true,
+      enabled: true,
+    });
+    expect(scheduler.list('shop')[0]?.enabled).toBe(true);
+    expect((await call('/jobs/shop/nope/pause', { method: 'POST' })).status).toBe(404);
+    expect((await call('/jobs/nope/sla/resume', { method: 'POST' })).status).toBe(404);
+    await close();
+  });
+
   it('requires the bearer token when one is set', async () => {
     const { call, close } = await api('s3cret');
     expect((await call('/health')).status).toBe(401);
@@ -382,6 +520,25 @@ describe('health digest', () => {
     expect(digest?.details).toContain('• `ads` failed at Sun 05:00: Portal login expired');
     expect(digest?.details).toContain('• `labels` Labels: Sun 00:00');
     expect(digest?.details).toContain('1.5k tokens in/out, 2.00M cache reads');
+  });
+
+  it('lists skill fixes from learning turns, without counting them as job runs or problems', () => {
+    const digest = buildDigest({
+      project: 'shop',
+      timeZone: 'UTC',
+      runs: [
+        run({ status: 'failed', jobId: 'ads', error: 'Save button not found' }),
+        run({ kind: 'learn', jobId: 'ads', output: '.claude/skills/ads/SKILL.md: new Save selector' }),
+        run({ kind: 'learn', jobId: 'ads', output: 'NONE' }),
+        run({ kind: 'learn', jobId: 'ads', status: 'timeout' }),
+      ],
+      missed: [],
+    });
+    expect(digest?.headline).toBe(
+      '⚠️ *Daily health · shop* · last 24h: 1 job runs (0 ok, 0 silent, 1 with problems), 0 chat turns · 🔧 1 skill fix · peak 5h usage 0%',
+    );
+    expect(digest?.details).toContain('*Learned*');
+    expect(digest?.details).toContain('• `ads` at Sun 05:00: .claude/skills/ads/SKILL.md: new Save selector');
   });
 
   it('finds slots that were never claimed (downtime) but not slots that ran', async () => {

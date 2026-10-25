@@ -11,7 +11,7 @@ import type { Scheduler } from '../scheduler/scheduler.js';
 import type { Logger } from '../sessions/manager.js';
 import type { Store } from '../store/store.js';
 import { allowList } from './access.js';
-import { jobsPage, runPage, sessionPage, sessionsPage } from './dashboard.js';
+import { homePage, type JobView, jobsPage, runPage, sessionPage, sessionsPage } from './dashboard.js';
 import { readTranscript } from './transcript.js';
 
 export interface HttpOptions {
@@ -52,6 +52,8 @@ class HttpError extends Error {
 }
 
 const iso = (d?: Date) => d?.toISOString() ?? null;
+/** Runs per job shown on the dashboard (recent-runs strip and history). */
+const RECENT_RUNS = 10;
 
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   let body = '';
@@ -73,6 +75,8 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
  *   GET  /health
  *   GET  /jobs?project=<name>
  *   POST /jobs/<project>/<id>/run      {"by": "who asked"}
+ *   POST /jobs/<project>/<id>/pause    flips `enabled` off in the repo's .tara/jobs.json → {ok, enabled}
+ *   POST /jobs/<project>/<id>/resume   flips it back on, effective at once
  *   GET  /jobs/<project>/<id>/runs?limit=15
  *   GET  /runs/<id>
  *   POST /reload                       re-read every .tara/jobs.json now
@@ -135,6 +139,12 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
         const result = options.scheduler.trigger(project, id, by);
         if (result === 'unknown') throw new HttpError(404, `No job "${id}" in ${project}`);
         return { result };
+      }
+      if (method === 'POST' && (action === 'pause' || action === 'resume')) {
+        const enabled = action === 'resume';
+        if (options.scheduler.setEnabled(project, id, enabled) === 'unknown')
+          throw new HttpError(404, `No job "${id}" in ${project}`);
+        return { ok: true, enabled };
       }
       if (method === 'GET' && action === 'runs') {
         const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 15));
@@ -215,14 +225,34 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
       slackUrl: dash.slackUrl?.(),
     };
     const names = dash.projects.map((p) => p.config.name);
-    if (parts.length === 0) {
+    const jobNames = () =>
+      new Map(names.flatMap((n) => options.scheduler.list(n).map((j) => [`${n}:${j.id}`, j.name] as const)));
+    // `/?project=…` and `/?kind=…` were the sessions list before it moved to /sessions.
+    const oldSessionsLink =
+      parts.length === 0 && (url.searchParams.has('project') || url.searchParams.has('kind'));
+    if ((parts[0] === 'sessions' && parts.length === 1) || oldSessionsLink) {
       const project = url.searchParams.get('project') ?? undefined;
-      const jobNames = new Map(
-        names.flatMap((n) => options.scheduler.list(n).map((j) => [`${n}:${j.id}`, j.name] as const)),
-      );
-      return sessionsPage(ctx, options.store.sessionsOverview({ project, limit: 300 }), jobNames, {
+      return sessionsPage(ctx, options.store.sessionsOverview({ project, limit: 300 }), jobNames(), {
         project,
         kind: url.searchParams.get('kind') ?? undefined,
+      });
+    }
+    const jobViews = (): JobView[] =>
+      names.flatMap((project) =>
+        options.scheduler.list(project).map((job) => ({
+          ...job,
+          project,
+          recent: options.store.jobRuns(project, job.id, RECENT_RUNS),
+        })),
+      );
+    if (parts.length === 0) {
+      const now = (options.now ?? Date.now)();
+      return homePage(ctx, {
+        jobs: jobViews(),
+        latest: options.store.recentJobRuns(8),
+        runsToday: options.store.runsSince(now - 86_400_000).filter((r) => r.kind === 'job').length,
+        uptimeSeconds: Math.floor((now - started) / 1000),
+        now,
       });
     }
     if (parts[0] === 'sessions' && parts.length === 2) {
@@ -235,11 +265,10 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
         : dash.projects.map((p) => readTranscript(p.dir, id)).find(Boolean);
       return sessionPage(ctx, session, id, entries);
     }
-    if (parts[0] === 'jobs' && parts.length === 1) {
-      return jobsPage(ctx, new Map(names.map((n) => [n, options.scheduler.list(n)])));
-    }
+    if (parts[0] === 'jobs' && parts.length === 1)
+      return jobsPage(ctx, jobViews(), (options.now ?? Date.now)());
     if (parts[0] === 'runs' && parts.length === 2)
-      return runPage(ctx, options.store.getRun(Number(parts[1])));
+      return runPage(ctx, options.store.getRun(Number(parts[1])), jobNames());
     return undefined;
   };
 

@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
-import { BRIDGE_PROMPT, type Bridge } from '../bridge/bridge.js';
+import { BRIDGE_PROMPT, type Bridge, type RunContext } from '../bridge/bridge.js';
 import type { HostConfig, ScheduledJob } from '../config/schema.js';
 import { buildClaudeArgs } from '../runner/args.js';
 import { buildChildEnv } from '../runner/env.js';
 import type { Runner, RunOutcome } from '../runner/run.js';
+import { jobDataDir, sessionScratch } from '../runner/workspace.js';
+import { type LearnRequest, learnFromRun, troubleReasons } from '../sessions/learn.js';
 import { type ChatPort, type Logger, threadKey } from '../sessions/manager.js';
 import { formatDuration, splitMessage, toSlackMrkdwn } from '../slack/format.js';
 import { StreamReply } from '../slack/reply.js';
@@ -99,6 +101,7 @@ export async function runJob(
   const releaseLocks = await deps.locks.acquire(job.locks);
   const startedAt = now();
   let script: ScriptResult | undefined;
+  let lesson: LearnRequest | undefined;
   const record = (status: JobStatus, extra: Partial<RunRecord> = {}) => {
     store.recordRun({
       kind: 'job',
@@ -123,8 +126,10 @@ export async function runJob(
 
   try {
     let env: NodeJS.ProcessEnv;
+    const stateDir = deps.host.stateDir as string;
     try {
       env = { ...buildChildEnv(deps.env ?? process.env, project.config.billing), ...scheduled.env };
+      env.TARA_JOB_DATA = jobDataDir(project, stateDir, job.id);
     } catch (err) {
       await postMain(`❌ ${title} could not start: ${(err as Error).message}`);
       return record('error', { error: (err as Error).message });
@@ -166,7 +171,14 @@ export async function runJob(
       started: false,
     };
     store.saveSession(session);
+    // Made only now, when the model runs: gate-skipped runs leave no empty folders behind.
+    const folders = {
+      scratch: sessionScratch(project, stateDir, job.id, session.sessionId),
+      jobData: env.TARA_JOB_DATA,
+    };
+    env = { ...env, TARA_SCRATCH: folders.scratch };
     let steps = 0;
+    let toolErrors = 0;
     const intervalMs = deps.host.statusIntervalSeconds * 1000;
     const status = new Throttle<string>(intervalMs, (text) => chat.update(channel, statusTs, text));
     const recipient = streamRecipient(trigger, project.config.owner);
@@ -176,13 +188,23 @@ export async function runJob(
         : undefined;
 
     // Jobs get approval buttons and file uploads, never permission prompts: nobody is watching live.
-    const bridged = deps.bridge?.open({
+    const bridgeContext: RunContext = {
       project,
       channel,
       threadTs: rootTs,
       kind: 'job',
       permissionPrompts: false,
-    });
+    };
+    const bridged = deps.bridge?.open(bridgeContext);
+    const appendSystemPrompt = [
+      identityPrompt(deps.host.agentName),
+      JOB_SYSTEM_PROMPT,
+      bridged && BRIDGE_PROMPT,
+      project.systemPrompt,
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+    const allowedTools = job.allowedTools ?? project.config.allowedTools;
     const outcome: RunOutcome = await deps
       .run({
         bin: deps.host.claude.bin,
@@ -191,22 +213,15 @@ export async function runJob(
           resume: false,
           permissionMode: project.config.permissionMode,
           model: job.model,
-          appendSystemPrompt: [
-            identityPrompt(deps.host.agentName),
-            JOB_SYSTEM_PROMPT,
-            identityPrompt,
-            bridged && BRIDGE_PROMPT,
-            project.systemPrompt,
-          ]
-            .filter(Boolean)
-            .join('\n\n'),
-          allowedTools: job.allowedTools ?? project.config.allowedTools,
+          effort: deps.host.claude.effort,
+          appendSystemPrompt,
+          allowedTools,
           mcpConfig: bridged?.mcpConfigPath,
           partialMessages: Boolean(live),
         }),
         cwd: project.dir,
         env,
-        prompt: buildJobPrompt(job, script),
+        prompt: buildJobPrompt(job, script, folders),
         timeoutMs,
         signal,
         onEvent: (event) => {
@@ -219,13 +234,36 @@ export async function runJob(
             steps++;
             status.push(`⏳ ${title} · step ${steps}\n> ${event.status}`);
             live?.toolStart(event.id, event.status);
-          } else if (event.kind === 'tool_result') live?.toolEnd(event.id, !event.isError);
-          else if (event.kind === 'text_start') live?.textBreak();
+          } else if (event.kind === 'tool_result') {
+            if (event.isError) toolErrors++;
+            live?.toolEnd(event.id, !event.isError);
+          } else if (event.kind === 'text_start') live?.textBreak();
           else if (event.kind === 'text') live?.text(event.text);
         },
       })
       .finally(() => bridged?.dispose());
     await status.flush();
+
+    /** Sets up a learning turn when this run had trouble; it runs once the job's locks are released. */
+    const learnIf = (failure: string | undefined, threadTs: string | undefined) => {
+      const reasons = troubleReasons(outcome, toolErrors, failure);
+      if (!project.config.selfImprove || !reasons.length) return;
+      lesson = {
+        project,
+        sessionId: outcome.sessionId ?? session.sessionId,
+        model: job.model,
+        appendSystemPrompt,
+        bridge: bridged ? bridgeContext : undefined,
+        allowedTools,
+        env,
+        reasons,
+        channel,
+        threadTs,
+        threadKey: threadTs ? key : undefined,
+        jobId: job.id,
+        label: `*${job.name}*`,
+      };
+    };
 
     const usage = {
       sessionId: outcome.sessionId ?? session.sessionId,
@@ -257,6 +295,7 @@ export async function runJob(
               : `❌ failed: ${(outcome.error ?? 'unknown error').slice(0, 500)}`;
       await chat.update(channel, statusTs, `${title} · ${reason}`);
       await live?.finish({ summary: reason, ok: false, answer: '', notes: [] });
+      learnIf(undefined, rootTs);
       return record(outcome.status, { ...usage, error: outcome.error, output: outcome.text });
     }
 
@@ -271,6 +310,7 @@ export async function runJob(
           .catch(() => chat.update(channel, rootTs, `🔇 ${title} · nothing to report`));
         store.deleteSession(key);
       }
+      learnIf(undefined, requestTs);
       return record('silent', { ...usage, output: outcome.text });
     }
 
@@ -291,12 +331,15 @@ export async function runJob(
     } else if (details) {
       for (const chunk of splitMessage(toSlackMrkdwn(details))) await chat.post(channel, rootTs, chunk);
     }
+    learnIf(failure, rootTs);
     return record(failure ? 'failed' : 'ok', { ...usage, error: failure, output: outcome.text });
   } catch (err) {
     log.error(`[${project.config.name}] job ${job.id} crashed: ${(err as Error).stack ?? err}`);
     return record('error', { error: (err as Error).message });
   } finally {
     releaseLocks();
+    // Still inside the job slot, so learning turns count towards jobConcurrency.
+    if (lesson) await learnFromRun(deps, lesson);
     releaseSlot();
   }
 }
