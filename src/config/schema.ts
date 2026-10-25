@@ -70,6 +70,14 @@ export const projectConfigSchema = z.object({
   allowedTools: z.array(z.string()).default([]),
   /** Extra system prompt appended to every session, relative to the repo root. */
   systemPromptFile: z.string().optional(),
+  /**
+   * Slack user who owns this project: jobs started from the local API or a dashboard stream their
+   * thread live to this person (jobs started with `!run` stream to whoever typed it).
+   */
+  owner: z
+    .string()
+    .regex(/^[UW][A-Z0-9]+$/, 'a Slack user ID such as U0123456789')
+    .optional(),
   /** Slack user IDs allowed to talk to the bot. Empty = every member of the channel. */
   allowedUsers: z.array(z.string()).default([]),
   /** `api` runs the CLI with ANTHROPIC_API_KEY instead of the host's Claude login. */

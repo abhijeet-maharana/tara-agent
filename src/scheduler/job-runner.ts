@@ -6,6 +6,7 @@ import { buildChildEnv } from '../runner/env.js';
 import type { Runner, RunOutcome } from '../runner/run.js';
 import { type ChatPort, type Logger, threadKey } from '../sessions/manager.js';
 import { formatDuration, splitMessage, toSlackMrkdwn } from '../slack/format.js';
+import { StreamReply } from '../slack/reply.js';
 import type { RunRecord, Store } from '../store/store.js';
 import { type Locks, type Semaphore, Throttle } from '../util/concurrency.js';
 import {
@@ -18,7 +19,21 @@ import {
 } from './prompt.js';
 import { runScript, type ScriptResult } from './script.js';
 
-export type JobTrigger = { kind: 'schedule' } | { kind: 'catch-up' } | { kind: 'manual'; by: string };
+export type JobTrigger =
+  | { kind: 'schedule' }
+  | { kind: 'catch-up' }
+  /** `thread`: the chat message that asked for the run; the run then happens in its thread. */
+  | { kind: 'manual'; by: string; thread?: { channel: string; ts: string } };
+
+const REACTIONS: Record<JobStatus, string> = {
+  ok: 'white_check_mark',
+  silent: 'white_check_mark',
+  failed: 'x',
+  error: 'x',
+  timeout: 'hourglass',
+  limit: 'double_vertical_bar',
+  aborted: 'black_square_for_stop',
+};
 
 /** How a run ended; stored on the slot claim and in the run log. */
 export type JobStatus = 'ok' | 'silent' | 'failed' | 'error' | 'timeout' | 'limit' | 'aborted';
@@ -36,6 +51,17 @@ export interface JobRunnerDeps {
   runScript?: typeof runScript;
   newSessionId?: () => string;
   now?: () => number;
+}
+
+const SLACK_USER = /^[UW][A-Z0-9]+$/;
+
+/**
+ * Who a run streams live to. Scheduled runs don't stream (nobody is waiting); a run someone started
+ * streams to them, or to the project owner when it came from the API or a dashboard.
+ */
+export function streamRecipient(trigger: JobTrigger, owner: string | undefined): string | undefined {
+  if (trigger.kind !== 'manual') return undefined;
+  return SLACK_USER.test(trigger.by) ? trigger.by : owner;
 }
 
 function triggerLabel(trigger: JobTrigger): string {
@@ -62,6 +88,11 @@ export async function runJob(
   const channel = job.channel ?? project.config.slackChannel;
   const title = `*${job.name}*${triggerLabel(trigger)}`;
   const timeoutMs = job.timeoutMinutes * 60_000;
+  // Asked for in chat: run inside that message's thread instead of posting a new channel message.
+  const requestTs =
+    trigger.kind === 'manual' && trigger.thread?.channel === channel ? trigger.thread.ts : undefined;
+  const postMain = (text: string) => chat.post(channel, requestTs, text);
+  if (requestTs) await chat.react(channel, requestTs, 'eyes').catch(() => {});
 
   const releaseSlot = await deps.slots.acquire();
   const releaseLocks = await deps.locks.acquire(job.locks);
@@ -79,6 +110,13 @@ export async function runJob(
       ...extra,
     });
     log.info(`[${project.config.name}] job ${job.id} ${status} in ${formatDuration(now() - startedAt)}`);
+    if (requestTs) {
+      void chat
+        .unreact(channel, requestTs, 'eyes')
+        .catch(() => {})
+        .then(() => chat.react(channel, requestTs, REACTIONS[status]))
+        .catch(() => {});
+    }
     return status;
   };
 
@@ -87,29 +125,37 @@ export async function runJob(
     try {
       env = { ...buildChildEnv(deps.env ?? process.env, project.config.billing), ...scheduled.env };
     } catch (err) {
-      await chat.post(channel, undefined, `❌ ${title} could not start: ${(err as Error).message}`);
+      await postMain(`❌ ${title} could not start: ${(err as Error).message}`);
       return record('error', { error: (err as Error).message });
     }
 
     if (job.preScript) {
       script = await (deps.runScript ?? runScript)(job.preScript, project.dir, env, timeoutMs, signal);
       if (signal?.aborted) return record('aborted');
-      if (script.ok && (!script.output.trim() || !parseWakeGate(script.output))) return record('silent');
+      if (script.ok && (!script.output.trim() || !parseWakeGate(script.output))) {
+        // Someone asked for this run: say why nothing happened instead of staying silent.
+        if (requestTs) {
+          const reason = script.output.split('\n').find((l) => l.trim() && !l.includes('wakeAgent'));
+          await postMain(
+            `🔇 ${title}: nothing to do right now.${reason ? `\n> ${reason.trim().slice(0, 300)}` : ''}`,
+          );
+        }
+        return record('silent');
+      }
       if (!job.agent) {
         const icon = script.ok ? '✅' : '❌';
         const meta = formatDuration(now() - startedAt);
-        await chat.post(
-          channel,
-          undefined,
-          `${icon} ${title} · ${meta}\n\`\`\`\n${script.output.slice(0, 3_000)}\n\`\`\``,
-        );
+        await postMain(`${icon} ${title} · ${meta}\n\`\`\`\n${script.output.slice(0, 3_000)}\n\`\`\``);
         return record(script.ok ? 'ok' : 'failed', {
           error: script.ok ? undefined : script.output.slice(-500),
         });
       }
     }
 
-    const rootTs = await chat.post(channel, undefined, `⏳ ${title}`);
+    // The job's thread: the requester's message, or a new channel message. The status line (⏳ → ✅
+    // with the headline) is that channel message, or the first reply in the requester's thread.
+    const statusTs = await postMain(`⏳ ${title}`);
+    const rootTs = requestTs ?? statusTs;
     const key = threadKey(channel, rootTs);
     let session = {
       threadKey: key,
@@ -120,9 +166,13 @@ export async function runJob(
     };
     store.saveSession(session);
     let steps = 0;
-    const status = new Throttle<string>(deps.host.statusIntervalSeconds * 1000, (text) =>
-      chat.update(channel, rootTs, text),
-    );
+    const intervalMs = deps.host.statusIntervalSeconds * 1000;
+    const status = new Throttle<string>(intervalMs, (text) => chat.update(channel, statusTs, text));
+    const recipient = streamRecipient(trigger, project.config.owner);
+    const live =
+      recipient && chat.stream && !chat.stream.disabled
+        ? new StreamReply(chat, chat.stream, channel, rootTs, recipient, false, Math.min(intervalMs, 1000))
+        : undefined;
 
     // Jobs get approval buttons and file uploads, never permission prompts: nobody is watching live.
     const bridged = deps.bridge?.open({
@@ -145,6 +195,7 @@ export async function runJob(
             .join('\n\n'),
           allowedTools: job.allowedTools ?? project.config.allowedTools,
           mcpConfig: bridged?.mcpConfigPath,
+          partialMessages: Boolean(live),
         }),
         cwd: project.dir,
         env,
@@ -155,10 +206,15 @@ export async function runJob(
           if (event.kind === 'init' && !session.started) {
             session = { ...session, started: true };
             store.saveSession(session);
-          } else if (event.kind === 'tool') {
+          }
+          if ('parent' in event && event.parent) return;
+          if (event.kind === 'tool') {
             steps++;
             status.push(`⏳ ${title} · step ${steps}\n> ${event.status}`);
-          }
+            live?.toolStart(event.id, event.status);
+          } else if (event.kind === 'tool_result') live?.toolEnd(event.id, !event.isError);
+          else if (event.kind === 'text_start') live?.textBreak();
+          else if (event.kind === 'text') live?.text(event.text);
         },
       })
       .finally(() => bridged?.dispose());
@@ -192,15 +248,22 @@ export async function runJob(
             : outcome.status === 'aborted'
               ? '⏹ stopped'
               : `❌ failed: ${(outcome.error ?? 'unknown error').slice(0, 500)}`;
-      await chat.update(channel, rootTs, `${title} · ${reason}`);
+      await chat.update(channel, statusTs, `${title} · ${reason}`);
+      await live?.finish({ summary: reason, ok: false, answer: '', notes: [] });
       return record(outcome.status, { ...usage, error: outcome.error, output: outcome.text });
     }
 
     if (isSilentReply(outcome.text)) {
-      await chat
-        .delete(channel, rootTs)
-        .catch(() => chat.update(channel, rootTs, `🔇 ${title} · nothing to report`));
-      store.deleteSession(key);
+      await live?.discard();
+      if (requestTs) {
+        // The requester's thread stays (and its session, for follow-up questions).
+        await chat.update(channel, statusTs, `🔇 ${title} · nothing to report`);
+      } else {
+        await chat
+          .delete(channel, rootTs)
+          .catch(() => chat.update(channel, rootTs, `🔇 ${title} · nothing to report`));
+        store.deleteSession(key);
+      }
       return record('silent', { ...usage, output: outcome.text });
     }
 
@@ -209,9 +272,18 @@ export async function runJob(
       ? { headline: failure.split('\n')[0] ?? '', details: failure }
       : splitHeadline(outcome.text);
     const icon = failure ? '❌' : '✅';
-    await chat.update(channel, rootTs, `${icon} ${title} · ${meta}\n${toSlackMrkdwn(headline)}`);
-    if (details)
+    await chat.update(channel, statusTs, `${icon} ${title} · ${meta}\n${toSlackMrkdwn(headline)}`);
+    if (live) {
+      // The whole reply was streamed into the thread already.
+      await live.finish({
+        summary: failure ? `❌ ${headline}` : `✅ Done · ${meta}`,
+        ok: !failure,
+        answer: outcome.text,
+        notes: [],
+      });
+    } else if (details) {
       for (const chunk of splitMessage(toSlackMrkdwn(details))) await chat.post(channel, rootTs, chunk);
+    }
     return record(failure ? 'failed' : 'ok', { ...usage, error: failure, output: outcome.text });
   } catch (err) {
     log.error(`[${project.config.name}] job ${job.id} crashed: ${(err as Error).stack ?? err}`);

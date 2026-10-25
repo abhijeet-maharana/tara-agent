@@ -57,6 +57,7 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
  *   POST /internal/file                {path, comment?}
  *   POST /internal/permission          {tool_name, input}  → {id}
  *   GET  /internal/permission/<id>?wait=45                 → {decision | null}
+ *   GET  /internal/jobs, POST /internal/run-job {id}        (chat turns only)
  */
 export function startHttpServer(options: HttpOptions): Promise<Server> {
   const started = (options.now ?? Date.now)();
@@ -157,6 +158,13 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
       const input =
         typeof body.input === 'object' && body.input !== null ? (body.input as Record<string, unknown>) : {};
       return bridge.askPermission(token, { tool_name: str(body.tool_name, 'tool_name'), input });
+    }
+    if (req.method === 'GET' && parts[1] === 'jobs' && parts.length === 2) {
+      return { jobs: bridge.listJobs(token) };
+    }
+    if (req.method === 'POST' && parts[1] === 'run-job' && parts.length === 2) {
+      const body = await readJson(req);
+      return bridge.runJob(token, str(body.id, 'id'));
     }
     if (req.method === 'GET' && parts[1] === 'permission' && parts.length === 3) {
       const waitMs = Math.min(55, Math.max(0, Number(url.searchParams.get('wait')) || 0)) * 1000;

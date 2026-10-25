@@ -1,14 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import { BRIDGE_PROMPT, type Bridge, wantsPermissionPrompts } from '../bridge/bridge.js';
+import { BRIDGE_PROMPT, type Bridge, JOB_TOOLS_PROMPT, wantsPermissionPrompts } from '../bridge/bridge.js';
 import type { HostConfig, Project } from '../config/schema.js';
 import { buildClaudeArgs } from '../runner/args.js';
 import { buildChildEnv } from '../runner/env.js';
 import type { Runner, RunOutcome } from '../runner/run.js';
-import type { JobControl } from '../scheduler/scheduler.js';
+import type { JobControl, JobInfo } from '../scheduler/scheduler.js';
+import type { ButtonTap } from '../slack/app.js';
 import { formatDuration, splitMessage } from '../slack/format.js';
 import { EditReply, type StreamPort, StreamReply, type TurnReply } from '../slack/reply.js';
 import type { SessionRow, Store } from '../store/store.js';
 import { KeyedQueue, Semaphore } from '../util/concurrency.js';
+import { matchJob } from './job-match.js';
 
 /** The chat platform as the session manager sees it. Slack implements it; tests fake it. */
 export interface ChatPort {
@@ -72,7 +74,7 @@ const HELP = `*Thread commands*
 • \`!stop\` stop the running turn
 • \`!status\` show session, model and queue
 • \`!jobs\` list this channel's scheduled jobs
-• \`!run <job-id>\` run a job now (it posts its own thread)
+• \`run <job name>\` run a scheduled job now, e.g. "run weekly redis health audit" (\`!run <job-id>\` works too)
 • \`!health\` the last 24 hours: runs, problems, missed slots, usage`;
 
 export const threadKey = (channel: string, threadTs: string) => `${channel}:${threadTs}`;
@@ -113,7 +115,79 @@ export class SessionManager {
     if (command)
       return this.command(project, key, msg, command[1]?.toLowerCase() ?? '', command[2]?.trim() ?? '');
 
+    // "Run Weekly Redis Health Audit": start the job straight away, no model needed.
+    if (await this.runRequest(project, msg, text)) return;
+
     await this.queue.run(key, () => this.turn(project, key, msg));
+  }
+
+  /** Handles "run <job name>". False when the message isn't one (it then goes to Claude). */
+  private async runRequest(project: Project, msg: IncomingMessage, text: string): Promise<boolean> {
+    const jobs = this.deps.jobs;
+    if (!jobs) return false;
+    const match = matchJob(text, jobs.list(project.config.name));
+    if (!match) return false;
+    // A top-level request gets its own thread for the run; inside a conversation, the run posts its own message.
+    const ownThread = msg.threadTs === msg.ts;
+    if ('job' in match) {
+      await this.startJob(project, match.job, msg.user, msg.channel, msg.threadTs, ownThread);
+      return true;
+    }
+    await this.deps.chat.postBlocks(msg.channel, msg.threadTs, 'Which job should I run?', [
+      { type: 'section', text: { type: 'mrkdwn', text: '*Which job should I run?*' } },
+      {
+        type: 'actions',
+        elements: match.choices.map((job, i) => ({
+          type: 'button',
+          text: { type: 'plain_text', text: job.name.slice(0, 75) },
+          action_id: `tara:runjob:${i}`,
+          value: `${job.id}|${ownThread ? 1 : 0}`,
+        })),
+      },
+    ]);
+    return true;
+  }
+
+  /** A tap on one of the "Which job should I run?" buttons. */
+  async runButton(tap: ButtonTap): Promise<void> {
+    const project = this.byChannel.get(tap.channel);
+    const [id = '', own] = tap.value.split('|');
+    const job = project && this.deps.jobs?.list(project.config.name).find((j) => j.id === id);
+    if (!project || !job) return;
+    const { allowedUsers } = project.config;
+    if (allowedUsers.length > 0 && !allowedUsers.includes(tap.user)) return;
+    await this.deps.chat
+      .update(tap.channel, tap.messageTs, `▶️ ${job.name}`, [
+        { type: 'section', text: { type: 'mrkdwn', text: `▶️ *${job.name}*, picked by <@${tap.user}>` } },
+      ])
+      .catch(() => {});
+    await this.startJob(project, job, tap.user, tap.channel, tap.threadTs ?? tap.messageTs, own === '1');
+  }
+
+  private async startJob(
+    project: Project,
+    job: JobInfo,
+    user: string,
+    channel: string,
+    threadTs: string,
+    ownThread: boolean,
+  ): Promise<void> {
+    const reply = (text: string) => this.deps.chat.post(channel, threadTs, text);
+    if (!job.enabled) {
+      await reply(
+        `⏸ *${job.name}* is paused. Turn it back on in \`.tara/jobs.json\` (or the dashboard) first.`,
+      );
+      return;
+    }
+    const result = this.deps.jobs?.trigger(
+      project.config.name,
+      job.id,
+      user,
+      ownThread ? { channel, ts: threadTs } : undefined,
+    );
+    if (result === 'running') await reply(`🔄 *${job.name}* is already running.`);
+    else if (result === 'started' && !ownThread)
+      await reply(`▶️ Started *${job.name}*. It posts its own message in this channel.`);
   }
 
   /** Stops every running turn (used on shutdown). */
@@ -234,6 +308,7 @@ export class SessionManager {
       threadTs: msg.threadTs,
       kind: 'chat',
       permissionPrompts,
+      user: msg.user,
     });
     let outcome: RunOutcome;
     try {
@@ -244,7 +319,12 @@ export class SessionManager {
           resume: session.started,
           permissionMode: project.config.permissionMode,
           model: session.model,
-          appendSystemPrompt: [BASE_PROMPT, bridged && BRIDGE_PROMPT, project.systemPrompt]
+          appendSystemPrompt: [
+            BASE_PROMPT,
+            bridged && BRIDGE_PROMPT,
+            bridged && this.deps.jobs && JOB_TOOLS_PROMPT,
+            project.systemPrompt,
+          ]
             .filter(Boolean)
             .join('\n\n'),
           allowedTools: project.config.allowedTools,

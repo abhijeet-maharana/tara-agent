@@ -97,6 +97,47 @@ server.registerTool(
   },
 );
 
+if (process.env.TARA_JOB_TOOLS === '1') {
+  server.registerTool(
+    'list_jobs',
+    {
+      title: "List this channel's scheduled jobs",
+      description: 'The scheduled jobs of this Slack channel, with ids, next run and last status.',
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const { jobs } = await api<{ jobs: unknown[] }>('/internal/jobs');
+        return text(JSON.stringify(jobs));
+      } catch (err) {
+        return text(`Could not list jobs: ${(err as Error).message}`, true);
+      }
+    },
+  );
+  server.registerTool(
+    'run_job',
+    {
+      title: 'Run a scheduled job now',
+      description:
+        "Start one of this channel's scheduled jobs right away (as if its schedule fired). It runs in its own " +
+        'message in the channel; this call returns as soon as it has started.',
+      inputSchema: { id: z.string().min(1).describe('Job id from list_jobs') },
+    },
+    async ({ id }) => {
+      try {
+        const { result, name } = await api<{ result: string; name?: string }>('/internal/run-job', { id });
+        const what = name ?? id;
+        if (result === 'started') return text(`Started "${what}". It posts its own message in the channel.`);
+        if (result === 'running') return text(`"${what}" is already running.`);
+        if (result === 'paused') return text(`"${what}" is paused, so it was not started.`);
+        return text(`Could not start "${what}": ${result}`, true);
+      } catch (err) {
+        return text(`Could not start the job: ${(err as Error).message}`, true);
+      }
+    },
+  );
+}
+
 if (PERMISSION_PROMPTS) {
   server.registerTool(
     'permission',

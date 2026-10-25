@@ -110,7 +110,10 @@ async function serve(configFlag: string | undefined) {
     appToken: requireEnv('SLACK_APP_TOKEN'),
     log,
     onMessage: (msg) => manager?.handle(msg) ?? Promise.resolve(),
-    onButton: (tap) => bridge?.handleButton(tap) ?? Promise.resolve(),
+    onButton: (tap) =>
+      tap.actionId.startsWith('tara:runjob:')
+        ? (manager?.runButton(tap) ?? Promise.resolve())
+        : (bridge?.handleButton(tap) ?? Promise.resolve()),
     streaming: host.streaming,
   });
   // tara's MCP tools reach tara-agent through the local API, so they need it.
@@ -137,7 +140,10 @@ async function serve(configFlag: string | undefined) {
     bridge,
     log,
   });
-  if (bridge) bridge.onDecision = (msg) => (manager as SessionManager).handle(msg);
+  if (bridge) {
+    bridge.onDecision = (msg) => (manager as SessionManager).handle(msg);
+    bridge.jobs = scheduler;
+  }
   await slack.start();
   scheduler.start();
   const http = host.http.enabled

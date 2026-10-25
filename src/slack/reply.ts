@@ -106,6 +106,8 @@ export class EditReply implements TurnReply {
  */
 export class StreamReply implements TurnReply {
   private ts: string | undefined;
+  /** Every stream message this reply opened (a sealed stream is continued in a new one). */
+  private readonly opened: string[] = [];
   private title: string;
   private readonly tasks = new Map<string, { title: string; status: TaskStatus }>();
   private pendingTasks = new Set<string>();
@@ -202,6 +204,14 @@ export class StreamReply implements TurnReply {
     }
   }
 
+  /** Removes everything this reply showed (a job that ended up having nothing to report). */
+  async discard(): Promise<void> {
+    if (this.timer) clearTimeout(this.timer);
+    await this.chain;
+    if (this.ts) await this.port.stop(this.channel, this.ts).catch(() => {});
+    for (const ts of this.opened) await this.chat.delete(this.channel, ts).catch(() => {});
+  }
+
   private setTitle(title: string): void {
     if (this.fallback || this.title === title) return;
     this.title = title;
@@ -246,7 +256,10 @@ export class StreamReply implements TurnReply {
       return;
     }
     try {
-      if (!this.ts) this.ts = await this.port.start(this.channel, this.threadTs, this.user);
+      if (!this.ts) {
+        this.ts = await this.port.start(this.channel, this.threadTs, this.user);
+        this.opened.push(this.ts);
+      }
       await this.port.append(this.channel, this.ts, chunks);
       this.streamed += text;
     } catch (err) {
@@ -262,6 +275,7 @@ export class StreamReply implements TurnReply {
         // Slack seals long streams after a few minutes: continue in a fresh card with the full state.
         try {
           this.ts = await this.port.start(this.channel, this.threadTs, this.user);
+          this.opened.push(this.ts);
           const state: StreamChunk[] = [
             { type: 'plan_update', title: this.title.slice(0, 256) },
             ...[...this.tasks].map(([id, t]) => ({

@@ -100,6 +100,7 @@ The agent then can't use your sudo, docker group, browser profile files, other p
 | `allowedTools` | `[]` | Tools allowed without asking, in `--allowedTools` syntax |
 | `chatModel` | `sonnet` | Model for new threads |
 | `systemPromptFile` | none | Extra instructions appended to every session |
+| `owner` | none | Slack user ID that live streams of jobs started from the API or a dashboard go to (`!run` streams to whoever typed it; scheduled runs don't stream) |
 | `allowedUsers` | `[]` (everyone in the channel) | Slack user IDs allowed to talk to the bot |
 | `billing` | `subscription` | `api` runs the CLI with `ANTHROPIC_API_KEY` |
 
@@ -141,6 +142,8 @@ Each repo can declare jobs in `.tara/jobs.json` (reloaded within 30 s of a chang
 | `channel` | project channel | Where the job posts |
 | `env` | `{}` | Extra environment for the script and the CLI (`~/` expanded); merged over the file-level `env` |
 | `enabled` | `true` | `false` keeps the job listed but never scheduled |
+
+**Watching a run live.** Scheduled runs show their current step in the channel message and post the report when done. A run someone starts also streams like a chat reply (live task card + report as it is written): typing "run <job name>" in the channel runs it right in that message's thread; runs from the API or a dashboard stream to the project `owner`.
 
 **How a run goes.** The pre-script runs first. Empty output, or a last line of `{"wakeAgent": false}`, ends the run silently. Otherwise its output (or its error) is put in front of the prompt as a `## Script Output` block. Claude's reply goes to Slack: the headline (before a `---` line) as a new message in the channel, the details in its thread. A reply of `[SILENT]` posts nothing, and a first line of `[CRON_FAILURE]` marks the run failed. Replying in a job's thread continues that session, so a job can ask for approval and act on your answer. These conventions match Hermes Agent's, so Hermes jobs run unchanged.
 
@@ -187,7 +190,7 @@ For dashboards and scripts on the same host (`127.0.0.1:4100` by default):
 | `!stop` | Stop the running turn |
 | `!status` | Show project, model, session and queue |
 | `!jobs` | List this channel's jobs with their next run |
-| `!run <job-id>` | Run a job now (it posts its own thread) |
+| `run <job name>` | Plain words, no command needed: "run weekly redis health audit", "start amazon sla report". One match starts at once and runs in your message's thread (live card + report, ✅ on your message, replies continue the job's session); several matches give you buttons to pick; anything looser goes to Claude, which can start jobs with its `run_job` tool. `!run <job-id>` still works |
 | `!health` | The last 24 hours: runs, problems, missed slots, usage |
 
 ## Security

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { PermissionMode, Project } from '../config/schema.js';
 import { describeTool } from '../runner/stream.js';
+import type { JobControl } from '../scheduler/scheduler.js';
 import type { ChatPort, IncomingMessage, Logger, SlackBlock } from '../sessions/manager.js';
 import type { ButtonTap } from '../slack/app.js';
 import { splitMessage, toSlackMrkdwn } from '../slack/format.js';
@@ -18,6 +19,8 @@ export interface RunContext {
   kind: 'chat' | 'job';
   /** Route permission prompts to Allow/Deny buttons (chat turns outside bypass mode). */
   permissionPrompts: boolean;
+  /** Who is talking (chat turns): jobs Claude starts are run in their name. */
+  user?: string;
 }
 
 export interface RunHandle {
@@ -48,6 +51,9 @@ export class BridgeError extends Error {
     super(message);
   }
 }
+
+/** Appended for chat turns, which can also start the channel's scheduled jobs. */
+export const JOB_TOOLS_PROMPT = `- To run one of this channel's scheduled jobs now, call \`run_job\` (\`list_jobs\` shows them). The job runs in its own message in the channel; tell the person it started, don't wait for it.`;
 
 /** Appended to the system prompt of every run that has tara's MCP tools. */
 export const BRIDGE_PROMPT = `Slack tools (tara MCP server):
@@ -86,6 +92,8 @@ export interface BridgeDeps {
 export class Bridge {
   /** Delivers a decision into its thread as if the person had typed it (set to SessionManager.handle). */
   onDecision?: (msg: IncomingMessage) => Promise<void>;
+  /** The scheduler, for the `list_jobs` / `run_job` tools in chat turns. */
+  jobs?: JobControl;
 
   private readonly runs = new Map<string, RunContext>();
   private readonly permissions = new Map<string, PendingPermission>();
@@ -113,6 +121,7 @@ export class Bridge {
             TARA_API: this.deps.apiUrl,
             TARA_RUN_TOKEN: token,
             TARA_PERMISSION_PROMPTS: ctx.permissionPrompts ? '1' : '0',
+            TARA_JOB_TOOLS: ctx.kind === 'chat' && this.jobs ? '1' : '0',
           },
         },
       },
@@ -207,6 +216,28 @@ export class Bridge {
     if (stat.size > MAX_FILE_BYTES) throw new BridgeError(413, 'File is larger than 100 MB');
     await this.deps.chat.uploadFile(ctx.channel, ctx.threadTs, real, input.comment?.slice(0, 2_000));
     return { name: path.basename(real) };
+  }
+
+  listJobs(token: string | undefined) {
+    const ctx = this.run(token);
+    return (this.jobs?.list(ctx.project.config.name) ?? []).map((j) => ({
+      id: j.id,
+      name: j.name,
+      enabled: j.enabled,
+      running: j.running,
+      nextRun: j.nextRun?.toISOString() ?? null,
+      lastStatus: j.lastStatus ?? null,
+    }));
+  }
+
+  runJob(token: string | undefined, id: string): { result: string; name?: string } {
+    const ctx = this.run(token);
+    if (ctx.kind !== 'chat' || !this.jobs)
+      throw new BridgeError(403, 'Jobs can only be started from a chat turn');
+    const job = this.jobs.list(ctx.project.config.name).find((j) => j.id === id);
+    if (!job) throw new BridgeError(404, `No job "${id}" in this channel; call list_jobs`);
+    if (!job.enabled) return { result: 'paused', name: job.name };
+    return { result: this.jobs.trigger(ctx.project.config.name, id, ctx.user ?? 'Claude'), name: job.name };
   }
 
   /** Posts Allow/Deny buttons for a tool call and returns the request id to wait on. */

@@ -260,11 +260,13 @@ describe('claude args', () => {
     expect(args.join(' ')).toContain(
       '--mcp-config /tmp/x.json --permission-prompt-tool mcp__tara__permission',
     );
-    expect(args.slice(-4)).toEqual([
+    expect(args.slice(-6)).toEqual([
       '--allowedTools',
       'Read',
       'mcp__tara__request_approval',
       'mcp__tara__send_file',
+      'mcp__tara__list_jobs',
+      'mcp__tara__run_job',
     ]);
   });
 });
@@ -397,5 +399,52 @@ describe('MCP server end to end', () => {
     });
     expect(res.status).toBe(401);
     server.close();
+  });
+});
+
+describe('job tools for Claude', () => {
+  it("lists and starts jobs for chat turns only, in the speaker's name", () => {
+    const { bridge, ctx } = setup();
+    const started: unknown[][] = [];
+    bridge.jobs = {
+      list: () => [
+        {
+          id: 'sla',
+          name: 'SLA Report',
+          enabled: true,
+          running: false,
+          cron: '* * * * *',
+          tz: 'UTC',
+          skills: [],
+          model: 'h',
+        },
+        {
+          id: 'off',
+          name: 'Off',
+          enabled: false,
+          running: false,
+          cron: '* * * * *',
+          tz: 'UTC',
+          skills: [],
+          model: 'h',
+        },
+      ],
+      trigger: (...a: unknown[]) => {
+        started.push(a);
+        return 'started';
+      },
+      digest: () => null,
+    };
+    const chatRun = openRun(bridge, { ...ctx, user: 'U7' });
+    expect(chatRun.config.mcpServers.tara.env.TARA_JOB_TOOLS).toBe('1');
+    expect(bridge.listJobs(chatRun.token).map((j) => j.id)).toEqual(['sla', 'off']);
+    expect(bridge.runJob(chatRun.token, 'sla')).toEqual({ result: 'started', name: 'SLA Report' });
+    expect(started).toEqual([['shop', 'sla', 'U7']]);
+    expect(bridge.runJob(chatRun.token, 'off')).toEqual({ result: 'paused', name: 'Off' });
+    expect(() => bridge.runJob(chatRun.token, 'nope')).toThrow(/No job "nope"/);
+
+    const jobRun = openRun(bridge, { ...ctx, kind: 'job' });
+    expect(jobRun.config.mcpServers.tara.env.TARA_JOB_TOOLS).toBe('0');
+    expect(() => bridge.runJob(jobRun.token, 'sla')).toThrow(/only be started from a chat turn/);
   });
 });

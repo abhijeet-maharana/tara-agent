@@ -1,7 +1,12 @@
 import type { PermissionMode } from '../config/schema.js';
 
 /** tara's own MCP tools; allowed without asking whatever the permission mode. */
-export const TARA_TOOLS = ['mcp__tara__request_approval', 'mcp__tara__send_file'];
+export const TARA_TOOLS = [
+  'mcp__tara__request_approval',
+  'mcp__tara__send_file',
+  'mcp__tara__list_jobs',
+  'mcp__tara__run_job',
+];
 export const TARA_PERMISSION_TOOL = 'mcp__tara__permission';
 
 export interface ClaudeArgsInput {

@@ -31,7 +31,13 @@ export interface JobInfo {
 /** What chat commands (`!jobs`, `!run`) need from the scheduler. */
 export interface JobControl {
   list(project: string): JobInfo[];
-  trigger(project: string, id: string, by: string): 'started' | 'unknown' | 'running';
+  /** Runs a job now; with `thread`, inside that chat message's thread. */
+  trigger(
+    project: string,
+    id: string,
+    by: string,
+    thread?: { channel: string; ts: string },
+  ): 'started' | 'unknown' | 'running';
   /** The last 24 hours of one project, or null when nothing ran or was missed. */
   digest(project: string): { headline: string; details: string } | null;
 }
@@ -171,11 +177,16 @@ export class Scheduler implements JobControl {
     for (const project of this.deps.projects) this.reload(project, { catchUp: false });
   }
 
-  trigger(project: string, id: string, by: string): 'started' | 'unknown' | 'running' {
+  trigger(
+    project: string,
+    id: string,
+    by: string,
+    thread?: { channel: string; ts: string },
+  ): 'started' | 'unknown' | 'running' {
     const entry = this.entries.get(jobKey(project, id));
     if (!entry) return 'unknown';
     if (this.running.has(jobKey(project, id))) return 'running';
-    this.launch(entry.scheduled, { kind: 'manual', by });
+    this.launch(entry.scheduled, { kind: 'manual', by, thread });
     return 'started';
   }
 

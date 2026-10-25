@@ -11,6 +11,8 @@ export interface ButtonTap {
   user: string;
   channel: string;
   messageTs: string;
+  /** Thread the button message sits in, if any. */
+  threadTs?: string;
 }
 
 export interface SlackOptions {
@@ -128,6 +130,7 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
         user: body.user.id,
         channel,
         messageTs,
+        threadTs: (body.message as { thread_ts?: string } | undefined)?.thread_ts,
       })
       .catch((err: Error) => options.log.error(`button handling failed: ${err.message}`));
   });

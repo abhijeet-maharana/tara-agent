@@ -7,14 +7,15 @@ import type { Project } from '../src/config/schema.js';
 import { startHttpServer } from '../src/http/server.js';
 import type { RunOptions, RunOutcome } from '../src/runner/run.js';
 import { buildDigest } from '../src/scheduler/health.js';
+import { streamRecipient } from '../src/scheduler/job-runner.js';
 import { Scheduler } from '../src/scheduler/scheduler.js';
 import type { ScriptResult } from '../src/scheduler/script.js';
 import { Store, type StoredRun } from '../src/store/store.js';
-import { FakeChat, testHost } from './fakes.js';
+import { FakeChat, FakeStream, testHost } from './fakes.js';
 
 const host = testHost({ concurrency: 2, catchUpHours: 6, claude: { bin: 'claude', chatTimeoutMinutes: 20 } });
 
-function makeProject(jobs: object[], env: object = {}): Project {
+function makeProject(jobs: object[], env: object = {}, owner?: string): Project {
   const dir = mkdtempSync(path.join(tmpdir(), 'tara-sched-'));
   mkdirSync(path.join(dir, '.tara'));
   writeFileSync(path.join(dir, '.tara', 'jobs.json'), JSON.stringify({ env, jobs }));
@@ -28,6 +29,7 @@ function makeProject(jobs: object[], env: object = {}): Project {
       allowedTools: [],
       allowedUsers: [],
       billing: 'subscription',
+      ...(owner ? { owner } : {}),
     },
     systemPrompt: 'Project rules.',
   };
@@ -50,14 +52,17 @@ function setup(opts: {
   script?: ScriptResult;
   now?: () => number;
   store?: Store;
+  stream?: FakeStream;
+  owner?: string;
 }) {
   const chat = new FakeChat('ts');
+  chat.stream = opts.stream;
   const store = opts.store ?? new Store(':memory:', opts.now);
   const calls: RunOptions[] = [];
   const callTimes: number[] = [];
   const scripts: { script: string; env: NodeJS.ProcessEnv }[] = [];
   const replies = [...(opts.replies ?? [])];
-  const project = makeProject(opts.jobs, opts.env);
+  const project = makeProject(opts.jobs, opts.env, opts.owner);
   const scheduler = new Scheduler({
     projects: [project],
     host,
@@ -76,7 +81,11 @@ function setup(opts: {
       callTimes.push(Date.now());
       o.onEvent?.({ kind: 'init', sessionId: 'sid', model: 'claude-haiku-5-5' });
       o.onEvent?.({ kind: 'tool', id: 't1', name: 'Bash', status: 'Bash: curl' });
-      return ok(replies.shift() ?? 'Headline\n---\nDetails here');
+      o.onEvent?.({ kind: 'tool_result', id: 't1', isError: false });
+      const reply = replies.shift() ?? 'Headline\n---\nDetails here';
+      o.onEvent?.({ kind: 'text_start' });
+      o.onEvent?.({ kind: 'text', text: reply });
+      return ok(reply);
     },
   });
   return { chat, store, calls, callTimes, scripts, scheduler, project };
@@ -394,5 +403,100 @@ describe('health digest', () => {
     expect(digest?.headline).toContain('*1 missed*');
     expect(digest?.details).toContain('• `sla` SLA Report: Sun 12:00');
     await later.scheduler.stop();
+  });
+});
+
+describe('job streaming', () => {
+  it('streams only runs someone started, to that person or the project owner', () => {
+    expect(streamRecipient({ kind: 'schedule' }, 'UOWNER')).toBeUndefined();
+    expect(streamRecipient({ kind: 'catch-up' }, 'UOWNER')).toBeUndefined();
+    expect(streamRecipient({ kind: 'manual', by: 'U123ABC' }, 'UOWNER')).toBe('U123ABC');
+    expect(streamRecipient({ kind: 'manual', by: 'Job Search Board' }, 'UOWNER')).toBe('UOWNER');
+    expect(streamRecipient({ kind: 'manual', by: 'api' }, undefined)).toBeUndefined();
+  });
+
+  it('streams a !run into the job thread and does not repost the details', async () => {
+    const stream = new FakeStream();
+    const { chat, calls, scheduler } = setup({ jobs: [baseJob], stream });
+    scheduler.start();
+    scheduler.trigger('shop', 'sla', 'U1');
+    await scheduler.idle();
+    expect(calls[0]?.args).toContain('--include-partial-messages');
+    expect(stream.calls[0]).toBe('start ts1 for U1 → s1');
+    expect(stream.text()).toBe('Headline\n---\nDetails here');
+    expect(stream.state()).toEqual({
+      title: '✅ Done · 2s · 2 steps · claude-haiku-5-5',
+      tasks: { 'Bash: curl': 'complete' },
+    });
+    // Headline still updates the channel message; details are not posted a second time.
+    expect(chat.log.some((l) => l.startsWith('update ts1: ✅ *SLA Report* (run by <@U1>)'))).toBe(true);
+    expect(chat.posts.filter((p) => p.thread === 'ts1')).toHaveLength(0);
+    await scheduler.stop();
+  });
+
+  it('streams board/API runs to the owner, and keeps scheduled runs as before', async () => {
+    const stream = new FakeStream();
+    const { chat, scheduler } = setup({ jobs: [baseJob], stream, owner: 'UOWNER' });
+    scheduler.start();
+    scheduler.trigger('shop', 'sla', 'Job Search Board');
+    await scheduler.idle();
+    expect(stream.calls[0]).toBe('start ts1 for UOWNER → s1');
+    await scheduler.stop();
+
+    const quiet = new FakeStream();
+    const plain = setup({ jobs: [baseJob], stream: quiet });
+    plain.scheduler.start();
+    plain.scheduler.trigger('shop', 'sla', 'api'); // no owner: no stream
+    await plain.scheduler.idle();
+    expect(quiet.calls).toEqual([]);
+    expect(plain.chat.texts()).toContain('Details here');
+    await plain.scheduler.stop();
+    expect(chat.posts.filter((p) => p.thread === 'ts1')).toHaveLength(0);
+  });
+
+  it('removes the streamed thread too when the job had nothing to report', async () => {
+    const stream = new FakeStream();
+    const { chat, scheduler } = setup({ jobs: [baseJob], stream, replies: ['[SILENT]'] });
+    scheduler.start();
+    scheduler.trigger('shop', 'sla', 'U1');
+    await scheduler.idle();
+    expect(chat.deleted).toEqual(['s1', 'ts1']);
+    await scheduler.stop();
+  });
+});
+
+describe('a job run asked for in chat', () => {
+  it("runs inside the requester's thread, with the status as its first reply and reactions on the request", async () => {
+    const stream = new FakeStream();
+    const { chat, scheduler, store } = setup({ jobs: [baseJob], stream });
+    scheduler.start();
+    scheduler.trigger('shop', 'sla', 'U1', { channel: 'C1', ts: '500.1' });
+    await scheduler.idle();
+    expect(chat.log[0]).toBe('post 500.1 ts1: ⏳ *SLA Report* (run by <@U1>)');
+    expect(stream.calls[0]).toBe('start 500.1 for U1 → s1');
+    expect(chat.log.some((l) => l.startsWith('update ts1: ✅ *SLA Report*'))).toBe(true);
+    expect(chat.reactions).toEqual(expect.arrayContaining(['+eyes@500.1', '+white_check_mark@500.1']));
+    // Replies in the requester's thread continue the job's session.
+    expect(store.getSession('C1:500.1')).toMatchObject({ model: 'haiku', started: true });
+    await scheduler.stop();
+  });
+
+  it('says why when the pre-check finds nothing to do', async () => {
+    const { chat, scheduler } = setup({
+      jobs: [{ ...baseJob, preScript: 'gate.py' }],
+      script: {
+        ok: true,
+        output: 'Skipping: 1 post in the queue\n{"wakeAgent": false}',
+        exitCode: 0,
+        timedOut: false,
+      },
+    });
+    scheduler.start();
+    scheduler.trigger('shop', 'sla', 'U1', { channel: 'C1', ts: '500.1' });
+    await scheduler.idle();
+    expect(chat.texts()).toEqual([
+      '🔇 *SLA Report* (run by <@U1>): nothing to do right now.\n> Skipping: 1 post in the queue',
+    ]);
+    await scheduler.stop();
   });
 });
