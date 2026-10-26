@@ -118,7 +118,7 @@ export const projectConfigSchema = z.object({
     .string()
     .min(1)
     .regex(/^[a-z0-9][a-z0-9-]*$/, 'lowercase letters, digits and dashes'),
-  /** How the dashboard names the project ("Job Search" for `remote-job`). Defaults to `name`. */
+  /** How the dashboard names the project ("Online Shop" for `shop`). Defaults to `name`. */
   title: z.string().min(1).max(40).optional(),
   slackChannel: z.string().regex(/^[CG][A-Z0-9]+$/, 'a Slack channel ID such as C0123456789'),
   permissionMode: z.enum(permissionModes).default('default'),

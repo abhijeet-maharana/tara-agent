@@ -158,7 +158,7 @@ describe('proposing and deciding', () => {
   it('refuses unknown queues and windows, and adds the project checks', async () => {
     const fetchFake = (async () =>
       new Response(
-        JSON.stringify({ checks: [{ text: 'Mentions Abtara', blocking: true }] }),
+        JSON.stringify({ checks: [{ text: 'Mentions a competitor', blocking: true }] }),
       )) as typeof fetch;
     const { project, approvals } = setup({
       fetch: fetchFake,
@@ -176,7 +176,7 @@ describe('proposing and deciding', () => {
       queue: 'linkedin',
       fields: [note('ok')],
     });
-    expect(item.checks).toEqual([{ text: 'Mentions Abtara', blocking: true }]);
+    expect(item.checks).toEqual([{ text: 'Mentions a competitor', blocking: true }]);
   });
 
   it('Revise on a draft keeps it waiting and asks Jarvis in its thread; a paused job continues as the job', async () => {

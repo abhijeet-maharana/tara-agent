@@ -585,7 +585,7 @@ describe('job streaming', () => {
     expect(streamRecipient({ kind: 'schedule' }, 'UOWNER')).toBeUndefined();
     expect(streamRecipient({ kind: 'catch-up' }, 'UOWNER')).toBeUndefined();
     expect(streamRecipient({ kind: 'manual', by: 'U123ABC' }, 'UOWNER')).toBe('U123ABC');
-    expect(streamRecipient({ kind: 'manual', by: 'Job Search Board' }, 'UOWNER')).toBe('UOWNER');
+    expect(streamRecipient({ kind: 'manual', by: 'Shop Dashboard' }, 'UOWNER')).toBe('UOWNER');
     expect(streamRecipient({ kind: 'manual', by: 'api' }, undefined)).toBeUndefined();
   });
 
@@ -612,7 +612,7 @@ describe('job streaming', () => {
     const stream = new FakeStream();
     const { chat, scheduler } = setup({ jobs: [baseJob], stream, owner: 'UOWNER' });
     scheduler.start();
-    scheduler.trigger('shop', 'sla', 'Job Search Board');
+    scheduler.trigger('shop', 'sla', 'Shop Dashboard');
     await scheduler.idle();
     expect(stream.calls[0]).toBe('start ts1 for UOWNER → s1');
     await scheduler.stop();

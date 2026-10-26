@@ -122,7 +122,7 @@ server.registerTool(
       args: z
         .record(z.string(), z.string().max(500))
         .optional()
-        .describe('The action\'s arguments, e.g. {"path": "/home/abhijeet/Projects/remote-job/data"}'),
+        .describe('The action\'s arguments, e.g. {"path": "/srv/shop/data"}'),
       command: z
         .string()
         .max(2000)
