@@ -27,8 +27,10 @@ tara-agent is one Node process per host. It never calls the Anthropic API: every
 | `src/sessions/manager.ts` | Slack thread ↔ Claude session, one turn at a time per thread, chat concurrency cap, live status message, thread commands |
 | `src/scheduler/` | Job timing (croner), slot claims, catch-up, locks, pre-scripts, job delivery, health digest |
 | `src/bridge/bridge.ts` | Per-run MCP config and token, approval buttons, permission prompts, file uploads |
-| `src/mcp/server.ts` | The stdio MCP server Claude starts: `request_approval`, `send_file`, `permission` |
+| `src/mcp/server.ts` | The stdio MCP server Claude starts: `request_approval`, `request_privileged`, `send_file`, `permission`, items and tasks |
+| `src/privileged/` | Root actions through the root-owned helper `deploy/tara-priv.mjs` (list, plan, run) |
 | `src/http/server.ts` | Local API for other tools, plus `/internal/*` for the MCP server |
+| `src/code/repo.ts`, `src/http/code.ts` | The Code page: read-only git status, diffs and files of each repo, through a private index copy ([code-view.md](code-view.md)) |
 | `src/http/dashboard.ts` | Server-rendered dashboard (home, jobs, runs, sessions); `cron-text.ts` turns schedules into plain English |
 | `src/slack/` | Bolt app, mrkdwn conversion, message splitting |
 | `src/store/store.ts` | `node:sqlite` with numbered migrations |

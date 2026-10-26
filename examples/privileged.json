@@ -1,0 +1,15 @@
+{
+  "actions": {
+    "fix-permissions": {
+      "description": "Re-apply the run user's access to files under a path in one of the repos (after Permission denied)",
+      "command": ["/usr/local/sbin/fix-repo-permissions", "--path", "{path}"],
+      "args": { "path": "/home/me/Projects/(shop|blog)(/.*)?" },
+      "auto": true,
+      "timeoutSeconds": 300
+    },
+    "restart-shop-server": {
+      "description": "Restart the shop's own server (systemd) after a code change",
+      "command": ["/usr/bin/systemctl", "restart", "shop-server.service"]
+    }
+  }
+}

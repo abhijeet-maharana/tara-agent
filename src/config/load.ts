@@ -45,6 +45,14 @@ export function loadHostConfig(file = DEFAULT_HOST_CONFIG): HostConfig {
   return {
     ...config,
     projects: config.projects.map((p) => path.resolve(expandHome(p))),
+    code: {
+      ...config.code,
+      repos: config.code.repos?.map((r) => ({
+        ...r,
+        path: path.resolve(expandHome(r.path)),
+        gitDir: r.gitDir && path.resolve(expandHome(r.gitDir)),
+      })),
+    },
     stateDir: path.resolve(expandHome(config.stateDir ?? '~/.local/state/tara-agent')),
   };
 }

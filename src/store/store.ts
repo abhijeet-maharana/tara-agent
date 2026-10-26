@@ -181,52 +181,9 @@ const MIGRATIONS = [
    DROP TABLE approvals;`,
   // A decided paused-run card is finished (the decision went to the run); only drafts wait in a queue.
   `UPDATE items SET status = 'done', finished_at = decided_at WHERE mode = 'resume' AND status = 'approved';`,
+  // The inbox is gone (2026-10-26): everything that needs a person is an approval card.
+  `DROP TABLE inbox;`,
 ];
-
-export const TASK_LEVELS = ['urgent', 'decide', 'later'] as const;
-export type TaskLevel = (typeof TASK_LEVELS)[number];
-
-/** Something only a person can do, left by a run (or added by hand) in a project's inbox. */
-export interface Task {
-  id: string;
-  project: string;
-  /** Stable dedupe key (`<job-or-skill>:<period-or-entity>`): adding it again updates the open task. */
-  key?: string;
-  title: string;
-  details?: string;
-  level: TaskLevel;
-  /** Job id or skill that added it, or `manual`. */
-  source: string;
-  link?: string;
-  dueAt?: number;
-  createdAt: number;
-  updatedAt: number;
-  doneAt?: number;
-}
-
-export type TaskInput = Pick<Task, 'project' | 'title' | 'level'> &
-  Partial<Pick<Task, 'key' | 'details' | 'source' | 'link' | 'dueAt' | 'createdAt'>>;
-
-/** Done tasks are kept this long, for "Done today" and Undo. */
-const DONE_RETENTION_MS = 30 * 86_400_000;
-
-function toTask(r: Record<string, unknown>): Task {
-  const opt = <T>(v: unknown) => (v ?? undefined) as T | undefined;
-  return {
-    id: r.id as string,
-    project: r.project as string,
-    key: opt(r.key),
-    title: r.title as string,
-    details: opt(r.details),
-    level: r.level as TaskLevel,
-    source: r.source as string,
-    link: opt(r.link),
-    dueAt: opt(r.due_at),
-    createdAt: r.created_at as number,
-    updatedAt: r.updated_at as number,
-    doneAt: opt(r.done_at),
-  };
-}
 
 export const ITEM_STATUSES = [
   'pending',
@@ -632,10 +589,11 @@ export class Store {
     };
     const cols = Object.keys(values);
     if (existing) {
+      // A refresh keeps where the card lives in Slack unless the new proposal names a thread itself.
+      const set = (c: string) =>
+        c === 'channel' || c === 'thread_ts' ? `${c} = COALESCE(?, ${c})` : `${c} = ?`;
       this.db
-        .prepare(
-          `UPDATE items SET ${cols.map((c) => `${c} = ?`).join(', ')}, reply = NULL, updated_at = ? WHERE id = ?`,
-        )
+        .prepare(`UPDATE items SET ${cols.map(set).join(', ')}, reply = NULL, updated_at = ? WHERE id = ?`)
         .run(...(Object.values(values) as (string | number | null)[]), t, existing.id);
       return this.getItem(existing.id) as Item;
     }
@@ -698,6 +656,13 @@ export class Store {
 
   setItemMessage(id: string, messageTs: string): void {
     this.db.prepare('UPDATE items SET message_ts = ? WHERE id = ?').run(messageTs, id);
+  }
+
+  /** A card posted as its own Slack message: that message is also the thread its run replies in. */
+  setItemSlack(id: string, channel: string, messageTs: string): void {
+    this.db
+      .prepare('UPDATE items SET channel = ?, thread_ts = ?, message_ts = ? WHERE id = ?')
+      .run(channel, messageTs, messageTs, id);
   }
 
   /** New field values (and the checks for them) on a pending item. */
@@ -874,82 +839,6 @@ export class Store {
          ON CONFLICT (project, queue) DO UPDATE SET last_slot = excluded.last_slot`,
       )
       .run(project, queue, slot);
-  }
-
-  /** Adds a task, or updates the open task of the same project with the same `key`. */
-  addTask(input: TaskInput): Task {
-    const t = this.now();
-    const existing = input.key
-      ? (this.db
-          .prepare('SELECT id FROM inbox WHERE project = ? AND key = ? AND done_at IS NULL')
-          .get(input.project, input.key) as { id: string } | undefined)
-      : undefined;
-    const fields = [
-      input.title.trim(),
-      input.details?.trim() || null,
-      input.level,
-      input.source || 'manual',
-      input.link || null,
-      input.dueAt ?? null,
-    ];
-    if (existing) {
-      this.db
-        .prepare(
-          'UPDATE inbox SET title = ?, details = ?, level = ?, source = ?, link = ?, due_at = ?, updated_at = ? WHERE id = ?',
-        )
-        .run(...fields, t, existing.id);
-      return this.getTask(existing.id) as Task;
-    }
-    const id = randomBytes(5).toString('hex');
-    this.db
-      .prepare(
-        `INSERT INTO inbox (id, project, key, title, details, level, source, link, due_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(id, input.project, input.key || null, ...fields, input.createdAt ?? t, t);
-    return this.getTask(id) as Task;
-  }
-
-  getTask(id: string): Task | undefined {
-    const row = this.db.prepare('SELECT * FROM inbox WHERE id = ?').get(id);
-    return row ? toTask(row as Record<string, unknown>) : undefined;
-  }
-
-  /** Open tasks (or done since `doneSince`), most urgent first, then by due date and age. */
-  tasks(opts: { project?: string; doneSince?: number } = {}): Task[] {
-    const where = [opts.doneSince === undefined ? 'done_at IS NULL' : 'done_at >= ?'];
-    const args: (string | number)[] = opts.doneSince === undefined ? [] : [opts.doneSince];
-    if (opts.project) {
-      where.push('project = ?');
-      args.push(opts.project);
-    }
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM inbox WHERE ${where.join(' AND ')}
-         ORDER BY CASE level WHEN 'urgent' THEN 0 WHEN 'decide' THEN 1 ELSE 2 END,
-           COALESCE(due_at, 9e15), created_at`,
-      )
-      .all(...args);
-    return (rows as Record<string, unknown>[]).map(toTask);
-  }
-
-  /** Marks a task done (or open again). Returns it, or undefined when there is no such task. */
-  setTaskDone(id: string, done: boolean): Task | undefined {
-    const t = this.now();
-    this.db.prepare('UPDATE inbox SET done_at = ?, updated_at = ? WHERE id = ?').run(done ? t : null, t, id);
-    this.db.prepare('DELETE FROM inbox WHERE done_at < ?').run(t - DONE_RETENTION_MS);
-    return this.getTask(id);
-  }
-
-  /**
-   * Marks done the open tasks of a project with this key, or, with `suffix`, every open task whose
-   * key ends in `:<entity>` (all tasks about one content item, whichever job added them).
-   */
-  closeTasks(project: string, match: { key?: string; suffix?: string }): Task[] {
-    const open = this.tasks({ project }).filter((task) =>
-      match.key ? task.key === match.key : match.suffix ? task.key?.endsWith(`:${match.suffix}`) : false,
-    );
-    return open.map((task) => this.setTaskDone(task.id, true) as Task);
   }
 
   close(): void {

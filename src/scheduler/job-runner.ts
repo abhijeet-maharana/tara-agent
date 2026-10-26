@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { BRIDGE_PROMPT, type Bridge, type RunContext } from '../bridge/bridge.js';
+import type { Bridge, RunContext } from '../bridge/bridge.js';
 import type { HostConfig, ScheduledJob } from '../config/schema.js';
 import { buildClaudeArgs } from '../runner/args.js';
 import { buildChildEnv } from '../runner/env.js';
@@ -98,9 +98,17 @@ export async function runJob(
   const channel = job.channel ?? project.config.slackChannel;
   const title = `*${job.name}*${triggerLabel(trigger)}`;
   const timeoutMs = job.timeoutMinutes * 60_000;
-  // Asked for in chat: run inside that message's thread instead of posting a new channel message.
+  // Asked for in chat, or running cards that share a Slack thread (a `slack` queue): run inside that
+  // thread instead of posting a new channel message.
+  const cardThread =
+    trigger.kind === 'queue' &&
+    trigger.items.every(
+      (i) => i.channel === channel && i.messageTs && i.threadTs === trigger.items[0]?.threadTs,
+    )
+      ? trigger.items[0]?.threadTs
+      : undefined;
   const requestTs =
-    trigger.kind === 'manual' && trigger.thread?.channel === channel ? trigger.thread.ts : undefined;
+    trigger.kind === 'manual' && trigger.thread?.channel === channel ? trigger.thread.ts : cardThread;
   // The thread the run posts in: the requester's message, or (continuing) the job's earlier thread.
   const inThread = trigger.kind === 'resume' ? trigger.threadTs : requestTs;
   const postMain = (text: string) => chat.post(channel, inThread, text);
@@ -216,7 +224,7 @@ export async function runJob(
     const appendSystemPrompt = [
       identityPrompt(deps.host.agentName),
       JOB_SYSTEM_PROMPT,
-      bridged && BRIDGE_PROMPT,
+      bridged && deps.bridge?.prompt(),
       project.systemPrompt,
     ]
       .filter(Boolean)

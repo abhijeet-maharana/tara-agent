@@ -36,6 +36,16 @@ export const hostConfigSchema = z.object({
       runAs: z.string().optional(),
     })
     .default({ bin: 'claude', chatTimeoutMinutes: 20 }),
+  /**
+   * Root actions a run may ask for (`request_privileged`), through the root-owned helper
+   * deploy/tara-priv.mjs. Unset = off. See docs/security.md "Privileged actions".
+   */
+  privileged: z
+    .object({
+      /** How to start the helper. */
+      command: z.array(z.string().min(1)).min(1).default(['sudo', '-n', '/usr/local/sbin/tara-priv']),
+    })
+    .optional(),
   /** Where the SQLite state lives. Defaults to `~/.local/state/tara-agent`. */
   stateDir: z.string().optional(),
   /** Days after its last use that a session's scratch folder (`TARA_SCRATCH`) is deleted. */
@@ -76,6 +86,30 @@ export const hostConfigSchema = z.object({
       fallback: z.string().url().optional(),
     })
     .default({ enabled: true, bind: '127.0.0.1', port: 4100, allowFrom: ['127.0.0.0/8', '::1/128'] }),
+  /**
+   * The Code page: each repo's files and uncommitted changes, read-only. Without `repos`, the
+   * projects are shown. See docs/code-view.md.
+   */
+  code: z
+    .object({
+      enabled: z.boolean().default(true),
+      repos: z
+        .array(
+          z.object({
+            path: z.string().min(1),
+            /** Where its git data is, when not `<path>/.git` (e.g. a one-way copy from another machine). */
+            gitDir: z.string().min(1).optional(),
+            /** How the page names it. Defaults to the project's title, else the folder name. */
+            title: z.string().min(1).max(40).optional(),
+            /** Project whose channel "Ask" posts to, for a repo that isn't a project. */
+            askIn: z.string().optional(),
+          }),
+        )
+        .optional(),
+      /** Never listed, shown or diffed (git pathspec globs). */
+      exclude: z.array(z.string().min(1)).default(['**/.env*', '**/*.pem', '**/*.key']),
+    })
+    .default({ enabled: true, exclude: ['**/.env*', '**/*.pem', '**/*.key'] }),
 });
 
 /** `<repo>/.tara/config.json`: committed in the project repo. */
@@ -228,6 +262,12 @@ export const queueSchema = z
       .default({}),
     /** Minutes between two runs of this queue. */
     gapMinutes: z.number().nonnegative().default(0),
+    /**
+     * Post each card in the project's Slack channel too, as its own thread (no buttons: decisions
+     * stay on the Approvals page). The message shows the decision, and a Revise and the run that
+     * executes the card reply in its thread.
+     */
+    slack: z.boolean().optional(),
     /** Timezone for slots, window defaults and the cap day. Defaults to the jobs file `tz`, then the host. */
     tz: z.string().optional(),
   })

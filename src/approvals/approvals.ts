@@ -1,6 +1,7 @@
 import { createHmac } from 'node:crypto';
 import { loadQueues } from '../config/load.js';
 import type { Project } from '../config/schema.js';
+import type { Privileged, PrivilegedResult } from '../privileged/privileged.js';
 import type { ChatPort, IncomingMessage, Logger, SlackBlock } from '../sessions/manager.js';
 import { splitMessage, toSlackMrkdwn } from '../slack/format.js';
 import type { Item, ItemCheck, ItemField, ItemMedia, Store } from '../store/store.js';
@@ -8,7 +9,8 @@ import { sealItem } from './seal.js';
 
 /**
  * Approval items: the cards on the Approvals page (and, for a paused run, in its Slack thread).
- *   resume  a run stopped for a decision (`request_approval`); the answer continues that run
+ *   resume  a run stopped for a decision (`request_approval`); the answer continues that run. A
+ *           project server can ask too (`ask`): the answer then starts the agent in the card's thread
  *   queue   a draft (`propose_item`) that, once approved, runs later through one of the project's
  *           queues (scheduler/queues.ts)
  * Decisions come from Slack taps and from the dashboard (human-only, see http/server.ts) and both
@@ -29,6 +31,8 @@ export const DEFAULT_OPTIONS = ['Approve', 'Reject'];
 export const NEGATIVE = /^(reject|deny|no|cancel|stop|decline|skip)/i;
 /** The option that asks for a new draft instead of deciding. */
 export const REVISE = 'Revise';
+/** Cards for root actions (`request_privileged`): approving one runs its action, then the run continues. */
+export const PRIVILEGED_KIND = 'privileged';
 const SECTION_MAX = 2_800;
 
 /** What a run proposes for later (`propose_item`). */
@@ -75,6 +79,8 @@ export interface ApprovalsDeps {
   timeZone: string;
   /** APPROVAL_SEAL_KEY. */
   sealKey?: string;
+  /** Runs the action of an approved privileged card (host `privileged`). */
+  privileged?: Privileged;
   fetch?: typeof fetch;
   now?: () => number;
   newId?: () => string;
@@ -105,7 +111,14 @@ export class Approvals {
   /** A paused run's decision: stored as a card and posted with buttons in the run's Slack thread. */
   async requestDecision(
     ctx: { project: Project; channel: string; threadTs: string; jobId?: string },
-    input: { title: string; details: string; options?: string[]; kind?: string },
+    input: {
+      title: string;
+      details: string;
+      options?: string[];
+      kind?: string;
+      key?: string;
+      fields?: ItemField[];
+    },
   ): Promise<{ id: string; options: string[] }> {
     const title = input.title.trim().slice(0, 150);
     const options = cleanOptions(input.options);
@@ -114,9 +127,11 @@ export class Approvals {
       id: this.deps.newId?.(),
       project: ctx.project.config.name,
       kind: input.kind || 'decision',
+      key: input.key,
       mode: 'resume',
       title,
       body: input.details.trim(),
+      fields: input.fields?.map(cleanField),
       options,
       source: ctx.jobId,
       jobId: ctx.jobId,
@@ -157,6 +172,30 @@ export class Approvals {
     return { id: item.id, options };
   }
 
+  /**
+   * A card a project server raises outside any run (a login that expired, a send that bounced): posted
+   * in the project's channel and on the Approvals page, and the decision goes to the agent in that
+   * thread like a reply. A pending card with the same `key` is returned instead of a second one.
+   */
+  async ask(
+    project: Project,
+    input: { title: string; details: string; options?: string[]; kind?: string; key?: string },
+  ): Promise<Item> {
+    const { store } = this.deps;
+    const title = input.title.trim().slice(0, 150);
+    if (!title) throw new ApprovalError(400, 'Need a title');
+    const pending = input.key
+      ? store
+          .items({ project: project.config.name, statuses: ['pending'], limit: 500 })
+          .find((i) => i.key === input.key)
+      : undefined;
+    if (pending) return pending;
+    const channel = project.config.slackChannel;
+    const threadTs = await this.deps.chat.post(channel, undefined, `🟡 ${title}`);
+    const { id } = await this.requestDecision({ project, channel, threadTs }, { ...input, title });
+    return store.getItem(id) as Item;
+  }
+
   /** A draft for later: checked, then waits on the Approvals page. Same key = update the pending one. */
   async propose(project: Project, input: ProposeInput, origin: Origin = {}): Promise<Item> {
     const queues = loadQueues(project);
@@ -172,7 +211,7 @@ export class Approvals {
       throw new ApprovalError(400, `Queue "${input.queue}" has no window "${input.window}"`);
     const fields = (input.fields ?? []).map(cleanField);
     const checks = [...(input.checks ?? []), ...(await this.checks(project, input.kind, input.key, fields))];
-    return this.deps.store.proposeItem({
+    const item = this.deps.store.proposeItem({
       id: this.deps.newId?.(),
       project: project.config.name,
       kind: input.kind,
@@ -192,6 +231,97 @@ export class Approvals {
       window: input.window,
       runAfter: input.runAfter,
     });
+    if (queue.slack) await this.postCard(project, item);
+    return this.deps.store.getItem(item.id) as Item;
+  }
+
+  /**
+   * A `slack` queue's card as its own message in the project's channel (a refresh edits the same
+   * message), so each card has a thread: the decision shows on the message, and a Revise and the run
+   * that executes the card reply in it. Decisions stay on the Approvals page: the message has no
+   * buttons. A Slack failure never loses the card: it still waits on the Approvals page.
+   */
+  private async postCard(project: Project, item: Item): Promise<void> {
+    const channel = item.channel ?? project.config.slackChannel;
+    if (!channel) return;
+    const shown = (v: string | string[]) => (Array.isArray(v) ? v.join('\n') : v).trim();
+    const fields = item.fields
+      .filter((f) => shown(f.value))
+      .map((f) => {
+        const value = shown(f.value).slice(0, 1_200);
+        return `*${f.label}*\n${value
+          .split('\n')
+          .map((l) => `> ${l}`)
+          .join('\n')}`;
+      });
+    const checks = item.checks.map((c) => `${c.blocking ? '⛔' : '⚠️'} ${c.text}`);
+    const text = [toSlackMrkdwn(item.body ?? ''), ...fields, ...checks].filter(Boolean).join('\n\n');
+    const blocks: SlackBlock[] = [
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text: `*📝 ${item.title}*\n${text}`.slice(0, SECTION_MAX) },
+      },
+      {
+        type: 'context',
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: `Waiting on the Approvals page (${item.options.join(' · ')} · Revise). What happens next shows in this thread.`,
+          },
+        ],
+      },
+    ];
+    try {
+      if (item.messageTs) await this.deps.chat.update(channel, item.messageTs, item.title, blocks);
+      else if (item.threadTs) {
+        // Proposed by a run: the card goes in that run's thread, which stays the card's thread.
+        this.deps.store.setItemMessage(
+          item.id,
+          await this.deps.chat.postBlocks(channel, item.threadTs, item.title, blocks),
+        );
+      } else {
+        this.deps.store.setItemSlack(
+          item.id,
+          channel,
+          await this.deps.chat.postBlocks(channel, undefined, item.title, blocks),
+        );
+      }
+    } catch (err) {
+      this.deps.log.warn(
+        `[${item.project}] could not post card ${item.id} to Slack: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  /**
+   * An item finished (any executor: a job's finish_item, a URL executor's answer, an external
+   * project's report, or a run that ended without reporting): say how it went in the card's Slack
+   * thread, unless the run that reported it is already posting in that thread. Then tell the hook.
+   */
+  finished(item: Item, runThread?: string): void {
+    if (item.channel && item.messageTs && item.threadTs && item.threadTs !== runThread)
+      this.postInThread(
+        item,
+        `${item.status === 'done' ? '✅ Done' : '❌ Failed'}${item.result ? `: ${item.result}` : ''}`,
+      );
+    this.notify(item, 'finished');
+  }
+
+  private postInThread(item: Item, text: string): void {
+    void this.deps.chat
+      .post(item.channel as string, item.threadTs, toSlackMrkdwn(text).slice(0, 2_000))
+      .catch((err: Error) => this.deps.log.warn(`could not post to the card's thread: ${err.message}`));
+  }
+
+  /** A card's Slack message once it closed without a decision there (withdrawn, cancelled). */
+  private closeMessage(item: Item, note: string): void {
+    if (!item.channel || !item.messageTs) return;
+    void this.deps.chat
+      .update(item.channel, item.messageTs, `${item.title}: ${note}`, [
+        { type: 'section', text: { type: 'mrkdwn', text: `*${item.title}*` } },
+        { type: 'context', elements: [{ type: 'mrkdwn', text: note }] },
+      ])
+      .catch((err: Error) => this.deps.log.warn(`could not update approval message: ${err.message}`));
   }
 
   /**
@@ -236,9 +366,17 @@ export class Approvals {
     const blocking = item.checks.filter((c) => c.blocking);
     if (runs && blocking.length)
       throw new ApprovalError(409, `Fix this first: ${blocking.map((c) => c.text).join('; ')}`);
+    // An approved root action runs first (approved → running → done/failed), then its run continues.
+    const action = runs && item.mode === 'resume' ? privilegedAction(item) : undefined;
     // A paused run's card is finished once decided (the run gets the answer); a draft waits in its queue.
     const decided = store.decideItem(id, {
-      status: negative ? 'rejected' : item.mode === 'resume' || !runs ? 'done' : 'approved',
+      status: negative
+        ? 'rejected'
+        : action
+          ? 'approved'
+          : item.mode === 'resume' || !runs
+            ? 'done'
+            : 'approved',
       decision: d.option,
       by: d.by,
       reply: d.reply?.trim() || undefined,
@@ -261,15 +399,67 @@ export class Approvals {
         ])
         .catch((err: Error) => this.deps.log.warn(`could not update approval message: ${err.message}`));
     }
+    const ran = action ? `\n${privilegedNote(await this.runPrivileged(decided.id, action))}` : '';
     if (decided.mode === 'resume') {
       const edits =
         d.fields && Object.keys(d.fields).length ? `\nEdited values: ${JSON.stringify(d.fields)}` : '';
       const note = d.reply?.trim() ? `\nNote: ${d.reply.trim()}` : '';
-      const text = `USER DECISION on "${decided.title}": ${d.option}${note}${edits} (${d.via === 'slack' ? 'tapped' : 'chosen on the Approvals page'} at ${when})`;
+      const text = `USER DECISION on "${decided.title}": ${d.option}${note}${edits} (${d.via === 'slack' ? 'tapped' : 'chosen on the Approvals page'} at ${when})${ran}`;
       await this.continueConversation(project, decided, d.by, text);
     }
-    this.notify(decided, 'decided');
-    return decided;
+    const final = action ? (store.getItem(id) as Item) : decided;
+    this.notify(final, 'decided');
+    return final;
+  }
+
+  /**
+   * A root action that needs no approval (`auto`): it runs at once and is kept as a finished card,
+   * so the Approvals page still shows what ran as root and when.
+   */
+  async runAutoPrivileged(
+    ctx: { project: Project; channel: string; threadTs: string; jobId?: string; kind?: string },
+    input: { title: string; details: string; fields: ItemField[] },
+  ): Promise<PrivilegedResult> {
+    const { store } = this.deps;
+    const item = store.proposeItem({
+      id: this.deps.newId?.(),
+      project: ctx.project.config.name,
+      kind: PRIVILEGED_KIND,
+      mode: 'resume',
+      title: input.title.trim().slice(0, 150),
+      body: input.details.trim(),
+      fields: input.fields.map(cleanField),
+      options: ['Run it'],
+      source: ctx.jobId ?? (ctx.kind === 'chat' ? 'chat' : undefined),
+      jobId: ctx.jobId,
+      channel: ctx.channel,
+      threadTs: ctx.threadTs,
+    });
+    store.decideItem(item.id, { status: 'approved', decision: 'Run it', by: 'auto' });
+    const action = privilegedAction(item);
+    if (!action) throw new ApprovalError(400, 'No action to run');
+    return this.runPrivileged(item.id, action);
+  }
+
+  /** Runs an approved privileged card's action and records how it went on the card. */
+  private async runPrivileged(id: string, action: { id: string; args: Record<string, string> }) {
+    const { store, privileged } = this.deps;
+    store.startItems([id]);
+    const result: PrivilegedResult = privileged
+      ? await privileged.run(action.id, action.args).catch((err: Error) => ({
+          ok: false,
+          exitCode: -1,
+          command: action.id,
+          output: err.message,
+        }))
+      : { ok: false, exitCode: -1, command: action.id, output: 'Privileged actions are off on this host' };
+    store.finishItem(
+      id,
+      result.ok ? 'done' : 'failed',
+      `${result.command}: exit ${result.exitCode}${result.output ? `\n${result.output}` : ''}`,
+    );
+    this.deps.log.info(`privileged ${action.id} (${id}) exited ${result.exitCode}`);
+    return result;
   }
 
   /**
@@ -303,6 +493,7 @@ export class Approvals {
   cancel(id: string, by: string): Item {
     const item = this.deps.store.cancelItem(id, by);
     if (!item) throw new ApprovalError(409, 'Only waiting or scheduled items can be cancelled');
+    this.closeMessage(item, '➖ Cancelled on the Approvals page');
     this.notify(item, 'decided'); // a project that runs it itself must stop now
     return item;
   }
@@ -319,6 +510,7 @@ export class Approvals {
     if (item.status !== 'pending') throw new ApprovalError(409, `Already ${item.status}`);
     const cancelled = store.cancelItem(id, 'project') as Item;
     store.noteItem(id, reason);
+    this.closeMessage(cancelled, `➖ Withdrawn${reason ? `: ${reason}` : ''}`);
     this.notify(cancelled, 'decided');
     return store.getItem(id) as Item;
   }
@@ -336,10 +528,13 @@ export class Approvals {
       throw new ApprovalError(409, 'Only items of an external queue are reported by their project');
     if (item.status !== 'approved' && item.status !== 'running')
       throw new ApprovalError(409, `Already ${item.status}`);
-    if (status === 'waiting') return store.noteItem(id, result) as Item;
+    if (status === 'waiting') {
+      if (result && result !== item.result && item.messageTs) this.postInThread(item, `⏳ ${result}`);
+      return store.noteItem(id, result) as Item;
+    }
     store.startItems([id]);
     const finished = store.finishItem(id, status, result) as Item;
-    this.notify(finished, 'finished');
+    this.finished(finished);
     return finished;
   }
 
@@ -408,6 +603,32 @@ export class Approvals {
       minute: '2-digit',
     });
   }
+}
+
+/** The action a privileged card runs when approved (none for "run this yourself" cards). */
+function privilegedAction(item: Item): { id: string; args: Record<string, string> } | undefined {
+  if (item.kind !== PRIVILEGED_KIND) return undefined;
+  const value = (key: string) => {
+    const v = item.fields.find((f) => f.key === key)?.value;
+    return typeof v === 'string' ? v : undefined;
+  };
+  const id = value('action');
+  if (!id) return undefined;
+  try {
+    const args = JSON.parse(value('args') || '{}') as unknown;
+    if (typeof args !== 'object' || args === null || Array.isArray(args)) return undefined;
+    return { id, args: args as Record<string, string> };
+  } catch {
+    return undefined;
+  }
+}
+
+/** How a root action went, for the run that asked for it. */
+export function privilegedNote(r: PrivilegedResult): string {
+  const head = r.ok
+    ? `Ran \`${r.command}\` as root: exit 0.`
+    : `\`${r.command}\` FAILED as root (exit ${r.exitCode}).`;
+  return r.output ? `${head}\nOutput:\n\`\`\`\n${r.output}\n\`\`\`` : head;
 }
 
 function cleanOptions(options: string[] | undefined): string[] {

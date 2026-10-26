@@ -26,10 +26,10 @@ export class FakeChat implements ChatPort {
     this.log.push(`post ${thread ?? 'top'} ${ts}: ${text}`);
     return ts;
   }
-  async postBlocks(_c: string, thread: string, text: string, blocks: SlackBlock[]) {
+  async postBlocks(_c: string, thread: string | undefined, text: string, blocks: SlackBlock[]) {
     const ts = this.nextTs();
-    this.blockPosts.push({ thread, text, ts, blocks });
-    this.log.push(`blocks ${thread} ${ts}: ${text}`);
+    this.blockPosts.push({ thread: thread ?? '', text, ts, blocks });
+    this.log.push(`blocks ${thread ?? 'top'} ${ts}: ${text}`);
     return ts;
   }
   async update(_c: string, ts: string, text: string, blocks?: SlackBlock[]) {

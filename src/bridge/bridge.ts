@@ -3,8 +3,15 @@ import { chmodSync, chownSync, mkdtempSync, realpathSync, rmSync, statSync, writ
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ApprovalError, type Approvals, type ProposeInput } from '../approvals/approvals.js';
+import {
+  ApprovalError,
+  type Approvals,
+  PRIVILEGED_KIND,
+  type ProposeInput,
+  privilegedNote,
+} from '../approvals/approvals.js';
 import type { PermissionMode, Project } from '../config/schema.js';
+import type { Privileged } from '../privileged/privileged.js';
 import { describeTool } from '../runner/stream.js';
 import type { JobControl } from '../scheduler/scheduler.js';
 import type { ChatPort, IncomingMessage, Logger, SlackBlock } from '../sessions/manager.js';
@@ -61,10 +68,16 @@ export const JOB_TOOLS_PROMPT = `- To run one of this channel's scheduled jobs n
 
 /** Appended to the system prompt of every run that has tara's MCP tools. */
 export const BRIDGE_PROMPT = `Slack tools (tara MCP server):
-- Before anything that needs a human decision (spending money; changing prices, listings, ads, orders or data; publishing; sending messages to other people), call \`request_approval\` with the exact proposal and numbers, then end your turn without acting. It becomes a card on the Approvals page and in this thread; the answer arrives as your next message, starting with "USER DECISION", and you continue from there.
+- Everything that needs a person goes through \`request_approval\`: a card on the Approvals page and in this thread. The answer arrives as your next message, starting with "USER DECISION", and you continue from there. There is no other task list. Raise a card for:
+  - a decision, before you act (spending money; changing prices, listings, ads, orders or data; publishing; sending messages to other people): the exact proposal and numbers. End your turn without acting.
+  - a suggestion worth acting on: approving it means you do it.
+  - something only a person can do (a login, an OTP, a captcha, a call, a failure you could not fix): say exactly what, with options like "Done, continue" / "Skip".
+  No card for OK or FYI news: that stays in your reply.
 - Drafts that should go out later (messages, emails, applications, posts) go through \`propose_item\` with the queue that sends them: one card each, approved or edited on the Approvals page, then run at the queue's time. Never send them yourself.
-- To share a screenshot, PDF, CSV or image, save it inside the project (e.g. .scratch/) and call \`send_file\`.
-- When something only a person can do blocks you (a login, an OTP, a captcha, a call, a failure you could not fix), call \`add_task\` with a stable \`key\`; call \`complete_task\` with that key once it is resolved. Never add a task to ask for an approval.`;
+- To share a screenshot, PDF, CSV or image, save it inside the project (e.g. .scratch/) and call \`send_file\`.`;
+
+/** Without root actions on the host: a run can still ask a person to run a command for it. */
+export const PRIVILEGED_MANUAL_PROMPT = `Root access (you have no sudo): when something needs root or fails with Permission denied outside your reach, call \`request_privileged\` with \`command\` (the exact shell command a person should run) and end your turn; you continue once they have run it.`;
 
 /** Modes in which Claude never asks, so there is nothing to route to buttons. */
 const NEVER_ASKS: PermissionMode[] = ['bypassPermissions', 'dontAsk'];
@@ -79,6 +92,8 @@ export interface BridgeDeps {
   store: Store;
   /** Approval items (request_approval, propose_item, finish_item). */
   approvals: Approvals;
+  /** Root actions (`request_privileged`); unset = runs can only ask a person to run a command. */
+  privileged?: Privileged;
   log: Logger;
   projects: Project[];
   timeZone: string;
@@ -156,6 +171,11 @@ export class Bridge {
     };
   }
 
+  /** The system prompt part for runs with tara's MCP tools. */
+  prompt(): string {
+    return [BRIDGE_PROMPT, this.deps.privileged?.prompt() || PRIVILEGED_MANUAL_PROMPT].join('\n\n');
+  }
+
   /** The run a token belongs to; throws 401 for unknown or finished runs. */
   run(token: string | undefined): RunContext {
     const ctx = token ? this.runs.get(token) : undefined;
@@ -169,6 +189,69 @@ export class Bridge {
   ): Promise<{ id: string; options: string[] }> {
     const ctx = this.run(token);
     return this.deps.approvals.requestDecision(ctx, input).catch(asBridgeError);
+  }
+
+  /**
+   * Something only root can do. An allowlisted action either runs at once (`auto`) and returns how it
+   * went, or becomes a card whose approval runs it and continues the run (a chat or a scheduled job
+   * alike); a free-form `command` becomes a card asking a person to run it.
+   */
+  async requestPrivileged(
+    token: string | undefined,
+    input: {
+      action?: string;
+      args?: Record<string, string>;
+      command?: string;
+      reason: string;
+      title?: string;
+    },
+  ): Promise<{ id?: string; ran?: boolean; ok?: boolean; result?: string; options?: string[] }> {
+    const ctx = this.run(token);
+    const reason = input.reason.trim();
+    if (!input.action === !input.command?.trim())
+      throw new BridgeError(400, 'Give either an "action" or a "command"');
+    if (input.command) {
+      const command = input.command.trim();
+      return this.deps.approvals
+        .requestDecision(ctx, {
+          kind: PRIVILEGED_KIND,
+          title: input.title?.trim() || `Run as root: ${command.split('\n')[0]?.slice(0, 100)}`,
+          details: `${reason}\n\nPlease run this on the machine, then continue:\n\`\`\`\n${command}\n\`\`\``,
+          options: ['I ran it, continue', 'Reject'],
+        })
+        .catch(asBridgeError);
+    }
+    const privileged = this.deps.privileged;
+    if (!privileged) throw new BridgeError(404, 'No root actions on this host: ask for a "command" instead');
+    const args = input.args ?? {};
+    const plan = await privileged.plan(input.action as string, args).catch((err: Error) => {
+      throw new BridgeError(400, err.message);
+    });
+    const card = {
+      title: input.title?.trim() || `Root: ${plan.description}`,
+      details: `${reason}\n\nRuns as root:\n\`\`\`\n${plan.command}\n\`\`\``,
+      fields: [
+        { key: 'action', label: 'Action', type: 'text' as const, value: plan.id, readOnly: true },
+        ...(Object.keys(args).length
+          ? [
+              {
+                key: 'args',
+                label: 'Arguments',
+                type: 'text' as const,
+                value: JSON.stringify(args),
+                readOnly: true,
+              },
+            ]
+          : []),
+      ],
+    };
+    if (plan.auto) {
+      const result = await this.deps.approvals.runAutoPrivileged(ctx, card).catch(asBridgeError);
+      return { ran: true, ok: result.ok, result: privilegedNote(result) };
+    }
+    return this.deps.approvals
+      .requestDecision(ctx, { ...card, kind: PRIVILEGED_KIND, options: ['Run it', 'Reject'] })
+      .catch(asBridgeError);
   }
 
   /** A draft for later, as an approval card of this run's project. */
@@ -195,7 +278,7 @@ export class Bridge {
       throw new BridgeError(403, `Item ${input.id} was not given to this run`);
     const item = this.deps.store.finishItem(input.id, input.status, input.result);
     if (!item) throw new BridgeError(409, `Item ${input.id} is not running (already reported?)`);
-    this.deps.approvals.notify(item, 'finished');
+    this.deps.approvals.finished(item, ctx.threadTs);
     return { id: item.id, status: item.status };
   }
 

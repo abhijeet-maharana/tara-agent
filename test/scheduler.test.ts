@@ -10,7 +10,7 @@ import { buildDigest } from '../src/scheduler/health.js';
 import { streamRecipient } from '../src/scheduler/job-runner.js';
 import { Scheduler } from '../src/scheduler/scheduler.js';
 import type { ScriptResult } from '../src/scheduler/script.js';
-import { Store, type StoredRun } from '../src/store/store.js';
+import { type Item, Store, type StoredRun } from '../src/store/store.js';
 import { FakeChat, FakeStream, testHost } from './fakes.js';
 
 const host = testHost({ concurrency: 2, catchUpHours: 6, claude: { bin: 'claude', chatTimeoutMinutes: 20 } });
@@ -112,6 +112,23 @@ const baseJob = {
 };
 
 describe('Scheduler', () => {
+  it('runs a card posted in Slack inside its thread', async () => {
+    const { chat, store, scheduler } = setup({ jobs: [baseJob] });
+    scheduler.start();
+    const card = store.proposeItem({
+      project: 'shop',
+      kind: 'x-reply',
+      mode: 'queue',
+      title: 'Reply',
+      options: ['Approve'],
+      queue: 'replies',
+    });
+    store.setItemSlack(card.id, 'C1', 'card.1');
+    await scheduler.runQueue('shop', 'sla', 'replies', [store.getItem(card.id) as Item]);
+    expect(chat.posts[0]?.thread).toBe('card.1');
+    expect(chat.reactions).toContain('+eyes@card.1');
+  });
+
   it('runs a job on demand: script context, job prompt, headline in channel, details in thread', async () => {
     const { chat, calls, scripts, scheduler, store } = setup({
       jobs: [{ ...baseJob, preScript: 'gate.sh', skills: ['sla-report'] }],

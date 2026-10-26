@@ -1,11 +1,11 @@
 # Dashboard look
 
-tara-agent's dashboard is the home for everything about the agent: jobs, runs, the schedule, sessions and the inbox. A project can have its own dashboard for its own work (set `dashboardUrl` in `.tara/config.json`). These rules keep the dashboards feeling like one app.
+tara-agent's dashboard is the home for everything about the agent: jobs, runs, the schedule, sessions and approval cards. A project can have its own dashboard for its own work (set `dashboardUrl` in `.tara/config.json`). These rules keep the dashboards feeling like one app.
 
 ## One home for each thing
-- **Agent things live in tara-agent only.** That covers job lists, Run now, Pause and Resume, run history, the schedule, sessions, inbox tasks and **approval cards** (every decision and every draft waiting for approval). A project dashboard may show a one-line summary, e.g. "41 jobs · 0 failing", plus its own urgent and decide tasks. It links to tara-agent for the rest and never re-implements those pages.
+- **Agent things live in tara-agent only.** That covers job lists, Run now, Pause and Resume, run history, the schedule, sessions and **approval cards** (everything that needs a person: every decision, suggestion, login and draft). A project dashboard may show a one-line summary, e.g. "41 jobs · 0 failing". It links to tara-agent for the rest and never re-implements those pages.
 - **Project dashboards show the project's own work and history**, such as orders, a pipeline or what was sent, plus one row "N approvals waiting →" that links to the Approvals page filtered to the project.
-- **Change jobs and tasks only through tara-agent's API** (`POST /jobs/…`, `POST /inbox…`). Never write another repo's `.tara/jobs.json`.
+- **Change jobs and cards only through tara-agent's API** (`POST /jobs/…`, `POST /items…`). Never write another repo's `.tara/jobs.json`.
 
 ## Tokens
 - Copy `TOKENS` and `SWITCHER_CSS` from [`src/http/look.ts`](../src/http/look.ts) verbatim, with a comment `copied from tara-agent src/http/look.ts — edit there`.

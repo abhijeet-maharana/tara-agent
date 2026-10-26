@@ -76,19 +76,19 @@ describe('dashboard token', () => {
     });
     const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     const html = { accept: 'text/html' };
-    expect((await fetch(`${base}/inbox`, { headers: html })).status).toBe(401);
-    expect((await fetch(`${base}/inbox`)).status).toBe(401);
+    expect((await fetch(`${base}/sessions`, { headers: html })).status).toBe(401);
+    expect((await fetch(`${base}/sessions`)).status).toBe(401);
 
-    const login = await fetch(`${base}/inbox?token=s3cret`, { headers: html, redirect: 'manual' });
+    const login = await fetch(`${base}/sessions?token=s3cret`, { headers: html, redirect: 'manual' });
     expect(login.status).toBe(303);
-    expect(login.headers.get('location')).toBe('/inbox');
+    expect(login.headers.get('location')).toBe('/sessions');
     const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0] as string;
-    const page = await fetch(`${base}/inbox`, { headers: { ...html, cookie } });
+    const page = await fetch(`${base}/sessions`, { headers: { ...html, cookie } });
     expect(page.status).toBe(200);
-    expect(await page.text()).toContain('<h1>Inbox</h1>');
+    expect(await page.text()).toContain('<h1>Sessions</h1>');
 
-    const api = await fetch(`${base}/inbox`, { headers: { authorization: 'Bearer s3cret' } });
-    expect(await api.json()).toEqual({ tasks: [] });
+    const api = await fetch(`${base}/sessions`, { headers: { authorization: 'Bearer s3cret' } });
+    expect(api.status).toBe(200);
     server.close();
   });
 });

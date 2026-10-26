@@ -6,9 +6,11 @@ import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { Approvals } from './approvals/approvals.js';
 import { Bridge } from './bridge/bridge.js';
+import { codeReaders } from './code/repo.js';
 import { DEFAULT_HOST_CONFIG, expandHome, loadHostConfig, loadJobs, loadProjects } from './config/load.js';
 import { startHttpServer } from './http/server.js';
 import { convertHermesJobs } from './import-hermes.js';
+import { Privileged } from './privileged/privileged.js';
 import { resolveRunAs } from './runner/as-user.js';
 import { type Runner, runClaude } from './runner/run.js';
 import { sweepScratch } from './runner/workspace.js';
@@ -30,9 +32,7 @@ const USAGE = `Usage:
   tara-agent validate [--config <file>]      check host, project and job config, then exit
   tara-agent import-hermes --from <hermes jobs json> --out <repo>/.tara/jobs.json
       [--scripts-dir .agents/hermes/cron/scripts] [--default-model haiku] [--tz UTC]
-      [--env KEY=VALUE ...] [--force]
-  tara-agent import-tasks --from <tasks.json> [--config <file>]
-      add the open tasks of an older JSON task board to the inbox (P0 urgent, P1 decide, P2/P3 later)`;
+      [--env KEY=VALUE ...] [--force]`;
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -66,37 +66,6 @@ function validate(configFlag: string | undefined): void {
     log.info(`✓ ${p.config.name} (${p.dir}): ${enabled}/${jobs.length} jobs enabled`);
   }
   log.info(`✓ config OK (timezone ${host.timezone}, jobConcurrency ${host.jobConcurrency})`);
-}
-
-/** One-off move of an older JSON task board (`[{title, priority: P0-P3, area, key?, …}]`) into the inbox. */
-function importTasks(args: string[]): void {
-  const { values } = parseArgs({ args, options: { from: { type: 'string' }, config: { type: 'string' } } });
-  if (!values.from) throw new Error(USAGE);
-  const { host, projects } = loadAll(values.config);
-  const names = projects.map((p) => p.config.name);
-  const store = new Store(path.join(host.stateDir as string, 'tara.db'));
-  const level = { P0: 'urgent', P1: 'decide', P2: 'later', P3: 'later' } as const;
-  const old = JSON.parse(readFileSync(path.resolve(expandHome(values.from)), 'utf8')) as Array<
-    Record<string, string | undefined>
-  >;
-  let added = 0;
-  for (const t of old) {
-    if (t.status !== 'open' || !t.title || !t.area || !names.includes(t.area)) continue;
-    store.addTask({
-      project: t.area,
-      title: t.title,
-      level: level[t.priority as keyof typeof level] ?? 'later',
-      key: t.key,
-      details: t.details,
-      source: t.source,
-      link: t.link,
-      dueAt: t.dueAt ? Date.parse(t.dueAt) : undefined,
-      createdAt: t.createdAt ? Date.parse(t.createdAt) : undefined,
-    });
-    added++;
-  }
-  store.close();
-  log.info(`Imported ${added} open tasks (${old.length - added} skipped: done or unknown project)`);
 }
 
 function importHermes(args: string[]): void {
@@ -162,6 +131,12 @@ async function serve(configFlag: string | undefined) {
         : (bridge?.handleButton(tap) ?? Promise.resolve()),
     streaming: host.streaming,
   });
+  // Root actions: the helper's allowlist is the source of truth; without it runs can only ask a person.
+  const privileged = host.privileged ? new Privileged(host.privileged.command) : undefined;
+  await privileged
+    ?.load()
+    .then((actions) => log.info(`Root actions: ${actions.map((a) => a.id).join(', ') || 'none'}`))
+    .catch((err: Error) => log.warn(`Root actions are unavailable: ${err.message}`));
   const approvals = new Approvals({
     store,
     chat: slack.chat,
@@ -169,6 +144,7 @@ async function serve(configFlag: string | undefined) {
     projects,
     timeZone: host.timezone,
     sealKey: process.env.APPROVAL_SEAL_KEY || undefined,
+    privileged,
   });
   if (!process.env.APPROVAL_SEAL_KEY) log.warn('APPROVAL_SEAL_KEY is not set: approved items are not sealed');
   // tara's MCP tools reach tara-agent through the local API, so they need it.
@@ -178,6 +154,7 @@ async function serve(configFlag: string | undefined) {
       chat: slack.chat,
       store,
       approvals,
+      privileged,
       log,
       projects,
       timeZone: host.timezone,
@@ -218,8 +195,9 @@ async function serve(configFlag: string | undefined) {
     log,
     jobs: scheduler,
     timeZone: host.timezone,
-    onFinished: (item) => approvals.notify(item, 'finished'),
+    onFinished: (item) => approvals.finished(item),
   });
+  const readers = codeReaders(host, projects);
   // HTTP first: when tara-agent takes over a port, the hand-over gap is as short as possible.
   const http = host.http.enabled
     ? await startHttpServer({
@@ -230,6 +208,24 @@ async function serve(configFlag: string | undefined) {
         bridge,
         approvals,
         adminToken: process.env.TARA_ADMIN_TOKEN || undefined,
+        readAs: runAs?.user,
+        continueThread: (msg) => (manager as SessionManager).handle(msg),
+        code: readers.length
+          ? {
+              readers,
+              // A new thread in the project's channel, as if its owner had asked there.
+              ask: async (repo, title, prompt) => {
+                const project = projects.find((p) => p.config.name === repo.askIn);
+                if (!project) throw new Error(`No project "${repo.askIn}" to ask in`);
+                const channel = project.config.slackChannel;
+                const ts = await slack.chat.post(channel, undefined, title);
+                const user = project.config.owner ?? project.config.allowedUsers[0] ?? 'dashboard';
+                void (manager as SessionManager).handle({ channel, threadTs: ts, ts, user, text: prompt });
+                const base = slack.workspaceUrl();
+                return { url: base && `${base}archives/${channel}/p${ts.replace('.', '')}` };
+              },
+            }
+          : undefined,
         projects: projects.map((p) => p.config.name),
         dashboard: {
           projects,
@@ -281,7 +277,6 @@ async function serve(configFlag: string | undefined) {
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
   if (command === 'import-hermes') return importHermes(rest);
-  if (command === 'import-tasks') return importTasks(rest);
   if (command === '--help' || command === 'help') return void log.info(USAGE);
   const args = command === 'validate' ? rest : process.argv.slice(2);
   const { values } = parseArgs({ args, options: { config: { type: 'string', short: 'c' } } });

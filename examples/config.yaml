@@ -8,3 +8,10 @@ claude:
   bin: claude
   chatTimeoutMinutes: 20
 statusIntervalSeconds: 5
+# Code page (/code): uncommitted changes and files of each repo. Default: the projects above.
+# code:
+#   repos:
+#     - path: ~/Projects/my-shop
+#     - path: ~/Projects/tara-agent
+#       askIn: my-shop # a repo that isn't a project: whose channel "Ask" uses
+#   exclude: ['**/.env*', '**/*.pem', '**/*.key']

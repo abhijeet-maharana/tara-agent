@@ -1,11 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import {
-  BRIDGE_PROMPT,
-  type Bridge,
-  JOB_TOOLS_PROMPT,
-  type RunContext,
-  wantsPermissionPrompts,
-} from '../bridge/bridge.js';
+import { type Bridge, JOB_TOOLS_PROMPT, type RunContext, wantsPermissionPrompts } from '../bridge/bridge.js';
 import type { HostConfig, Project } from '../config/schema.js';
 import { buildClaudeArgs } from '../runner/args.js';
 import { buildChildEnv } from '../runner/env.js';
@@ -27,8 +21,13 @@ export interface ChatPort {
   post(channel: string, threadTs: string | undefined, text: string): Promise<string>;
   delete(channel: string, ts: string): Promise<void>;
   update(channel: string, ts: string, text: string, blocks?: SlackBlock[]): Promise<void>;
-  /** Posts a Block Kit message (text is the notification/fallback text). */
-  postBlocks(channel: string, threadTs: string, text: string, blocks: SlackBlock[]): Promise<string>;
+  /** Posts a Block Kit message (text is the notification/fallback text), top-level without `threadTs`. */
+  postBlocks(
+    channel: string,
+    threadTs: string | undefined,
+    text: string,
+    blocks: SlackBlock[],
+  ): Promise<string>;
   /** Uploads a local file into a thread. */
   uploadFile(channel: string, threadTs: string, filePath: string, comment?: string): Promise<void>;
   /** Native message streaming, when the platform has it. */
@@ -324,7 +323,7 @@ export class SessionManager {
     const appendSystemPrompt = [
       identityPrompt(host.agentName),
       BASE_PROMPT,
-      bridged && BRIDGE_PROMPT,
+      bridged && this.deps.bridge?.prompt(),
       bridged && this.deps.jobs && JOB_TOOLS_PROMPT,
       project.systemPrompt,
     ]

@@ -49,6 +49,13 @@ const QUEUES = {
     caps: { perDay: 5 },
     gapMinutes: 0,
   },
+  replies: {
+    executor: { job: 'sender' },
+    batch: 1,
+    caps: {},
+    gapMinutes: 0,
+    slack: true,
+  },
 } satisfies Record<string, QueueConfig>;
 
 function makeProject(extra: object = {}): Project {
@@ -211,6 +218,132 @@ describe('proposing and deciding', () => {
   });
 });
 
+describe('cards of a slack queue', () => {
+  it('posts the card in the channel, edits it on refresh, and closes it on a decision or a withdrawal', async () => {
+    const { project, store, chat, approvals } = setup();
+    const reply = (value: string) => ({ key: 'reply', label: 'Reply', type: 'textarea' as const, value });
+    const card = await approvals.propose(project, {
+      kind: 'x-reply',
+      key: 'r1',
+      title: 'Reply to @ann',
+      body: 'Ann posted **2h** ago',
+      queue: 'replies',
+      options: ['Approve', 'Skip'],
+      fields: [reply('Locks need a timeout.'), { key: 'link', label: 'Link', type: 'text', value: '' }],
+    });
+    expect(chat.blockPosts).toHaveLength(1);
+    const posted = chat.blockPosts[0];
+    expect(posted?.thread).toBe('');
+    expect(card).toMatchObject({ channel: 'C1', messageTs: posted?.ts, threadTs: posted?.ts });
+    const section = JSON.stringify(posted?.blocks[0]);
+    expect(section).toContain('Ann posted *2h* ago');
+    expect(section).toContain('> Locks need a timeout.');
+    expect(section).not.toContain('*Link*'); // empty fields stay out
+    // No buttons: decisions stay on the Approvals page.
+    expect(posted?.blocks.some((b) => b.type === 'actions')).toBe(false);
+    expect(JSON.stringify(posted?.blocks[1])).toContain(
+      'Waiting on the Approvals page (Approve · Skip · Revise)',
+    );
+
+    // A refresh (same key) edits the same message and keeps where the card lives.
+    const again = await approvals.propose(project, {
+      kind: 'x-reply',
+      key: 'r1',
+      title: 'Reply to @ann',
+      queue: 'replies',
+      options: ['Approve', 'Skip'],
+      fields: [reply('Set lock_timeout first.')],
+    });
+    expect(chat.blockPosts).toHaveLength(1);
+    expect(again).toMatchObject({ id: card.id, channel: 'C1', threadTs: posted?.ts });
+    expect(JSON.stringify(chat.updates.at(-1)?.blocks)).toContain('Set lock_timeout first.');
+
+    await approvals.decide(card.id, { option: 'Approve', by: 'U1', via: 'dashboard' });
+    expect(chat.updates.at(-1)?.text).toBe('Reply to @ann: Approve');
+
+    const other = await approvals.propose(project, {
+      kind: 'x-reply',
+      key: 'r2',
+      title: 'Reply to @bob',
+      queue: 'replies',
+    });
+    approvals.withdraw(other.id, 'post too old');
+    expect(chat.updates.at(-1)?.text).toBe('Reply to @bob: ➖ Withdrawn: post too old');
+    expect(store.getItem(other.id)?.status).toBe('cancelled');
+  });
+
+  it('puts a card from a run in that run thread, and every outcome in the card thread', async () => {
+    const { project, store, chat, approvals } = setup();
+    const fromRun = await approvals.propose(
+      project,
+      { kind: 'post', key: 'p1', title: 'Post', queue: 'replies' },
+      { channel: 'C1', threadTs: 'run.1', source: 'discovery' },
+    );
+    expect(chat.blockPosts[0]?.thread).toBe('run.1');
+    expect(fromRun).toMatchObject({ threadTs: 'run.1', messageTs: chat.blockPosts[0]?.ts });
+
+    // Finished by another run (or a URL executor, or a project's report): the outcome goes in the thread.
+    await approvals.decide(fromRun.id, { option: 'Approve', by: 'U1', via: 'dashboard' });
+    store.startItems([fromRun.id]);
+    approvals.finished(store.finishItem(fromRun.id, 'done', 'Posted: https://x.test/1') as Item);
+    await new Promise((r) => setImmediate(r));
+    expect(chat.posts.at(-1)).toMatchObject({ thread: 'run.1', text: '✅ Done: Posted: https://x.test/1' });
+
+    // Reported by a run that is already in the card's thread: nothing more to say there.
+    const own = await approvals.propose(project, {
+      kind: 'x-reply',
+      key: 'r9',
+      title: 'Reply',
+      queue: 'replies',
+    });
+    await approvals.decide(own.id, { option: 'Approve', by: 'U1', via: 'dashboard' });
+    store.startItems([own.id]);
+    const posts = chat.posts.length;
+    approvals.finished(store.finishItem(own.id, 'failed', 'Login wall') as Item, own.threadTs);
+    await new Promise((r) => setImmediate(r));
+    expect(chat.posts).toHaveLength(posts);
+  });
+
+  it("posts an external queue's progress and result in the card thread", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'tara-appr-'));
+    mkdirSync(path.join(dir, '.tara'));
+    writeFileSync(
+      path.join(dir, '.tara', 'queues.json'),
+      JSON.stringify({ queues: { linkedin: { ...QUEUES.outreach, slack: true } } }),
+    );
+    const project = makeProject();
+    project.dir = dir;
+    const { store, chat, approvals } = setup({ project });
+    const card = await approvals.propose(project, {
+      kind: 'outreach',
+      key: 'o1',
+      title: 'Ann',
+      queue: 'linkedin',
+      window: 'EU',
+    });
+    await approvals.decide(card.id, { option: 'Approve', by: 'U1', via: 'dashboard' });
+    approvals.report(card.id, 'waiting', 'Comment posted; the note goes out next send day');
+    approvals.report(card.id, 'done', 'Note sent');
+    await new Promise((r) => setImmediate(r));
+    expect(chat.posts.map((p) => [p.thread, p.text])).toEqual([
+      [card.threadTs, '⏳ Comment posted; the note goes out next send day'],
+      [card.threadTs, '✅ Done: Note sent'],
+    ]);
+    expect(store.getItem(card.id)?.status).toBe('done');
+  });
+
+  it('leaves cards of other queues off Slack', async () => {
+    const { project, chat, approvals } = setup();
+    await approvals.propose(project, {
+      kind: 'note',
+      title: 'Jane',
+      queue: 'linkedin',
+      fields: [note('hi')],
+    });
+    expect(chat.blockPosts).toHaveLength(0);
+  });
+});
+
 describe('queue worker', () => {
   it('knows when windows are open', () => {
     const eu = QUEUES.linkedin.windows.EU;
@@ -363,6 +496,49 @@ describe('queue worker', () => {
 });
 
 describe('decisions over HTTP', () => {
+  it('lets a project server ask outside any run: one card per key, the decision goes to Jarvis', async () => {
+    const { project, store, chat, approvals, chats } = setup();
+    const server = await startHttpServer({
+      bind: '127.0.0.1',
+      port: 0,
+      scheduler: { list: () => [] } as unknown as Scheduler,
+      store,
+      approvals,
+      projects: ['shop'],
+      log: silent,
+      dashboard: { projects: [project], timeZone: 'UTC', agentName: 'Jarvis' },
+    });
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const ask = (body: object) =>
+      fetch(`${base}/items/ask`, { method: 'POST', body: JSON.stringify(body) }).then(
+        (r) => r.json() as Promise<{ item: Item; error?: string }>,
+      );
+    const body = {
+      project: 'shop',
+      key: 'login:portal',
+      title: 'Log in to the portal again',
+      details: 'The session expired.',
+      options: ['Done', 'Dismiss'],
+    };
+    const { item } = await ask(body);
+    expect(item).toMatchObject({
+      mode: 'resume',
+      status: 'pending',
+      key: 'login:portal',
+      options: ['Done', 'Dismiss'],
+    });
+    expect(chat.posts[0]).toMatchObject({ thread: '', text: '🟡 Log in to the portal again' });
+    expect(chat.blockPosts[0]?.thread).toBe(chat.posts[0]?.ts);
+    expect((await ask(body)).item.id).toBe(item.id);
+    expect(chat.posts).toHaveLength(1);
+    expect((await ask({ project: 'shop' })).error).toMatch(/title/);
+
+    await approvals.decide(item.id, { option: 'Done', by: 'U1', via: 'slack' });
+    expect(chats[0]).toMatchObject({ channel: 'C1', threadTs: chat.posts[0]?.ts });
+    expect(chats[0]?.text).toContain('USER DECISION on "Log in to the portal again": Done');
+    server.close();
+  });
+
   it("lists a project's queues with the next slot times and the kind that went last", async () => {
     const { project, store, approvals } = setup({ now: () => Date.parse('2026-10-26T18:00:00Z') });
     const server = await startHttpServer({

@@ -270,13 +270,14 @@ describe('claude args', () => {
     expect(args.join(' ')).toContain(
       '--mcp-config /tmp/x.json --permission-prompt-tool mcp__tara__permission',
     );
-    expect(args.slice(-6)).toEqual([
+    expect(args.slice(-7)).toEqual([
       '--allowedTools',
       'Read',
       'mcp__tara__request_approval',
       'mcp__tara__send_file',
       'mcp__tara__list_jobs',
       'mcp__tara__run_job',
+      'mcp__tara__request_privileged',
     ]);
   });
 });
@@ -371,14 +372,12 @@ describe('MCP server end to end', () => {
     try {
       const { tools } = await client.listTools();
       expect(tools.map((t) => t.name).sort()).toEqual([
-        'add_task',
-        'complete_task',
         'finish_item',
         'list_items',
-        'list_tasks',
         'permission',
         'propose_item',
         'request_approval',
+        'request_privileged',
         'send_file',
       ]);
 

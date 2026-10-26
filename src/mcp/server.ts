@@ -2,10 +2,11 @@
 /**
  * tara's MCP server. Claude Code starts one per run (stdio, from the `--mcp-config` file tara-agent
  * writes), and every tool forwards to tara-agent's local API with that run's token:
- *   request_approval  Slack buttons; the tap comes back as the next message ("USER DECISION …")
+ *   request_approval  a card (Approvals page + Slack buttons) for anything that needs a person; the
+ *                     answer comes back as the next message ("USER DECISION …")
  *   send_file         upload a file into the thread
+ *   request_privileged  a root action (runs at once, or after approval), or a command for a person to run
  *   permission        Allow/Deny buttons for tool calls (only when the run asks for prompts)
- *   add_task, list_tasks, complete_task   the project's inbox (what only a person can do)
  *   propose_item, list_items, finish_item   approval cards for drafts that run later through a queue
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -40,10 +41,12 @@ server.registerTool(
   {
     title: 'Ask for approval in Slack',
     description:
-      'Ask the people in this Slack thread to approve or reject something before you do it (spending money, ' +
-      'changing prices, listings, ads or data, publishing, sending messages to others). Posts the proposal with ' +
-      'buttons. After calling it, END YOUR TURN without doing the action: the answer arrives as your next message, ' +
-      'starting with "USER DECISION", or as a normal reply.',
+      'Ask a person through a card on the Approvals page and in this Slack thread, for anything that needs ' +
+      'one: a decision before you act (spending money, changing prices, listings, ads or data, publishing, ' +
+      'sending messages to others), a suggestion worth acting on, or something only a person can do (a login, ' +
+      'an OTP, a call, a failure you could not fix: say exactly what, with options like "Done, continue" / ' +
+      '"Skip"). After calling it, END YOUR TURN without doing the action: the answer arrives as your next ' +
+      'message, starting with "USER DECISION", or as a normal reply.',
     inputSchema: {
       title: z
         .string()
@@ -100,6 +103,49 @@ server.registerTool(
       return text(`Posted ${name} to the Slack thread.`);
     } catch (err) {
       return text(`Could not send the file: ${(err as Error).message}`, true);
+    }
+  },
+);
+
+server.registerTool(
+  'request_privileged',
+  {
+    title: 'Ask for something only root can do',
+    description:
+      'You have no sudo. When a step needs root (a "Permission denied" you cannot fix, restarting a service), ask ' +
+      'for one of the root actions listed in your instructions with `action` (+ `args`), or, if none fits, for a ' +
+      'person to run a `command`. An action marked "runs at once" returns its output now: check it and carry on. ' +
+      'Anything else becomes an approval card: END YOUR TURN; the decision (and the command output) arrives as ' +
+      'your next message, starting with "USER DECISION".',
+    inputSchema: {
+      action: z.string().max(80).optional().describe('Id of a root action, e.g. "fix-permissions"'),
+      args: z
+        .record(z.string(), z.string().max(500))
+        .optional()
+        .describe('The action\'s arguments, e.g. {"path": "/home/abhijeet/Projects/remote-job/data"}'),
+      command: z
+        .string()
+        .max(2000)
+        .optional()
+        .describe('Only when no action fits: the exact shell command a person should run'),
+      reason: z
+        .string()
+        .min(1)
+        .max(2000)
+        .describe('What failed and why this fixes it (the error message, the file or service)'),
+      title: z.string().max(150).optional().describe('Short card title; a default is made from the action'),
+    },
+  },
+  async (args) => {
+    try {
+      const r = await api<{ ran?: boolean; ok?: boolean; result?: string }>('/internal/privileged', args);
+      if (r.ran) return text(r.result ?? '', !r.ok);
+      return text(
+        'Approval card posted (Approvals page and this thread). Stop now: end your turn. The decision, and the ' +
+          "command's output if it ran, arrives as your next message.",
+      );
+    } catch (err) {
+      return text(`Could not ask for it: ${(err as Error).message}`, true);
     }
   },
 );
@@ -218,85 +264,6 @@ server.registerTool(
       return text(`Reported ${args.id} as ${args.status}.`);
     } catch (err) {
       return text(`Could not report the item: ${(err as Error).message}`, true);
-    }
-  },
-);
-
-server.registerTool(
-  'add_task',
-  {
-    title: 'Add a task to the inbox',
-    description:
-      "Leave a task in this project's inbox on the dashboard when something needs a person: a login, OTP or " +
-      'captcha that blocks a job, a decision or draft to review, a failure you could not fix. Adding the same ' +
-      '`key` again updates the open task instead of making a duplicate, so use one stable key per root cause.',
-    inputSchema: {
-      title: z.string().min(1).max(160).describe('What to do, imperative, with the number that matters'),
-      level: z
-        .enum(['urgent', 'decide', 'later'])
-        .describe(
-          'urgent: money, customers or jobs blocked today (login/OTP, SLA, a failure you could not recover). ' +
-            'decide: something to look at and choose (not an approval card). later: recommendations, follow-ups.',
-        ),
-      key: z
-        .string()
-        .min(1)
-        .max(120)
-        .describe('Stable dedupe key, `<job-or-skill>:<period-or-entity>`, e.g. "flipkart-login:seller-hub"'),
-      details: z.string().max(4000).optional().describe('1-5 lines: exactly what to do'),
-      link: z.string().url().optional().describe('Where to do it: Slack thread or page URL'),
-      source: z.string().max(80).optional().describe('Job id or skill that adds it'),
-      dueAt: z.string().optional().describe('ISO time it must be done by'),
-    },
-  },
-  async (args) => {
-    try {
-      const { task } = await api<{ task: { id: string } }>('/internal/task', args);
-      return text(`Task in the inbox (id ${task.id}). Close it with complete_task once it is resolved.`);
-    } catch (err) {
-      return text(`Could not add the task: ${(err as Error).message}`, true);
-    }
-  },
-);
-
-server.registerTool(
-  'list_tasks',
-  {
-    title: "List this project's open inbox tasks",
-    description:
-      "Open tasks in this project's inbox, with id, key, level and title. Check before adding one.",
-    inputSchema: {},
-  },
-  async () => {
-    try {
-      const { tasks } = await api<{ tasks: Array<Record<string, unknown>> }>('/internal/tasks');
-      return text(
-        JSON.stringify(tasks.map(({ id, key, level, title, source }) => ({ id, key, level, title, source }))),
-      );
-    } catch (err) {
-      return text(`Could not list tasks: ${(err as Error).message}`, true);
-    }
-  },
-);
-
-server.registerTool(
-  'complete_task',
-  {
-    title: 'Mark an inbox task done',
-    description:
-      'Close a task once it is resolved: the person approved or rejected, or you fixed it yourself. Pass its key ' +
-      '(closes the open task with that key) or its id.',
-    inputSchema: {
-      key: z.string().min(1).optional().describe('The key the task was added with'),
-      id: z.string().min(1).optional().describe('Task id from list_tasks'),
-    },
-  },
-  async (args) => {
-    try {
-      const { tasks } = await api<{ tasks: unknown[] }>('/internal/task-done', args);
-      return text(tasks.length ? `Closed ${tasks.length} task(s).` : 'No open task matched.');
-    } catch (err) {
-      return text(`Could not close the task: ${(err as Error).message}`, true);
     }
   },
 );

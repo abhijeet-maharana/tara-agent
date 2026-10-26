@@ -10,6 +10,7 @@ tara-agent lets people in Slack, and scheduled prompts, make Claude act on a mac
 | A job reads hostile text (web pages, chat channels, email) that tells Claude to do something else (prompt injection) | Run tara-agent as a **dedicated unprivileged user** (below); keep mutations behind `request_approval`; jobs never get permission prompts, so in non-bypass modes an unexpected tool is simply denied |
 | Claude reads secrets | The CLI's environment has no Slack tokens or credentials (only `ANTHROPIC_API_KEY` for projects on API billing); with a dedicated user, repo `.env` files and the owner's home are unreadable |
 | Claude edits tara-agent itself or its config | Dedicated user with read-only access to the checkout; config and env file outside its reach |
+| A run needs root (a permission it lacks, a service restart) | It never gets sudo: it asks for a **privileged action** from a root-owned allowlist (below); anything not marked `auto` waits for a person's approval |
 | Claude approves its own drafts (forges a decision) | **Split users** (below): decisions on the dashboard need a cookie key Claude can't read and must come from another device; approved items are sealed with a key Claude can't read, and executors in other processes check the seal |
 | Another local process drives the bot | The API binds to `127.0.0.1`; set `TARA_HTTP_TOKEN` to require a bearer token; `/internal/*` needs a per-run token that exists only while that run is alive |
 | A file upload leaks something outside the project | `send_file` resolves symlinks and only accepts files inside the project or the temp directory |
@@ -35,10 +36,31 @@ With approval cards (the Approvals page), a run must never be able to approve it
 - **No prompts on command lines.** The system prompt goes to Claude in a file (`--append-system-prompt-file`, in a temp dir only tara-agent and the run user's group can read, removed after the run), so it never fills sudo's log (sudo-rs has no setting to quiet it) or shows in `ps`.
 - **Decisions need a person.** Dashboard decisions need the `tara_admin` cookie, set once per browser on `/unlock` with `TARA_ADMIN_TOKEN`, and are refused from any address of the machine itself (where the agent runs). Slack taps by `allowedUsers` are the other way to decide.
 - **Approved items are sealed** (HMAC of kind, id, title and the approved field values with `APPROVAL_SEAL_KEY`). A job executor only ever gets items from tara-agent itself; a URL executor in another process (say a project server sending email) verifies the seal with the same key from its own root-only env file before it acts. (Or, simpler, it reads the item back with `GET /items/<id>` and acts only on what tara-agent holds; that is what the remote-job board does.)
-- **What a run can still do** through the local API: propose drafts (`POST /items`, harmless: a person still decides) and report items of an `external` queue (`POST /items/<id>/report`). A false report only changes what the page shows; the project acts on its own sealed records, so nothing goes out that a person did not approve.
+- **What a run can still do** through the local API: propose drafts (`POST /items`) and ask a question (`POST /items/ask`), both harmless: a person still decides and report items of an `external` queue (`POST /items/<id>/report`). A false report only changes what the page shows; the project acts on its own sealed records, so nothing goes out that a person did not approve.
 - tara-agent joins the run user's group, so it still reads transcripts, edits `.tara/jobs.json` (pause, resume, durations) and removes old scratch folders.
 
 `deploy/split-users.sh` sets this up on a dedicated-user install (user, sudoers, ACLs, config, keys, database move, unit) and checks at the end that the run user can't read the state, config or env file. `--rollback` goes back to the single-user unit.
+
+## Privileged actions
+
+Runs have no sudo, yet some failures need root: a file a sync wrote with a tight mode, a project server that needs a restart after a code change. `request_privileged` covers them without giving Claude root:
+
+- **A root-owned helper is the allowlist.** `deploy/tara-priv.mjs` runs only actions listed in `/etc/tara-agent/privileged.json` (root-owned; see `examples/privileged.json`): each a fixed command (absolute path, no shell) with named arguments that must match a pattern in full, never contain `..` or control characters. Install a root-owned copy and allow only that path, for the tara-agent user only (never the run user):
+  ```sh
+  sudo install -o root -g root -m 755 deploy/tara-priv.mjs /usr/local/sbin/tara-priv
+  sudo install -o root -g root -m 644 my-privileged.json /etc/tara-agent/privileged.json
+  echo 'tara-agent ALL=(root) NOPASSWD: /usr/local/sbin/tara-priv' | sudo tee /etc/sudoers.d/tara-agent-priv
+  sudo chmod 440 /etc/sudoers.d/tara-agent-priv && sudo visudo -c
+  ```
+  Then set host `privileged: {}` (the default command is `sudo -n /usr/local/sbin/tara-priv`) and restart. The helper reads its allowlist from that fixed path when it runs as root, whatever the environment says.
+- **Approval by default.** An action runs only after a person approves its card (Slack `allowedUsers`, or the dashboard with the unlock cookie from another device), the same rules as any decision. The card shows the exact command; its action and arguments are read-only, and the helper checks them again when it runs. Mark an action `auto` only when it is harmless whatever the arguments (re-applying a permission policy, reading a status).
+- **Never put in the allowlist** a command that runs code the run user can change as root: a script in a repo it can write, a shell, an editor, a package manager. Restarting a service whose code the run user can edit runs its edits as that service's user, so keep such restarts behind approval (never `auto`) and read what the run changed before you approve.
+- **Everything is recorded**: each root action is a card that ends done or failed with its exit code and output, and sudo logs every call.
+- Without `privileged`, `request_privileged` still works with a `command`: a card asks a person to run it, and **I ran it, continue** resumes the run.
+
+## Code page
+
+The Code page (`/code`) shows source code, so it is only as private as the dashboard: keep `http.allowFrom` to your own network and set `TARA_HTTP_TOKEN`. It serves only files git lists (never ignored ones), never `.git`, paths outside the repo or symlinks out of it, and hides `code.exclude` globs (`.env*`, keys) even when tracked. Git runs read-only (no optional locks, a private index copy, no hooks, external diff or textconv). Asking about a file starts a Claude run, so it needs the unlock cookie from another device. See [code-view.md](code-view.md).
 
 ## Reporting a vulnerability
 

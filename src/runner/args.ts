@@ -6,6 +6,7 @@ export const TARA_TOOLS = [
   'mcp__tara__send_file',
   'mcp__tara__list_jobs',
   'mcp__tara__run_job',
+  'mcp__tara__request_privileged',
 ];
 export const TARA_PERMISSION_TOOL = 'mcp__tara__permission';
 

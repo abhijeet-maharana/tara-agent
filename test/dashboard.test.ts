@@ -10,7 +10,7 @@ import { esc, md } from '../src/http/dashboard.js';
 import { startHttpServer } from '../src/http/server.js';
 import { firstPrompt, parseTranscript, transcriptPath } from '../src/http/transcript.js';
 import type { Scheduler } from '../src/scheduler/scheduler.js';
-import { Store, type Task } from '../src/store/store.js';
+import { Store } from '../src/store/store.js';
 
 const SID = '11111111-2222-4333-8444-555555555555';
 const lines = [
@@ -202,54 +202,16 @@ describe('dashboard pages', () => {
     expect((await html('/?project=shop')).body).toContain(`href="/sessions/${SID}"`);
   });
 
-  it('puts urgent tasks and failing jobs first on the home page, with the dashboard switcher', async () => {
-    store.addTask({ project: 'shop', title: 'Enter the <OTP>', level: 'urgent', key: 'otp:portal' });
+  it('puts failing jobs first on the home page, with the dashboard switcher', async () => {
     const r = await html('/');
     expect(r.body).toContain('Needs attention');
-    expect(r.body).toContain('Enter the &lt;OTP&gt;');
+    expect(r.body).not.toContain('href="/inbox"');
     expect(r.body).toMatch(/SLA Report<\/a> failed/);
     expect(r.body).toContain('data-action="run" data-job="shop/sla"');
     expect(r.body).toContain('class="switch" href="https://shop.example/board"');
     expect(r.body).toContain('<span>Shop</span>'); // project title, not its name
     expect(r.body).toContain('href="/runs/2"'); // "Just ran"
     expect(r.body).not.toContain('prefers-color-scheme');
-  });
-
-  it('keeps one open task per key, and Done / Reopen work through the API', async () => {
-    const post = (p: string, body: unknown = {}) =>
-      fetch(base + p, { method: 'POST', body: JSON.stringify(body) }).then(
-        (x) => x.json() as Promise<{ task: Task; tasks: Task[]; error?: string }>,
-      );
-    const a = await post('/inbox', {
-      project: 'shop',
-      title: 'Log in to the portal',
-      level: 'urgent',
-      key: 'login:portal',
-    });
-    const b = await post('/inbox', {
-      project: 'shop',
-      title: 'Log in to the portal (2 jobs blocked)',
-      level: 'urgent',
-      key: 'login:portal',
-    });
-    expect(b.task.id).toBe(a.task.id);
-    expect(b.task.title).toContain('2 jobs blocked');
-    expect((await post('/inbox', { project: 'shop', title: 'x', level: 'soon' })).error).toMatch(/level/);
-    expect((await post('/inbox', { project: 'nope', title: 'x', level: 'later' })).error).toMatch(
-      /Unknown project/,
-    );
-
-    const page = (await html('/inbox')).body;
-    expect(page).toContain('Log in to the portal (2 jobs blocked)');
-    expect(page).toContain(`data-task="${a.task.id}"`);
-
-    expect((await post(`/inbox/${a.task.id}/done`)).task.doneAt).toBeGreaterThan(0);
-    const open = (await fetch(`${base}/inbox?project=shop`).then((x) => x.json())) as {
-      tasks: Array<{ id: string }>;
-    };
-    expect(open.tasks.map((t) => t.id)).not.toContain(a.task.id);
-    expect((await post(`/inbox/${a.task.id}/reopen`)).task.doneAt).toBeUndefined();
-    expect((await post('/inbox/close', { project: 'shop', key: 'login:portal' })).tasks).toHaveLength(1);
   });
 
   it('shows the schedule and an HTML 404 for unknown pages', async () => {

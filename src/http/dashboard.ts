@@ -2,14 +2,14 @@ import { closeSync, openSync, readSync } from 'node:fs';
 import type { Project } from '../config/schema.js';
 import type { JobInfo } from '../scheduler/scheduler.js';
 import { formatDuration } from '../slack/format.js';
-import type { SessionOverview, StoredRun, Task } from '../store/store.js';
+import type { SessionOverview, StoredRun } from '../store/store.js';
 import { cronText } from './cron-text.js';
 import { SWITCHER_CSS, TOKENS } from './look.js';
 import { firstPrompt, parseTranscript, type TranscriptEntry, transcriptPath } from './transcript.js';
 
 /**
  * Server-rendered pages for people (the same paths answer JSON for tools): a home page with what
- * needs attention, the inbox, jobs with Run now / Pause / Resume, the day's schedule, single runs,
+ * needs attention, jobs with Run now / Pause / Resume, the day's schedule, single runs,
  * and sessions with their transcripts. Plain HTML, inline CSS and a small script; phone-friendly,
  * dark only, in the shared look of src/http/look.ts.
  */
@@ -23,10 +23,11 @@ export interface DashboardContext {
   slackUrl?: string;
   /** This machine's host name: dashboard links that point at it follow the host the page was opened with. */
   hostName?: string;
-  /** Open urgent tasks, waiting approvals and failing jobs, for the sidebar badges. */
-  urgent?: number;
+  /** Waiting approvals and failing jobs, for the sidebar badges. */
   waiting?: number;
   failing?: number;
+  /** The Code page is on. */
+  code?: boolean;
 }
 
 /** A job with its project and latest runs (newest first), as the home and jobs pages show it. */
@@ -37,8 +38,6 @@ export interface JobView extends JobInfo {
 
 export interface HomeData {
   jobs: JobView[];
-  /** Open urgent tasks of every project. */
-  urgent: Task[];
   /** Latest job runs across projects, newest first. */
   latest: StoredRun[];
   uptimeSeconds: number;
@@ -229,7 +228,6 @@ a.stat:hover{border-color:var(--border-light);background:var(--card-hover)}
 .todo{display:grid;gap:6px}
 .row{display:flex;align-items:center;gap:12px;padding:11px 14px;background:var(--card-bg);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);text-decoration:none}
 a.row:hover{border-color:var(--border-light);background:var(--card-hover)}.row .grow{flex:1;min-width:0}
-.row.done .title{text-decoration:line-through;color:var(--text-dim)}
 .dot{width:9px;height:9px;border-radius:50%;flex:none;background:var(--accent)}.dot.bad{background:var(--red)}.dot.warn{background:var(--amber)}.dot.ok{background:var(--green)}.dot.dim{background:var(--border-light)}
 .clear{color:var(--green);background:var(--green-dim);border-radius:var(--radius);padding:11px 14px}
 .alert{color:var(--amber);background:var(--amber-dim);border-radius:var(--radius);padding:11px 14px;margin-bottom:12px}
@@ -243,7 +241,7 @@ a.row:hover{border-color:var(--border-light);background:var(--card-hover)}.row .
 .card-head{display:flex;gap:12px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap}.card-head .grow{flex:1;min-width:0}
 .title{color:var(--text-heading);font-weight:600;overflow-wrap:anywhere}a.title{text-decoration:none}a.title:hover{color:var(--accent)}
 .meta{display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px;margin-top:3px;font-size:12.5px;color:var(--text-dim)}.meta b{color:var(--text-heading);font-weight:600}
-.meta.error,.overdue{color:var(--red)}
+.meta.error{color:var(--red)}
 .tag{display:inline-block;padding:0 8px;border-radius:999px;background:var(--accent-dim);color:var(--accent);font-size:12px;line-height:20px;white-space:nowrap}
 .tag.bad{background:var(--red-dim);color:var(--red)}.tag.ok{background:var(--green-dim);color:var(--green)}.tag.warn{background:var(--amber-dim);color:var(--amber)}.tag.dim{background:var(--border);color:var(--text-dim)}
 .strip{display:inline-flex;gap:2px;vertical-align:middle}.strip i{width:9px;height:12px;border-radius:2px;background:var(--border-light)}
@@ -338,18 +336,6 @@ document.addEventListener('click', async (e) => {
     } catch (err) { toast(err.message, { error: true }); b.disabled = false; }
     return;
   }
-  const t = e.target.closest('button[data-task]');
-  if (t) {
-    const { task, done } = t.dataset;
-    t.disabled = true;
-    try {
-      await post('/inbox/' + task + (done ? '/reopen' : '/done'));
-      t.closest('.row')?.classList.toggle('done', !done);
-      if (done) { toast('Moved back to the inbox'); reload(); return; }
-      toast('Done', { undo: async () => { await post('/inbox/' + task + '/reopen').catch((err) => toast(err.message, { error: true })); location.reload(); } });
-      setTimeout(() => location.reload(), 6500);
-    } catch (err) { toast(err.message, { error: true }); t.disabled = false; }
-  }
 });
 // Dashboard links that point at this machine follow the host this page was opened with (LAN or tailnet IP).
 document.querySelectorAll('a[data-same-host]').forEach((a) => { const u = new URL(a.href); u.hostname = location.hostname; a.href = u; });
@@ -388,7 +374,7 @@ const target = location.hash && document.getElementById(location.hash.slice(1));
 if (target) { target.hidden = false; target.querySelector('details')?.setAttribute('open', ''); target.scrollIntoView({ block: 'center' }); }
 `;
 
-export type Page = 'Home' | 'Approvals' | 'Inbox' | 'Jobs' | 'Schedule' | 'Sessions' | '';
+export type Page = 'Home' | 'Approvals' | 'Jobs' | 'Schedule' | 'Sessions' | 'Code' | '';
 
 /** The "Dashboards" switcher: this dashboard first, then each project's own dashboard. */
 function switcher(ctx: DashboardContext): string {
@@ -414,17 +400,16 @@ export function layout(
   body: string,
   opts: { refresh?: boolean; script?: string } = {},
 ): string {
-  const urgent = ctx.urgent ?? 0;
   const waiting = ctx.waiting ?? 0;
   const failing = ctx.failing ?? 0;
   const nav = (
     [
       ['/', 'Home', '🏠', 0, ''],
       ['/approvals', 'Approvals', '✅', waiting, 'waiting for a decision'],
-      ['/inbox', 'Inbox', '📥', urgent, 'urgent tasks'],
       ['/jobs', 'Jobs', '⏱️', failing, 'failing jobs'],
       ['/schedule', 'Schedule', '📅', 0, ''],
       ['/sessions', 'Sessions', '💬', 0, ''],
+      ...(ctx.code ? ([['/code', 'Code', '📝', 0, '']] as const) : []),
     ] as const
   )
     .map(
@@ -442,7 +427,7 @@ export function layout(
 <style>${CSS}</style></head><body${opts.refresh ? ' data-refresh="1"' : ''}><div class="shell">
 <aside class="sidebar"><div class="brand"><span class="mark" aria-hidden="true">${esc(ctx.agentName.slice(0, 1).toUpperCase())}</span><span>${esc(ctx.agentName)}</span>
 <button type="button" class="menu-btn" aria-label="Menu" aria-expanded="false">${
-    urgent + waiting + failing ? `<span class="badge">${urgent + waiting + failing}</span>` : ''
+    waiting + failing ? `<span class="badge">${waiting + failing}</span>` : ''
   }☰</button></div>
 <nav>${nav}</nav>${switcher(ctx)}<div class="side-foot"><a href="" title="Refresh now">Updated ${esc(updated)} ↻</a></div></aside>
 <main class="main">${body}</main></div>
@@ -463,41 +448,6 @@ const stat = (label: string, value: string | number, tone = '', href = '') =>
     ? `<a class="stat ${tone}" href="${href}"><b>${esc(value)}</b><span>${esc(label)}</span></a>`
     : `<div class="stat ${tone}"><b>${esc(value)}</b><span>${esc(label)}</span></div>`;
 
-/** One inbox task as a row with its Done (or, once done, Reopen) button. */
-export function taskRow(
-  ctx: DashboardContext,
-  task: Task,
-  now: number,
-  opts: { showProject?: boolean } = {},
-): string {
-  const tone = task.doneAt
-    ? 'dim'
-    : task.level === 'urgent'
-      ? 'bad'
-      : task.level === 'decide'
-        ? 'warn'
-        : 'dim';
-  const title = task.link
-    ? `<a class="title" href="${esc(task.link)}" target="_blank" rel="noopener noreferrer">${esc(task.title)} ↗</a>`
-    : `<span class="title">${esc(task.title)}</span>`;
-  const overdue = task.dueAt !== undefined && task.dueAt < now && !task.doneAt;
-  return `<div class="row${task.doneAt ? ' done' : ''}"><span class="dot ${tone}"></span><span class="grow">${title}
-<span class="meta">${opts.showProject ? projectTag(ctx, task.project) : ''}${
-    task.dueAt !== undefined
-      ? `<span class="${overdue ? 'overdue' : ''}">${overdue ? 'overdue · ' : 'due '}${esc(when(task.dueAt, ctx.timeZone))}</span>`
-      : ''
-  }<span>${task.doneAt ? `done ${esc(relative(task.doneAt, now))}` : `added ${esc(relative(task.createdAt, now))}`}</span></span>${
-    task.details
-      ? `<details><summary>Details</summary><div class="msg">${md(task.details)}</div></details>`
-      : ''
-  }</span>
-<span class="actions">${
-    task.doneAt
-      ? `<button type="button" class="btn quiet" data-task="${esc(task.id)}" data-done="1">Reopen</button>`
-      : `<button type="button" class="btn green" data-task="${esc(task.id)}">✓ Done</button>`
-  }</span></div>`;
-}
-
 export function homePage(ctx: DashboardContext, data: HomeData): string {
   const { jobs, now } = data;
   const tz = ctx.timeZone;
@@ -516,7 +466,7 @@ export function homePage(ctx: DashboardContext, data: HomeData): string {
   }</b><span class="dim">· up ${uptime} · ${jobs.length - paused.length} of ${jobs.length} jobs on</span></div>`;
 
   const waiting = ctx.waiting ?? 0;
-  const stats = `<div class="stats">${stat('Waiting approvals', waiting, waiting ? 'warn' : 'ok', '/approvals')}${stat('Urgent tasks', data.urgent.length, data.urgent.length ? 'bad' : 'ok', '/inbox')}${stat(
+  const stats = `<div class="stats">${stat('Waiting approvals', waiting, waiting ? 'warn' : 'ok', '/approvals')}${stat(
     'Failing jobs',
     failing.length,
     failing.length ? 'bad' : 'ok',
@@ -531,7 +481,6 @@ export function homePage(ctx: DashboardContext, data: HomeData): string {
           } waiting for you</b></span><span class="dim">Approvals →</span></a>`,
         ]
       : []),
-    ...data.urgent.map((t) => taskRow(ctx, t, now, { showProject: true })),
     ...failing.map(
       (
         j,
@@ -581,7 +530,6 @@ export function homePage(ctx: DashboardContext, data: HomeData): string {
 ${section(
   'Needs attention',
   attention ? `<div class="todo">${attention}</div>` : '<div class="clear">✓ Nothing needs attention.</div>',
-  { more: data.urgent.length ? '<a class="more" href="/inbox">Whole inbox →</a>' : undefined },
 )}
 ${section('Coming up', coming, { more: '<a class="more" href="/schedule">Schedule →</a>' })}
 ${section('Just ran', ran, { more: '<a class="more" href="/jobs">All jobs →</a>' })}`,

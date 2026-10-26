@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -106,15 +107,30 @@ export function parseTranscript(jsonl: string): TranscriptEntry[] {
   return entries;
 }
 
-/** The transcript of a session, or undefined when this host has no file for it. */
+/**
+ * The transcript of a session, or undefined when this host has no file for it. Claude Code writes
+ * transcripts readable by their owner only, so with `claude.runAs` a file tara-agent can't open is
+ * read as that user (the sudoers rule that starts runs allows it).
+ */
 export function readTranscript(
   cwd: string,
   sessionId: string,
   configDir?: string,
+  readAs?: string,
 ): TranscriptEntry[] | undefined {
   const file = transcriptPath(cwd, sessionId, configDir);
   if (!/^[0-9a-f-]{36}$/i.test(sessionId) || !existsSync(file)) return undefined;
-  return parseTranscript(readFileSync(file, 'utf8'));
+  let jsonl: string;
+  try {
+    jsonl = readFileSync(file, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EACCES' || !readAs) throw err;
+    jsonl = execFileSync('sudo', ['-n', '-u', readAs, '/bin/cat', '--', file], {
+      encoding: 'utf8',
+      maxBuffer: 256 * 1024 * 1024,
+    });
+  }
+  return parseTranscript(jsonl);
 }
 
 /** The first thing someone asked in a session, without the leading Slack mention. */

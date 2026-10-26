@@ -7,24 +7,27 @@ import {
   type ServerResponse,
 } from 'node:http';
 import { networkInterfaces } from 'node:os';
+import path from 'node:path';
 import { Cron } from 'croner';
 import { ApprovalError, type Approvals, type ProposeInput } from '../approvals/approvals.js';
 import { type Bridge, BridgeError } from '../bridge/bridge.js';
+import { CodeError, type CodeRepo, MIN_QUERY, type RepoReader } from '../code/repo.js';
 import { loadQueues } from '../config/load.js';
 import type { Project, QueueConfig } from '../config/schema.js';
 import type { Scheduler } from '../scheduler/scheduler.js';
-import type { Logger } from '../sessions/manager.js';
-import {
-  ITEM_STATUSES,
-  type ItemStatus,
-  type Store,
-  TASK_LEVELS,
-  type TaskInput,
-  type TaskLevel,
-} from '../store/store.js';
+import type { IncomingMessage as ChatMessage, Logger } from '../sessions/manager.js';
+import { ITEM_STATUSES, type ItemStatus, type Store } from '../store/store.js';
 import { addDays, dayKey, midnight } from '../util/time.js';
 import { allowList } from './access.js';
 import { type ApprovalsTab, approvalsPage, unlockPage } from './approvals.js';
+import {
+  codeDiffPage,
+  codeFilePage,
+  codeHomePage,
+  codeRepoPage,
+  codeSearchPage,
+  codeTreePage,
+} from './code.js';
 import {
   type DashboardContext,
   errorPage,
@@ -36,7 +39,6 @@ import {
   sessionPage,
   sessionsPage,
 } from './dashboard.js';
-import { inboxPage } from './inbox.js';
 import { isDayKey, MAX_RUNS_PER_DAY, type PlanJob, planDay, schedulePage } from './schedule.js';
 import { readTranscript } from './transcript.js';
 
@@ -70,6 +72,19 @@ export interface HttpOptions {
   decisionsFromLocal?: boolean;
   /** Queue config per project (defaults to reading `.tara/queues.json`). */
   queueConfig?: (project: Project) => Record<string, QueueConfig>;
+  /**
+   * The run user (`claude.runAs`): Claude writes its transcripts readable by that user only, so they
+   * are read as that user through sudo when tara-agent can't open them itself.
+   */
+  readAs?: string;
+  /** Puts a message into a session's thread as if its owner had typed it (SessionManager.handle). */
+  continueThread?: (msg: ChatMessage) => Promise<void>;
+  /** The Code page: repos' uncommitted changes and files, read-only. */
+  code?: {
+    readers: RepoReader[];
+    /** Starts a Slack conversation in the repo's `askIn` project; returns the thread's link. */
+    ask?: (repo: CodeRepo, title: string, prompt: string) => Promise<{ url?: string }>;
+  };
   /** Enables the HTML pages (sessions, transcripts, jobs) for browsers. */
   dashboard?: {
     projects: Project[];
@@ -125,26 +140,31 @@ async function readJson(req: IncomingMessage, limit = 10_000): Promise<Record<st
  *   POST /jobs/<project>/<id>/resume   flips it back on, effective at once
  *   POST /jobs/<project>/<id>/duration {"minutes": 20} sets `durationMinutes` in the jobs file
  *   GET  /jobs/<project>/<id>/runs?limit=15
+ *   GET  /runs?limit=30                latest job runs of every project (no outputs)
  *   GET  /runs/<id>
+ *   GET  /sessions?project=<name>&limit=30   latest sessions with their last run
+ *   GET  /sessions/<id>/transcript     the conversation as JSON (prompts, replies, tool calls and results)
+ *   POST /sessions/<id>/message        {text} continues that session's thread as its owner; needs the
+ *                                      header `x-tara-admin: <TARA_ADMIN_TOKEN>` (for a person's own Claude
+ *                                      fixing a run, never for runs)
  *   POST /reload                       re-read every .tara/jobs.json now
- *   GET  /inbox?project=<name>&done=<hours>   open tasks (or the ones done in the last <hours>)
- *   POST /inbox                        {project, title, level, key?, details?, source?, link?, dueAt?} → {task}
- *   POST /inbox/close                  {project, key} or {project, suffix} → {tasks}
- *   POST /inbox/<id>/done | /reopen    → {task}
  *   GET  /schedule?day=YYYY-MM-DD&project=<name>   one day's planned runs, overlaps and free windows
  *   GET  /schedule/conflicts?days=7    overlapping and back-to-back jobs over the next days
+ *   GET  /code                         each repo's branch, last commit and uncommitted changes
+ *   GET  /code/<repo>                  one repo's changes; /diff?path=, /file?path=, /files?path= (a folder)
+ *   GET  /code?q=, /code/<repo>?q=     search file names and text (every repo, or one)
+ *   POST /code/<repo>/ask              {path, question} asks in Slack; needs the unlocked browser
  * and, for tara's own MCP server (header `x-tara-run: <run token>`):
  *   POST /internal/approval            {title, details, options?}
  *   POST /internal/file                {path, comment?}
+ *   POST /internal/privileged          {action, args?, reason} | {command, reason} → {ran, ok, result} | {id}
  *   POST /internal/permission          {tool_name, input}  → {id}
  *   GET  /internal/permission/<id>?wait=45                 → {decision | null}
  *   GET  /internal/jobs, POST /internal/run-job {id}        (chat turns only)
- *   POST /internal/task {title, level, …}, GET /internal/tasks, POST /internal/task-done {key | id}
- *                                      (the run's own project only)
  */
 /** Paths tara-agent serves itself; with a fallback, everything else is passed through. */
 const OWN_PATH =
-  /^\/(?:$|(?:health|reload|jobs|runs|sessions|inbox|schedule|approvals|items|unlock|internal)(?:\/|$))/;
+  /^\/(?:$|(?:health|reload|jobs|runs|sessions|schedule|approvals|items|unlock|code|internal)(?:\/|$))/;
 const TOKEN_COOKIE = 'tara_token';
 const ADMIN_COOKIE = 'tara_admin';
 /** Finished items shown on the Done tab. */
@@ -225,30 +245,6 @@ export function itemInput(body: Record<string, unknown>): ProposeInput {
   };
 }
 
-/** Checks a task from the API or a run; returns the input or throws 400. */
-export function taskInput(body: Record<string, unknown>, project: string): TaskInput {
-  const title = str(body.title);
-  if (!title) throw new HttpError(400, '"title" is required');
-  const level = body.level as TaskLevel;
-  if (!TASK_LEVELS.includes(level))
-    throw new HttpError(400, `"level" must be one of ${TASK_LEVELS.join(', ')}`);
-  const dueAt = str(body.dueAt) ? Date.parse(body.dueAt as string) : undefined;
-  if (Number.isNaN(dueAt)) throw new HttpError(400, '"dueAt" must be an ISO date');
-  for (const field of ['key', 'details', 'source', 'link'])
-    if (body[field] !== undefined && typeof body[field] !== 'string')
-      throw new HttpError(400, `"${field}" must be a string`);
-  return {
-    project,
-    title: title.slice(0, 200),
-    level,
-    key: str(body.key),
-    details: str(body.details)?.slice(0, 4_000),
-    source: str(body.source)?.slice(0, 80),
-    link: str(body.link),
-    dueAt,
-  };
-}
-
 export function startHttpServer(options: HttpOptions): Promise<Server> {
   const now = options.now ?? Date.now;
   const started = now();
@@ -257,6 +253,16 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
     if (!name || !options.projects.includes(name))
       throw new HttpError(404, `Unknown project "${name ?? ''}"`);
     return name;
+  };
+
+  /** A session's transcript: from its project's folder, or (thread cleared) whichever project has it. */
+  const transcript = (id: string, dir?: string) => {
+    const dirs = dir ? [dir] : (options.dashboard?.projects ?? []).map((p) => p.dir);
+    for (const d of dirs) {
+      const entries = readTranscript(d, id, undefined, options.readAs);
+      if (entries) return entries;
+    }
+    return undefined;
   };
 
   /** One calendar day of every (or one) project's planned runs, matched with the runs that happened. */
@@ -381,6 +387,46 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
         };
       }
     }
+    if (method === 'GET' && parts[0] === 'runs' && parts.length === 1) {
+      const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit')) || 30));
+      return {
+        runs: options.store.recentJobRuns(limit).map(({ output, scriptOutput, ...run }) => ({
+          ...run,
+          hasOutput: Boolean(output || scriptOutput),
+        })),
+      };
+    }
+    if (parts[0] === 'sessions') {
+      if (method === 'GET' && parts.length === 1) {
+        const project = url.searchParams.get('project')
+          ? knownProject(url.searchParams.get('project'))
+          : undefined;
+        const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit')) || 30));
+        return { sessions: options.store.sessionsOverview({ project, limit }) };
+      }
+      const id = parts[1] as string;
+      if (method === 'GET' && parts.length === 3 && parts[2] === 'transcript') {
+        const entries = transcript(id);
+        if (!entries) throw new HttpError(404, 'No transcript for this session on this host');
+        return { sessionId: id, entries };
+      }
+      if (method === 'POST' && parts.length === 3 && parts[2] === 'message') {
+        const given = req.headers['x-tara-admin'];
+        if (!options.adminToken || typeof given !== 'string' || !sameSecret(given, options.adminToken))
+          throw new HttpError(403, 'Needs the x-tara-admin header with TARA_ADMIN_TOKEN');
+        if (!options.continueThread) throw new HttpError(404, 'Chat is not running');
+        const body = await readJson(req);
+        const text = str(body.text)?.trim();
+        if (!text) throw new HttpError(400, '"text" is required');
+        const session = options.store.sessionsOverview({ sessionId: id, limit: 1 })[0];
+        const [channel, threadTs] = session?.threadKey.split(':') ?? [];
+        if (!session || !channel || !threadTs) throw new HttpError(404, 'No thread for this session');
+        const owner = options.dashboard?.projects.find((p) => p.config.name === session.project)?.config
+          .owner;
+        void options.continueThread({ channel, threadTs, ts: threadTs, user: owner ?? 'admin', text });
+        return { ok: true, threadKey: session.threadKey };
+      }
+    }
     if (method === 'GET' && parts[0] === 'runs' && parts.length === 2) {
       const run = options.store.getRun(Number(parts[1]));
       if (!run) throw new HttpError(404, 'No such run');
@@ -435,6 +481,23 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
         const body = await readJson(req, ITEM_BODY_LIMIT);
         const project = approvals.project(knownProject(str(body.project) ?? null));
         return { item: await approvals.propose(project, itemInput(body), { source: str(body.source) }) };
+      }
+      if (method === 'POST' && parts.length === 2 && parts[1] === 'ask') {
+        // A project server asking a person outside any run (a login expired, a send bounced). It only
+        // asks: whatever the person picks goes to the agent in the card's thread.
+        const body = await readJson(req);
+        const project = approvals.project(knownProject(str(body.project) ?? null));
+        const title = str(body.title);
+        if (!title) throw new HttpError(400, '"title" is required');
+        return {
+          item: await approvals.ask(project, {
+            title,
+            details: str(body.details) ?? '',
+            options: arr(body.options).filter((o): o is string => typeof o === 'string'),
+            kind: str(body.kind)?.slice(0, 40),
+            key: str(body.key)?.slice(0, 120),
+          }),
+        };
       }
       if (method === 'GET' && parts.length === 2) {
         const item = options.store.getItem(parts[1] as string);
@@ -498,35 +561,6 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
         return { item: approvals.cancel(parts[1] as string, owner(parts[1] as string) ?? by) };
       }
     }
-    if (parts[0] === 'inbox') {
-      if (method === 'GET' && parts.length === 1) {
-        const project = url.searchParams.get('project')
-          ? knownProject(url.searchParams.get('project'))
-          : undefined;
-        const hours = Number(url.searchParams.get('done'));
-        return {
-          tasks: options.store.tasks({
-            project,
-            doneSince: hours > 0 ? now() - hours * 3_600_000 : undefined,
-          }),
-        };
-      }
-      if (method === 'POST' && parts.length === 1) {
-        const body = await readJson(req);
-        return { task: options.store.addTask(taskInput(body, knownProject(str(body.project) ?? null))) };
-      }
-      if (method === 'POST' && parts[1] === 'close' && parts.length === 2) {
-        const body = await readJson(req);
-        const project = knownProject(str(body.project) ?? null);
-        if (!str(body.key) && !str(body.suffix)) throw new HttpError(400, '"key" or "suffix" is required');
-        return { tasks: options.store.closeTasks(project, { key: str(body.key), suffix: str(body.suffix) }) };
-      }
-      if (method === 'POST' && parts.length === 3 && (parts[2] === 'done' || parts[2] === 'reopen')) {
-        const task = options.store.setTaskDone(parts[1] as string, parts[2] === 'done');
-        if (!task) throw new HttpError(404, 'No such task');
-        return { task };
-      }
-    }
     if (method === 'GET' && parts[0] === 'schedule' && parts.length === 1) {
       const project = url.searchParams.get('project')
         ? knownProject(url.searchParams.get('project'))
@@ -561,7 +595,71 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
         }),
       };
     }
+    if (parts[0] === 'code' && options.code) {
+      const query = url.searchParams.get('q');
+      if (method === 'GET' && parts.length === 1 && query !== null)
+        return { results: await searchAll(query) };
+      if (method === 'GET' && parts.length === 1)
+        return {
+          repos: await Promise.all(
+            options.code.readers.map(async (r) => ({
+              name: r.repo.name,
+              title: r.repo.title,
+              ...(await r.status()),
+            })),
+          ),
+        };
+      const reader = codeReader(parts[1]);
+      const file = url.searchParams.get('path') ?? '';
+      if (method === 'GET' && parts.length === 2 && query !== null) return reader.search(query);
+      if (method === 'GET' && parts.length === 2) return reader.status();
+      if (method === 'GET' && parts[2] === 'diff' && parts.length === 3) return reader.diff(file);
+      if (method === 'GET' && parts[2] === 'file' && parts.length === 3) return reader.read(file);
+      if (method === 'GET' && parts[2] === 'files' && parts.length === 3) return reader.tree(file);
+      if (method === 'POST' && parts[2] === 'ask' && parts.length === 3) {
+        human(req);
+        const ask = options.code.ask;
+        if (!ask || !reader.repo.askIn) throw new HttpError(404, 'Asking is off for this repo');
+        const body = await readJson(req);
+        const question = str(body.question)?.slice(0, 4_000);
+        if (!question) throw new HttpError(400, '"question" is required');
+        const target = str(body.path) ?? '';
+        const change = (await reader.status()).changes.find((c) => c.path === target);
+        // The diff goes to Claude only: the thread shows the question.
+        const diff = change ? (await reader.diff(target)).text.split('\n').slice(0, 400).join('\n') : '';
+        const where = target ? `\`${target}\` in ${reader.repo.title}` : reader.repo.title;
+        return ask(
+          reader.repo,
+          `📄 ${where}: ${question}`,
+          `${question}\n\nAbout ${target ? `the file \`${path.join(reader.repo.dir, target)}\`` : `the repo ${reader.repo.dir}`}${
+            change
+              ? `, which has an uncommitted change (${change.state}). The diff against the last commit:\n\`\`\`diff\n${diff}\n\`\`\``
+              : '.'
+          }`,
+        );
+      }
+    }
     throw new HttpError(404, 'Not found');
+  };
+
+  /** One search over every repo; a repo that fails says why instead of failing the rest. */
+  const searchAll = async (query: string) => {
+    if (query.trim().length < MIN_QUERY)
+      throw new CodeError(400, `Search for at least ${MIN_QUERY} characters`);
+    return Promise.all(
+      (options.code?.readers ?? []).map((r) =>
+        r.search(query).then(
+          (result) => ({ repo: r.repo, result }),
+          (err: Error) => ({ repo: r.repo, error: err.message.split('\n')[0] }),
+        ),
+      ),
+    );
+  };
+
+  const codeReader = (name: string | undefined) => {
+    const reader = options.code?.readers.find((r) => r.repo.name === name);
+    if (!reader) throw new HttpError(404, `Unknown repo "${name ?? ''}"`);
+    return reader;
   };
 
   const internal = async (req: IncomingMessage): Promise<unknown> => {
@@ -584,6 +682,20 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
         details: required(body.details, 'details'),
         options,
         kind: str(body.kind)?.slice(0, 40),
+      });
+    }
+    if (req.method === 'POST' && parts[1] === 'privileged' && parts.length === 2) {
+      const body = await readJson(req);
+      const args =
+        body.args && typeof body.args === 'object' && !Array.isArray(body.args)
+          ? Object.fromEntries(Object.entries(body.args).map(([k, v]) => [k, String(v)]))
+          : undefined;
+      return bridge.requestPrivileged(token, {
+        action: str(body.action),
+        args,
+        command: str(body.command),
+        reason: required(body.reason, 'reason'),
+        title: str(body.title)?.slice(0, 150),
       });
     }
     if (req.method === 'POST' && parts[1] === 'file' && parts.length === 2) {
@@ -626,27 +738,6 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
         result: typeof body.result === 'string' ? body.result : undefined,
       });
     }
-    if (req.method === 'POST' && parts[1] === 'task' && parts.length === 2) {
-      const body = await readJson(req);
-      const project = bridge.run(token).project.config.name;
-      return { task: options.store.addTask(taskInput(body, project)) };
-    }
-    if (req.method === 'GET' && parts[1] === 'tasks' && parts.length === 2) {
-      return { tasks: options.store.tasks({ project: bridge.run(token).project.config.name }) };
-    }
-    if (req.method === 'POST' && parts[1] === 'task-done' && parts.length === 2) {
-      const body = await readJson(req);
-      const project = bridge.run(token).project.config.name;
-      const key = typeof body.key === 'string' ? body.key : undefined;
-      const id = typeof body.id === 'string' ? body.id : undefined;
-      if (!key && !id) throw new HttpError(400, '"key" or "id" is required');
-      // A run only closes its own project's tasks.
-      const task = id ? options.store.getTask(id) : undefined;
-      if (id && task?.project !== project) throw new HttpError(404, 'No such task in this project');
-      return {
-        tasks: id ? [options.store.setTaskDone(id, true)] : options.store.closeTasks(project, { key }),
-      };
-    }
     if (req.method === 'GET' && parts[1] === 'permission' && parts.length === 3) {
       const waitMs = Math.min(55, Math.max(0, Number(url.searchParams.get('wait')) || 0)) * 1000;
       return { decision: (await bridge.waitPermission(token, parts[2] as string, waitMs)) ?? null };
@@ -666,13 +757,13 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
       agentName: dash.agentName,
       slackUrl: dash.slackUrl?.(),
       hostName: dash.hostName,
-      urgent: options.store.tasks().filter((t) => t.level === 'urgent').length,
       waiting: options.approvals
         ? options.store.items({ statuses: ['pending'], limit: 500 }).length
         : undefined,
       failing: options.projects
         .flatMap((p) => options.scheduler.list(p))
         .filter((j) => jobState(j) === 'failing').length,
+      code: Boolean(options.code),
     };
   };
 
@@ -718,7 +809,6 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
       const at = now();
       return homePage(ctx, {
         jobs: jobViews(),
-        urgent: options.store.tasks().filter((t) => t.level === 'urgent'),
         // Each job's latest run only, so a job that ran three times doesn't fill the list.
         latest: options.store
           .recentJobRuns(60)
@@ -770,13 +860,6 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
       });
     }
     if (parts[0] === 'unlock' && parts.length === 1) return unlockPage(ctx);
-    if (parts[0] === 'inbox' && parts.length === 1) {
-      const at = now();
-      return inboxPage(ctx, options.store.tasks(), options.store.tasks({ doneSince: at - 86_400_000 }), {
-        project: projectParam(),
-        now: at,
-      });
-    }
     if (parts[0] === 'schedule' && parts.length === 1) {
       const at = now();
       const today = dayKey(at, timeZone);
@@ -790,9 +873,7 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
       const session = options.store.sessionsOverview({ sessionId: id, limit: 1 })[0];
       const dir = ctx.projects.find((p) => p.config.name === session?.project)?.dir;
       // Sessions whose thread was cleared are still on disk: look in every project.
-      const entries = dir
-        ? readTranscript(dir, id)
-        : ctx.projects.map((p) => readTranscript(p.dir, id)).find(Boolean);
+      const entries = transcript(id, dir);
       const last = session?.lastRun;
       const jobName = last?.jobId ? jobNames().get(`${last.project}:${last.jobId}`) : undefined;
       return sessionPage(ctx, session, id, entries, jobName);
@@ -804,6 +885,53 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
       const job = run.jobId ? options.scheduler.list(run.project).find((j) => j.id === run.jobId) : undefined;
       return runPage(ctx, run, job);
     }
+    return undefined;
+  };
+
+  /** The Code pages (they read git, so they are async); undefined for other paths. */
+  const codePage = async (req: IncomingMessage, ctx: DashboardContext): Promise<string | undefined> => {
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+    if (parts[0] !== 'code' || !options.code) return undefined;
+    const at = now();
+    const query = url.searchParams.get('q')?.trim();
+    if (parts.length === 1 && query) return codeSearchPage(ctx, query, await searchAll(query));
+    if (parts.length === 1)
+      return codeHomePage(
+        ctx,
+        await Promise.all(
+          options.code.readers.map(async (r) => ({ repo: r.repo, status: await r.status() })),
+        ),
+        at,
+      );
+    const reader = codeReader(parts[1]);
+    const file = url.searchParams.get('path') ?? '';
+    if (parts.length === 2 && query)
+      return codeSearchPage(
+        ctx,
+        query,
+        [{ repo: reader.repo, result: await reader.search(query) }],
+        reader.repo,
+      );
+    if (parts.length === 2) return codeRepoPage(ctx, reader.repo, await reader.status(), at);
+    const changes = parts.length === 3 ? (await reader.status()).changes : [];
+    if (parts[2] === 'diff') {
+      const diff = await reader.diff(file);
+      const change = changes.find((c) => c.path === file);
+      return change && codeDiffPage(ctx, reader.repo, change, diff, canDecide(req));
+    }
+    if (parts[2] === 'file') {
+      const view = await reader.read(file);
+      return codeFilePage(
+        ctx,
+        reader.repo,
+        file,
+        view,
+        changes.find((c) => c.path === file),
+        canDecide(req),
+      );
+    }
+    if (parts[2] === 'files') return codeTreePage(ctx, reader.repo, file, await reader.tree(file), changes);
     return undefined;
   };
 
@@ -907,9 +1035,11 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
       );
     if (wantsHtml && ctx) {
       try {
-        const html = page(req, ctx);
+        const html = (await codePage(req, ctx)) ?? page(req, ctx);
         if (html) return sendHtml(res, 200, html);
       } catch (err) {
+        if (err instanceof CodeError || err instanceof HttpError)
+          return sendHtml(res, err.status, errorPage(ctx, 404, err.status === 404 ? undefined : err.message));
         options.log.error(`http page ${req.url}: ${(err as Error).stack ?? err}`);
         return sendHtml(res, 500, errorPage(ctx, 500));
       }
@@ -925,7 +1055,10 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
       }
     } catch (err) {
       status =
-        err instanceof HttpError || err instanceof BridgeError || err instanceof ApprovalError
+        err instanceof HttpError ||
+        err instanceof BridgeError ||
+        err instanceof ApprovalError ||
+        err instanceof CodeError
           ? err.status
           : 500;
       payload = { error: (err as Error).message };
