@@ -1,6 +1,6 @@
 ---
 name: Feature request
-about: An idea that fits tara-agent's scope (Slack + schedules for the official Claude Code CLI)
+about: An idea that fits tara-agent's scope (a 24/7 agent with approvals in Slack and the dashboard)
 labels: enhancement
 ---
 

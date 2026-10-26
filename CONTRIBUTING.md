@@ -13,7 +13,7 @@ Node ≥ 22.13. Tests don't need Slack or a Claude login: the CLI is replaced by
 
 ## Guidelines
 
-- **Never call the Anthropic API or reuse Claude credentials.** Everything goes through the official `claude` binary. PRs that add token handling, header spoofing or account pooling will be closed.
+- **All model work goes through the `claude` CLI.** Don't add direct API calls.
 - Keep it small and dependency-light. New runtime dependencies need a good reason.
 - Add tests for behaviour changes. Fixtures of CLI output must be sanitised (no real paths, ids or content).
 - Match the existing style: Biome formats and lints (`npm run format`), comments explain why rather than what.

@@ -1,39 +1,49 @@
 # tara-agent
 
-Self-hosted gateway that turns **Slack threads** and **cron schedules** into real **Claude Code** sessions on your own machine, across as many project repos as you like.
+**A 24/7 AI agent that works on your projects, with a human in the loop through Slack and a web dashboard.**
 
-> **Status:** early development, running in production for one small business. Slack threads, scheduled jobs, approval buttons and Slack permission prompts work. See [docs/plan.md](docs/plan.md).
+tara-agent runs on your own server around the clock. It runs scheduled jobs, answers you in Slack, and does real work in your project repos: reports, checks, outreach drafts, fixes. Whenever something needs a person (sending a message, a risky change, a login), it stops and asks. You approve from Slack or the dashboard, usually from your phone, and it carries on.
 
-## Why
+## Features
 
-Many agent frameworks let you plug in a Claude subscription by calling the API with its OAuth token while pretending to be Claude Code: a spoofed user-agent, a spoofed system prompt, renamed tools. That can get an account, or a whole Team org, banned.
+**Always on**
+- **Scheduled jobs.** Cron jobs per project, run day and night. A job can run a cheap script first and only wake the agent when there is something to do.
+- **Survives restarts.** Sessions, approvals and schedules are stored locally. Missed jobs catch up after downtime, and no job slot runs twice.
+- **Learns from mistakes.** After a run that had trouble, the agent gets one chance to fix the instructions it followed.
 
-tara-agent never talks to Anthropic itself. It starts the official `claude` CLI in headless mode (`claude -p`), the same as you would in a terminal:
+**Human in the loop**
+- **Approval buttons in Slack.** The agent asks with Approve / Reject (or your own options). Your tap continues the same session.
+- **Approvals dashboard.** Drafts (messages, emails, posts) wait as cards you can edit, approve, reject or send back for a new version. Approved ones go out on a schedule, with daily limits.
+- **Permission prompts.** When the agent wants a tool it isn't allowed to use, you get **Allow / Deny** in the thread.
+- **Root actions on approval.** It never gets sudo. It asks for actions from an allowlist, and you approve them.
 
-- **Your login stays inside Claude Code.** tara-agent never reads, copies or forwards credentials.
-- **No spoofing, no account pools.**
-- **Your project setup is used as-is:** skills, `CLAUDE.md`, MCP servers and plugins.
-- **API-key billing is opt-in** per project, for overflow or for shared use.
+**Talk to it**
+- **Chat in Slack.** Each channel is one project. A message starts a session, and replies in the thread continue it. Progress streams live.
+- **Many projects, one agent.** Every project keeps its own repo, instructions, skills and tools.
 
-You are still responsible for following your plan's terms, especially for unattended use and for letting other people use a bot that runs on your seat.
+**See everything**
+- **Web dashboard.** What's running, what needs you, failing jobs, the day's schedule, full transcripts of every run, and your repos' uncommitted changes. Works on a phone.
+- **Daily health digest** in each project channel.
 
 ## How it works
 
 ```
-Slack thread ──► tara-agent ──► claude -p --resume <session>   (cwd = the project repo)
+Slack thread ──► tara-agent ──► claude -p --resume <session>   (runs inside the project repo)
    ▲                 │
-   └── live status, final answer, reactions
+   └── live progress, final answer, files, buttons
 ```
 
-- Each Slack channel maps to one project repo.
-- A new message starts a Claude Code session, and replies in its thread resume it. Sessions survive restarts.
-- The reply streams into the thread like Slack's own AI apps: a live task card (each tool call ticks off as it finishes) and Claude's text typed out below it. Without Slack's "Agents & AI Apps" feature it falls back to one status message that updates, then the answer.
+1. tara-agent connects to Slack (Socket Mode, so no public URL is needed).
+2. A message comes in. tara-agent finds the project for that channel and starts the `claude` CLI in headless mode inside that repo, or resumes the thread's session.
+3. Claude's progress streams into the thread as a task list, followed by the answer.
+4. Scheduled jobs use the same path: on their cron time, tara-agent runs the job's script and prompt and posts the result in the project channel. Replying to that post continues the job's session.
+5. Everything (sessions, runs, approvals) is stored in a local SQLite file. The dashboard and local API read from it.
 
 ## Quick start
 
-Requirements: Node ≥ 22.13, Claude Code installed and logged in (`claude` then `/login`) as the user that runs tara-agent.
+**You need:** Node 22.13 or newer, and Claude Code installed and logged in (`claude`, then `/login`) as the user that will run tara-agent.
 
-1. **Slack app:** create it from [`deploy/slack-app-manifest.yaml`](deploy/slack-app-manifest.yaml), then invite the bot to your project channels.
+1. **Create the Slack app** from [`deploy/slack-app-manifest.yaml`](deploy/slack-app-manifest.yaml) and invite the bot to your project channels.
 2. **Install:**
    ```sh
    git clone https://github.com/abhijeet-maharana/tara-agent && cd tara-agent
@@ -41,263 +51,94 @@ Requirements: Node ≥ 22.13, Claude Code installed and logged in (`claude` then
    ```
 3. **Host config:** copy [`examples/config.yaml`](examples/config.yaml) to `~/.config/tara-agent/config.yaml` and list your project paths.
 4. **Secrets:** put `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` in `~/.config/tara-agent/env` (see [`.env.example`](.env.example)).
-5. **Each project:** add `.tara/config.json` (see [`examples/project`](examples/project/.tara)).
-6. **Run it:** `node dist/index.js`, or as a service with [`deploy/systemd/tara-agent.service`](deploy/systemd/tara-agent.service).
+5. **Each project:** add `<repo>/.tara/config.json` with at least a `name` and a `slackChannel` (see [`examples/project`](examples/project/.tara)).
+6. **Run:** `node dist/index.js`.
 
-## Run on a server
+Post a message in a mapped channel. Claude replies in the thread.
 
-1. Get the code onto the server (`git clone`, or a file sync such as Mutagen that skips `node_modules` and `dist`), then `npm ci && npm run build` there.
-2. Log in to Claude Code as the service user: run `claude`, then `/login`.
-3. Write `~/.config/tara-agent/config.yaml` and `~/.config/tara-agent/env` (mode 600). If `claude` isn't on the service's PATH, set `claude.bin` to its full path.
-4. Install the unit:
-   ```sh
-   cp deploy/systemd/tara-agent.service ~/.config/systemd/user/
-   systemctl --user daemon-reload && systemctl --user enable --now tara-agent
-   loginctl enable-linger "$USER"
-   journalctl --user -u tara-agent -f
-   ```
-5. Projects that use MCP servers from their `.mcp.json` must have them approved for headless runs. Put `"enableAllProjectMcpServers": true` (or `enabledMcpjsonServers`) in that repo's `.claude/settings.local.json`, then check with `claude mcp list` from the repo.
+### Add a scheduled job
 
-### Run as a dedicated user (recommended)
-
-Scheduled jobs often read untrusted text (web pages, chat channels, email), and a job that gets talked into something runs with the rights of the user tara-agent runs as. On an always-on machine, give it its own user:
-
-1. `sudo useradd --create-home --user-group tara` (no sudo, no docker group), then install Claude Code and log in as that user: `sudo -iu tara`, install, `claude`, `/login`.
-2. Give it the project repos and nothing else. The setup that works well: a shared group with ACLs on the repo directories (`setfacl -m g:tara:rwx,d:g:tara:rwx` on every directory, default ACLs included), so files either side creates stay writable for both. If you sync code with Mutagen, create the session with `--default-group-beta=tara`; synced files are staged elsewhere and don't inherit ACLs.
-3. Keep secrets out: remove the group's access to `.env` files and session/key files in the repos, and keep your home directory closed (`setfacl -m u:tara:--x ~` lets it pass through to the repos only).
-4. Put the Slack tokens in a root-only `/etc/tara-agent.env` and install [`deploy/systemd/tara-agent-dedicated-user.service`](deploy/systemd/tara-agent-dedicated-user.service) as a system unit.
-
-The agent then can't use your sudo, docker group, browser profile files, other projects or secrets, and can't edit tara-agent itself.
-
-**Moving from another bot on the same Slack app:** with Socket Mode, Slack splits events across every connection of one app. Stop the old bot before starting tara-agent with the same tokens.
-
-## Configuration
-
-**Host** (`~/.config/tara-agent/config.yaml`, never committed)
-
-| Key | Default | Meaning |
-|---|---|---|
-| `projects` | required | Paths of project repos |
-| `agentName` | `tara` | What the agent calls itself: Claude is told "Your name is …" in every run, and the dashboard shows it. The name on its Slack messages is the Slack app's bot name (App Home → Display name) |
-| `concurrency` | `2` | Max Claude sessions at once |
-| `claude.bin` | `claude` | CLI path |
-| `claude.chatTimeoutMinutes` | `20` | Per-turn time limit |
-| `claude.effort` | model's default | Effort for every run, passed as `--effort`: `low`, `medium`, `high` or `xhigh`. Learning turns use it too |
-| `stateDir` | `~/.local/state/tara-agent` | SQLite state (sessions, run history), and the default home of scratch and job data folders |
-| `scratchDays` | `3` | Days after its last use that a session's scratch folder is deleted (see [Files](#files)) |
-| `streaming` | `true` | Stream replies natively (task card + live text). Needs the Slack app's "Agents & AI Apps" feature and the `assistant:write` scope; without them tara-agent switches to edited messages by itself |
-| `statusIntervalSeconds` | `5` | Min gap between status-message edits in the fallback mode |
-| `jobConcurrency` | `1` | Max scheduled jobs at once (chat has its own limit) |
-| `catchUpHours` | `6` | After downtime, run a job's latest missed slot if it is at most this old (`0` = never) |
-| `timezone` | host's | Default timezone for job schedules and times shown in Slack |
-| `healthDigest` | on, `0 9 * * *` | Daily summary per project channel (`enabled`, `cron` in `timezone`): runs, problems, missed slots, peak 5-hour usage. Silent for projects with nothing to report |
-| `claude.runAs` | none | Run Claude and pre-run scripts as this OS user through sudo, so they can't read tara-agent's database or keys ([docs/security.md](docs/security.md#split-users-approvals)) |
-| `privileged.command` | off | Root actions a run may ask for (`request_privileged`) through the root-owned helper `deploy/tara-priv.mjs`; usually `["sudo", "-n", "/usr/local/sbin/tara-priv"]` ([docs/security.md](docs/security.md#privileged-actions)) |
-| `http` | `127.0.0.1:4100` | Local API and dashboard (`enabled`, `bind`, `port`, `allowFrom`); set `TARA_HTTP_TOKEN` to require a bearer token for the API and the pages (open a page once with `?token=…` to sign a browser in). Also needed by the MCP tools |
-| `http.allowFrom` | `127.0.0.0/8`, `::1/128` | CIDR ranges that may connect at all. Transcripts hold everything Claude saw, so when you bind beyond localhost keep this to a trusted network, e.g. add `100.64.0.0/10` and `fd7a:115c:a1e0::/48` for Tailscale |
-| `code` | on, the projects | The Code page: `repos` (`path`, `gitDir`, `title`, `askIn`), `exclude` globs never shown (default `.env*`, `*.pem`, `*.key`) ([docs/code-view.md](docs/code-view.md)) |
-| `http.fallback` | none | URL that gets every request for a path tara-agent doesn't serve, streamed through unchanged. Lets tara-agent take over a port from another service while that service's callers move |
-
-**Project** (`<repo>/.tara/config.json`, committed in that repo)
-
-| Key | Default | Meaning |
-|---|---|---|
-| `name` | required | Short id (`a-z0-9-`) |
-| `slackChannel` | required | Channel ID (`C…`/`G…`) |
-| `permissionMode` | `default` | `default`, `acceptEdits`, `plan` or `bypassPermissions` |
-| `allowedTools` | `[]` | Tools allowed without asking, in `--allowedTools` syntax |
-| `chatModel` | `sonnet` | Model for new threads |
-| `systemPromptFile` | none | Extra instructions appended to every session |
-| `owner` | none | Slack user ID that live streams of jobs started from the API or a dashboard go to (`!run` streams to whoever typed it; scheduled runs don't stream) |
-| `allowedUsers` | `[]` (everyone in the channel) | Slack user IDs allowed to talk to the bot |
-| `billing` | `subscription` | `api` runs the CLI with `ANTHROPIC_API_KEY` |
-| `title` | `name` | How the dashboard names the project, e.g. "Job Search" for `remote-job` |
-| `dashboardUrl` | none | The project's own web dashboard, if it has one; it appears in the dashboard's "Dashboards" switcher |
-| `scratchDir` | `<stateDir>/scratch/<name>` | Parent of the per-session scratch folders, relative to the repo. Keep it out of git (see [Files](#files)) |
-| `jobDataDir` | `<stateDir>/job-data/<name>` | Parent of the per-job data folders, relative to the repo |
-| `selfImprove` | `true` | After a job run or chat turn with trouble, resume its session once so Claude can fix the skill it followed (see "Self-improving jobs and chats" under [Scheduled jobs](#scheduled-jobs)) |
-
-## Scheduled jobs
-
-Each repo can declare jobs in `.tara/jobs.json` (reloaded within 30 s of a change):
+Create `<repo>/.tara/jobs.json`. tara-agent picks up changes within 30 seconds.
 
 ```json
 {
   "tz": "Asia/Kolkata",
-  "env": { "DATA_DIR": "~/data" },
   "jobs": [
     {
-      "id": "daily-sla-report",
-      "name": "Daily SLA report",
+      "id": "daily-report",
+      "name": "Daily report",
       "cron": "45 10 * * *",
-      "durationMinutes": 5,
-      "prompt": "Check yesterday's late orders and summarise them.",
-      "skills": ["order-sla-report"],
-      "preScript": "scripts/sla-gate.py",
-      "model": "haiku",
-      "locks": ["chrome"]
+      "prompt": "Check yesterday's late orders and summarise them."
     }
   ]
 }
 ```
 
-| Key | Default | Meaning |
-|---|---|---|
-| `id`, `name`, `cron` | required | Slug for `!run`, display name, cron expression (5 or 6 fields) |
-| `tz` | file-level `tz`, else host `timezone` | Timezone of `cron` (set it once at the top of the file) |
-| `durationMinutes` | none | Typical run time, for schedule planning tools; tara doesn't use it |
-| `prompt` | required unless `agent: false` | What Claude should do |
-| `skills` | `[]` | Skills named in the prompt so Claude reads them first |
-| `preScript` | none | Runs first, from the repo root (`.py` → python3, `.sh` → bash) |
-| `agent` | `true` | `false`: the script is the job; its stdout is posted as-is |
-| `model` | `sonnet` | Model for this job |
-| `locks` | `[]` | Named locks held for the run, e.g. `["chrome"]` |
-| `timeoutMinutes` | `30` | Per-run limit (script and model each) |
-| `catchUp` | `true` | Run the latest missed slot after downtime |
-| `channel` | project channel | Where the job posts |
-| `env` | `{}` | Extra environment for the script and the CLI (`~/` expanded); merged over the file-level `env` |
-| `enabled` | `true` | `false` keeps the job listed but never scheduled |
+Type `run daily report` in the channel to try it right away.
 
-**Watching a run live.** Scheduled runs show their current step in the channel message and post the report when done. A run someone starts also streams like a chat reply (live task card + report as it is written): typing "run <job name>" in the channel runs it right in that message's thread; runs from the API or a dashboard stream to the project `owner`.
+## Run it as a service
 
-**How a run goes.** The pre-script runs first. Empty output, or a last line of `{"wakeAgent": false}`, ends the run silently. Otherwise its output (or its error) is put in front of the prompt as a `## Script Output` block. Claude's reply goes to Slack: the headline (before a `---` line) as a new message in the channel, the details in its thread. A reply of `[SILENT]` posts nothing, and a first line of `[CRON_FAILURE]` marks the run failed. Replying in a job's thread continues that session, so a job can ask for approval and act on your answer. These conventions match Hermes Agent's, so Hermes jobs run unchanged.
+On Linux, use the systemd units in [`deploy/systemd/`](deploy/systemd/):
 
-**Self-improving jobs and chats.** When a job run or a chat turn had trouble (it failed, errored or timed out, or 2+ tool calls returned errors), tara-agent resumes the same session once (for a job after its locks are released; for a chat before the thread's next message is handled) and asks Claude to fix the instructions behind it: the skill's `SKILL.md` or another `.md` file the run used, never code, never a new skill. Claude replies `NONE` when nothing should change. A change is posted in the job's or chat's thread (`🔧 … learned from this run`) and listed under *Learned* in the daily health digest. The turn reuses the run's model, system prompt and tools, so the prompt cache still applies; clean runs, silent gate skips and usage-limit stops cost nothing extra. Learning turns are stored as runs of kind `learn` and never count in a job's history or as problems. Turn it off per project with `"selfImprove": false`.
-
-**Every slot runs at most once**, even across restarts (claimed in SQLite). A job added while tara-agent was down never runs for its past slots.
-
-**Moving from Hermes Agent:**
 ```sh
-tara-agent import-hermes --from ~/.hermes/cron/jobs.json --out <repo>/.tara/jobs.json \
-  --env REPO_ROOT=~/Projects/my-repo   # map container paths your scripts expect
+cp deploy/systemd/tara-agent.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now tara-agent
+loginctl enable-linger "$USER"
+journalctl --user -u tara-agent -f
 ```
-Hermes' cron default model becomes `--default-model` (`haiku`), browser-capable jobs get the `chrome` lock, and schedules stay in UTC.
 
-## Files
+- If `claude` isn't on the service's `PATH`, set `claude.bin` to its full path in the host config.
+- If a project uses MCP servers from its `.mcp.json`, approve them for headless runs: add `"enableAllProjectMcpServers": true` to that repo's `.claude/settings.local.json`, then check with `claude mcp list`.
+- On an always-on machine, **run it as its own user** with access only to the project repos. Setup steps are in [`docs/security.md`](docs/security.md#run-as-a-dedicated-user).
+- Only one bot can use a Slack app's tokens at a time. Stop any old bot on the same app first.
 
-Temporary files from many runs used to pile up in one shared folder. Each run now gets its own folders, as environment variables and as absolute paths in its first message (the Write tool needs absolute paths):
+## In Slack
 
-| Variable | What | Lifetime |
-|---|---|---|
-| `TARA_SCRATCH` | This session's scratch folder, `<scratchDir>/<job id or chat>-<session id>`: helper scripts, request bodies, downloads | Deleted `scratchDays` (3) after the session last used it. A chat thread keeps its folder while people keep replying |
-| `TARA_JOB_DATA` | The job's data folder, `<jobDataDir>/<job id>`: what the job needs on its next run. Pre-run scripts get it too | Never deleted |
-
-- A scratch folder is made only when the model runs, so runs the pre-script skips leave nothing behind.
-- The sweep (at start and hourly) deletes only folders tara-agent made (they hold a `.tara-scratch` marker); other files in `scratchDir` are left alone.
-- Claude is told to keep temporary files out of the repo, and to propose a script that would speed up every run instead of saving it: a saved script would run on every later run, so it should be reviewed code.
-
-## Approvals, permission prompts and files
-
-Every run gets tara's own MCP server (next to the repo's `.mcp.json` servers) with these tools:
-
-| Tool | What happens |
+| You type | What happens |
 |---|---|
-| `request_approval` | **Everything that needs a person**: a decision before Claude acts, a suggestion worth acting on, or something only a person can do (a login, an OTP, a failure it could not fix). A scheduled job finishes what it can first and asks at the end. Claude posts the proposal with buttons (default **Approve / Reject**, up to 5 options) and ends its turn. A tap updates the card ("✅ Approve, chosen by @you at 14:02") and resumes the same session with `USER DECISION on "<title>": <option>`. Replying in words works too. Taps are recorded once (a double tap or a second person can't decide twice) and survive restarts. |
-| `request_privileged` | **Something only root can do**, for chats and scheduled jobs alike. With `privileged` set, Claude names an action from the helper's allowlist (fix permissions under a path, restart a service): an `auto` action runs at once and Claude carries on; any other becomes an approval card (Approvals page and the thread) and approving it runs the action and continues the run with the command's output. Without a fitting action Claude gives a `command` for a person, and **I ran it, continue** resumes the run. Every root action is kept as a card (Done tab), with its exit code and output. |
-| `send_file` | Uploads a screenshot, PDF, CSV or image into the thread. Only files inside the project or the temp directory, resolved through symlinks, up to 100 MB. |
-| `permission` | Chat turns outside `bypassPermissions`/`dontAsk`: when Claude wants a tool your `allowedTools` don't cover, the thread gets **Allow / Deny** buttons and the call waits (denied after 10 minutes). Scheduled jobs never wait on a prompt. |
-| `propose_item` / `list_items` / `finish_item` | **Approval cards for drafts that go out later** (a message, an email, an application, a post): each is a card on the Approvals page, approved, edited or rejected by a person, then run at its queue's time by the queue's executor, which reports each item with `finish_item`. Proposing the same `key` again replaces the waiting card. |
-
-The tools reach tara-agent through its local API with a per-run token, written to a mode-600 config file, so the token never appears on a command line. This needs `http.enabled` (the default).
+| Any message | Starts a session in the project repo; replies in the thread continue it |
+| `run <job name>` | Runs a job now, in your message's thread |
+| `!new` | Starts fresh in this thread |
+| `!model <name>` | Switches model for this thread |
+| `!stop` | Stops the current turn |
+| `!status` | Shows project, model, session and queue |
+| `!jobs` | Lists this channel's jobs and their next run |
+| `!health` | Shows the last 24 hours: runs, problems, usage |
 
 ## Dashboard
 
-Open the HTTP address in a browser (e.g. `http://my-server:4100` on your tailnet). Dark, and usable on a phone (the sidebar becomes a menu). Project dashboards can share the look: see [docs/dashboard-look.md](docs/dashboard-look.md).
+Open `http://127.0.0.1:4100` (or the address you set under `http`).
 
-- **Home** (`/`): what is running now, then **Needs attention** (approvals waiting, failing jobs with **Run now**, paused jobs with **Resume**), the next scheduled runs and the latest runs ("did work", "nothing to do", "failed"…). Refreshes every minute.
-- **Approvals** (`/approvals`): every card waiting for a person, from every project. A paused run's decision (`request_approval`, also in Slack) continues that run as its job. A draft (`propose_item`) shows its editable fields with character counts and its checks; approve (one, or "Approve all N" of a kind), approve and run now, revise (Jarvis makes a new version) or reject. Tabs: Waiting, Scheduled (approved, with when each goes out), Done (30 days). Deciding needs the browser unlocked once on `/unlock` with `TARA_ADMIN_TOKEN`, from another device than the server.
-- **Jobs** (`/jobs`): every job of every project, failing first, filterable by project and state (failing, running, paused) and searchable. Each card has the schedule in plain English, next and last run, the last 10 runs as coloured squares, the failure streak and last error, **Run now** (streams to the project `owner`), **Pause** / **Resume**, and details with the skills, the script that runs first, model and run history.
-- **Schedule** (`/schedule`): one day (today and the next six) of every job as a timeline with each job's usual length (click it to change `durationMinutes`), the runs that already happened, jobs that overlap or start back to back, and free windows.
-- **Run** (`/runs/<id>`): one run's status, error, Claude's reply and what the pre-run script found, with **Run now**.
-- **Sessions** (`/sessions`): every Slack thread and job run tara-agent started, newest first, filterable by project and chat/job. Old `/?project=…` links still land here.
-- **Code** (`/code`): each repo's uncommitted changes with coloured diffs, a file browser and search (file names and text, one repo or all), read-only. An **Ask** box on a diff or file starts a Slack thread about it in the project's channel (needs the unlocked browser). Works with git data copied from another machine. See [docs/code-view.md](docs/code-view.md).
-- **Session** (`/sessions/<id>`): the full transcript, read from Claude Code's own session file: prompts, Claude's replies, and every tool call folded with its input and result, plus a link to the Slack thread.
-
-The sidebar's **Dashboards** list links every project's own `dashboardUrl`. Every action asks for confirmation first. The same paths answer JSON to tools; browsers get HTML. Only sessions of the user tara-agent runs as are listed.
-
-## Local API
-
-For dashboards and scripts on the same host (`127.0.0.1:4100` by default):
-
-| Call | Does |
+| Page | Shows |
 |---|---|
-| `GET /health` | Uptime and job counts |
-| `GET /jobs?project=<name>` | Jobs with next run, last status and error; `&upcoming=7` adds each job's start times for the next 7 days |
-| `POST /jobs/<project>/<id>/run` `{"by": "who"}` | Run a job now |
-| `POST /jobs/<project>/<id>/pause` | Stop a job's schedule: sets `"enabled": false` in the repo's `.tara/jobs.json` and reloads at once. Returns `{"ok": true, "enabled": false}` |
-| `POST /jobs/<project>/<id>/resume` | Put it back on its schedule (removes the `enabled` key, so a pause + resume leaves the file as it was). Returns `{"ok": true, "enabled": true}` |
-| `GET /jobs/<project>/<id>/runs?limit=15` | Run history |
-| `GET /runs?limit=30` | The latest job runs of every project (status, error, session), without outputs |
-| `GET /runs/<id>` | One run, with Claude's reply and the script output |
-| `GET /sessions?project=&limit=30` | The latest sessions with their last run |
-| `GET /sessions/<id>/transcript` | A session's conversation as JSON: prompts, replies, tool calls with input and result |
-| `POST /sessions/<id>/message` `{text}` | Continue that session's thread as the project owner, e.g. "fixed, retry" from your own Claude after repairing what a run tripped on. Needs the header `x-tara-admin: <TARA_ADMIN_TOKEN>`, which runs can't read |
-| `POST /jobs/<project>/<id>/duration` `{"minutes": 20}` | Set the job's usual length (`durationMinutes`) |
-| `POST /reload` | Re-read every `.tara/jobs.json` now |
-| `GET /schedule?day=YYYY-MM-DD&project=<name>` | One day's planned runs, overlaps, tight gaps and free windows |
-| `GET /schedule/conflicts?days=7` | Overlapping and back-to-back jobs for the next days |
-| `GET /items?project=&status=&kind=` | Approval items (`status`: comma list of pending, approved, running, done, failed, rejected, expired, cancelled) |
-| `GET /items/<id>` | One item, with its seal |
-| `POST /items` `{project, kind, key?, title, body?, fields?, media?, checks?, queue, window?, runAfter?}` | Propose a draft (e.g. a project server proposing the next follow-up); it still needs a person |
-| `POST /items/ask` `{project, title, details?, options?, kind?, key?}` | A project server asking a person outside any run (a login that expired, a send that bounced): a card on the Approvals page and in the project's channel, one per pending `key`. Whatever the person picks goes to Claude in that thread, like a reply |
-| `GET /code`, `GET /code/<repo>`, `/code/<repo>/diff?path=`, `/file?path=`, `/files?path=` | Repos' uncommitted changes, one file's diff, a file, a folder; `?q=` on `/code` or `/code/<repo>` searches file names and text ([docs/code-view.md](docs/code-view.md)) |
-| `POST /code/<repo>/ask` `{path, question}` | Human only (unlock cookie): starts a Slack thread about that file in the project's channel |
-| `GET /queues?project=<p>&upcoming=<n>` | A project's queues with their next slot times and the kind that went last (for a content calendar) |
-| `POST /items/<id>/withdraw` `{reason?}` | A project server taking back a card still waiting (the thing was posted by hand); it ends cancelled and the hook is told |
-| `POST /items/<id>/report` `{status, result?}` | A project server reporting an item of its `external` queue: done, failed, or waiting with a status line |
-| `POST /items/<id>/decide` `{option, fields?, reply?, runNow?}`, `POST /items/bulk` `{ids, option}`, `POST /items/<id>/cancel` | Human only: the unlock cookie, from another device |
-
-## Queues
-
-Approved drafts run through queues declared in `<repo>/.tara/queues.json`:
-
-```json
-{ "queues": {
-  "linkedin": { "executor": { "job": "linkedin-sender" }, "batch": 5,
-    "windows": { "EU": { "tz": "Europe/Berlin", "days": "tue-thu", "from": "10:00", "to": "12:00" } },
-    "caps": { "perDay": 12, "perWeek": 40 }, "gapMinutes": 3 },
-  "email":    { "executor": { "url": "http://127.0.0.1:4002/api/send" }, "caps": { "perDay": 10 } },
-  "content":  { "executor": { "job": "publisher" }, "slots": "30 18 * * 1,3,5", "alternate": ["image-post", "reel"] } } }
-```
-
-- One batch at a time per queue (plus the usual `jobConcurrency` and job `locks`), oldest approval first.
-- `windows`: an item runs only while its window (`window` on the item, e.g. a region) is open, else any window. `slots`: one batch per cron slot instead, taking turns between the `alternate` kinds. "Approve & run now" skips windows and slots.
-- `caps` (per day in the queue's `tz`, per rolling week) and `gapMinutes` between runs.
-- `slack: true`: each card is also posted in the project's Slack channel without buttons (decisions stay on the Approvals page): as its own message, or inside the thread of the run that proposed it. The message shows the decision or a withdrawal; a Revise and the run that executes the card reply in that thread, and so does the outcome from any executor (a job's `finish_item`, a URL executor's answer, an external project's `waiting`/`done`/`failed` reports, a run that ended without reporting), so one card is one thread.
-- A **job executor** gets the items in its prompt under "## Approved items" (each item's `fields` by key, plus `labels` for fields whose key doesn't say what they are, e.g. a form question behind `q3`) and reports each with `finish_item`; a **URL executor** gets one POST `{item}` per item (with its `seal`) and answers `{status: "done"|"failed", result}`, or `{status: "later", result, retryAt?}` when it can't take the item yet (a daily cap, a pause): the item goes back to approved until `retryAt` (default an hour), with the reason shown under Scheduled, and doesn't count against the caps. An item that is never reported ends as failed and is not run again, so nothing goes out twice.
-- An **external** queue (`"executor": {"external": true}`) is never run by tara-agent: the project's own server runs its approved items on its own schedule and reports each with `POST /items/<id>/report` `{status: "done"|"failed"|"waiting", result}` (waiting sets the line shown under Scheduled). Windows still show when an item is expected to go. A cancelled item is told to the project's hook at once, so it can stop.
-- **Options on a draft:** the first option (default Approve) seals the item and queues it. Any other option closes it: a negative one (Reject, Skip, No…) as `rejected`, anything else (e.g. "Applied by hand") as `done`. Revise keeps it pending and sends the request to Jarvis, whose new version replaces the card (same `key`). A card holds up to 40 fields.
-- A project's `approvals.validateUrl` (in `.tara/config.json`) is asked for its own checks on every proposed or edited item (POST `{kind, key, fields}` → `{checks: [{text, blocking}]}`); blocking checks stop approval. Pending items expire after `approvals.expireDays` (7).
-- A project's `approvals.hookUrl` gets POST `{event: "decided" | "finished", item}` whenever one of its items is decided or finishes (done, failed, or failed because unreported), so its server can do its side (log a send, drop a draft). The header `x-tara-signature` is the HMAC-SHA256 of the body with `APPROVAL_SEAL_KEY`; a server without the key can instead read the item back with `GET /items/<id>` before acting. Best effort: a server that is down misses it, so it should also catch up on its own.
-
-## Thread commands
-
-| Command | Effect |
-|---|---|
-| `!new` | Forget this thread's session |
-| `!model <name>` | Switch model for this thread |
-| `!stop` | Stop the running turn |
-| `!status` | Show project, model, session and queue |
-| `!jobs` | List this channel's jobs with their next run |
-| `run <job name>` | Plain words, no command needed: "run weekly redis health audit", "start amazon sla report". One match starts at once and runs in your message's thread (live card + report, ✅ on your message, replies continue the job's session); several matches give you buttons to pick; anything looser goes to Claude, which can start jobs with its `run_job` tool. `!run <job-id>` still works |
-| `!health` | The last 24 hours: runs, problems, missed slots, usage |
+| **Home** | What's running, what needs attention, upcoming and recent runs |
+| **Approvals** | Cards waiting for a decision, scheduled drafts, and past decisions |
+| **Jobs** | Every job with its schedule, recent results, **Run now** and **Pause** |
+| **Schedule** | A day's timeline of jobs, with overlaps and free time |
+| **Sessions** | Every Slack thread and job run, with full transcripts |
+| **Code** | Each repo's uncommitted changes, diffs and files (read-only) |
 
 ## Security
 
-**Anyone who can post in a mapped channel can make Claude act on your machine.**
-- The default `permissionMode: default` only runs tools listed in `allowedTools`. Anything else is blocked and reported in the thread.
-- `bypassPermissions` runs everything without asking. Use it only in private channels you control, and limit `allowedUsers`.
-- Credentials are stripped from the CLI's environment unless a project opts into API billing.
+**Anyone who can post in a mapped channel can make Claude act on your machine.** Treat that channel like a shell.
 
-More in [`docs/security.md`](docs/security.md).
+- Keep project channels private and set `allowedUsers`.
+- The default `permissionMode: default` runs only the tools in `allowedTools`. For anything else, the thread gets **Allow / Deny** buttons.
+- `bypassPermissions` runs everything without asking. Use it only in channels you fully control.
+- Claude never gets your Slack tokens or other secrets in its environment.
+
+Full threat model: [`docs/security.md`](docs/security.md).
 
 ## Documentation
 
-- [`docs/architecture.md`](docs/architecture.md): modules and the flow of a chat turn, a job and an approval
-- [`docs/security.md`](docs/security.md): threat model and the dedicated-user setup
-- [`docs/code-view.md`](docs/code-view.md): the Code page (diffs and files on a phone)
-- [`docs/plan.md`](docs/plan.md): design notes and roadmap
-- [`CHANGELOG.md`](CHANGELOG.md), [`CONTRIBUTING.md`](CONTRIBUTING.md)
+| Doc | Covers |
+|---|---|
+| [`docs/configuration.md`](docs/configuration.md) | Every setting: host, project, jobs, files, approvals, queues, local API |
+| [`docs/security.md`](docs/security.md) | Threat model, dedicated user, split users, privileged actions |
+| [`docs/architecture.md`](docs/architecture.md) | Modules and how a chat turn, job and approval flow |
+| [`docs/code-view.md`](docs/code-view.md) | The Code page |
+| [`docs/dashboard-look.md`](docs/dashboard-look.md) | Reusing the dashboard style in your own project dashboards |
+| [`CHANGELOG.md`](CHANGELOG.md), [`CONTRIBUTING.md`](CONTRIBUTING.md) | Changes and how to contribute |
 
 ## Development
 

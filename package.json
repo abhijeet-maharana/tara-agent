@@ -2,7 +2,7 @@
   "name": "tara-agent",
   "version": "0.1.0",
   "private": true,
-  "description": "Self-hosted gateway that turns Slack threads and cron schedules into real Claude Code sessions on your own machine.",
+  "description": "A self-hosted 24/7 AI agent for your projects, with human-in-the-loop approvals in Slack and a web dashboard.",
   "license": "MIT",
   "author": "Abhijeet Maharana",
   "type": "module",

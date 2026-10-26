@@ -14,11 +14,17 @@ tara-agent lets people in Slack, and scheduled prompts, make Claude act on a mac
 | Claude approves its own drafts (forges a decision) | **Split users** (below): decisions on the dashboard need a cookie key Claude can't read and must come from another device; approved items are sealed with a key Claude can't read, and executors in other processes check the seal |
 | Another local process drives the bot | The API binds to `127.0.0.1`; set `TARA_HTTP_TOKEN` to require a bearer token; `/internal/*` needs a per-run token that exists only while that run is alive |
 | A file upload leaks something outside the project | `send_file` resolves symlinks and only accepts files inside the project or the temp directory |
-| Your Claude account is banned for automation through a third-party client | tara-agent only runs the official `claude` binary; no token extraction, header or prompt spoofing, or account pools. You are still responsible for your plan's terms |
 
 ## Run as a dedicated user
 
-The recommended setup on an always-on machine (see also the README):
+The recommended setup on an always-on machine. Scheduled jobs often read untrusted text, and a job that gets talked into something runs with the rights of the user tara-agent runs as.
+
+1. `sudo useradd --create-home --user-group tara` (no sudo, no docker group), then install Claude Code and log in as that user: `sudo -iu tara`, install, `claude`, `/login`.
+2. Give it the project repos and nothing else: a shared group with ACLs on the repo directories (`setfacl -m g:tara:rwx,d:g:tara:rwx` on every directory, default ACLs included). If you sync code with Mutagen, create the session with `--default-group-beta=tara`.
+3. Keep secrets out: remove the group's access to `.env` files and session/key files in the repos, and keep your home closed (`setfacl -m u:tara:--x ~` lets it pass through to the repos only).
+4. Put the Slack tokens in a root-only `/etc/tara-agent.env` and install `deploy/systemd/tara-agent-dedicated-user.service` as a system unit.
+
+The agent then can't use your sudo, docker group, browser profiles, other projects or secrets, and can't edit tara-agent itself. In detail:
 
 - A system user with no sudo and no docker group, with its own Claude Code login.
 - Repo access through a shared group and **default ACLs** on every repo directory, so files created by either side stay writable for both whatever the umask. Name the owner in the ACLs too, so services started before a group change still work.
