@@ -23,7 +23,7 @@ describe('loadHostConfig', () => {
     writeFileSync(file, 'projects:\n  - ~/Projects/a\n  - /srv/b\n');
     const host = loadHostConfig(file);
     expect(host.projects).toEqual([path.join(homedir(), 'Projects/a'), '/srv/b']);
-    expect(host.concurrency).toBe(2);
+    expect(host.concurrency).toBe(8);
     expect(host.claude).toEqual({ bin: 'claude', chatTimeoutMinutes: 20 });
     expect(host.stateDir).toBe(path.join(homedir(), '.local/state/tara-agent'));
   });

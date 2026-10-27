@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Host `concurrency` defaults to 8 chat sessions at once (was 2). Hosts that set it keep their value.
 - **No more `!` commands in Slack.** `!new`, `!model`, `!status`, `!jobs`, `!health` and `!run` are gone; such messages go to Claude like any other. Typing `stop` on its own (also `cancel`, `abort`, `halt`; `!stop` still works) stops whatever runs in the thread. A reply sent while a run works waits for it, and the thread says so. "run <job name>" stays.
 - **Job threads hold their thread**: a reply in a running job's thread waits for the job instead of resuming the same session alongside it, and `stop` there ends the job. Chat turns and jobs share one per-thread tracker (`src/sessions/threads.ts`).
 - **Code page** (`/code`, host `code`): each repo's uncommitted changes with coloured diffs, a file browser and search (file names and text, one repo or all, `?q=`), read-only and phone-friendly, plus an **Ask** box that starts a Slack thread about a file or diff (unlock cookie needed). Git runs read-only through a private index copy, so the git data can be a one-way copy from another machine (`gitDir`). Only files git lists are served; `exclude` hides `.env*` and keys. API: `GET /code`, `/code/<repo>`, `/diff`, `/file`, `/files`, `POST /code/<repo>/ask`.

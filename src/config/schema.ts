@@ -21,7 +21,7 @@ export const hostConfigSchema = z.object({
   /** Project repo paths. Each repo describes itself in `.tara/config.json`. */
   projects: z.array(z.string().min(1)).min(1),
   /** Max Claude sessions running at once on this host. */
-  concurrency: z.number().int().min(1).max(16).default(2),
+  concurrency: z.number().int().min(1).max(16).default(8),
   claude: z
     .object({
       bin: z.string().default('claude'),

@@ -18,7 +18,7 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 |---|---|---|
 | `projects` | required | Paths of project repos |
 | `agentName` | `tara` | The agent's name: Claude is told "Your name is …" in every run, and the dashboard shows it. The name on Slack messages is the Slack app's bot name (App Home → Display name) |
-| `concurrency` | `2` | Max chat sessions at once |
+| `concurrency` | `8` | Max chat sessions at once |
 | `jobConcurrency` | `1` | Max scheduled jobs at once |
 | `claude.bin` | `claude` | CLI path |
 | `claude.chatTimeoutMinutes` | `20` | Time limit per chat turn |

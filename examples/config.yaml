@@ -3,7 +3,7 @@ agentName: tara # what the agent calls itself; match the Slack app's bot name
 projects:
   - ~/Projects/my-shop
   - ~/Projects/side-project
-concurrency: 2
+concurrency: 8
 claude:
   bin: claude
   chatTimeoutMinutes: 20
