@@ -131,6 +131,7 @@ async function serve(configFlag: string | undefined) {
         ? (manager?.runButton(tap) ?? Promise.resolve())
         : (bridge?.handleButton(tap) ?? Promise.resolve()),
     streaming: host.streaming,
+    voice: host.voice && { ...host.voice, apiKey: process.env.TARA_VOICE_API_KEY || undefined },
   });
   // Root actions: the helper's allowlist is the source of truth; without it runs can only ask a person.
   const privileged = host.privileged ? new Privileged(host.privileged.command) : undefined;

@@ -55,6 +55,17 @@ export const hostConfigSchema = z.object({
    * app's "Agents & AI Apps" feature; falls back to an edited status message without it).
    */
   streaming: z.boolean().default(true),
+  /**
+   * Speech-to-text for Slack voice notes that Slack didn't transcribe: an OpenAI-compatible chat
+   * completions URL whose models take audio (e.g. Gemini), tried in order. The key comes from
+   * TARA_VOICE_API_KEY. Unset = Slack's own transcript only.
+   */
+  voice: z
+    .object({
+      url: z.string().url(),
+      models: z.array(z.string().min(1)).min(1),
+    })
+    .optional(),
   /** Minimum gap between edits of the live status message. */
   statusIntervalSeconds: z.number().min(1).default(5),
   /** Max scheduled jobs running at once (separate from chat). */

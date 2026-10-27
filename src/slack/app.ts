@@ -3,6 +3,7 @@ import path from 'node:path';
 import { App, type BlockAction, type ButtonAction, LogLevel } from '@slack/bolt';
 import type { ChatPort, IncomingMessage, Logger } from '../sessions/manager.js';
 import { StreamError, type StreamPort } from './reply.js';
+import { transcribeAudio, type VoiceOptions } from './voice.js';
 
 /** A tap on one of tara's buttons (action ids start with `tara:`). */
 export interface ButtonTap {
@@ -23,6 +24,8 @@ export interface SlackOptions {
   onButton?: (tap: ButtonTap) => Promise<void>;
   /** Stream replies natively (Slack's "Agents & AI Apps" feature); default true. */
   streaming?: boolean;
+  /** Speech-to-text for voice notes Slack didn't transcribe; unset = Slack's transcript only. */
+  voice?: VoiceOptions;
 }
 
 /** Slack sends &, < and > escaped. Mentions and links (`<@U1>`, `<https://…>`) stay as they are. */
@@ -51,6 +54,9 @@ export interface SlackFile {
   transcription?: { status?: string; preview?: { content?: string; has_more?: boolean } };
   /** The full transcript as WebVTT (needs the bot token), for when the preview is cut short. */
   vtt?: string;
+  /** The audio itself (needs the bot token), for `voice` when Slack has no transcript. */
+  url_private_download?: string;
+  filetype?: string;
 }
 
 /** The first voice note (a Slack audio clip) in a message, if any. */
@@ -148,23 +154,32 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
   };
 
   /**
-   * The words of a voice note, from Slack's transcript. Slack transcribes after posting, so this
-   * polls the file for up to a minute. Undefined when Slack has no transcript for it.
+   * The words of a voice note. Slack's own transcript comes first: it transcribes after posting, so
+   * this polls the file (10 s with a `voice` fallback, a minute without). Slack skips some clips
+   * (short ones, some languages), so then the audio goes to `voice` if set.
    */
   const transcribe = async (clip: SlackFile): Promise<string | undefined> => {
     let file = clip;
-    for (let attempt = 0; file.transcription?.status !== 'complete'; attempt++) {
+    const attempts = options.voice ? 5 : 30;
+    for (let attempt = 0; attempt < attempts; attempt++) {
       const status = file.transcription?.status;
-      if (attempt >= 30 || (status !== undefined && status !== 'processing')) return undefined;
+      if (status === 'complete' || status === 'failed') break;
       await new Promise((r) => setTimeout(r, 2000));
       file = ((await app.client.files.info({ file: clip.id })).file as SlackFile | undefined) ?? file;
     }
-    const preview = file.transcription?.preview;
-    if (preview?.has_more && file.vtt) {
-      const res = await fetch(file.vtt, { headers: { Authorization: `Bearer ${options.botToken}` } });
-      if (res.ok) return vttToText(await res.text()) || undefined;
+    const auth = { headers: { Authorization: `Bearer ${options.botToken}` } };
+    if (file.transcription?.status === 'complete') {
+      const preview = file.transcription.preview;
+      if (preview?.has_more && file.vtt) {
+        const res = await fetch(file.vtt, auth);
+        if (res.ok) return vttToText(await res.text()) || undefined;
+      }
+      if (preview?.content?.trim()) return preview.content.trim();
     }
-    return preview?.content?.trim() || undefined;
+    if (!options.voice || !file.url_private_download) return undefined;
+    const res = await fetch(file.url_private_download, auth);
+    if (!res.ok) return undefined;
+    return transcribeAudio(Buffer.from(await res.arrayBuffer()), file.filetype ?? 'm4a', options.voice);
   };
 
   app.message(async ({ message }) => {

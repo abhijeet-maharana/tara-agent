@@ -27,6 +27,7 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `stateDir` | `~/.local/state/tara-agent` | SQLite database, and default home of scratch and job data folders |
 | `scratchDays` | `3` | Days after its last use that a session's scratch folder is deleted (see [Files](#files)) |
 | `streaming` | `true` | Stream replies as a live task card and text. Needs the Slack app's "Agents & AI Apps" feature and the `assistant:write` scope; without them, tara-agent falls back to one edited status message |
+| `voice` | unset | Speech-to-text for Slack voice notes that Slack didn't transcribe (it skips short clips and some languages): `url` (an OpenAI-compatible chat completions endpoint whose models take `input_audio`, e.g. Gemini) and `models` (tried in order). Key from `TARA_VOICE_API_KEY`. Unset = Slack's transcript only, and voice notes without one get a "please type it" reply |
 | `statusIntervalSeconds` | `5` | Min gap between status edits in the fallback mode |
 | `catchUpHours` | `6` | After downtime, run a job's latest missed slot if it is at most this old (`0` = never) |
 | `timezone` | host's | Default timezone for job schedules and times shown in Slack |
