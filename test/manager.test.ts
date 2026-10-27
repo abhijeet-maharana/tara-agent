@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { HostConfig, Project, ProjectConfig } from '../src/config/schema.js';
 import type { RunOptions, RunOutcome } from '../src/runner/run.js';
-import { type IncomingMessage, SessionManager } from '../src/sessions/manager.js';
+import { type IncomingMessage, isStopRequest, SessionManager } from '../src/sessions/manager.js';
+import { Threads } from '../src/sessions/threads.js';
 import { Store } from '../src/store/store.js';
 import { FakeChat, testHost } from './fakes.js';
 
@@ -119,41 +120,10 @@ describe('SessionManager', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('switches model with !model and clears the session with !new', async () => {
-    const { chat, calls, manager, store } = setup();
-    await manager.handle(msg('!model opus'));
-    await manager.handle(msg('hi'));
-    expect(calls[0]?.args).toEqual(expect.arrayContaining(['--model', 'opus']));
-    await manager.handle(msg('!new'));
-    expect(store.getSession('C1:100.1')).toBeUndefined();
-    expect(chat.texts().some((t) => t.includes('Session cleared'))).toBe(true);
-  });
-
-  it('shows the health digest on !health', async () => {
-    const chat = new FakeChat('bot.');
-    const manager = new SessionManager({
-      projects: [project()],
-      host,
-      store: new Store(':memory:'),
-      chat,
-      log: { info() {}, warn() {}, error() {} },
-      run: async () => ok(),
-      jobs: {
-        list: () => [],
-        trigger: () => 'unknown',
-        digest: () => ({ headline: '🩺 all good', details: '*Usage*\n• 1k tokens' }),
-      },
-    });
-    await manager.handle(msg('!health'));
-    expect(chat.texts()).toEqual(['🩺 all good', '*Usage*\n• 1k tokens']);
-  });
-
-  it('shows status and help', async () => {
-    const { chat, manager } = setup();
+  it('sends "!" messages to Claude like any other message', async () => {
+    const { calls, manager } = setup();
     await manager.handle(msg('!status'));
-    await manager.handle(msg('!help'));
-    expect(chat.texts()[0]).toContain('*Project:* shop');
-    expect(chat.texts()[1]).toContain('!stop');
+    expect(calls[0]?.prompt).toMatch(/^<@U1>: !status/);
   });
 
   it('explains permission denials', async () => {
@@ -243,26 +213,99 @@ describe('SessionManager', () => {
     expect(chat.updates.at(-1)?.text).toMatch(/ANTHROPIC_API_KEY/);
   });
 
-  it('stops a running turn with !stop', async () => {
+  /** A manager whose turns run until stopped. */
+  function blocking() {
     const chat = new FakeChat('bot.');
+    const calls: RunOptions[] = [];
     const manager = new SessionManager({
-      projects: [project()],
+      projects: [project({ selfImprove: false })],
       host,
       store: new Store(':memory:'),
       chat,
       env: {},
       log: { info() {}, warn() {}, error() {} },
-      run: (options) =>
-        new Promise((resolve) =>
-          options.signal?.addEventListener('abort', () =>
-            resolve(ok({ status: 'aborted', text: '', durationMs: 1000 })),
-          ),
-        ),
+      run: (options) => {
+        calls.push(options);
+        return new Promise((resolve) => {
+          const stop = () => resolve(ok({ status: 'aborted', text: '', durationMs: 1000 }));
+          if (options.signal?.aborted) stop();
+          options.signal?.addEventListener('abort', stop);
+        });
+      },
     });
-    const turn = manager.handle(msg('long job'));
+    return { chat, calls, manager };
+  }
+
+  it.each(['stop', 'Stop!', '!stop', 'please stop it', 'cancel', 'abort now'])(
+    'stops a running turn on "%s"',
+    async (word) => {
+      const { chat, calls, manager } = blocking();
+      const turn = manager.handle(msg('long job'));
+      await new Promise((r) => setTimeout(r, 10));
+      await manager.handle(msg(word, { ts: '100.2' }));
+      await turn;
+      expect(chat.updates.at(-1)?.text).toBe('⏹ Stopped after 1s.');
+      expect(calls).toHaveLength(1);
+    },
+  );
+
+  it('treats "stop" inside a longer message as a normal message', async () => {
+    const { calls, manager } = setup();
+    expect(isStopRequest('stop the meesho ads')).toBe(false);
+    await manager.handle(msg('stop the meesho ads'));
+    expect(calls[0]?.prompt).toMatch(/^<@U1>: stop the meesho ads/);
+  });
+
+  it('says so when "stop" finds nothing running', async () => {
+    const { chat, calls, manager } = setup();
+    await manager.handle(msg('stop'));
+    expect(calls).toHaveLength(0);
+    expect(chat.texts()).toEqual(['Nothing is running in this thread.']);
+  });
+
+  it('tells you a message waits for the running turn, then runs it next', async () => {
+    const { chat, calls, manager } = blocking();
+    const first = manager.handle(msg('long job'));
     await new Promise((r) => setTimeout(r, 10));
-    await manager.handle(msg('!stop', { ts: '100.2' }));
-    await turn;
-    expect(chat.updates.at(-1)?.text).toBe('⏹ Stopped after 1s.');
+    const second = manager.handle(msg('also include X', { ts: '100.2' }));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(chat.texts().some((t) => t.startsWith('⏳ Noted.'))).toBe(true);
+    expect(calls).toHaveLength(1);
+
+    await manager.handle(msg('stop', { ts: '100.3' }));
+    await first;
+    await new Promise((r) => setTimeout(r, 10));
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.prompt).toMatch(/^<@U1>: also include X/);
+    await manager.handle(msg('stop', { ts: '100.4' }));
+    await second;
+  });
+
+  it('makes a reply wait for a job holding the thread, and stops the job on "stop"', async () => {
+    const threads = new Threads();
+    const chat = new FakeChat('bot.');
+    const calls: RunOptions[] = [];
+    const manager = new SessionManager({
+      projects: [project({ selfImprove: false })],
+      host,
+      store: new Store(':memory:'),
+      chat,
+      threads,
+      log: { info() {}, warn() {}, error() {} },
+      run: async (options) => {
+        calls.push(options);
+        return ok();
+      },
+    });
+    const job = await threads.enter('C1:100.1');
+    const reply = manager.handle(msg('also include X', { ts: '100.2' }));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(calls).toHaveLength(0);
+
+    await manager.handle(msg('stop', { ts: '100.3' }));
+    expect(job.signal.aborted).toBe(true);
+    job.release();
+    await reply;
+    expect(calls).toHaveLength(1);
   });
 });

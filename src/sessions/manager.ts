@@ -8,12 +8,13 @@ import { sessionScratch } from '../runner/workspace.js';
 import { foldersNote, identityPrompt } from '../scheduler/prompt.js';
 import type { JobControl, JobInfo } from '../scheduler/scheduler.js';
 import type { ButtonTap } from '../slack/app.js';
-import { formatDuration, splitMessage } from '../slack/format.js';
+import { formatDuration } from '../slack/format.js';
 import { EditReply, type StreamPort, StreamReply, type TurnReply } from '../slack/reply.js';
 import type { SessionRow, Store } from '../store/store.js';
-import { KeyedQueue, Semaphore } from '../util/concurrency.js';
+import { Semaphore } from '../util/concurrency.js';
 import { matchJob } from './job-match.js';
 import { learnFromRun, troubleReasons } from './learn.js';
+import { Threads } from './threads.js';
 
 /** The chat platform as the session manager sees it. Slack implements it; tests fake it. */
 export interface ChatPort {
@@ -60,8 +61,10 @@ export interface ManagerDeps {
   store: Store;
   chat: ChatPort;
   run: Runner;
-  /** Scheduler, for `!jobs` and `!run`. */
+  /** Scheduler, for "run <job name>". */
   jobs?: JobControl;
+  /** Shared with the scheduler, so a reply in a job's thread waits for the job and "stop" reaches it. */
+  threads?: Threads;
   /** Approval buttons, permission prompts and file uploads (tara's MCP tools). */
   bridge?: Bridge;
   env?: NodeJS.ProcessEnv;
@@ -75,24 +78,21 @@ const BASE_PROMPT = `You are running headless for a Slack thread, through tara-a
 - Your text appears in the thread as you write it, including notes between tool calls, so keep those to a word or two and put the answer at the end.
 - Each message starts with the sender's Slack mention, e.g. "<@U123>: ...". Several people may share a thread.
 - You cannot ask questions mid-turn. If you need input, end your turn with the question.
+- Messages sent while you work reach you as the next turn, after this one ends; one that follows a stopped turn may change the plan.
 - Temporary files go in $TARA_SCRATCH (this conversation's own folder, deleted automatically later), never in the repo.`;
 
-const HELP = `*Thread commands*
-• \`!new\` forget this thread's session; the next message starts fresh
-• \`!model <name>\` switch model for this thread (e.g. \`opus\`, \`sonnet\`, \`haiku\`)
-• \`!stop\` stop the running turn
-• \`!status\` show session, model and queue
-• \`!jobs\` list this channel's scheduled jobs
-• \`run <job name>\` run a scheduled job now, e.g. "run weekly redis health audit" (\`!run <job-id>\` works too)
-• \`!health\` the last 24 hours: runs, problems, missed slots, usage`;
+/** "stop", "please stop", "cancel it": the whole message, nothing else in it. */
+const STOP =
+  /^!?\s*(?:please\s+|pls\s+)?(?:stop|cancel|abort|halt)(?:\s+(?:it|now|this|that|please|pls))*\s*[.!]*$/i;
+
+export const isStopRequest = (text: string) => STOP.test(text.trim());
 
 export const threadKey = (channel: string, threadTs: string) => `${channel}:${threadTs}`;
 
 export class SessionManager {
   private readonly byChannel: Map<string, Project>;
-  private readonly queue = new KeyedQueue();
+  private readonly threads: Threads;
   private readonly slots: Semaphore;
-  private readonly running = new Map<string, AbortController>();
   private readonly env: NodeJS.ProcessEnv;
   private readonly log: Logger;
   private readonly newSessionId: () => string;
@@ -100,6 +100,7 @@ export class SessionManager {
 
   constructor(private readonly deps: ManagerDeps) {
     this.byChannel = new Map(deps.projects.map((p) => [p.config.slackChannel, p]));
+    this.threads = deps.threads ?? new Threads();
     this.slots = new Semaphore(deps.host.concurrency);
     this.env = deps.env ?? process.env;
     this.log = deps.log ?? console;
@@ -119,15 +120,21 @@ export class SessionManager {
     const text = msg.text.trim();
     if (!text) return;
     const key = threadKey(msg.channel, msg.threadTs);
+    const reply = (text: string) => this.deps.chat.post(msg.channel, msg.threadTs, text);
 
-    const command = /^!(\w+)\s*(.*)$/s.exec(text);
-    if (command)
-      return this.command(project, key, msg, command[1]?.toLowerCase() ?? '', command[2]?.trim() ?? '');
+    // "stop" stops whatever runs in this thread (a chat turn or a job) right away.
+    if (isStopRequest(text)) {
+      if (!this.threads.stop(key)) await reply('Nothing is running in this thread.');
+      return;
+    }
 
     // "Run Weekly Redis Health Audit": start the job straight away, no model needed.
     if (await this.runRequest(project, msg, text)) return;
 
-    await this.queue.run(key, () => this.turn(project, key, msg));
+    // The running turn can't read new messages; this one goes next, once it has finished.
+    if (this.threads.busy(key))
+      await reply('⏳ Noted. I’ll read this when the current work finishes. Say *stop* to stop it now.');
+    await this.threads.run(key, (signal) => this.turn(project, key, msg, signal));
   }
 
   /** Handles "run <job name>". False when the message isn't one (it then goes to Claude). */
@@ -201,78 +208,7 @@ export class SessionManager {
 
   /** Stops every running turn (used on shutdown). */
   stopAll(): void {
-    for (const controller of this.running.values()) controller.abort();
-  }
-
-  private async command(project: Project, key: string, msg: IncomingMessage, name: string, arg: string) {
-    const reply = (text: string) => this.deps.chat.post(msg.channel, msg.threadTs, text);
-    const session = this.deps.store.getSession(key);
-    switch (name) {
-      case 'new':
-        if (this.running.has(key)) return void (await reply('A turn is still running. Use `!stop` first.'));
-        this.deps.store.deleteSession(key);
-        return void (await reply('🧹 Session cleared. The next message starts a fresh one.'));
-      case 'model': {
-        if (!/^[\w.[\]-]+$/.test(arg))
-          return void (await reply('Usage: `!model <name>`, e.g. `!model opus`'));
-        this.deps.store.saveSession({ ...(session ?? this.freshSession(project, key)), model: arg });
-        return void (await reply(`🧠 Model for this thread: \`${arg}\` (from the next message).`));
-      }
-      case 'stop': {
-        const controller = this.running.get(key);
-        if (!controller) return void (await reply('Nothing is running in this thread.'));
-        controller.abort();
-        return;
-      }
-      case 'status': {
-        const queued = Math.max(0, this.queue.size(key) - (this.running.has(key) ? 1 : 0));
-        return void (await reply(
-          [
-            `*Project:* ${project.config.name}`,
-            `*Model:* ${session?.model ?? project.config.chatModel}`,
-            `*Session:* ${session?.started ? `\`${session.sessionId}\`` : 'not started'}`,
-            `*Running:* ${this.running.has(key) ? 'yes' : 'no'}${queued ? ` (${queued} queued)` : ''}`,
-            `*Permissions:* ${project.config.permissionMode}`,
-          ].join('\n'),
-        ));
-      }
-      case 'jobs': {
-        const jobs = this.deps.jobs?.list(project.config.name) ?? [];
-        if (jobs.length === 0) return void (await reply('No scheduled jobs for this channel.'));
-        const timeZone = this.deps.host.timezone;
-        const when = (d?: Date) =>
-          d
-            ? d.toLocaleString('en-GB', { timeZone, weekday: 'short', hour: '2-digit', minute: '2-digit' })
-            : 'off';
-        const lines = jobs.map(
-          (j) =>
-            `• \`${j.id}\` ${j.running ? '🔄 ' : j.enabled ? '' : '⏸ '}${j.name} · ${when(j.nextRun)} · ${j.model}` +
-            (j.lastStatus ? ` · last: ${j.lastStatus}` : ''),
-        );
-        return void (await reply(`*Jobs* (next run, ${timeZone})\n${lines.join('\n')}`));
-      }
-      case 'health': {
-        const digest = this.deps.jobs?.digest(project.config.name);
-        if (!digest) return void (await reply('Nothing ran or was missed in the last 24 hours.'));
-        await reply(digest.headline);
-        for (const chunk of splitMessage(digest.details)) await reply(chunk);
-        return;
-      }
-      case 'run': {
-        if (!this.deps.jobs) return void (await reply('Scheduling is not enabled.'));
-        if (!arg) return void (await reply('Usage: `!run <job-id>` (see `!jobs`)'));
-        const result = this.deps.jobs.trigger(project.config.name, arg, msg.user);
-        const text =
-          result === 'started'
-            ? `▶️ Started \`${arg}\`. It posts its own thread in this channel.`
-            : result === 'running'
-              ? `\`${arg}\` is already running.`
-              : `No job \`${arg}\` here. See \`!jobs\`.`;
-        return void (await reply(text));
-      }
-      default:
-        return void (await reply(HELP));
-    }
+    this.threads.stopAll();
   }
 
   private freshSession(project: Project, key: string): SessionRow {
@@ -285,7 +221,12 @@ export class SessionManager {
     };
   }
 
-  private async turn(project: Project, key: string, msg: IncomingMessage): Promise<void> {
+  private async turn(
+    project: Project,
+    key: string,
+    msg: IncomingMessage,
+    signal: AbortSignal,
+  ): Promise<void> {
     const { chat, store, host } = this.deps;
     const name = project.config.name;
     const intervalMs = host.statusIntervalSeconds * 1000;
@@ -304,8 +245,6 @@ export class SessionManager {
     await chat.react(msg.channel, msg.ts, 'eyes').catch(() => {});
     const release = await this.slots.acquire();
     reply.working();
-    const controller = new AbortController();
-    this.running.set(key, controller);
     const startedAt = this.now();
 
     let session = store.getSession(key) ?? this.freshSession(project, key);
@@ -355,7 +294,7 @@ export class SessionManager {
         prompt,
         systemPrompt: appendSystemPrompt,
         timeoutMs: host.claude.chatTimeoutMinutes * 60_000,
-        signal: controller.signal,
+        signal,
         onEvent: (event) => {
           if (event.kind === 'init' && !session.started) {
             session = { ...session, started: true };
@@ -383,7 +322,6 @@ export class SessionManager {
       };
     } finally {
       bridged?.dispose();
-      this.running.delete(key);
       release();
     }
 

@@ -7,6 +7,7 @@ import type { Runner, RunOutcome } from '../runner/run.js';
 import { jobDataDir, sessionScratch } from '../runner/workspace.js';
 import { type LearnRequest, learnFromRun, troubleReasons } from '../sessions/learn.js';
 import { type ChatPort, type Logger, threadKey } from '../sessions/manager.js';
+import type { ThreadHold, Threads } from '../sessions/threads.js';
 import { formatDuration, splitMessage, toSlackMrkdwn } from '../slack/format.js';
 import { StreamReply } from '../slack/reply.js';
 import type { Item, RunRecord, Store } from '../store/store.js';
@@ -53,6 +54,8 @@ export interface JobRunnerDeps {
   log: Logger;
   slots: Semaphore;
   locks: Locks;
+  /** One run per Slack thread, shared with chat turns. */
+  threads: Threads;
   bridge?: Bridge;
   env?: NodeJS.ProcessEnv;
   runScript?: typeof runScript;
@@ -114,6 +117,10 @@ export async function runJob(
   const postMain = (text: string) => chat.post(channel, inThread, text);
   if (requestTs) await chat.react(channel, requestTs, 'eyes').catch(() => {});
 
+  // An existing thread may have a chat turn in it: wait for it before taking a slot and locks.
+  let hold: ThreadHold | undefined = inThread
+    ? await deps.threads.enter(threadKey(channel, inThread))
+    : undefined;
   const releaseSlot = await deps.slots.acquire();
   const releaseLocks = await deps.locks.acquire(job.locks);
   const startedAt = now();
@@ -181,6 +188,9 @@ export async function runJob(
     const statusTs = await postMain(`⏳ ${title}`);
     const rootTs = inThread ?? statusTs;
     const key = threadKey(channel, rootTs);
+    // Holding the thread makes replies wait for this run, and lets "stop" in the thread end it.
+    hold ??= await deps.threads.enter(key);
+    const stop = signal ? AbortSignal.any([signal, hold.signal]) : hold.signal;
     const earlier = trigger.kind === 'resume' ? store.getSession(key) : undefined;
     if (trigger.kind === 'resume' && !earlier?.started) {
       await chat.update(channel, statusTs, `❌ ${title}: the run's session is gone, so it can't continue`);
@@ -251,7 +261,7 @@ export async function runJob(
             ? trigger.text
             : buildJobPrompt(job, script, folders, trigger.kind === 'queue' ? trigger.items : undefined),
         timeoutMs,
-        signal,
+        signal: stop,
         onEvent: (event) => {
           if (event.kind === 'init' && !session.started) {
             session = { ...session, started: true };
@@ -368,6 +378,7 @@ export async function runJob(
     releaseLocks();
     // Still inside the job slot, so learning turns count towards jobConcurrency.
     if (lesson) await learnFromRun(deps, lesson);
+    hold?.release();
     releaseSlot();
   }
 }

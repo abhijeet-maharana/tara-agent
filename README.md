@@ -94,16 +94,15 @@ journalctl --user -u tara-agent -f
 
 ## In Slack
 
+No commands to remember: just write.
+
 | You type | What happens |
 |---|---|
-| Any message | Starts a session in the project repo; replies in the thread continue it |
+| Any message | Starts a session in the project repo; replies in the thread continue it. A new top-level message starts fresh |
+| A reply while it's working | Waits, and is read as soon as the current work finishes (the thread says so). This includes a scheduled job's thread |
+| `stop` (or `cancel`) | Stops whatever is running in the thread, a chat turn or a job. Only the word on its own; "stop the ads" is a normal message |
 | `run <job name>` | Runs a job now, in your message's thread |
-| `!new` | Starts fresh in this thread |
-| `!model <name>` | Switches model for this thread |
-| `!stop` | Stops the current turn |
-| `!status` | Shows project, model, session and queue |
-| `!jobs` | Lists this channel's jobs and their next run |
-| `!health` | Shows the last 24 hours: runs, problems, usage |
+| "Which jobs run today?" | Claude answers with its `list_jobs` tool; the health digest posts itself daily |
 
 ## Dashboard
 

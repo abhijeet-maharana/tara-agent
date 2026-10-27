@@ -23,8 +23,9 @@ tara-agent is one Node process per host. It never calls the Anthropic API: every
 | Path | Responsibility |
 |---|---|
 | `src/config/` | Host config (YAML), project config and jobs files (JSON), all validated with zod |
-| `src/runner/` | Builds `claude` arguments, strips credentials from the environment, spawns the CLI, parses `stream-json`, kills the process group on timeout or `!stop` |
-| `src/sessions/manager.ts` | Slack thread ↔ Claude session, one turn at a time per thread, chat concurrency cap, live status message, thread commands |
+| `src/runner/` | Builds `claude` arguments, strips credentials from the environment, spawns the CLI, parses `stream-json`, kills the process group on timeout or stop |
+| `src/sessions/manager.ts` | Slack thread ↔ Claude session, chat concurrency cap, live status message, "stop" and "run <job name>" |
+| `src/sessions/threads.ts` | One run at a time per Slack thread, shared by chat turns and jobs: replies wait for the run, "stop" ends it |
 | `src/scheduler/` | Job timing (croner), slot claims, catch-up, locks, pre-scripts, job delivery, health digest |
 | `src/bridge/bridge.ts` | Per-run MCP config and token, approval buttons, permission prompts, file uploads |
 | `src/mcp/server.ts` | The stdio MCP server Claude starts: `request_approval`, `request_privileged`, `send_file`, `permission`, items and tasks |

@@ -18,6 +18,7 @@ import { QueueWorker } from './scheduler/queues.js';
 import { Scheduler } from './scheduler/scheduler.js';
 import { runScript } from './scheduler/script.js';
 import { type Logger, SessionManager } from './sessions/manager.js';
+import { Threads } from './sessions/threads.js';
 import { createSlackGateway } from './slack/app.js';
 import { Store } from './store/store.js';
 
@@ -163,6 +164,8 @@ async function serve(configFlag: string | undefined) {
   } else {
     log.warn('http is disabled: approval buttons, permission prompts and send_file are off');
   }
+  // Chat turns and job runs share threads: one Claude session at a time per Slack thread.
+  const threads = new Threads();
   const scheduler = new Scheduler({
     projects,
     host,
@@ -171,6 +174,7 @@ async function serve(configFlag: string | undefined) {
     run,
     runScript: runAs ? (s, cwd, env, ms, signal) => runScript(s, cwd, env, ms, signal, runAs) : undefined,
     bridge,
+    threads,
     log,
   });
   manager = new SessionManager({
@@ -180,6 +184,7 @@ async function serve(configFlag: string | undefined) {
     chat: slack.chat,
     run,
     jobs: scheduler,
+    threads,
     bridge,
     log,
   });

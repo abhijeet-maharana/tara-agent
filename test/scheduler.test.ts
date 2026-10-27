@@ -10,6 +10,7 @@ import { buildDigest } from '../src/scheduler/health.js';
 import { streamRecipient } from '../src/scheduler/job-runner.js';
 import { Scheduler } from '../src/scheduler/scheduler.js';
 import type { ScriptResult } from '../src/scheduler/script.js';
+import { Threads } from '../src/sessions/threads.js';
 import { type Item, Store, type StoredRun } from '../src/store/store.js';
 import { FakeChat, FakeStream, testHost } from './fakes.js';
 
@@ -580,6 +581,36 @@ describe('health digest', () => {
   });
 });
 
+describe('job threads', () => {
+  it('holds its thread while it runs, and a stop there ends the run', async () => {
+    const threads = new Threads();
+    const store = new Store(':memory:');
+    const scheduler = new Scheduler({
+      projects: [makeProject([baseJob])],
+      host,
+      store,
+      chat: new FakeChat('ts'),
+      threads,
+      log: { info() {}, warn() {}, error() {} },
+      env: { PATH: '/bin' },
+      newSessionId: () => 'sid',
+      run: (o) =>
+        new Promise((resolve) =>
+          o.signal?.addEventListener('abort', () => resolve({ ...ok(''), status: 'aborted' })),
+        ),
+    });
+    scheduler.start();
+    scheduler.trigger('shop', 'sla', 'U1');
+    while (!threads.busy('C1:ts1')) await new Promise((r) => setTimeout(r, 5));
+
+    expect(threads.stop('C1:ts1')).toBe(true);
+    await scheduler.idle();
+    expect(store.lastJobRun('shop', 'sla')?.status).toBe('aborted');
+    expect(threads.busy('C1:ts1')).toBe(false);
+    await scheduler.stop();
+  });
+});
+
 describe('job streaming', () => {
   it('streams only runs someone started, to that person or the project owner', () => {
     expect(streamRecipient({ kind: 'schedule' }, 'UOWNER')).toBeUndefined();
@@ -589,7 +620,7 @@ describe('job streaming', () => {
     expect(streamRecipient({ kind: 'manual', by: 'api' }, undefined)).toBeUndefined();
   });
 
-  it('streams a !run into the job thread and does not repost the details', async () => {
+  it('streams a run someone started into the job thread and does not repost the details', async () => {
     const stream = new FakeStream();
     const { chat, calls, scheduler } = setup({ jobs: [baseJob], stream });
     scheduler.start();

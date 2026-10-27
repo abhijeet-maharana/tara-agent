@@ -129,7 +129,7 @@ export const projectConfigSchema = z.object({
   systemPromptFile: z.string().optional(),
   /**
    * Slack user who owns this project: jobs started from the local API or a dashboard stream their
-   * thread live to this person (jobs started with `!run` stream to whoever typed it).
+   * thread live to this person (jobs started from Slack stream to whoever asked).
    */
   owner: z
     .string()

@@ -6,6 +6,7 @@ import { JOBS_FILE, loadJobs } from '../config/load.js';
 import type { HostConfig, Project, ScheduledJob } from '../config/schema.js';
 import type { Runner } from '../runner/run.js';
 import type { ChatPort, Logger } from '../sessions/manager.js';
+import { Threads } from '../sessions/threads.js';
 import { splitMessage } from '../slack/format.js';
 import type { Item, Store } from '../store/store.js';
 import { Locks, Semaphore } from '../util/concurrency.js';
@@ -33,7 +34,7 @@ export interface JobInfo {
   lastError?: string;
 }
 
-/** What chat commands (`!jobs`, `!run`) need from the scheduler. */
+/** What chat ("run <job name>") and the `list_jobs` / `run_job` tools need from the scheduler. */
 export interface JobControl {
   list(project: string): JobInfo[];
   /** Runs a job now; with `thread`, inside that chat message's thread. */
@@ -43,8 +44,6 @@ export interface JobControl {
     by: string,
     thread?: { channel: string; ts: string },
   ): 'started' | 'unknown' | 'running';
-  /** The last 24 hours of one project, or null when nothing ran or was missed. */
-  digest(project: string): { headline: string; details: string } | null;
 }
 
 export interface SchedulerDeps {
@@ -57,6 +56,8 @@ export interface SchedulerDeps {
   env?: NodeJS.ProcessEnv;
   runScript?: typeof runScript;
   bridge?: Bridge;
+  /** Shared with the chat sessions, so replies in a job's thread wait for it and "stop" reaches it. */
+  threads?: Threads;
   newSessionId?: () => string;
   now?: () => number;
   /** How often job files are checked for changes. */
@@ -79,6 +80,7 @@ export class Scheduler implements JobControl {
   private readonly fileStamps = new Map<string, number>();
   private readonly slots: Semaphore;
   private readonly locks = new Locks();
+  private readonly threads: Threads;
   private readonly controller = new AbortController();
   private readonly inflight = new Set<Promise<unknown>>();
   private readonly now: () => number;
@@ -89,6 +91,7 @@ export class Scheduler implements JobControl {
 
   constructor(private readonly deps: SchedulerDeps) {
     this.slots = new Semaphore(deps.host.jobConcurrency);
+    this.threads = deps.threads ?? new Threads();
     this.now = deps.now ?? Date.now;
     this.startedAt = this.now();
   }
@@ -139,6 +142,7 @@ export class Scheduler implements JobControl {
       .sort((a, b) => (a.nextRun?.getTime() ?? Infinity) - (b.nextRun?.getTime() ?? Infinity));
   }
 
+  /** The last 24 hours of one project, or null when nothing ran or was missed. */
   digest(project: string): { headline: string; details: string } | null {
     const now = this.now();
     const from = now - 24 * 3_600_000;
@@ -390,6 +394,7 @@ export class Scheduler implements JobControl {
         log: this.deps.log,
         slots: this.slots,
         locks: this.locks,
+        threads: this.threads,
         env: this.deps.env,
         runScript: this.deps.runScript,
         bridge: this.deps.bridge,

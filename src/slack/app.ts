@@ -39,6 +39,41 @@ export interface SlackMessageEvent {
   ts: string;
   thread_ts?: string;
   text?: string;
+  files?: SlackFile[];
+}
+
+/** The parts of a Slack file the gateway looks at: enough to read a voice note's transcript. */
+export interface SlackFile {
+  id: string;
+  subtype?: string;
+  media_display_type?: string;
+  /** Slack's own speech-to-text for audio clips; usually still `processing` when the message arrives. */
+  transcription?: { status?: string; preview?: { content?: string; has_more?: boolean } };
+  /** The full transcript as WebVTT (needs the bot token), for when the preview is cut short. */
+  vtt?: string;
+}
+
+/** The first voice note (a Slack audio clip) in a message, if any. */
+export function voiceClip(files: SlackFile[] | undefined): SlackFile | undefined {
+  return files?.find((f) => f.subtype === 'slack_audio' || f.media_display_type === 'audio');
+}
+
+/** The spoken text of a WebVTT transcript: cue text only, without the header, cue ids and timings. */
+export function vttToText(vtt: string): string {
+  const blocks = vtt.replace(/\r/g, '').split(/\n{2,}/);
+  return blocks
+    .map((block) => {
+      const lines = block.split('\n');
+      const timing = lines.findIndex((l) => l.includes('-->'));
+      return timing < 0
+        ? ''
+        : lines
+            .slice(timing + 1)
+            .join(' ')
+            .trim();
+    })
+    .filter(Boolean)
+    .join(' ');
 }
 
 /**
@@ -112,13 +147,48 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
     },
   };
 
+  /**
+   * The words of a voice note, from Slack's transcript. Slack transcribes after posting, so this
+   * polls the file for up to a minute. Undefined when Slack has no transcript for it.
+   */
+  const transcribe = async (clip: SlackFile): Promise<string | undefined> => {
+    let file = clip;
+    for (let attempt = 0; file.transcription?.status !== 'complete'; attempt++) {
+      const status = file.transcription?.status;
+      if (attempt >= 30 || (status !== undefined && status !== 'processing')) return undefined;
+      await new Promise((r) => setTimeout(r, 2000));
+      file = ((await app.client.files.info({ file: clip.id })).file as SlackFile | undefined) ?? file;
+    }
+    const preview = file.transcription?.preview;
+    if (preview?.has_more && file.vtt) {
+      const res = await fetch(file.vtt, { headers: { Authorization: `Bearer ${options.botToken}` } });
+      if (res.ok) return vttToText(await res.text()) || undefined;
+    }
+    return preview?.content?.trim() || undefined;
+  };
+
   app.message(async ({ message }) => {
-    const incoming = toIncoming(message as SlackMessageEvent, botUserId);
+    const event = message as SlackMessageEvent;
+    const incoming = toIncoming(event, botUserId);
     if (!incoming) return;
     // Don't block Bolt's listener on a whole Claude turn.
-    void options
-      .onMessage(incoming)
-      .catch((err: Error) => options.log.error(`message handling failed: ${err.message}`));
+    void (async () => {
+      const clip = voiceClip(event.files);
+      if (clip) {
+        const spoken = await transcribe(clip);
+        if (!spoken) {
+          options.log.warn(`no transcript for voice note ${clip.id}`);
+          await chat.post(
+            incoming.channel,
+            incoming.threadTs,
+            'I couldn’t get a transcript for that voice note. Please type it.',
+          );
+          return;
+        }
+        incoming.text = [incoming.text, spoken].filter(Boolean).join('\n\n');
+      }
+      await options.onMessage(incoming);
+    })().catch((err: Error) => options.log.error(`message handling failed: ${err.message}`));
   });
 
   app.action<BlockAction<ButtonAction>>(/^tara:/, async ({ ack, body, action }) => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decodeSlackText, toIncoming } from '../src/slack/app.js';
+import { decodeSlackText, toIncoming, voiceClip, vttToText } from '../src/slack/app.js';
 
 const BOT = 'UBOT';
 const base = { channel: 'C1', ts: '100.1' };
@@ -45,5 +45,25 @@ describe('toIncoming', () => {
 describe('decodeSlackText', () => {
   it('unescapes entities but keeps mentions', () => {
     expect(decodeSlackText('a &lt;b&gt; &amp; <@U1>')).toBe('a <b> & <@U1>');
+  });
+});
+
+describe('voiceClip', () => {
+  it('finds a Slack audio clip among the files', () => {
+    const clip = { id: 'F2', subtype: 'slack_audio' };
+    expect(voiceClip([{ id: 'F1', subtype: 'slack_image' }, clip])).toBe(clip);
+  });
+
+  it('ignores messages without audio', () => {
+    expect(voiceClip(undefined)).toBeUndefined();
+    expect(voiceClip([{ id: 'F1', media_display_type: 'image' }])).toBeUndefined();
+  });
+});
+
+describe('vttToText', () => {
+  it('keeps only the spoken text', () => {
+    const vtt =
+      'WEBVTT\n\n1\n00:00:00.000 --> 00:00:02.000\nI have cold,\n\n2\n00:00:02.000 --> 00:00:03.500\ncan I eat banana?\n';
+    expect(vttToText(vtt)).toBe('I have cold, can I eat banana?');
   });
 });

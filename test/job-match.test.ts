@@ -90,7 +90,6 @@ describe('"run <job name>" in chat', () => {
           triggered.push(args);
           return 'started';
         },
-        digest: () => null,
       },
     });
     return { chat, manager, triggered, runs };

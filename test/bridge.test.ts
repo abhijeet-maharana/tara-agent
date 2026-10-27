@@ -452,7 +452,6 @@ describe('job tools for Claude', () => {
         started.push(a);
         return 'started';
       },
-      digest: () => null,
     };
     const chatRun = openRun(bridge, { ...ctx, user: 'U7' });
     expect(chatRun.config.mcpServers.tara.env.TARA_JOB_TOOLS).toBe('1');
