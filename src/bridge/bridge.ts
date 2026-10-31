@@ -1,5 +1,15 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { chmodSync, chownSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  accessSync,
+  chmodSync,
+  chownSync,
+  constants,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -49,6 +59,8 @@ interface PendingPermission {
   messageTs: string;
   title: string;
   input: Record<string, unknown>;
+  /** When it was asked. */
+  at: number;
   result?: PermissionResult;
   waiters: Array<(r: PermissionResult) => void>;
   timer: NodeJS.Timeout;
@@ -325,6 +337,14 @@ export class Bridge {
     const stat = statSync(real);
     if (!stat.isFile()) throw new BridgeError(400, 'Not a file');
     if (stat.size > MAX_FILE_BYTES) throw new BridgeError(413, 'File is larger than 100 MB');
+    try {
+      accessSync(real, constants.R_OK);
+    } catch {
+      throw new BridgeError(
+        403,
+        `tara-agent cannot read this file: run \`chmod g+r ${input.path}\` and send it again`,
+      );
+    }
     await this.deps.chat.uploadFile(ctx.channel, ctx.threadTs, real, input.comment?.slice(0, 2_000));
     return { name: path.basename(real) };
   }
@@ -401,8 +421,23 @@ export class Bridge {
       );
     }, timeoutMs);
     timer.unref();
-    this.permissions.set(id, { ctx, messageTs, title, input: input.input, waiters: [], timer });
+    this.permissions.set(id, {
+      ctx,
+      messageTs,
+      title,
+      input: input.input,
+      at: this.now(),
+      waiters: [],
+      timer,
+    });
     return { id };
+  }
+
+  /** Permission prompts nobody has answered yet. */
+  pendingPermissions(): Array<{ project: string; title: string; at: number }> {
+    return [...this.permissions.values()]
+      .filter((p) => !p.result)
+      .map((p) => ({ project: p.ctx.project.config.name, title: p.title, at: p.at }));
   }
 
   /** Resolves with the decision, or undefined if none arrived within `waitMs` (callers poll again). */

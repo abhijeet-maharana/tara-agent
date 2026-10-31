@@ -36,7 +36,10 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `http` | `127.0.0.1:4100` | Local API and dashboard (`enabled`, `bind`, `port`, `allowFrom`). Set `TARA_HTTP_TOKEN` to require a bearer token (open a page once with `?token=…` to sign a browser in). The MCP tools need it enabled |
 | `http.allowFrom` | `127.0.0.0/8`, `::1/128` | CIDR ranges allowed to connect. Transcripts hold everything Claude saw, so keep this to a trusted network, e.g. add `100.64.0.0/10` and `fd7a:115c:a1e0::/48` for Tailscale |
 | `http.fallback` | none | URL that receives every request tara-agent doesn't serve, passed through unchanged. Useful when taking over a port from another service |
+| `http.tls` | off | Also serve HTTPS on `port` (default `4443`) with `cert` and `key` files, e.g. from `tailscale cert`. Browsers only allow the microphone ([Live](live.md)) over HTTPS. The certificate is re-read when its file changes, so renewing it needs no restart |
 | `code` | on, the projects | The Code page: `repos` (`path`, `gitDir`, `title`, `askIn`) and `exclude` globs never shown (default `.env*`, `*.pem`, `*.key`). See [code-view.md](code-view.md) |
+| `attention` | GitHub on, nothing urgent | What needs you (`GET /attention`, read out by [Live](live.md)): `github` (your open PRs and review requests through `gh`, logged in as the user tara-agent runs as) and `urgent` rules that let a failing job interrupt: `{consecutiveFailures: 3}` or `{job: "project/jobId"}` |
+| `live` | off | Talk to tara out loud ([live.md](live.md)): `url` (default Google's Gemini Live endpoint), `model` (`gemini-3.8-live`), `voice` (`Kore`), `language` (how to speak, in plain words, e.g. "Indian English; Hindi when I speak Hindi"), `idleSeconds` (`20`), `askModel` (`haiku`), `askTimeoutSeconds` (`120`). Key from `TARA_LIVE_API_KEY` (Google AI Studio) |
 
 ## Project config
 
@@ -217,6 +220,7 @@ For scripts and dashboards on the same host (`127.0.0.1:4100` by default).
 | Call | Does |
 |---|---|
 | `GET /health` | Uptime and job counts |
+| `GET /attention` | What needs you, most pressing first: `items` (`tier` urgent / waiting / later, `kind`, `title`, `project`, `url`) and `notes` for sources that couldn't be read |
 | `GET /jobs?project=<name>` | Jobs with next run, last status and error; `&upcoming=7` adds start times for the next 7 days |
 | `POST /jobs/<project>/<id>/run` `{"by": "who"}` | Run a job now |
 | `POST /jobs/<project>/<id>/pause` | Set `"enabled": false` in `jobs.json` and reload |

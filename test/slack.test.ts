@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { decodeSlackText, toIncoming, voiceClip, vttToText } from '../src/slack/app.js';
+import {
+  attachedFiles,
+  decodeSlackText,
+  MAX_FILE_BYTES,
+  toIncoming,
+  voiceClip,
+  vttToText,
+} from '../src/slack/app.js';
 
 const BOT = 'UBOT';
 const base = { channel: 'C1', ts: '100.1' };
@@ -45,6 +52,21 @@ describe('toIncoming', () => {
 describe('decodeSlackText', () => {
   it('unescapes entities but keeps mentions', () => {
     expect(decodeSlackText('a &lt;b&gt; &amp; <@U1>')).toBe('a <b> & <@U1>');
+  });
+});
+
+describe('attachedFiles', () => {
+  it('keeps downloadable files but not the voice clip or oversized ones', () => {
+    const url = 'https://files.slack.com/x';
+    const photo = { id: 'F1', media_display_type: 'image', url_private_download: url, size: 1000 };
+    const files = [
+      photo,
+      { id: 'F2', subtype: 'slack_audio', url_private_download: url },
+      { id: 'F3', url_private_download: url, size: MAX_FILE_BYTES + 1 },
+      { id: 'F4' },
+    ];
+    expect(attachedFiles(files)).toEqual([photo]);
+    expect(attachedFiles(undefined)).toEqual([]);
   });
 });
 

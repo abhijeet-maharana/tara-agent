@@ -4,12 +4,17 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
+import type { WebSocket } from 'ws';
 import { Approvals } from './approvals/approvals.js';
 import { Bridge } from './bridge/bridge.js';
 import { codeReaders } from './code/repo.js';
 import { DEFAULT_HOST_CONFIG, expandHome, loadHostConfig, loadJobs, loadProjects } from './config/load.js';
 import { startHttpServer } from './http/server.js';
 import { convertHermesJobs } from './import-hermes.js';
+import { askProject } from './live/ask.js';
+import { gatherAttention, githubPullRequests } from './live/attention.js';
+import { LiveSession } from './live/session.js';
+import type { LiveDeps, LiveState } from './live/tools.js';
 import { Privileged } from './privileged/privileged.js';
 import { resolveRunAs } from './runner/as-user.js';
 import { type Runner, runClaude } from './runner/run.js';
@@ -203,7 +208,66 @@ async function serve(configFlag: string | undefined) {
     timeZone: host.timezone,
     onFinished: (item) => approvals.finished(item),
   });
+  /** A new thread in the project's channel, as if its owner had asked there; returns its link. */
+  const startThread = async (name: string | undefined, title: string, prompt: string) => {
+    const project = projects.find((p) => p.config.name === name);
+    if (!project) throw new Error(`No project "${name}" to ask in`);
+    const channel = project.config.slackChannel;
+    const ts = await slack.chat.post(channel, undefined, title);
+    const user = project.config.owner ?? project.config.allowedUsers[0] ?? 'dashboard';
+    void (manager as SessionManager).handle({ channel, threadTs: ts, ts, user, text: prompt });
+    const base = slack.workspaceUrl();
+    return { url: base && `${base}archives/${channel}/p${ts.replace('.', '')}` };
+  };
   const readers = codeReaders(host, projects);
+  const pullRequests = host.attention.github ? githubPullRequests() : undefined;
+  const attention = () =>
+    gatherAttention({
+      approvals: () => store.items({ statuses: ['pending'], limit: 500 }),
+      permissions: () => bridge?.pendingPermissions() ?? [],
+      jobs: () =>
+        projects.flatMap(({ config: { name } }) =>
+          scheduler
+            .list(name)
+            .map((job) => ({ ...job, project: name, recent: store.jobRuns(name, job.id, 10) })),
+        ),
+      repos: readers,
+      pullRequests,
+      urgent: host.attention.urgent,
+    });
+  const liveState: LiveState = { focusUntil: 0 };
+  const liveEndpoint = (cfg: NonNullable<typeof host.live>) => {
+    const apiKey = requireEnv('TARA_LIVE_API_KEY');
+    const askDeps = {
+      run,
+      bin: host.claude.bin,
+      agentName: host.agentName,
+      model: cfg.askModel,
+      timeoutMs: cfg.askTimeoutSeconds * 1000,
+      store,
+    };
+    const deps: LiveDeps = {
+      agentName: host.agentName,
+      projects: projects.map((p) => p.config.name),
+      attention,
+      ask: async (name, question, signal) => {
+        const project = projects.find((p) => p.config.name === name);
+        if (!project) throw new Error(`No project "${name}"`);
+        return askProject(askDeps, project, question, signal);
+      },
+      dispatch: (name, task) => startThread(name, `🎙️ ${task.split('\n')[0]?.slice(0, 120)}`, task),
+      running: () =>
+        projects.flatMap(({ config: { name } }) =>
+          scheduler
+            .list(name)
+            .filter((j) => j.running)
+            .map((j) => ({ project: name, name: j.name })),
+        ),
+    };
+    return {
+      connect: (ws: WebSocket) => new LiveSession(ws, { ...cfg, apiKey }, deps, liveState, log),
+    };
+  };
   // HTTP first: when tara-agent takes over a port, the hand-over gap is as short as possible.
   const http = host.http.enabled
     ? await startHttpServer({
@@ -216,20 +280,13 @@ async function serve(configFlag: string | undefined) {
         adminToken: process.env.TARA_ADMIN_TOKEN || undefined,
         readAs: runAs?.user,
         continueThread: (msg) => (manager as SessionManager).handle(msg),
+        attention,
+        live: host.live && liveEndpoint(host.live),
         code: readers.length
           ? {
               readers,
               // A new thread in the project's channel, as if its owner had asked there.
-              ask: async (repo, title, prompt) => {
-                const project = projects.find((p) => p.config.name === repo.askIn);
-                if (!project) throw new Error(`No project "${repo.askIn}" to ask in`);
-                const channel = project.config.slackChannel;
-                const ts = await slack.chat.post(channel, undefined, title);
-                const user = project.config.owner ?? project.config.allowedUsers[0] ?? 'dashboard';
-                void (manager as SessionManager).handle({ channel, threadTs: ts, ts, user, text: prompt });
-                const base = slack.workspaceUrl();
-                return { url: base && `${base}archives/${channel}/p${ts.replace('.', '')}` };
-              },
+              ask: (repo, title, prompt) => startThread(repo.askIn, title, prompt),
             }
           : undefined,
         projects: projects.map((p) => p.config.name),
@@ -278,6 +335,13 @@ async function serve(configFlag: string | undefined) {
   };
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  // A crash kills every running turn and job, so a stray error is logged instead.
+  process.on('uncaughtException', (err) => log.error(`Uncaught: ${err.stack ?? err.message}`));
+  process.on('unhandledRejection', (reason) =>
+    log.error(
+      `Unhandled rejection: ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}`,
+    ),
+  );
 }
 
 async function main() {

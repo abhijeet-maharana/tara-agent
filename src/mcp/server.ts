@@ -57,7 +57,7 @@ server.registerTool(
         .string()
         .min(1)
         .describe(
-          'The exact proposal: what changes, the numbers, and why. Slack mrkdwn, phone-friendly bullets.',
+          'The exact proposal: what changes, the numbers, and why. Standard Markdown (**bold**, - bullets, [text](url), ``` blocks for anything to copy); it is converted for Slack. Short, phone-friendly.',
         ),
       options: z
         .array(z.string().min(1).max(75))

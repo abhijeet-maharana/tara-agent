@@ -28,6 +28,8 @@ export interface DashboardContext {
   failing?: number;
   /** The Code page is on. */
   code?: boolean;
+  /** Live (talking to the agent) is on. */
+  live?: boolean;
 }
 
 /** A job with its project and latest runs (newest first), as the home and jobs pages show it. */
@@ -50,19 +52,77 @@ export const esc = (s: unknown) =>
     (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string,
   );
 
-/** Just enough Markdown for Claude's replies: code blocks, inline code, bold, links, line breaks. */
+/**
+ * Just enough Markdown for Claude's replies and approval cards: code blocks, inline code, bold, italic,
+ * links, headings, bullet lists, quotes and line breaks. Slack-style text (`*bold*`, `• ` bullets,
+ * `<url|text>` links) renders too, since older cards and Slack-minded drafts use it.
+ */
 export function md(text: string): string {
   return text
     .split(/(```[\s\S]*?```)/g)
     .map((part) => {
       if (part.startsWith('```')) return `<pre>${esc(part.replace(/^```\w*\n?|```$/g, ''))}</pre>`;
-      return esc(part)
-        .replace(/`([^`\n]+)`/g, '<code>$1</code>')
-        .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
-        .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2">$1</a>')
-        .replace(/\n/g, '<br>');
+      return mdLines(part);
     })
     .join('');
+}
+
+/** Block level: headings, runs of bullets (one list) and runs of quote lines; other lines joined by <br>. */
+function mdLines(part: string): string {
+  const out: string[] = [];
+  // Typed through `as`: TS would otherwise narrow it to null, not seeing the closures assign it.
+  let block = null as { tag: 'ul' | 'blockquote'; items: string[] } | null;
+  const flush = () => {
+    if (!block) return;
+    out.push(
+      block.tag === 'ul'
+        ? `<ul class="md">${block.items.map((i) => `<li>${i}</li>`).join('')}</ul>`
+        : `<blockquote class="md">${block.items.join('<br>')}</blockquote>`,
+    );
+    block = null;
+  };
+  let text: string[] = [];
+  const flushText = () => {
+    if (text.length) out.push(text.join('<br>'));
+    text = [];
+  };
+  for (const line of part.split('\n')) {
+    const bullet = /^\s*[-*•]\s+(.*)$/.exec(line);
+    const quote = /^>\s?(.*)$/.exec(line);
+    const tag = bullet ? 'ul' : quote ? 'blockquote' : null;
+    if (tag) {
+      flushText();
+      if (block?.tag !== tag) flush();
+      block ??= { tag, items: [] };
+      block.items.push(inline(((bullet ?? quote) as RegExpExecArray)[1] as string));
+      continue;
+    }
+    if (block) {
+      flush();
+      if (line === '') continue; // the blank line after a list is its end, not an extra break
+    }
+    const heading = /^#{1,6}\s+(.+?)\s*#*$/.exec(line);
+    text.push(heading ? `<b>${inline(heading[1] as string)}</b>` : inline(line));
+  }
+  flush();
+  flushText();
+  return out.join('');
+}
+
+/** Inline: code spans and links are set aside first, so bold/italic never reach into them. */
+function inline(line: string): string {
+  const kept: string[] = [];
+  const keep = (html: string) => `\uE000${kept.push(html) - 1}\uE000`;
+  const link = (url: string, label: string) => keep(`<a href="${esc(url)}">${inline(label)}</a>`);
+  const s = line
+    .replace(/`([^`\n]+)`/g, (_, c: string) => keep(`<code>${esc(c)}</code>`))
+    .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, l: string, u: string) => link(u, l))
+    .replace(/<(https?:\/\/[^|>\s]+)\|([^>\n]+)>/g, (_, u: string, l: string) => link(u, l));
+  return esc(s)
+    .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
+    .replace(/(?<![*\w])\*(?![\s*])([^*\n]+?)(?<![\s*])\*(?![*\w])/g, '<b>$1</b>')
+    .replace(/(?<![\w])_(?![\s_])([^_\n]+?)(?<![\s_])_(?![\w])/g, '<i>$1</i>')
+    .replace(/\uE000(\d+)\uE000/g, (_, i: string) => kept[Number(i)] as string);
 }
 
 /** "Sun 25 Oct, 6:00 pm" in the host timezone. */
@@ -105,7 +165,7 @@ export function relative(ms: number | Date | undefined, now: number): string {
 }
 
 /** Run statuses that count as a failure. `silent` means the pre-run script found nothing to do. */
-const FAILED = ['failed', 'error', 'timeout', 'limit'];
+export const FAILED = ['failed', 'error', 'timeout', 'limit'];
 const RUN_LABEL: Record<string, string> = {
   ok: 'did work',
   silent: 'nothing to do',
@@ -200,6 +260,8 @@ const CSS = `${TOKENS}
 *{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 var(--font)}
 a{color:var(--accent)}:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 code{background:var(--card-bg);border:1px solid var(--border);border-radius:6px;padding:1px 6px;font-size:13px;overflow-wrap:anywhere}
+ul.md{margin:4px 0;padding-left:22px}ul.md li{margin:2px 0}
+blockquote.md{margin:6px 0;padding:2px 0 2px 10px;border-left:3px solid var(--border-light);color:var(--text-dim)}
 pre{margin:6px 0 0;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:9px 11px;font-size:12.5px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:480px;overflow-y:auto}
 .shell{display:flex;min-height:100vh}
 .sidebar{width:var(--sidebar);flex:none;position:sticky;top:0;height:100vh;display:flex;flex-direction:column;background:var(--panel);border-right:1px solid var(--border);overflow-y:auto}
@@ -374,7 +436,7 @@ const target = location.hash && document.getElementById(location.hash.slice(1));
 if (target) { target.hidden = false; target.querySelector('details')?.setAttribute('open', ''); target.scrollIntoView({ block: 'center' }); }
 `;
 
-export type Page = 'Home' | 'Approvals' | 'Jobs' | 'Schedule' | 'Sessions' | 'Code' | '';
+export type Page = 'Home' | 'Live' | 'Approvals' | 'Jobs' | 'Schedule' | 'Sessions' | 'Code' | '';
 
 /** The "Dashboards" switcher: this dashboard first, then each project's own dashboard. */
 function switcher(ctx: DashboardContext): string {
@@ -405,6 +467,7 @@ export function layout(
   const nav = (
     [
       ['/', 'Home', '🏠', 0, ''],
+      ...(ctx.live ? ([['/live', 'Live', '🎙️', 0, '']] as const) : []),
       ['/approvals', 'Approvals', '✅', waiting, 'waiting for a decision'],
       ['/jobs', 'Jobs', '⏱️', failing, 'failing jobs'],
       ['/schedule', 'Schedule', '📅', 0, ''],

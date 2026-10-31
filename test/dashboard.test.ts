@@ -86,6 +86,19 @@ describe('access and rendering', () => {
       '<b>b</b> <code>c</code> &lt;i&gt;<br><pre>&lt;x&gt;\n</pre>',
     );
   });
+
+  it('renders card Markdown: lists, quotes, headings, links, Slack-style bold', () => {
+    expect(md('Intro:\n- one\n- **two**\n\nAfter')).toBe(
+      'Intro:<ul class="md"><li>one</li><li><b>two</b></li></ul>After',
+    );
+    expect(md('> Hi,\n>\n> Thanks')).toBe('<blockquote class="md">Hi,<br><br>Thanks</blockquote>');
+    expect(md('## Plan\n*Proposal:* _soon_')).toBe('<b>Plan</b><br><b>Proposal:</b> <i>soon</i>');
+    expect(md('[Docs](https://x.dev/a_b_c) <https://y.dev/q?a=1&b=2|Y>')).toBe(
+      '<a href="https://x.dev/a_b_c">Docs</a> <a href="https://y.dev/q?a=1&amp;b=2">Y</a>',
+    );
+    // Not formatting: cron text, snake_case, code spans.
+    expect(md('*/5 * * * * my_var_name `*x* _y_`')).toBe('*/5 * * * * my_var_name <code>*x* _y_</code>');
+  });
 });
 
 describe('dashboard pages', () => {

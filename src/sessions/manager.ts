@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { mkdir, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { type Bridge, JOB_TOOLS_PROMPT, type RunContext, wantsPermissionPrompts } from '../bridge/bridge.js';
 import type { HostConfig, Project } from '../config/schema.js';
 import { buildClaudeArgs } from '../runner/args.js';
@@ -47,6 +49,13 @@ export interface IncomingMessage {
   ts: string;
   user: string;
   text: string;
+  /** Files posted with the message (photos, PDFs), saved to the session's scratch folder for Claude. */
+  attachments?: Attachment[];
+}
+
+export interface Attachment {
+  name: string;
+  fetch(): Promise<Buffer>;
 }
 
 export interface Logger {
@@ -118,7 +127,7 @@ export class SessionManager {
       return;
     }
     const text = msg.text.trim();
-    if (!text) return;
+    if (!text && !msg.attachments?.length) return;
     const key = threadKey(msg.channel, msg.threadTs);
     const reply = (text: string) => this.deps.chat.post(msg.channel, msg.threadTs, text);
 
@@ -221,6 +230,25 @@ export class SessionManager {
     };
   }
 
+  /** Saves the message's files to `<scratch>/slack/` and returns the prompt lines naming them ('' if none). */
+  private async saveAttachments(scratch: string, msg: IncomingMessage): Promise<string> {
+    if (!msg.attachments?.length) return '';
+    const dir = path.join(scratch, 'slack');
+    await mkdir(dir, { recursive: true });
+    const lines: string[] = [];
+    for (const [i, file] of msg.attachments.entries()) {
+      const target = path.join(dir, `${msg.ts}-${i + 1}-${file.name.replace(/[^\w.-]+/g, '_')}`);
+      try {
+        await writeFile(target, await file.fetch());
+        lines.push(`- ${target}`);
+      } catch (err) {
+        this.log.warn(`attachment ${file.name} not saved: ${(err as Error).message}`);
+        lines.push(`- ${file.name} (could not be downloaded)`);
+      }
+    }
+    return `\n\nAttached files (read them with the Read tool):\n${lines.join('\n')}`;
+  }
+
   private async turn(
     project: Project,
     key: string,
@@ -274,8 +302,9 @@ export class SessionManager {
     try {
       const scratch = sessionScratch(project, host.stateDir as string, 'chat', session.sessionId);
       env = { ...buildChildEnv(this.env, project.config.billing), TARA_SCRATCH: scratch };
+      const files = await this.saveAttachments(scratch, msg);
       // The first message of a session says where the folder is (the Write tool needs absolute paths).
-      const prompt = `<@${msg.user}>: ${msg.text}${session.started ? '' : `\n\n${foldersNote({ scratch })}`}`;
+      const prompt = `<@${msg.user}>: ${msg.text}${files}${session.started ? '' : `\n\n${foldersNote({ scratch })}`}`;
       outcome = await this.deps.run({
         bin: host.claude.bin,
         args: buildClaudeArgs({

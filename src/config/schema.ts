@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { GEMINI_LIVE_URL } from '../live/gemini.js';
 
 /** Claude Code permission modes (`default` is the older name of `manual`). */
 export const permissionModes = [
@@ -95,6 +96,17 @@ export const hostConfigSchema = z.object({
       allowFrom: z.array(z.string()).default(['127.0.0.0/8', '::1/128']),
       /** Pass requests for paths tara-agent doesn't serve to this URL (e.g. the port's previous owner). */
       fallback: z.string().url().optional(),
+      /**
+       * Also serve HTTPS on this port, e.g. with a Tailscale certificate (`tailscale cert`). Browsers
+       * only allow the microphone (Live) over HTTPS. Plain HTTP on `port` stays as it is.
+       */
+      tls: z
+        .object({
+          port: z.number().int().min(1).max(65535).default(4443),
+          cert: z.string().min(1),
+          key: z.string().min(1),
+        })
+        .optional(),
     })
     .default({ enabled: true, bind: '127.0.0.1', port: 4100, allowFrom: ['127.0.0.0/8', '::1/128'] }),
   /**
@@ -121,6 +133,61 @@ export const hostConfigSchema = z.object({
       exclude: z.array(z.string().min(1)).default(['**/.env*', '**/*.pem', '**/*.key']),
     })
     .default({ enabled: true, exclude: ['**/.env*', '**/*.pem', '**/*.key'] }),
+  /**
+   * What needs you (`GET /attention`, and what Live reads out): approvals, permission prompts,
+   * failing jobs, uncommitted work, and your GitHub PRs. See docs/live.md.
+   */
+  attention: z
+    .object({
+      /** Your open PRs and review requests through the `gh` CLI, logged in as the user tara-agent runs as. */
+      github: z.boolean().default(true),
+      /** Failing jobs that may interrupt you. None (the default): nothing ever does. */
+      urgent: z
+        .array(
+          z
+            .object({
+              /** A job that failed this many times in a row. */
+              consecutiveFailures: z.number().int().min(1).optional(),
+              /** This job failing, as `project/jobId`. */
+              job: z
+                .string()
+                .regex(/^[^/]+\/[^/]+$/, 'Use "project/jobId"')
+                .optional(),
+            })
+            .refine(
+              (r) => r.consecutiveFailures !== undefined || r.job !== undefined,
+              'Set consecutiveFailures or job',
+            ),
+        )
+        .default([]),
+    })
+    .default({ github: true, urgent: [] }),
+  /**
+   * Live: talk to tara out loud from the dashboard (`/live`), through a Gemini Live session. The key
+   * (Google AI Studio) comes from TARA_LIVE_API_KEY. Unset = off. See docs/live.md.
+   */
+  live: z
+    .object({
+      /** A Gemini Live (`BidiGenerateContent`) WebSocket endpoint. */
+      url: z
+        .string()
+        .regex(/^wss?:\/\//, 'Use a ws:// or wss:// URL')
+        .default(GEMINI_LIVE_URL),
+      model: z.string().min(1).default('gemini-3.8-live'),
+      voice: z.string().min(1).default('Kore'),
+      /**
+       * How it should speak, in plain words; Live models pick the language themselves and take no
+       * language code. E.g. "Indian English with an Indian accent. If I speak Hindi or Hinglish,
+       * answer in the same."
+       */
+      language: z.string().min(1).max(500).optional(),
+      /** Close the voice session after this long with nothing said by either side. */
+      idleSeconds: z.number().min(5).max(600).default(20),
+      /** Model for `ask`: read-only questions about a project, answered by Claude. */
+      askModel: z.string().min(1).default('haiku'),
+      askTimeoutSeconds: z.number().min(10).max(900).default(120),
+    })
+    .optional(),
 });
 
 /** `<repo>/.tara/config.json`: committed in the project repo. */

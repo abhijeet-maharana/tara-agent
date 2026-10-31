@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { readFileSync, unwatchFile, watchFile } from 'node:fs';
 import {
   createServer,
   request as httpRequest,
@@ -6,14 +7,18 @@ import {
   type Server,
   type ServerResponse,
 } from 'node:http';
+import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https';
 import { networkInterfaces } from 'node:os';
 import path from 'node:path';
+import type { Duplex } from 'node:stream';
 import { Cron } from 'croner';
+import { type WebSocket, WebSocketServer } from 'ws';
 import { ApprovalError, type Approvals, type ProposeInput } from '../approvals/approvals.js';
 import { type Bridge, BridgeError } from '../bridge/bridge.js';
 import { CodeError, type CodeRepo, MIN_QUERY, type RepoReader } from '../code/repo.js';
 import { loadQueues } from '../config/load.js';
 import type { Project, QueueConfig } from '../config/schema.js';
+import type { Attention } from '../live/attention.js';
 import type { Scheduler } from '../scheduler/scheduler.js';
 import type { IncomingMessage as ChatMessage, Logger } from '../sessions/manager.js';
 import { ITEM_STATUSES, type ItemStatus, type Store } from '../store/store.js';
@@ -39,6 +44,7 @@ import {
   sessionPage,
   sessionsPage,
 } from './dashboard.js';
+import { livePage } from './live-page.js';
 import { isDayKey, MAX_RUNS_PER_DAY, type PlanJob, planDay, schedulePage } from './schedule.js';
 import { readTranscript } from './transcript.js';
 
@@ -85,6 +91,15 @@ export interface HttpOptions {
     /** Starts a Slack conversation in the repo's `askIn` project; returns the thread's link. */
     ask?: (repo: CodeRepo, title: string, prompt: string) => Promise<{ url?: string }>;
   };
+  /** What needs the owner (`GET /attention`). */
+  attention?: () => Promise<Attention>;
+  /**
+   * A second, HTTPS listener on the same address (browsers only allow the microphone over HTTPS).
+   * The certificate is re-read when its file changes.
+   */
+  tls?: { port: number; cert: string; key: string };
+  /** Live voice: takes each browser connection to `/live/ws` (unlocked browsers only). */
+  live?: { connect: (ws: WebSocket) => void };
   /** Enables the HTML pages (sessions, transcripts, jobs) for browsers. */
   dashboard?: {
     projects: Project[];
@@ -106,6 +121,13 @@ class HttpError extends Error {
 }
 
 const iso = (d?: Date) => d?.toISOString() ?? null;
+const originHost = (origin: string) => {
+  try {
+    return new URL(origin).host;
+  } catch {
+    return '';
+  }
+};
 /** Runs per job shown on the dashboard (recent-runs strip and history). */
 const RECENT_RUNS = 10;
 /** Most start times `GET /jobs?upcoming=` returns per job. */
@@ -164,7 +186,7 @@ async function readJson(req: IncomingMessage, limit = 10_000): Promise<Record<st
  */
 /** Paths tara-agent serves itself; with a fallback, everything else is passed through. */
 const OWN_PATH =
-  /^\/(?:$|(?:health|reload|jobs|runs|sessions|schedule|approvals|items|unlock|code|internal)(?:\/|$))/;
+  /^\/(?:$|(?:health|reload|attention|live|jobs|runs|sessions|schedule|approvals|items|unlock|code|internal)(?:\/|$))/;
 const TOKEN_COOKIE = 'tara_token';
 const ADMIN_COOKIE = 'tara_admin';
 /** Finished items shown on the Done tab. */
@@ -245,7 +267,7 @@ export function itemInput(body: Record<string, unknown>): ProposeInput {
   };
 }
 
-export function startHttpServer(options: HttpOptions): Promise<Server> {
+export async function startHttpServer(options: HttpOptions): Promise<Server> {
   const now = options.now ?? Date.now;
   const started = now();
   const timeZone = options.dashboard?.timeZone ?? 'UTC';
@@ -325,6 +347,9 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
           running: jobs.filter((j) => j.running).length,
         },
       };
+    }
+    if (method === 'GET' && url.pathname === '/attention' && options.attention) {
+      return options.attention();
     }
     if (method === 'GET' && url.pathname === '/jobs') {
       const project = knownProject(url.searchParams.get('project'));
@@ -764,6 +789,7 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
         .flatMap((p) => options.scheduler.list(p))
         .filter((j) => jobState(j) === 'failing').length,
       code: Boolean(options.code),
+      live: Boolean(options.live),
     };
   };
 
@@ -818,6 +844,8 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
         now: at,
       });
     }
+    if (parts[0] === 'live' && parts.length === 1 && options.live)
+      return livePage(ctx, { unlocked: canDecide(req) });
     if (parts[0] === 'approvals' && parts.length === 1 && options.approvals) {
       const at = now();
       const project = projectParam();
@@ -1069,12 +1097,69 @@ export function startHttpServer(options: HttpOptions): Promise<Server> {
     res.end(JSON.stringify(payload));
   };
 
-  return new Promise((resolve, reject) => {
-    const server = createServer((req, res) => void handle(req, res));
-    server.once('error', reject);
-    server.listen(options.port, options.bind, () => {
-      options.log.info(`HTTP API on http://${options.bind}:${options.port}`);
-      resolve(server);
+  const sockets = options.live ? new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 }) : undefined;
+  /** `/live/ws`: the same checks as a decision (it can start Claude conversations), plus same-origin. */
+  const upgrade = (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+    const refuse = (status: number, message: string) => {
+      socket.end(`HTTP/1.1 ${status} ${message}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+    };
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    if (!sockets || !options.live || url.pathname !== '/live/ws') return refuse(404, 'Not Found');
+    if (!allowed(req.socket.remoteAddress)) return refuse(403, 'Forbidden');
+    if (req.headers.origin && originHost(req.headers.origin) !== req.headers.host)
+      return refuse(403, 'Forbidden');
+    if (!authorized(req)) return refuse(401, 'Unauthorized');
+    try {
+      human(req);
+    } catch {
+      return refuse(403, 'Forbidden');
+    }
+    const live = options.live;
+    sockets.handleUpgrade(req, socket, head, (ws) => live.connect(ws));
+  };
+
+  const listen = <S extends Server | HttpsServer>(server: S, port: number, label: string) =>
+    new Promise<S>((resolve, reject) => {
+      server.on('upgrade', upgrade);
+      server.once('error', reject);
+      server.listen(port, options.bind, () => {
+        options.log.info(`${label} on ${label === 'HTTPS' ? 'https' : 'http'}://${options.bind}:${port}`);
+        resolve(server);
+      });
     });
-  });
+
+  const server = await listen(
+    createServer((req, res) => void handle(req, res)),
+    options.port,
+    'HTTP API',
+  );
+  const tls = options.tls;
+  if (tls) {
+    const read = () => ({ cert: readFileSync(tls.cert), key: readFileSync(tls.key) });
+    let secure: HttpsServer;
+    try {
+      secure = await listen(
+        createHttpsServer(read(), (req, res) => void handle(req, res)),
+        tls.port,
+        'HTTPS',
+      );
+    } catch (err) {
+      server.close();
+      throw err;
+    }
+    // Certificates are renewed in place (`tailscale cert` every month or two): pick up the new one.
+    watchFile(tls.cert, { interval: 60_000 }, () => {
+      try {
+        secure.setSecureContext(read());
+        options.log.info('HTTPS: loaded the renewed certificate');
+      } catch (err) {
+        options.log.warn(`HTTPS: could not load the certificate: ${(err as Error).message}`);
+      }
+    });
+    server.on('close', () => {
+      unwatchFile(tls.cert);
+      secure.close();
+    });
+  }
+  return server;
 }

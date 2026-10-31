@@ -76,6 +76,7 @@ document.addEventListener('click', async (e) => {
   const b = e.target.closest('button');
   if (!b) return;
   if (b.dataset.decide) return decide(card(b), b.dataset.decide, b.dataset.now);
+  if (b.dataset.expand !== undefined) { const body = card(b).querySelector('.body'); body.classList.toggle('open'); b.textContent = body.classList.contains('open') ? 'Show less' : 'Show all'; return; }
   if (b.dataset.toggleReply !== undefined) { const r = card(b).querySelector('.reply'); r.hidden = !r.hidden; if (!r.hidden) r.querySelector('textarea').focus(); return; }
   if (b.dataset.cancel) {
     if (!(await ask('Cancel "' + b.dataset.title + '"?', 'It will not run. Jarvis can propose it again.', 'Cancel it', true))) return;
@@ -114,7 +115,8 @@ document.addEventListener('change', (e) => {
 `;
 
 const CSS = `<style>
-.item .body{margin-top:8px;font-size:14px;overflow-wrap:anywhere}.item .body.long{max-height:220px;overflow:auto}
+.item .body{margin-top:8px;font-size:14px;overflow-wrap:anywhere}.item .body.long:not(.open){max-height:260px;overflow:hidden;-webkit-mask-image:linear-gradient(#000 75%,transparent);mask-image:linear-gradient(#000 75%,transparent)}
+.btn.expand{margin-top:6px}
 .media{display:flex;gap:8px;overflow-x:auto;margin-top:10px;align-items:flex-start}.media img,.media video{height:180px;border-radius:8px;border:1px solid var(--border);background:var(--bg)}.media video{height:min(62vh,520px);max-width:100%;aspect-ratio:9/16;background:#000;object-fit:contain}
 .fieldset{display:grid;gap:10px;margin-top:12px}.fieldset .field{position:relative}
 .fieldset textarea{min-height:90px;width:100%;min-width:0}.fieldset input.input{width:100%;min-width:0}
@@ -192,7 +194,7 @@ function waitingCard(ctx: DashboardContext, item: Item, data: ApprovalsData, mul
       ? `<input type="checkbox" class="pick" data-pick="${esc(item.id)}" aria-label="Select">`
       : ''
   }</div>
-${item.body ? `<div class="body${long ? ' long' : ''}">${md(item.body)}</div>` : ''}
+${item.body ? `<div class="body${long ? ' long' : ''}">${md(item.body)}</div>${long ? '<button type="button" class="btn quiet expand" data-expand>Show all</button>' : ''}` : ''}
 ${mediaHtml(item)}
 ${item.fields.length ? `<div class="fieldset">${item.fields.map((f) => fieldHtml(f, data.canDecide)).join('')}</div>` : ''}
 ${item.checks.length ? `<ul class="checks">${item.checks.map((c) => `<li class="${c.blocking ? 'bad' : 'warn'}">${esc(c.text)}</li>`).join('')}</ul>` : ''}

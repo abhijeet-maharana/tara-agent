@@ -1,4 +1,12 @@
-import { mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -205,6 +213,21 @@ describe('send_file', () => {
     if (!outside.startsWith(tmpdir())) {
       await expect(bridge.sendFile(token, { path: 'link.txt' })).rejects.toMatchObject({ status: 403 });
     }
+  });
+
+  it('refuses a file it cannot read instead of failing in the upload', async () => {
+    // Root reads anything, so there is nothing to refuse.
+    if (process.getuid?.() === 0) return;
+    const { chat, bridge, ctx, project: p } = setup();
+    const { token } = openRun(bridge, ctx);
+    const file = path.join(p.dir, 'locked.png');
+    writeFileSync(file, 'png');
+    chmodSync(file, 0o000);
+    await expect(bridge.sendFile(token, { path: 'locked.png' })).rejects.toMatchObject({
+      status: 403,
+      message: expect.stringContaining('chmod g+r locked.png'),
+    });
+    expect(chat.uploads).toHaveLength(0);
   });
 });
 

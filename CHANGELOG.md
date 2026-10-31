@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Photos and files in Slack**: files posted with a message (not voice clips; up to 10, 20 MB each) are downloaded to `<scratch>/slack/<ts>-<n>-<name>` and listed in the prompt for Claude to read. A message with only a photo now starts a turn too.
 - Host `concurrency` defaults to 8 chat sessions at once (was 2). Hosts that set it keep their value.
 - **No more `!` commands in Slack.** `!new`, `!model`, `!status`, `!jobs`, `!health` and `!run` are gone; such messages go to Claude like any other. Typing `stop` on its own (also `cancel`, `abort`, `halt`; `!stop` still works) stops whatever runs in the thread. A reply sent while a run works waits for it, and the thread says so. "run <job name>" stays.
 - **Job threads hold their thread**: a reply in a running job's thread waits for the job instead of resuming the same session alongside it, and `stop` there ends the job. Chat turns and jobs share one per-thread tracker (`src/sessions/threads.ts`).

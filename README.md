@@ -18,7 +18,7 @@ tara-agent runs on your own server around the clock. It runs scheduled jobs, ans
 - **Root actions on approval.** It never gets sudo. It asks for actions from an allowlist, and you approve them.
 
 **Talk to it**
-- **Chat in Slack.** Each channel is one project. A message starts a session, and replies in the thread continue it. Progress streams live.
+- **Chat in Slack.** Each channel is one project. A message starts a session, and replies in the thread continue it. Progress streams live. Photos and files posted with a message (up to 10, 20 MB each) are saved to the session's scratch folder and their paths added to the prompt, so Claude can read them.
 - **Many projects, one agent.** Every project keeps its own repo, instructions, skills and tools.
 
 **See everything**

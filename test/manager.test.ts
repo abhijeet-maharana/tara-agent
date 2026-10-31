@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { HostConfig, Project, ProjectConfig } from '../src/config/schema.js';
 import type { RunOptions, RunOutcome } from '../src/runner/run.js';
@@ -96,6 +97,24 @@ describe('SessionManager', () => {
     expect(chat.reactions).toEqual(
       expect.arrayContaining(['+eyes@100.1', '-eyes@100.1', '+white_check_mark@100.1']),
     );
+  });
+
+  it('saves posted files to the scratch folder and names them in the prompt', async () => {
+    const { calls, manager } = setup();
+    await manager.handle(
+      msg('', {
+        ts: '100.3',
+        attachments: [
+          { name: 'label photo.jpg', fetch: async () => Buffer.from('jpg') },
+          { name: 'gone.png', fetch: async () => Promise.reject(new Error('HTTP 404')) },
+        ],
+      }),
+    );
+    const saved = '/tmp/scratch/shop/chat-sid-1/slack/100.3-1-label_photo.jpg';
+    expect(calls[0]?.prompt).toMatch(
+      /^<@U1>: \n\nAttached files \(read them with the Read tool\):\n- \/tmp\/scratch\/shop\/chat-sid-1\/slack\/100\.3-1-label_photo\.jpg\n- gone\.png \(could not be downloaded\)\n\nYour folders:/,
+    );
+    expect(readFileSync(saved, 'utf8')).toBe('jpg');
   });
 
   it('runs every turn at the host effort level when one is set', async () => {

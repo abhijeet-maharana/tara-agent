@@ -1,4 +1,4 @@
-import { createReadStream } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { App, type BlockAction, type ButtonAction, LogLevel } from '@slack/bolt';
 import type { ChatPort, IncomingMessage, Logger } from '../sessions/manager.js';
@@ -57,11 +57,23 @@ export interface SlackFile {
   /** The audio itself (needs the bot token), for `voice` when Slack has no transcript. */
   url_private_download?: string;
   filetype?: string;
+  name?: string;
+  size?: number;
 }
 
 /** The first voice note (a Slack audio clip) in a message, if any. */
 export function voiceClip(files: SlackFile[] | undefined): SlackFile | undefined {
   return files?.find((f) => f.subtype === 'slack_audio' || f.media_display_type === 'audio');
+}
+
+/** Files Claude gets to read (photos, PDFs, …): everything but voice clips, up to `MAX_FILE_BYTES` each. */
+export const MAX_FILES = 10;
+export const MAX_FILE_BYTES = 20 * 1024 * 1024;
+export function attachedFiles(files: SlackFile[] | undefined): SlackFile[] {
+  const clip = voiceClip(files);
+  return (files ?? [])
+    .filter((f) => f !== clip && f.url_private_download && (f.size ?? 0) <= MAX_FILE_BYTES)
+    .slice(0, MAX_FILES);
 }
 
 /** The spoken text of a WebVTT transcript: cue text only, without the header, cue ids and timings. */
@@ -202,6 +214,18 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
         }
         incoming.text = [incoming.text, spoken].filter(Boolean).join('\n\n');
       }
+      const files = attachedFiles(event.files);
+      if (files.length > 0) {
+        const auth = { headers: { Authorization: `Bearer ${options.botToken}` } };
+        incoming.attachments = files.map((f) => ({
+          name: f.name ?? `${f.id}.${f.filetype ?? 'bin'}`,
+          async fetch() {
+            const res = await fetch(f.url_private_download as string, auth);
+            if (!res.ok) throw new Error(`download of ${f.id} failed: HTTP ${res.status}`);
+            return Buffer.from(await res.arrayBuffer());
+          },
+        }));
+      }
       await options.onMessage(incoming);
     })().catch((err: Error) => options.log.error(`message handling failed: ${err.message}`));
   });
@@ -250,10 +274,12 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
       return res.ts as string;
     },
     async uploadFile(channel, threadTs, filePath, comment) {
+      // Read up front: a stream that fails to open emits an 'error' nobody listens to and crashes the process.
+      const file = await readFile(filePath);
       await app.client.files.uploadV2({
         channel_id: channel,
         thread_ts: threadTs,
-        file: createReadStream(filePath),
+        file,
         filename: path.basename(filePath),
         ...(comment ? { initial_comment: comment } : {}),
       });
