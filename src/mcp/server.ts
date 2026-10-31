@@ -8,6 +8,7 @@
  *   request_privileged  a root action (runs at once, or after approval), or a command for a person to run
  *   permission        Allow/Deny buttons for tool calls (only when the run asks for prompts)
  *   propose_item, list_items, finish_item   approval cards for drafts that run later through a queue
+ *   withdraw_card     close a waiting card of this thread (the person did it themselves)
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -264,6 +265,30 @@ server.registerTool(
       return text(`Reported ${args.id} as ${args.status}.`);
     } catch (err) {
       return text(`Could not report the item: ${(err as Error).message}`, true);
+    }
+  },
+);
+
+server.registerTool(
+  'withdraw_card',
+  {
+    title: 'Close a waiting card',
+    description:
+      'Close an approval card raised in this thread that is still waiting, when it is no longer needed: the ' +
+      'person did the work themselves, or it no longer applies. It ends as cancelled with your reason, on the ' +
+      'Approvals page and in Slack. Never ask the person to tap a button just to clear a card. Find the id ' +
+      'with list_items.',
+    inputSchema: {
+      id: z.string().min(1).describe('Card id from list_items'),
+      reason: z.string().max(500).optional().describe('Why, e.g. "Sent the email himself"'),
+    },
+  },
+  async (args) => {
+    try {
+      await api('/internal/withdraw', args);
+      return text(`Closed card ${args.id}.`);
+    } catch (err) {
+      return text(`Could not close the card: ${(err as Error).message}`, true);
     }
   },
 );

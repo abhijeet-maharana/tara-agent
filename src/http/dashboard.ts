@@ -28,7 +28,7 @@ export interface DashboardContext {
   failing?: number;
   /** The Code page is on. */
   code?: boolean;
-  /** Live (talking to the agent) is on. */
+  /** Command (talking to the agent) is on. */
   live?: boolean;
 }
 
@@ -179,7 +179,7 @@ const runTone = (status: string) => (FAILED.includes(status) ? 'bad' : status ==
 export const runTag = (status?: string) =>
   status ? `<span class="tag ${runTone(status)}">${esc(RUN_LABEL[status] ?? status)}</span>` : '';
 
-type JobState = 'running' | 'failing' | 'paused' | 'ok' | 'new';
+export type JobState = 'running' | 'failing' | 'paused' | 'ok' | 'new';
 export function jobState(j: JobInfo): JobState {
   if (j.running) return 'running';
   if (!j.enabled) return 'paused';
@@ -406,7 +406,7 @@ document.querySelector('.menu-btn')?.addEventListener('click', (e) => {
   e.currentTarget.setAttribute('aria-expanded', open);
 });
 if (document.body.dataset.refresh) setInterval(() => {
-  if (!document.hidden && !document.querySelector('.overlay, details[open], .input:focus, .toast')) location.reload();
+  if (!document.hidden && !document.querySelector('.overlay, details[open], .input:focus, .toast, .dragging')) location.reload();
 }, 60000);
 `;
 
@@ -436,7 +436,16 @@ const target = location.hash && document.getElementById(location.hash.slice(1));
 if (target) { target.hidden = false; target.querySelector('details')?.setAttribute('open', ''); target.scrollIntoView({ block: 'center' }); }
 `;
 
-export type Page = 'Home' | 'Live' | 'Approvals' | 'Jobs' | 'Schedule' | 'Sessions' | 'Code' | '';
+export type Page =
+  | 'Home'
+  | 'Command'
+  | 'Approvals'
+  | 'Queue'
+  | 'Jobs'
+  | 'Schedule'
+  | 'Sessions'
+  | 'Code'
+  | '';
 
 /** The "Dashboards" switcher: this dashboard first, then each project's own dashboard. */
 function switcher(ctx: DashboardContext): string {
@@ -467,8 +476,9 @@ export function layout(
   const nav = (
     [
       ['/', 'Home', '🏠', 0, ''],
-      ...(ctx.live ? ([['/live', 'Live', '🎙️', 0, '']] as const) : []),
+      ...(ctx.live ? ([['/command', 'Command', '🎙️', 0, '']] as const) : []),
       ['/approvals', 'Approvals', '✅', waiting, 'waiting for a decision'],
+      ['/queue', 'Queue', '📤', 0, ''],
       ['/jobs', 'Jobs', '⏱️', failing, 'failing jobs'],
       ['/schedule', 'Schedule', '📅', 0, ''],
       ['/sessions', 'Sessions', '💬', 0, ''],

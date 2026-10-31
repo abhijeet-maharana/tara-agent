@@ -62,6 +62,7 @@ export async function askProject(
     systemPrompt: `${identityPrompt(deps.agentName)}\n\n${ASK_PROMPT}`,
     timeoutMs: deps.timeoutMs,
     signal,
+    label: { project: project.config.name, kind: 'ask', title: question },
   });
   deps.store.recordRun({
     kind: 'chat',

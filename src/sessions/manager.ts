@@ -324,6 +324,12 @@ export class SessionManager {
         systemPrompt: appendSystemPrompt,
         timeoutMs: host.claude.chatTimeoutMinutes * 60_000,
         signal,
+        label: {
+          project: name,
+          kind: 'chat',
+          title: msg.text,
+          thread: { channel: msg.channel, ts: msg.threadTs },
+        },
         onEvent: (event) => {
           if (event.kind === 'init' && !session.started) {
             session = { ...session, started: true };

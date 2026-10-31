@@ -68,7 +68,7 @@ export function nextWindowStart(window: QueueWindow, defaultTz: string, now: num
 
 /** When an approved item can next run, for the page ("goes out Tue 14:40"). */
 export function nextRun(
-  item: Item,
+  item: Pick<Item, 'runAfter' | 'runNow' | 'window'>,
   queue: QueueConfig | undefined,
   hostTz: string,
   now: number,

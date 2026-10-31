@@ -499,16 +499,35 @@ export class Approvals {
   }
 
   /**
-   * A project server takes back a card still waiting for a decision (the thing was posted by hand, or
-   * deleted). It ends as cancelled, and the hook is told. Harmless if misused: a project that still
-   * has the draft proposes it again.
+   * A person moves an approved item within its queue (Queue page), for a queue with `reorder`. A
+   * queue that alternates kinds takes turns by kind, so the item moves among the items of its kind.
    */
-  withdraw(id: string, reason?: string): Item {
+  move(id: string, to: 'up' | 'down' | 'top' | 'bottom' | number): Item {
+    const { store } = this.deps;
+    const item = store.getItem(id);
+    if (!item) throw new ApprovalError(404, 'No such item');
+    const queue = item.queue ? loadQueues(this.project(item.project))[item.queue] : undefined;
+    if (item.queue && !queue?.reorder)
+      throw new ApprovalError(
+        409,
+        `Queue "${item.queue}" runs in approval order (no "reorder" in queues.json)`,
+      );
+    const moved = store.moveItem(id, to, Boolean(queue?.alternate?.length));
+    if (!moved) throw new ApprovalError(409, 'Only approved items waiting in a queue can be moved');
+    return moved;
+  }
+
+  /**
+   * A project server, or the run that raised it, takes back a card still waiting for a decision (the
+   * thing was done or posted by hand, or deleted). It ends as cancelled, and the hook is told.
+   * Harmless if misused: a project that still has the draft proposes it again.
+   */
+  withdraw(id: string, reason?: string, by = 'project'): Item {
     const { store } = this.deps;
     const item = store.getItem(id);
     if (!item) throw new ApprovalError(404, 'No such item');
     if (item.status !== 'pending') throw new ApprovalError(409, `Already ${item.status}`);
-    const cancelled = store.cancelItem(id, 'project') as Item;
+    const cancelled = store.cancelItem(id, by) as Item;
     store.noteItem(id, reason);
     this.closeMessage(cancelled, `➖ Withdrawn${reason ? `: ${reason}` : ''}`);
     this.notify(cancelled, 'decided');

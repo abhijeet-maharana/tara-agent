@@ -33,6 +33,7 @@ import {
   codeSearchPage,
   codeTreePage,
 } from './code.js';
+import { commandPage } from './command-page.js';
 import {
   type DashboardContext,
   errorPage,
@@ -44,7 +45,7 @@ import {
   sessionPage,
   sessionsPage,
 } from './dashboard.js';
-import { livePage } from './live-page.js';
+import { queuePage } from './queue.js';
 import { isDayKey, MAX_RUNS_PER_DAY, type PlanJob, planDay, schedulePage } from './schedule.js';
 import { readTranscript } from './transcript.js';
 
@@ -98,7 +99,7 @@ export interface HttpOptions {
    * The certificate is re-read when its file changes.
    */
   tls?: { port: number; cert: string; key: string };
-  /** Live voice: takes each browser connection to `/live/ws` (unlocked browsers only). */
+  /** Command (voice): takes each browser connection to `/command/ws` (unlocked browsers only). */
   live?: { connect: (ws: WebSocket) => void };
   /** Enables the HTML pages (sessions, transcripts, jobs) for browsers. */
   dashboard?: {
@@ -183,10 +184,11 @@ async function readJson(req: IncomingMessage, limit = 10_000): Promise<Record<st
  *   POST /internal/permission          {tool_name, input}  → {id}
  *   GET  /internal/permission/<id>?wait=45                 → {decision | null}
  *   GET  /internal/jobs, POST /internal/run-job {id}        (chat turns only)
+ *   POST /internal/withdraw            {id, reason?}  closes a waiting card raised in the run's thread
  */
 /** Paths tara-agent serves itself; with a fallback, everything else is passed through. */
 const OWN_PATH =
-  /^\/(?:$|(?:health|reload|attention|live|jobs|runs|sessions|schedule|approvals|items|unlock|code|internal)(?:\/|$))/;
+  /^\/(?:$|(?:health|reload|attention|command|live|jobs|runs|sessions|schedule|approvals|queue|items|unlock|code|internal)(?:\/|$))/;
 const TOKEN_COOKIE = 'tara_token';
 const ADMIN_COOKIE = 'tara_admin';
 /** Finished items shown on the Done tab. */
@@ -585,6 +587,19 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         const by = human(req);
         return { item: approvals.cancel(parts[1] as string, owner(parts[1] as string) ?? by) };
       }
+      if (method === 'POST' && parts.length === 3 && parts[2] === 'move') {
+        human(req);
+        const to = (await readJson(req)).to;
+        if (
+          !(typeof to === 'number' && Number.isInteger(to) && to >= 0) &&
+          to !== 'up' &&
+          to !== 'down' &&
+          to !== 'top' &&
+          to !== 'bottom'
+        )
+          throw new HttpError(400, '"to" must be up, down, top, bottom or a place (0 is first)');
+        return { item: approvals.move(parts[1] as string, to) };
+      }
     }
     if (method === 'GET' && parts[0] === 'schedule' && parts.length === 1) {
       const project = url.searchParams.get('project')
@@ -763,6 +778,10 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         result: typeof body.result === 'string' ? body.result : undefined,
       });
     }
+    if (req.method === 'POST' && parts[1] === 'withdraw' && parts.length === 2) {
+      const body = await readJson(req);
+      return bridge.withdrawCard(token, { id: required(body.id, 'id'), reason: str(body.reason) });
+    }
     if (req.method === 'GET' && parts[1] === 'permission' && parts.length === 3) {
       const waitMs = Math.min(55, Math.max(0, Number(url.searchParams.get('wait')) || 0)) * 1000;
       return { decision: (await bridge.waitPermission(token, parts[2] as string, waitMs)) ?? null };
@@ -844,45 +863,48 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         now: at,
       });
     }
-    if (parts[0] === 'live' && parts.length === 1 && options.live)
-      return livePage(ctx, { unlocked: canDecide(req) });
-    if (parts[0] === 'approvals' && parts.length === 1 && options.approvals) {
+    if (parts[0] === 'command' && parts.length === 1 && options.live)
+      return commandPage(ctx, { unlocked: canDecide(req) });
+    if ((parts[0] === 'approvals' || parts[0] === 'queue') && parts.length === 1 && options.approvals) {
       const at = now();
       const project = projectParam();
-      const tabParam = url.searchParams.get('tab');
-      const tab: ApprovalsTab = tabParam === 'scheduled' || tabParam === 'done' ? tabParam : 'waiting';
+      const configs = new Map<string, Record<string, QueueConfig>>();
+      const queues = (name: string) => {
+        if (!configs.has(name)) {
+          const p = ctx.projects.find((x) => x.config.name === name);
+          let q: Record<string, QueueConfig> = {};
+          try {
+            q = p ? (options.queueConfig ?? loadQueues)(p) : {};
+          } catch {}
+          configs.set(name, q);
+        }
+        return configs.get(name) ?? {};
+      };
+      if (parts[0] === 'queue')
+        return queuePage(ctx, {
+          project,
+          approved: options.store.items({ project, statuses: ['approved'], limit: 1000 }),
+          running: options.store.items({ project, statuses: ['running'], limit: 100 }),
+          pending: options.store.items({ project, statuses: ['pending'], limit: 500 }),
+          queues,
+          canDecide: canDecide(req),
+          now: at,
+        });
+      const tab: ApprovalsTab = url.searchParams.get('tab') === 'done' ? 'done' : 'waiting';
       const STATUSES: Record<ApprovalsTab, ItemStatus[]> = {
         waiting: ['pending'],
-        scheduled: ['approved', 'running'],
         done: ['done', 'failed', 'rejected', 'expired', 'cancelled'],
       };
       const since = (t: ApprovalsTab) => (t === 'done' ? at - DONE_DAYS * 86_400_000 : undefined);
       const list = (t: ApprovalsTab) =>
         options.store.items({ project, statuses: STATUSES[t], since: since(t), limit: 500 });
-      const items = list(tab);
-      const configs = new Map<string, Record<string, QueueConfig>>();
       return approvalsPage(ctx, {
         tab,
         project,
         kind: url.searchParams.get('kind') ?? undefined,
-        items:
-          tab === 'scheduled' ? [...items].sort((a, b) => (a.decidedAt ?? 0) - (b.decidedAt ?? 0)) : items,
-        counts: {
-          waiting: list('waiting').length,
-          scheduled: list('scheduled').length,
-          done: list('done').length,
-        },
-        queues: (name) => {
-          if (!configs.has(name)) {
-            const p = ctx.projects.find((x) => x.config.name === name);
-            let q: Record<string, QueueConfig> = {};
-            try {
-              q = p ? (options.queueConfig ?? loadQueues)(p) : {};
-            } catch {}
-            configs.set(name, q);
-          }
-          return configs.get(name) ?? {};
-        },
+        items: list(tab),
+        counts: { waiting: list('waiting').length, done: list('done').length },
+        queues,
         canDecide: canDecide(req),
         now: at,
       });
@@ -1052,6 +1074,23 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       res.end();
       return;
     }
+    // Approved items moved from the Approvals page's Scheduled tab to the Queue page.
+    if (
+      req.method === 'GET' &&
+      url.pathname === '/approvals' &&
+      url.searchParams.get('tab') === 'scheduled'
+    ) {
+      const project = url.searchParams.get('project');
+      res.writeHead(301, { location: `/queue${project ? `?project=${encodeURIComponent(project)}` : ''}` });
+      res.end();
+      return;
+    }
+    // Command was called Live before.
+    if (options.live && req.method === 'GET' && (url.pathname === '/live' || url.pathname === '/live/')) {
+      res.writeHead(301, { location: `/command${url.search}` });
+      res.end();
+      return;
+    }
     const ctx = pageContext();
     const wantsHtml =
       Boolean(ctx) && req.method === 'GET' && (req.headers.accept ?? '').includes('text/html');
@@ -1098,13 +1137,17 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
   };
 
   const sockets = options.live ? new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 }) : undefined;
-  /** `/live/ws`: the same checks as a decision (it can start Claude conversations), plus same-origin. */
+  /**
+   * `/command/ws` (and `/live/ws`, its old name): the same checks as a decision (it can start Claude
+   * conversations and decide approvals), plus same-origin.
+   */
   const upgrade = (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     const refuse = (status: number, message: string) => {
       socket.end(`HTTP/1.1 ${status} ${message}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
     };
     const url = new URL(req.url ?? '/', 'http://localhost');
-    if (!sockets || !options.live || url.pathname !== '/live/ws') return refuse(404, 'Not Found');
+    if (!sockets || !options.live || !['/command/ws', '/live/ws'].includes(url.pathname))
+      return refuse(404, 'Not Found');
     if (!allowed(req.socket.remoteAddress)) return refuse(403, 'Forbidden');
     if (req.headers.origin && originHost(req.headers.origin) !== req.headers.host)
       return refuse(403, 'Forbidden');

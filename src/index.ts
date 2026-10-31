@@ -9,12 +9,15 @@ import { Approvals } from './approvals/approvals.js';
 import { Bridge } from './bridge/bridge.js';
 import { codeReaders } from './code/repo.js';
 import { DEFAULT_HOST_CONFIG, expandHome, loadHostConfig, loadJobs, loadProjects } from './config/load.js';
+import { jobState } from './http/dashboard.js';
 import { startHttpServer } from './http/server.js';
 import { convertHermesJobs } from './import-hermes.js';
+import { Activity } from './live/activity.js';
+import { Alerts } from './live/alerts.js';
 import { askProject } from './live/ask.js';
 import { gatherAttention, githubPullRequests } from './live/attention.js';
 import { LiveSession } from './live/session.js';
-import type { LiveDeps, LiveState } from './live/tools.js';
+import type { JobSummary, LiveDeps, LiveState } from './live/tools.js';
 import { Privileged } from './privileged/privileged.js';
 import { resolveRunAs } from './runner/as-user.js';
 import { type Runner, runClaude } from './runner/run.js';
@@ -123,7 +126,13 @@ async function serve(configFlag: string | undefined) {
   const store = new Store(path.join(host.stateDir as string, 'tara.db'));
   const runAs = host.claude.runAs ? resolveRunAs(host.claude.runAs) : undefined;
   if (runAs) log.info(`Claude runs as ${runAs.user} (${runAs.home})`);
-  const run: Runner = runAs ? (o) => runClaude({ ...o, runAs }) : runClaude;
+  const threadUrl = (channel: string, ts: string) => {
+    const base = slack.workspaceUrl();
+    return base && `${base}archives/${channel}/p${ts.replace('.', '')}`;
+  };
+  // Every labelled run, live, for Command's Live tasks (and its Stop).
+  const activity = new Activity({ threadUrl });
+  const run: Runner = activity.wrap(runAs ? (o) => runClaude({ ...o, runAs }) : runClaude);
   let manager: SessionManager | undefined;
   let bridge: Bridge | undefined;
   const slack = createSlackGateway({
@@ -216,8 +225,7 @@ async function serve(configFlag: string | undefined) {
     const ts = await slack.chat.post(channel, undefined, title);
     const user = project.config.owner ?? project.config.allowedUsers[0] ?? 'dashboard';
     void (manager as SessionManager).handle({ channel, threadTs: ts, ts, user, text: prompt });
-    const base = slack.workspaceUrl();
-    return { url: base && `${base}archives/${channel}/p${ts.replace('.', '')}` };
+    return { url: threadUrl(channel, ts), thread: { channel, ts } };
   };
   const readers = codeReaders(host, projects);
   const pullRequests = host.attention.github ? githubPullRequests() : undefined;
@@ -236,6 +244,22 @@ async function serve(configFlag: string | undefined) {
       urgent: host.attention.urgent,
     });
   const liveState: LiveState = { focusUntil: 0 };
+  // The urgent tier: one alert watcher for every Command tab.
+  const alerts =
+    host.live &&
+    new Alerts({
+      attention,
+      state: liveState,
+      gapMinutes: host.live.urgentGapMinutes,
+      alwaysInterrupt: host.live.alwaysInterrupt,
+    });
+  if (alerts) {
+    alerts.start();
+    // A job that ended may have made something urgent.
+    activity.subscribe((e) => {
+      if (e.type === 'task' && e.task.kind === 'job' && e.task.status !== 'running') alerts.poke();
+    });
+  }
   const liveEndpoint = (cfg: NonNullable<typeof host.live>) => {
     const apiKey = requireEnv('TARA_LIVE_API_KEY');
     const askDeps = {
@@ -246,23 +270,94 @@ async function serve(configFlag: string | undefined) {
       timeoutMs: cfg.askTimeoutSeconds * 1000,
       store,
     };
+    const jobs = (): JobSummary[] =>
+      projects.flatMap(({ config: { name } }) =>
+        scheduler.list(name).map((j) => ({
+          project: name,
+          id: j.id,
+          name: j.name,
+          state: jobState(j),
+          cron: j.cron,
+          nextRun: j.nextRun?.getTime(),
+          lastRunAt: j.lastRunAt?.getTime(),
+          lastError: j.lastError,
+          recent: store
+            .jobRuns(name, j.id, 12)
+            .map((r) => ({ status: r.status, at: r.startedAt, ms: r.endedAt - r.startedAt })),
+        })),
+      );
+    const pending = () => store.items({ statuses: ['pending'], limit: 500 });
+    const reader = (name: string) => readers.find((r) => r.repo.name === name);
     const deps: LiveDeps = {
       agentName: host.agentName,
       projects: projects.map((p) => p.config.name),
+      repos: readers.map((r) => r.repo.name),
+      overview: async () => {
+        const all = jobs();
+        const waiting = pending();
+        return Promise.all(
+          projects.map(async ({ config }) => {
+            const own = all.filter((j) => j.project === config.name);
+            const r = reader(config.name);
+            const status = r && (await r.status().catch((e: Error) => ({ changes: [], error: e.message })));
+            return {
+              name: config.name,
+              title: config.title ?? config.name,
+              jobs: {
+                total: own.length,
+                running: own.filter((j) => j.state === 'running').map((j) => j.name),
+                failing: own.filter((j) => j.state === 'failing').map((j) => j.name),
+                paused: own.filter((j) => j.state === 'paused').length,
+              },
+              approvals: waiting.filter((i) => i.project === config.name).length,
+              repo: status && {
+                branch: 'branch' in status ? status.branch : undefined,
+                changes: status.changes.length,
+                error: status.error,
+              },
+              dashboardUrl: config.dashboardUrl,
+            };
+          }),
+        );
+      },
       attention,
       ask: async (name, question, signal) => {
         const project = projects.find((p) => p.config.name === name);
         if (!project) throw new Error(`No project "${name}"`);
         return askProject(askDeps, project, question, signal);
       },
+      activity,
+      alerts: alerts || undefined,
       dispatch: (name, task) => startThread(name, `🎙️ ${task.split('\n')[0]?.slice(0, 120)}`, task),
-      running: () =>
-        projects.flatMap(({ config: { name } }) =>
-          scheduler
-            .list(name)
-            .filter((j) => j.running)
-            .map((j) => ({ project: name, name: j.name })),
-        ),
+      jobs,
+      runJob: (project, id) => scheduler.trigger(project, id, 'command'),
+      setJobEnabled: (project, id, enabled) => scheduler.setEnabled(project, id, enabled),
+      repo: async (name) => {
+        const r = reader(name);
+        if (!r) throw new Error(`No repo "${name}"`);
+        return r.status();
+      },
+      diff: async (name, file) => {
+        const r = reader(name);
+        if (!r) throw new Error(`No repo "${name}"`);
+        return r.diff(file);
+      },
+      approvals: () =>
+        pending().map((i) => ({
+          id: i.id,
+          project: i.project,
+          title: i.title,
+          kind: i.kind,
+          options: i.options,
+          body: i.body?.slice(0, 600),
+          createdAt: i.createdAt,
+        })),
+      decide: async (id, option) => {
+        const item = store.getItem(id);
+        const owner = projects.find((p) => p.config.name === item?.project)?.config.owner;
+        const decided = await approvals.decide(id, { option, by: owner ?? 'dashboard', via: 'dashboard' });
+        return { status: decided.status };
+      },
     };
     return {
       connect: (ws: WebSocket) => new LiveSession(ws, { ...cfg, apiKey }, deps, liveState, log),

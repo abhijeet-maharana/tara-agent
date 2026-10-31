@@ -262,6 +262,13 @@ export async function runJob(
             : buildJobPrompt(job, script, folders, trigger.kind === 'queue' ? trigger.items : undefined),
         timeoutMs,
         signal: stop,
+        label: {
+          project: project.config.name,
+          kind: 'job',
+          title: job.name,
+          thread: { channel, ts: rootTs },
+          jobId: job.id,
+        },
         onEvent: (event) => {
           if (event.kind === 'init' && !session.started) {
             session = { ...session, started: true };

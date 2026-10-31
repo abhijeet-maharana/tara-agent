@@ -182,6 +182,23 @@ describe('approvals', () => {
     expect(decisions).toHaveLength(0);
   });
 
+  it('withdraws a waiting card of its own thread only', async () => {
+    const { chat, store, bridge, decisions, ctx } = setup();
+    const { token } = openRun(bridge, ctx);
+    await bridge.requestApproval(token, { title: 'Send email', details: 'D' });
+    const other = openRun(bridge, { ...ctx, threadTs: '200.2' });
+    expect(() => bridge.withdrawCard(other.token, { id: 'id1' })).toThrow(/not raised in this thread/);
+
+    expect(bridge.withdrawCard(token, { id: 'id1', reason: 'Sent it himself' })).toEqual({
+      id: 'id1',
+      status: 'cancelled',
+    });
+    expect(store.getItem('id1')).toMatchObject({ status: 'cancelled', decidedBy: 'chat' });
+    expect(JSON.stringify(chat.updates.at(-1)?.blocks)).toContain('Withdrawn: Sent it himself');
+    expect(() => bridge.withdrawCard(token, { id: 'id1' })).toThrow(/Already cancelled/);
+    expect(decisions).toHaveLength(0);
+  });
+
   it('rejects unknown runs', async () => {
     const { bridge } = setup();
     await expect(bridge.requestApproval('nope', { title: 'T', details: 'D' })).rejects.toMatchObject({
@@ -402,6 +419,7 @@ describe('MCP server end to end', () => {
         'request_approval',
         'request_privileged',
         'send_file',
+        'withdraw_card',
       ]);
 
       const result = await client.callTool({

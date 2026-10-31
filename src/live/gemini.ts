@@ -15,7 +15,10 @@ export interface FunctionDeclaration {
   description: string;
   parameters?: {
     type: 'OBJECT';
-    properties: Record<string, { type: 'STRING' | 'NUMBER' | 'INTEGER' | 'BOOLEAN'; description: string }>;
+    properties: Record<
+      string,
+      { type: 'STRING' | 'NUMBER' | 'INTEGER' | 'BOOLEAN'; description: string; enum?: string[] }
+    >;
     required?: string[];
   };
 }

@@ -9,7 +9,7 @@ const exec = promisify(execFile);
 
 /**
  * What needs the owner, in three tiers. `urgent` may interrupt (chime and one spoken line), `waiting`
- * is a count on screen, `later` is only told when asked. See docs/live.md.
+ * is a count on screen, `later` is only told when asked. See docs/command.md.
  */
 export type Tier = 'urgent' | 'waiting' | 'later';
 

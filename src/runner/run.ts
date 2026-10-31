@@ -22,6 +22,19 @@ export interface RunOptions {
   onEvent?: (event: StreamEvent) => void;
   /** Run as another OS user (host `claude.runAs`). */
   runAs?: RunAs;
+  /** What the run is for, so Command can show it live (src/live/activity.ts). */
+  label?: RunLabel;
+}
+
+/** What a run is for. Runs without one (e.g. learning after a session) aren't shown on Command. */
+export interface RunLabel {
+  project: string;
+  kind: 'chat' | 'job' | 'ask';
+  /** One short line: the message, the job's name, the question. */
+  title: string;
+  /** The Slack thread it works in. */
+  thread?: { channel: string; ts: string };
+  jobId?: string;
 }
 
 export type RunStatus = 'ok' | 'error' | 'timeout' | 'limit' | 'aborted';

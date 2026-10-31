@@ -135,7 +135,7 @@ export const hostConfigSchema = z.object({
     .default({ enabled: true, exclude: ['**/.env*', '**/*.pem', '**/*.key'] }),
   /**
    * What needs you (`GET /attention`, and what Live reads out): approvals, permission prompts,
-   * failing jobs, uncommitted work, and your GitHub PRs. See docs/live.md.
+   * failing jobs, uncommitted work, and your GitHub PRs. See docs/command.md.
    */
   attention: z
     .object({
@@ -163,8 +163,8 @@ export const hostConfigSchema = z.object({
     })
     .default({ github: true, urgent: [] }),
   /**
-   * Live: talk to tara out loud from the dashboard (`/live`), through a Gemini Live session. The key
-   * (Google AI Studio) comes from TARA_LIVE_API_KEY. Unset = off. See docs/live.md.
+   * Command: talk to tara out loud from the dashboard (`/command`), through a Gemini Live session. The key
+   * (Google AI Studio) comes from TARA_LIVE_API_KEY. Unset = off. See docs/command.md.
    */
   live: z
     .object({
@@ -186,6 +186,17 @@ export const hostConfigSchema = z.object({
       /** Model for `ask`: read-only questions about a project, answered by Claude. */
       askModel: z.string().min(1).default('haiku'),
       askTimeoutSeconds: z.number().min(10).max(900).default(120),
+      /** At most one spoken urgent alert per this many minutes; later ones are shown, not said. */
+      urgentGapMinutes: z.number().min(0).max(1440).default(30),
+      /** Jobs (`project/jobId`) whose urgent failures are said even in focus mode, and without the gap. */
+      alwaysInterrupt: z
+        .array(z.string().regex(/^[a-z0-9][a-z0-9-]*\/[^/\s]+$/, 'project/jobId, e.g. shop/payments-sync'))
+        .default([]),
+      /**
+       * The browser voice for alerts said while the voice session is closed, as a language tag
+       * (e.g. `en-IN`). Unset: the browser's default voice.
+       */
+      alertLang: z.string().min(2).max(35).optional(),
     })
     .optional(),
 });
@@ -338,6 +349,8 @@ export const queueSchema = z
         perWeek: z.number().int().positive().optional(),
       })
       .default({}),
+    /** A person sets the order of its approved items on the Queue page (otherwise oldest approval first). */
+    reorder: z.boolean().optional(),
     /** Minutes between two runs of this queue. */
     gapMinutes: z.number().nonnegative().default(0),
     /**

@@ -86,6 +86,7 @@ export const BRIDGE_PROMPT = `Slack tools (tara MCP server):
   - something only a person can do (a login, an OTP, a captcha, a call, a failure you could not fix): say exactly what, with options like "Done, continue" / "Skip".
   No card for OK or FYI news: that stays in your reply.
 - Drafts that should go out later (messages, emails, applications, posts) go through \`propose_item\` with the queue that sends them: one card each, approved or edited on the Approvals page, then run at the queue's time. Never send them yourself.
+- When a person says they did a waiting card's work themselves, or it no longer applies, close it with \`withdraw_card\` (its id from \`list_items\`, and why). Never ask them to tap a button just to clear it.
 - To share a screenshot, PDF, CSV or image, save it inside the project (e.g. .scratch/) and call \`send_file\`.`;
 
 /** Without root actions on the host: a run can still ask a person to run a command for it. */
@@ -292,6 +293,28 @@ export class Bridge {
     if (!item) throw new BridgeError(409, `Item ${input.id} is not running (already reported?)`);
     this.deps.approvals.finished(item, ctx.threadTs);
     return { id: item.id, status: item.status };
+  }
+
+  /**
+   * Takes back a card raised in this run's thread that is still waiting (the person did it themselves,
+   * or it no longer applies). Only cards of this thread, so a run cannot clear other people's cards.
+   */
+  withdrawCard(token: string | undefined, input: { id: string; reason?: string }) {
+    const ctx = this.run(token);
+    const item = this.deps.store.getItem(input.id);
+    if (
+      !item ||
+      item.project !== ctx.project.config.name ||
+      item.channel !== ctx.channel ||
+      item.threadTs !== ctx.threadTs
+    )
+      throw new BridgeError(403, `Card ${input.id} was not raised in this thread`);
+    try {
+      const withdrawn = this.deps.approvals.withdraw(item.id, input.reason, ctx.jobId ?? 'chat');
+      return { id: withdrawn.id, status: withdrawn.status };
+    } catch (err) {
+      asBridgeError(err);
+    }
   }
 
   /** This project's items, for checking before proposing again. */

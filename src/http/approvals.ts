@@ -15,11 +15,11 @@ import {
 
 /**
  * The Approvals page: every card that waits for a person, from every project. Paused runs wait for a
- * decision; drafts wait for approval (with edits) and then run at their queue's time. Tabs: Waiting,
- * Scheduled (approved, in queue order) and Done (the last 30 days).
+ * decision; drafts wait for approval (with edits) and then run at their queue's time (in the order
+ * set on the Queue page). Tabs: Waiting and Done (the last 30 days).
  */
 
-export type ApprovalsTab = 'waiting' | 'scheduled' | 'done';
+export type ApprovalsTab = 'waiting' | 'done';
 
 export interface ApprovalsData {
   tab: ApprovalsTab;
@@ -35,7 +35,7 @@ export interface ApprovalsData {
   now: number;
 }
 
-const kindLabel = (kind: string) =>
+export const kindLabel = (kind: string) =>
   kind === 'decision' ? 'Decisions' : (kind.charAt(0).toUpperCase() + kind.slice(1)).replace(/-/g, ' ');
 
 const STATUS_TONE: Record<string, string> = {
@@ -160,11 +160,18 @@ function mediaHtml(item: Item): string {
     .join('')}</div>`;
 }
 
-function goesOut(ctx: DashboardContext, item: Item, data: ApprovalsData): string {
+/** "goes out Tue 14:40 · linkedin · EU" (`withQueue` false: without the queue's name). */
+export function goesOut(
+  ctx: DashboardContext,
+  item: Item,
+  queues: ApprovalsData['queues'],
+  now: number,
+  withQueue = true,
+): string {
   if (item.mode !== 'queue') return '';
-  const at = nextRun(item, data.queues(item.project)[item.queue ?? ''], ctx.timeZone, data.now);
-  const where = [item.queue, item.window].filter(Boolean).join(' · ');
-  return `<span>${at ? `goes out ${esc(at <= data.now + 60_000 ? 'now' : when(at, ctx.timeZone))}` : 'no window coming up'}${where ? ` · ${esc(where)}` : ''}</span>`;
+  const at = nextRun(item, queues(item.project)[item.queue ?? ''], ctx.timeZone, now);
+  const where = [withQueue && item.queue, item.window].filter(Boolean).join(' · ');
+  return `<span>${at ? `goes out ${esc(at <= now + 60_000 ? 'now' : when(at, ctx.timeZone))}` : 'no window coming up'}${where ? ` · ${esc(where)}` : ''}</span>`;
 }
 
 function waitingCard(ctx: DashboardContext, item: Item, data: ApprovalsData, multi: boolean): string {
@@ -189,7 +196,7 @@ function waitingCard(ctx: DashboardContext, item: Item, data: ApprovalsData, mul
 <div class="card-head"><div class="grow"><div class="title">${esc(item.title)}</div>
 <div class="meta">${multi ? projectTag(ctx, item.project) : ''}${item.source ? `<span>${esc(item.source)}</span>` : ''}<span>${esc(
     relative(item.createdAt, data.now),
-  )}</span>${goesOut(ctx, item, data)}</div></div>${
+  )}</span>${goesOut(ctx, item, data.queues, data.now)}</div></div>${
     data.canDecide && item.mode === 'queue' && !blocking
       ? `<input type="checkbox" class="pick" data-pick="${esc(item.id)}" aria-label="Select">`
       : ''
@@ -209,21 +216,6 @@ ${
     : ''
 }
 ${buttons ? `<div class="actions">${buttons}</div>` : ''}</article>`;
-}
-
-function scheduledRow(ctx: DashboardContext, item: Item, data: ApprovalsData, multi: boolean): string {
-  const running = item.status === 'running';
-  return `<div class="row"><span class="dot${running ? '' : ' ok'}"></span><span class="grow"><span class="title">${esc(item.title)}</span>
-<span class="meta">${multi ? projectTag(ctx, item.project) : ''}<span class="tag">${esc(kindLabel(item.kind))}</span>${
-    running ? '<span class="tag">running now</span>' : goesOut(ctx, item, data)
-  }<span>approved ${esc(relative(item.decidedAt, data.now))}</span></span>${
-    // Why an executor put it back ("daily cap reached").
-    !running && item.result ? `<div class="result">Waiting: ${esc(item.result.slice(0, 300))}</div>` : ''
-  }</span>${
-    !running && data.canDecide
-      ? `<span class="actions"><button type="button" class="btn quiet" data-cancel="${esc(item.id)}" data-title="${esc(item.title)}">Cancel</button></span>`
-      : ''
-  }</div>`;
 }
 
 function doneRow(ctx: DashboardContext, item: Item, data: ApprovalsData, multi: boolean): string {
@@ -248,11 +240,11 @@ export function approvalsPage(ctx: DashboardContext, data: ApprovalsData): strin
     );
     return `/approvals${p.size ? `?${p}` : ''}`;
   };
-  const tabs = (['waiting', 'scheduled', 'done'] as const)
+  const tabs = (['waiting', 'done'] as const)
     .map(
       (t) =>
         `<a class="chip${data.tab === t ? ' on' : ''}" href="${link({ tab: t === 'waiting' ? '' : t, kind: '' })}">${
-          { waiting: 'Waiting', scheduled: 'Scheduled', done: 'Done' }[t]
+          { waiting: 'Waiting', done: 'Done' }[t]
         }<small>${data.counts[t]}</small></a>`,
     )
     .join('');
@@ -306,10 +298,6 @@ export function approvalsPage(ctx: DashboardContext, data: ApprovalsData): strin
       })
       .join('');
     if (!body) body = '<div class="clear">✓ Nothing waiting for you.</div>';
-  } else if (data.tab === 'scheduled') {
-    body = shown.length
-      ? `<div class="todo">${shown.map((i) => scheduledRow(ctx, i, data, multi)).join('')}</div>`
-      : '<div class="empty">Nothing approved is waiting to run.</div>';
   } else {
     body = shown.length
       ? `<div class="todo">${shown.map((i) => doneRow(ctx, i, data, multi)).join('')}</div>`
@@ -322,7 +310,7 @@ export function approvalsPage(ctx: DashboardContext, data: ApprovalsData): strin
     'Approvals',
     `${CSS}${pageHead('Approvals', "Decide here. Paused runs continue with your answer; approved drafts run at their queue's time, one at a time.")}
 ${data.canDecide ? '' : '<div class="lock">This browser can look but not decide. <a href="/unlock">Unlock it</a> once with the approvals key (only from your own phone or computer, never from Jarvis).</div>'}
-<div class="toolbar"><div class="chips">${tabs}</div></div>
+<div class="toolbar"><div class="chips">${tabs}<a class="chip" href="/queue">Scheduled → Queue</a></div></div>
 ${projectChips ? `<div class="toolbar"><div class="chips">${projectChips}</div></div>` : ''}
 ${kindChips ? `<div class="toolbar"><div class="chips">${kindChips}</div></div>` : ''}
 ${body}`,

@@ -20,6 +20,7 @@ tara-agent runs on your own server around the clock. It runs scheduled jobs, ans
 **Talk to it**
 - **Chat in Slack.** Each channel is one project. A message starts a session, and replies in the thread continue it. Progress streams live. Photos and files posted with a message (up to 10, 20 MB each) are saved to the session's scratch folder and their paths added to the prompt, so Claude can read them.
 - **Many projects, one agent.** Every project keeps its own repo, instructions, skills and tools.
+- **Command: talk to it out loud** (optional, Gemini Live). Ask what needs you, how every project is doing, or about the code; run and pause jobs, decide approvals, hand work to Slack. Answers are spoken in a sentence, and the details appear on screen as panels next to a live view of every project.
 
 **See everything**
 - **Web dashboard.** What's running, what needs you, failing jobs, the day's schedule, full transcripts of every run, and your repos' uncommitted changes. Works on a phone.
@@ -111,6 +112,7 @@ Open `http://127.0.0.1:4100` (or the address you set under `http`).
 | Page | Shows |
 |---|---|
 | **Home** | What's running, what needs attention, upcoming and recent runs |
+| **Command** | Talk to tara: every project's health, and a panel for each thing it looks up or does (with `live` set) |
 | **Approvals** | Cards waiting for a decision, scheduled drafts, and past decisions |
 | **Jobs** | Every job with its schedule, recent results, **Run now** and **Pause** |
 | **Schedule** | A day's timeline of jobs, with overlaps and free time |
@@ -136,6 +138,7 @@ Full threat model: [`docs/security.md`](docs/security.md).
 | [`docs/security.md`](docs/security.md) | Threat model, dedicated user, split users, privileged actions |
 | [`docs/architecture.md`](docs/architecture.md) | Modules and how a chat turn, job and approval flow |
 | [`docs/code-view.md`](docs/code-view.md) | The Code page |
+| [`docs/command.md`](docs/command.md) | Command: the voice control room, its tools and protocol |
 | [`docs/dashboard-look.md`](docs/dashboard-look.md) | Reusing the dashboard style in your own project dashboards |
 | [`CHANGELOG.md`](CHANGELOG.md), [`CONTRIBUTING.md`](CONTRIBUTING.md) | Changes and how to contribute |
 

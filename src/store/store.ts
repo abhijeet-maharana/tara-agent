@@ -183,6 +183,8 @@ const MIGRATIONS = [
   `UPDATE items SET status = 'done', finished_at = decided_at WHERE mode = 'resume' AND status = 'approved';`,
   // The inbox is gone (2026-10-26): everything that needs a person is an approval card.
   `DROP TABLE inbox;`,
+  // An approved item's place in its queue once a person moved it (otherwise its approval time).
+  `ALTER TABLE items ADD COLUMN queue_rank REAL;`,
 ];
 
 export const ITEM_STATUSES = [
@@ -255,6 +257,8 @@ export interface Item {
   runAfter?: number;
   /** Approved with "run now": skips the queue's windows and slots (caps still apply). */
   runNow: boolean;
+  /** Place in its queue once moved on the Approvals page; unset = its approval time. */
+  queueRank?: number;
   status: ItemStatus;
   decision?: string;
   reply?: string;
@@ -288,6 +292,9 @@ export type ItemInput = Pick<Item, 'project' | 'kind' | 'mode' | 'title' | 'opti
     >
   >;
 
+/** Where an approved item sits in its queue: where a person moved it, or its approval time. */
+export const queueKey = (i: Item): number => i.queueRank ?? i.decidedAt ?? 0;
+
 /** Done, failed and other finished items are kept this long. */
 const ITEM_RETENTION_MS = 60 * 86_400_000;
 
@@ -314,6 +321,7 @@ function toItem(r: Record<string, unknown>): Item {
     window: opt(r.window),
     runAfter: opt(r.run_after),
     runNow: r.run_now === 1,
+    queueRank: opt(r.queue_rank),
     status: r.status as ItemStatus,
     decision: opt(r.decision),
     reply: opt(r.reply),
@@ -619,7 +627,7 @@ export class Store {
     return row ? toItem(row as Record<string, unknown>) : undefined;
   }
 
-  /** Items, newest first (or by approval for `approved`, the order queues run them). */
+  /** Items, newest first (or in queue order for `approved`, the order queues run them). */
   items(
     filter: {
       project?: string;
@@ -644,7 +652,7 @@ export class Store {
     if (filter.since !== undefined) add('updated_at >= ?', filter.since);
     const order =
       filter.statuses?.length === 1 && filter.statuses[0] === 'approved'
-        ? 'decided_at, created_at'
+        ? 'COALESCE(queue_rank, decided_at), created_at'
         : 'created_at DESC';
     const rows = this.db
       .prepare(
@@ -785,6 +793,55 @@ export class Store {
       )
       .run(by, t, id);
     return r.changes > 0 ? this.getItem(id) : undefined;
+  }
+
+  /**
+   * Moves an approved item up, down, to the top or bottom of its queue, or to a place in it (0 is
+   * first) (`sameKind`: among the items of its kind, for a queue that alternates kinds). The moved
+   * items keep their sort keys, handed out in the new order, so items approved later still go after
+   * them. Undefined when it is not an approved queue item.
+   */
+  moveItem(id: string, to: 'up' | 'down' | 'top' | 'bottom' | number, sameKind = false): Item | undefined {
+    const item = this.getItem(id);
+    if (item?.status !== 'approved' || !item.queue) return undefined;
+    const queue = this.items({
+      project: item.project,
+      queue: item.queue,
+      kind: sameKind ? item.kind : undefined,
+      statuses: ['approved'],
+      limit: 10_000,
+    });
+    const from = queue.findIndex((i) => i.id === id);
+    const last = queue.length - 1;
+    const target =
+      typeof to === 'number'
+        ? Math.min(Math.max(0, Math.trunc(to)), last)
+        : to === 'top'
+          ? 0
+          : to === 'bottom'
+            ? last
+            : to === 'up'
+              ? Math.max(0, from - 1)
+              : Math.min(last, from + 1);
+    if (target === from) return item;
+    const keys = queue.map(queueKey);
+    const order = [...queue];
+    order.splice(target, 0, ...order.splice(from, 1));
+    const update = this.db.prepare('UPDATE items SET queue_rank = ? WHERE id = ?');
+    this.db.exec('BEGIN');
+    try {
+      let last = Number.NEGATIVE_INFINITY;
+      order.forEach((i, n) => {
+        // Equal keys (a bulk approval in one millisecond) would leave the order to chance.
+        last = Math.max(keys[n] as number, last + 0.001);
+        update.run(last, i.id);
+      });
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+    return this.getItem(id);
   }
 
   /** Pending items (of one project) older than `before` expire; old finished items are deleted. */

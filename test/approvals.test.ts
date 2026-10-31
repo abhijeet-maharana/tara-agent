@@ -26,6 +26,7 @@ const QUEUES = {
     windows: { EU: { tz: 'Europe/Berlin', days: 'tue-thu', from: '10:00', to: '12:00' } },
     caps: { perDay: 3 },
     gapMinutes: 0,
+    reorder: true,
   },
   content: {
     executor: { url: 'http://board/send' },
@@ -34,6 +35,7 @@ const QUEUES = {
     alternate: ['image-post', 'reel'],
     caps: {},
     gapMinutes: 0,
+    reorder: true,
   },
   outreach: {
     executor: { external: true },
@@ -645,6 +647,162 @@ describe('decisions over HTTP', () => {
     expect(ok.status).toBe(200);
     expect(store.getItem(item.id)).toMatchObject({ status: 'approved', decidedBy: 'U1' });
     expect(store.getItem(item.id)?.fields[0]?.value).toBe('edited');
+    server.close();
+  });
+});
+
+describe('reordering a queue', () => {
+  const titles = (store: Store, queue: string) =>
+    store.items({ queue, statuses: ['approved'] }).map((i) => i.title);
+
+  it('moves an approved item up, down or to the top; the worker runs it in that order', async () => {
+    let now = TUE_9_UTC - 3_600_000;
+    const { project, store, approvals } = setup({ now: () => now });
+    const runs: string[][] = [];
+    const worker = new QueueWorker({
+      projects: [project],
+      store,
+      log: silent,
+      timeZone: 'UTC',
+      now: () => now,
+      jobs: {
+        enabled: () => true,
+        runQueue: async (_p, _job, _q, items) => {
+          runs.push(items.map((i) => i.title));
+          for (const i of items) store.finishItem(i.id, 'done', 'sent');
+          return 'ok';
+        },
+      },
+    });
+    const ids: string[] = [];
+    // Same millisecond for all, as a bulk approval: the order must still be exact after a move.
+    for (const n of [1, 2, 3, 4]) {
+      const i = await approvals.propose(project, { kind: 'note', title: `Lead ${n}`, queue: 'linkedin' });
+      await approvals.decide(i.id, { option: 'Approve', by: 'U1', via: 'dashboard' });
+      ids.push(i.id);
+    }
+    approvals.move(ids[3] as string, 'top');
+    expect(titles(store, 'linkedin')).toEqual(['Lead 4', 'Lead 1', 'Lead 2', 'Lead 3']);
+    approvals.move(ids[0] as string, 'down');
+    approvals.move(ids[2] as string, 'up');
+    expect(titles(store, 'linkedin')).toEqual(['Lead 4', 'Lead 2', 'Lead 3', 'Lead 1']);
+    approvals.move(ids[3] as string, 'up'); // already first
+    expect(titles(store, 'linkedin')[0]).toBe('Lead 4');
+    approvals.move(ids[3] as string, 'bottom');
+    expect(titles(store, 'linkedin')).toEqual(['Lead 2', 'Lead 3', 'Lead 1', 'Lead 4']);
+    approvals.move(ids[3] as string, 0); // dragged to a place
+    approvals.move(ids[0] as string, 1);
+    approvals.move(ids[2] as string, 99); // past the end: last
+    expect(titles(store, 'linkedin')).toEqual(['Lead 4', 'Lead 1', 'Lead 2', 'Lead 3']);
+    approvals.move(ids[0] as string, 3);
+    expect(titles(store, 'linkedin')).toEqual(['Lead 4', 'Lead 2', 'Lead 3', 'Lead 1']);
+
+    // Approved later: still goes after every moved item.
+    now += 1000;
+    const late = await approvals.propose(project, { kind: 'note', title: 'Lead 5', queue: 'linkedin' });
+    await approvals.decide(late.id, { option: 'Approve', by: 'U1', via: 'dashboard' });
+    expect(titles(store, 'linkedin').at(-1)).toBe('Lead 5');
+
+    now = TUE_9_UTC;
+    await worker.tick();
+    await worker.idle();
+    expect(runs).toEqual([['Lead 4', 'Lead 2']]);
+    expect(() => approvals.move(ids[3] as string, 'down')).toThrow(/Only approved items/);
+    const pending = await approvals.propose(project, { kind: 'note', title: 'Lead 6', queue: 'linkedin' });
+    expect(() => approvals.move(pending.id, 'top')).toThrow(/Only approved items/);
+  });
+
+  it('moves among the same kind in a queue that alternates kinds', async () => {
+    let now = TUE_9_UTC;
+    const { project, store, approvals } = setup({ now: () => now });
+    const ids: Record<string, string> = {};
+    for (const [kind, title] of [
+      ['image-post', 'Post A'],
+      ['reel', 'Reel A'],
+      ['image-post', 'Post B'],
+      ['reel', 'Reel B'],
+    ] as const) {
+      now += 1000;
+      const i = await approvals.propose(project, { kind, title, queue: 'content' });
+      await approvals.decide(i.id, { option: 'Approve', by: 'U1', via: 'dashboard' });
+      ids[title] = i.id;
+    }
+    // Reel A is the first reel, so "up" has nothing of its kind to pass: it stays.
+    approvals.move(ids['Reel A'] as string, 'up');
+    expect(titles(store, 'content')).toEqual(['Post A', 'Reel A', 'Post B', 'Reel B']);
+    approvals.move(ids['Post B'] as string, 'top');
+    expect(titles(store, 'content')).toEqual(['Post B', 'Reel A', 'Post A', 'Reel B']);
+  });
+
+  it('needs the unlock cookie; the Queue page shows each queue in order, with the buttons', async () => {
+    let now = TUE_9_UTC;
+    const { project, store, approvals } = setup({ now: () => now });
+    const ids: string[] = [];
+    for (const title of ['First', 'Second']) {
+      now += 1000;
+      const i = await approvals.propose(project, { kind: 'note', title, queue: 'linkedin' });
+      await approvals.decide(i.id, { option: 'Approve', by: 'U1', via: 'dashboard' });
+      ids.push(i.id);
+    }
+    const alone = await approvals.propose(project, { kind: 'email', title: 'Alone', queue: 'email' });
+    await approvals.decide(alone.id, { option: 'Approve', by: 'U1', via: 'dashboard' });
+    // A queue without "reorder" runs in approval order.
+    expect(() => approvals.move(alone.id, 'top')).toThrow(/runs in approval order/);
+    const server = await startHttpServer({
+      bind: '127.0.0.1',
+      port: 0,
+      scheduler: { list: () => [], plannedRuns: () => [] } as unknown as Scheduler,
+      store,
+      approvals,
+      adminToken: 'open-sesame',
+      decisionsFromLocal: true,
+      projects: ['shop'],
+      log: silent,
+      dashboard: { projects: [project], timeZone: 'UTC', agentName: 'Jarvis' },
+    });
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const move = (id: string, to: string | number, cookie?: string) =>
+      fetch(`${base}/items/${id}/move`, {
+        method: 'POST',
+        headers: cookie ? { cookie } : {},
+        body: JSON.stringify({ to }),
+      });
+    expect((await move(ids[1] as string, 'top')).status).toBe(403);
+    expect((await move(ids[1] as string, 'sideways', 'tara_admin=open-sesame')).status).toBe(400);
+    expect((await move(ids[1] as string, -1, 'tara_admin=open-sesame')).status).toBe(400);
+    expect((await move(ids[1] as string, 'top', 'tara_admin=open-sesame')).status).toBe(200);
+    expect(titles(store, 'linkedin')).toEqual(['Second', 'First']);
+    expect((await move(ids[1] as string, 1, 'tara_admin=open-sesame')).status).toBe(200);
+    expect(titles(store, 'linkedin')).toEqual(['First', 'Second']);
+    await move(ids[1] as string, 0, 'tara_admin=open-sesame');
+
+    const old = await fetch(`${base}/approvals?tab=scheduled`, {
+      headers: { accept: 'text/html' },
+      redirect: 'manual',
+    });
+    expect(old.status).toBe(301);
+    expect(old.headers.get('location')).toBe('/queue');
+    const page = await fetch(`${base}/queue`, {
+      headers: { accept: 'text/html', cookie: 'tara_admin=open-sesame' },
+    }).then((r) => r.text());
+    expect(page).toContain('<h2>Linkedin</h2>');
+    expect(page).toContain('<h2>Content</h2>'); // reorderable: shown while empty
+    // Not reorderable: read-only, under "Other queues".
+    expect(page.indexOf('<details class="others">')).toBeLessThan(page.indexOf('<h2>Email</h2>'));
+    expect(page.indexOf('<h2>Linkedin</h2>')).toBeLessThan(page.indexOf('<details class="others">'));
+    expect(page.indexOf('Second')).toBeLessThan(page.indexOf('First'));
+    expect(page).toContain(`data-qitem="${ids[1]}"`);
+    expect(page).toContain(
+      `data-move="${ids[1]}" data-to="top" title="Run first in its queue" aria-label="Run first in its queue" disabled`,
+    );
+    expect(page).toContain(
+      `data-move="${ids[0]}" data-to="down" title="Move down" aria-label="Move down" disabled`,
+    );
+    expect(page).toContain(
+      `data-move="${ids[0]}" data-to="bottom" title="Run last in its queue" aria-label="Run last in its queue" disabled`,
+    );
+    expect(page).not.toContain(`data-move="${alone.id}"`); // alone in its queue
+    expect(page).toContain(`data-cancel="${alone.id}"`);
     server.close();
   });
 });

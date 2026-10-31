@@ -36,10 +36,10 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `http` | `127.0.0.1:4100` | Local API and dashboard (`enabled`, `bind`, `port`, `allowFrom`). Set `TARA_HTTP_TOKEN` to require a bearer token (open a page once with `?token=…` to sign a browser in). The MCP tools need it enabled |
 | `http.allowFrom` | `127.0.0.0/8`, `::1/128` | CIDR ranges allowed to connect. Transcripts hold everything Claude saw, so keep this to a trusted network, e.g. add `100.64.0.0/10` and `fd7a:115c:a1e0::/48` for Tailscale |
 | `http.fallback` | none | URL that receives every request tara-agent doesn't serve, passed through unchanged. Useful when taking over a port from another service |
-| `http.tls` | off | Also serve HTTPS on `port` (default `4443`) with `cert` and `key` files, e.g. from `tailscale cert`. Browsers only allow the microphone ([Live](live.md)) over HTTPS. The certificate is re-read when its file changes, so renewing it needs no restart |
+| `http.tls` | off | Also serve HTTPS on `port` (default `4443`) with `cert` and `key` files, e.g. from `tailscale cert`. Browsers only allow the microphone ([Command](command.md)) over HTTPS. The certificate is re-read when its file changes, so renewing it needs no restart |
 | `code` | on, the projects | The Code page: `repos` (`path`, `gitDir`, `title`, `askIn`) and `exclude` globs never shown (default `.env*`, `*.pem`, `*.key`). See [code-view.md](code-view.md) |
-| `attention` | GitHub on, nothing urgent | What needs you (`GET /attention`, read out by [Live](live.md)): `github` (your open PRs and review requests through `gh`, logged in as the user tara-agent runs as) and `urgent` rules that let a failing job interrupt: `{consecutiveFailures: 3}` or `{job: "project/jobId"}` |
-| `live` | off | Talk to tara out loud ([live.md](live.md)): `url` (default Google's Gemini Live endpoint), `model` (`gemini-3.8-live`), `voice` (`Kore`), `language` (how to speak, in plain words, e.g. "Indian English; Hindi when I speak Hindi"), `idleSeconds` (`20`), `askModel` (`haiku`), `askTimeoutSeconds` (`120`). Key from `TARA_LIVE_API_KEY` (Google AI Studio) |
+| `attention` | GitHub on, nothing urgent | What needs you (`GET /attention`, read out by [Command](command.md)): `github` (your open PRs and review requests through `gh`, logged in as the user tara-agent runs as) and `urgent` rules that let a failing job interrupt: `{consecutiveFailures: 3}` or `{job: "project/jobId"}` |
+| `live` | off | The voice behind the Command page ([command.md](command.md)): `url` (default Google's Gemini Live endpoint), `model` (`gemini-3.8-live`), `voice` (`Kore`), `language` (how to speak, in plain words, e.g. "Indian English; Hindi when I speak Hindi"), `idleSeconds` (`20`), `askModel` (`haiku`), `askTimeoutSeconds` (`120`), `urgentGapMinutes` (`30`: at most one spoken urgent alert per this long), `alwaysInterrupt` (`project/jobId` jobs said even in focus mode), `alertLang` (browser voice for alerts, e.g. `en-IN`). Key from `TARA_LIVE_API_KEY` (Google AI Studio) |
 
 ## Project config
 
@@ -155,6 +155,7 @@ Every run gets tara-agent's own MCP server alongside the repo's `.mcp.json` serv
 | `send_file` | Uploads a file (screenshot, PDF, CSV, image) into the thread. Only files inside the project or temp directory, up to 100 MB |
 | `permission` | In chat, when Claude wants a tool not in `allowedTools`, the thread gets **Allow / Deny** buttons (denied after 10 minutes). Scheduled jobs never wait on this |
 | `propose_item`, `list_items`, `finish_item` | Drafts that go out later (a message, email, post): each becomes a card on the Approvals page and, once approved, runs through a [queue](#queues) |
+| `withdraw_card` | Closes a waiting card raised in the same thread (the person did it themselves, or it no longer applies). It ends as cancelled with the reason; cards of other threads are refused |
 | `run_job` | Starts one of the project's jobs |
 
 The tools reach tara-agent through the local API with a per-run token, so `http.enabled` must stay on.
@@ -174,7 +175,7 @@ Approved drafts are sent through queues declared in `<repo>/.tara/queues.json`:
 
 **When items run**
 
-- One batch at a time per queue, oldest approval first.
+- One batch at a time per queue, oldest approval first. With `"reorder": true`, a person sets the order on the **Queue** page instead (drag a row, or **Top**, **↑**, **↓**, **Bottom** per item). Items approved after a move go to the end. In a queue with `alternate`, an item moves among items of its own kind, because kinds take turns.
 - `windows`: items run only while their window is open. `slots`: one batch per cron slot instead, rotating through the `alternate` kinds.
 - `caps` (per day, per rolling week) and `gapMinutes` limit how fast items go out.
 - "Approve & run now" skips windows and slots.
@@ -202,7 +203,8 @@ An item that is never reported ends as failed and is not retried, so nothing goe
 Open the HTTP address in a browser. Every page also answers JSON to tools.
 
 - **Home** (`/`): what's running, what needs attention (waiting approvals, failing or paused jobs), upcoming and recent runs.
-- **Approvals** (`/approvals`): cards waiting for a person, scheduled drafts, and decisions from the last 30 days. Deciding needs the browser unlocked once on `/unlock` with `TARA_ADMIN_TOKEN`, from a device other than the server.
+- **Approvals** (`/approvals`): cards waiting for a person, and decisions from the last 30 days. Deciding needs the browser unlocked once on `/unlock` with `TARA_ADMIN_TOKEN`, from a device other than the server.
+- **Queue** (`/queue`): approved drafts waiting to run, in run order with the next slot or window. Each queue with `"reorder": true` has its own section (per kind with `alternate`), shown even when empty, with how many cards wait for approval. Drag a row (mouse or touch) or use **Top** / **↑** / **↓** / **Bottom** to choose what goes out first; **Cancel** drops one. Reordering needs the unlocked browser. Other queues are listed read-only under **Other queues**.
 - **Jobs** (`/jobs`): every job, failing first, with schedule, recent results, **Run now**, **Pause** / **Resume**, and run history.
 - **Schedule** (`/schedule`): a day's timeline with each job's usual length, overlaps and free windows.
 - **Sessions** (`/sessions`, `/sessions/<id>`): every thread and job run, with full transcripts and tool calls.
@@ -252,7 +254,7 @@ For scripts and dashboards on the same host (`127.0.0.1:4100` by default).
 | `POST /items/<id>/withdraw` `{reason?}` | Take back a waiting card |
 | `POST /items/<id>/report` `{status, result?}` | Report an `external` queue item: done, failed or waiting |
 | `GET /queues?project=<p>&upcoming=<n>` | A project's queues with their next slots |
-| `POST /items/<id>/decide`, `POST /items/bulk`, `POST /items/<id>/cancel` | Human only: needs the unlock cookie, from another device |
+| `POST /items/<id>/decide`, `POST /items/bulk`, `POST /items/<id>/cancel`, `POST /items/<id>/move` `{to: up\|down\|top}` | Human only: needs the unlock cookie, from another device |
 
 **Code**
 
