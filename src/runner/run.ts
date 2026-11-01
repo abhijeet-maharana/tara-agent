@@ -3,6 +3,7 @@ import { chmodSync, chownSync, mkdtempSync, rmSync, writeFileSync } from 'node:f
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
+import type { Harness, McpServer } from '../config/schema.js';
 import { asUser, type RunAs, signalGroup } from './as-user.js';
 import { parseStreamLine, type RateLimit, type StreamEvent, type TokenUsage } from './stream.js';
 
@@ -24,6 +25,12 @@ export interface RunOptions {
   runAs?: RunAs;
   /** What the run is for, so Command can show it live (src/live/activity.ts). */
   label?: RunLabel;
+  /** The CLI to run (default `claude`); `args` must come from that harness's builder. */
+  harness?: Harness;
+  /** `agy` runs: tara's MCP config (from the bridge) and session-only settings (permissions). */
+  agy?: { mcpConfig?: string; settings?: object };
+  /** The job's own MCP servers (`${VAR}` already replaced), next to tara's. */
+  mcpServers?: Record<string, McpServer>;
 }
 
 /** What a run is for. Runs without one (e.g. learning after a session) aren't shown on Command. */
@@ -74,28 +81,59 @@ function systemPromptFile(text: string, runAs: RunAs | undefined): { file: strin
   return { file, dispose: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
-/** Adds the file flag before `--allowedTools`, which is variadic and must stay last. */
-function withSystemPromptFile(args: string[], file: string): string[] {
+/** Adds flags before `--allowedTools`, which is variadic and must stay last. */
+function beforeAllowedTools(args: string[], flag: string[]): string[] {
   const at = args.indexOf('--allowedTools');
-  const flag = ['--append-system-prompt-file', file];
   return at === -1 ? [...args, ...flag] : [...args.slice(0, at), ...flag, ...args.slice(at)];
 }
 
-/** Runs one headless `claude -p` turn and resolves when the process exits. Never rejects. */
-export const runClaude: Runner = (options) =>
-  new Promise((resolve) => {
-    const started = Date.now();
-    let result: Extract<StreamEvent, { kind: 'result' }> | undefined;
-    let init: Extract<StreamEvent, { kind: 'init' }> | undefined;
-    let rateLimit: RateLimit | undefined;
-    let toolCalls = 0;
-    let stderr = '';
-    let stopReason: 'timeout' | 'aborted' | undefined;
-    let spawnError: Error | undefined;
+/**
+ * Writes the job's MCP servers to their own config file for `--mcp-config` (variadic: the file goes
+ * right after tara's config when there is one). Mode like the system prompt file; removed after the run.
+ */
+function withMcpServers(
+  args: string[],
+  servers: Record<string, McpServer>,
+  runAs: RunAs | undefined,
+): { args: string[]; dispose: () => void } {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tara-mcp-job-'));
+  const file = path.join(dir, 'mcp.json');
+  writeFileSync(file, JSON.stringify({ mcpServers: servers }), { mode: 0o600 });
+  if (runAs) {
+    chownSync(dir, process.getuid?.() ?? -1, runAs.gid);
+    chownSync(file, process.getuid?.() ?? -1, runAs.gid);
+    chmodSync(dir, 0o750);
+    chmodSync(file, 0o640);
+  }
+  const at = args.indexOf('--mcp-config');
+  const next =
+    at === -1
+      ? beforeAllowedTools(args, ['--mcp-config', file])
+      : [...args.slice(0, at + 2), file, ...args.slice(at + 2)];
+  return { args: next, dispose: () => rmSync(dir, { recursive: true, force: true }) };
+}
 
-    const prompt = options.systemPrompt ? systemPromptFile(options.systemPrompt, options.runAs) : undefined;
-    const args = prompt ? withSystemPromptFile(options.args, prompt.file) : options.args;
-    // Own process group, so a timeout also stops whatever the CLI started (shells, MCP servers).
+export interface CliExit {
+  code: number | null;
+  stderr: string;
+  stopReason?: 'timeout' | 'aborted';
+  spawnError?: Error;
+}
+
+/**
+ * Starts a CLI in its own process group (so a timeout also stops whatever it started: shells, MCP
+ * servers), feeds `stdin`, hands each stdout line to `onLine` and resolves when it exits. Never rejects.
+ */
+export function spawnCli(
+  options: RunOptions,
+  args: string[],
+  stdin: string,
+  onLine: (line: string) => void,
+): Promise<CliExit> {
+  return new Promise((resolve) => {
+    let stderr = '';
+    let stopReason: CliExit['stopReason'];
+    let spawnError: Error | undefined;
     const cmd = options.runAs
       ? asUser(options.bin, args, options.env, options.runAs)
       : { bin: options.bin, args, env: options.env };
@@ -125,66 +163,90 @@ export const runClaude: Runner = (options) =>
       spawnError = err;
     });
     child.stdin.on('error', () => {}); // CLI exiting early closes stdin; the exit handler reports it.
-    child.stdin.end(options.prompt);
+    child.stdin.end(stdin);
 
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk: string) => {
       stderr = (stderr + chunk).slice(-STDERR_TAIL);
     });
-
-    createInterface({ input: child.stdout }).on('line', (line) => {
-      for (const event of parseStreamLine(line)) {
-        if (event.kind === 'init') init = event;
-        else if (event.kind === 'tool') toolCalls++;
-        else if (event.kind === 'rate_limit') rateLimit = event.rateLimit;
-        else if (event.kind === 'result') result = event;
-        try {
-          options.onEvent?.(event);
-        } catch {
-          // A failing listener must not break the run.
-        }
-      }
-    });
+    createInterface({ input: child.stdout }).on('line', onLine);
 
     child.on('close', (code) => {
       clearTimeout(timer);
-      prompt?.dispose();
       options.signal?.removeEventListener('abort', onAbort);
-
-      const base = {
-        text: result?.text ?? '',
-        sessionId: result?.sessionId || init?.sessionId,
-        model: init?.model,
-        costUsd: result?.costUsd,
-        durationMs: Date.now() - started,
-        numTurns: result?.numTurns,
-        toolCalls,
-        usage: result?.usage,
-        rateLimit,
-        permissionDenials: result?.permissionDenials ?? [],
-      };
-
-      let status: RunStatus;
-      let error: string | undefined;
-      if (spawnError) {
-        status = 'error';
-        error =
-          (spawnError as NodeJS.ErrnoException).code === 'ENOENT'
-            ? `Claude Code CLI not found ("${options.bin}"). Install it and log in as this user.`
-            : spawnError.message;
-      } else if (stopReason) {
-        status = stopReason;
-      } else if (rateLimit?.status === 'rejected' || (result?.isError && LIMIT_TEXT.test(result.text))) {
-        status = 'limit';
-        error = result?.text || 'Claude usage limit reached';
-      } else if (result && !result.isError && code === 0) {
-        status = 'ok';
-      } else {
-        status = 'error';
-        error = result?.isError
-          ? result.text || result.subtype
-          : stderr.trim() || `claude exited with code ${code}`;
-      }
-      resolve({ ...base, status, error });
+      resolve({ code, stderr, stopReason, spawnError });
     });
   });
+}
+
+/** Hands an event to the run's listener; a failing listener must not break the run. */
+export function emit(options: RunOptions, event: StreamEvent): void {
+  try {
+    options.onEvent?.(event);
+  } catch {}
+}
+
+/** Runs one headless `claude -p` turn and resolves when the process exits. Never rejects. */
+export const runClaude: Runner = async (options) => {
+  const started = Date.now();
+  let result: Extract<StreamEvent, { kind: 'result' }> | undefined;
+  let init: Extract<StreamEvent, { kind: 'init' }> | undefined;
+  let rateLimit: RateLimit | undefined;
+  let toolCalls = 0;
+
+  const prompt = options.systemPrompt ? systemPromptFile(options.systemPrompt, options.runAs) : undefined;
+  const servers =
+    options.mcpServers && Object.keys(options.mcpServers).length
+      ? withMcpServers(options.args, options.mcpServers, options.runAs)
+      : undefined;
+  const base = servers?.args ?? options.args;
+  const args = prompt ? beforeAllowedTools(base, ['--append-system-prompt-file', prompt.file]) : base;
+  const exit = await spawnCli(options, args, options.prompt, (line) => {
+    for (const event of parseStreamLine(line)) {
+      if (event.kind === 'init') init = event;
+      else if (event.kind === 'tool') toolCalls++;
+      else if (event.kind === 'rate_limit') rateLimit = event.rateLimit;
+      else if (event.kind === 'result') result = event;
+      emit(options, event);
+    }
+  }).finally(() => {
+    prompt?.dispose();
+    servers?.dispose();
+  });
+
+  const outcome = {
+    text: result?.text ?? '',
+    sessionId: result?.sessionId || init?.sessionId,
+    model: init?.model,
+    costUsd: result?.costUsd,
+    durationMs: Date.now() - started,
+    numTurns: result?.numTurns,
+    toolCalls,
+    usage: result?.usage,
+    rateLimit,
+    permissionDenials: result?.permissionDenials ?? [],
+  };
+
+  let status: RunStatus;
+  let error: string | undefined;
+  if (exit.spawnError) {
+    status = 'error';
+    error =
+      (exit.spawnError as NodeJS.ErrnoException).code === 'ENOENT'
+        ? `Claude Code CLI not found ("${options.bin}"). Install it and log in as this user.`
+        : exit.spawnError.message;
+  } else if (exit.stopReason) {
+    status = exit.stopReason;
+  } else if (rateLimit?.status === 'rejected' || (result?.isError && LIMIT_TEXT.test(result.text))) {
+    status = 'limit';
+    error = result?.text || 'Claude usage limit reached';
+  } else if (result && !result.isError && exit.code === 0) {
+    status = 'ok';
+  } else {
+    status = 'error';
+    error = result?.isError
+      ? result.text || result.subtype
+      : exit.stderr.trim() || `claude exited with code ${exit.code}`;
+  }
+  return { ...outcome, status, error };
+};

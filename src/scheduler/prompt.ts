@@ -1,4 +1,4 @@
-import type { JobConfig } from '../config/schema.js';
+import type { Harness, JobConfig } from '../config/schema.js';
 import type { Item } from '../store/store.js';
 import type { ScriptResult } from './script.js';
 
@@ -13,6 +13,12 @@ export const JOB_SYSTEM_PROMPT = `You are running a scheduled job unattended, th
 - If the job failed, start your reply with a line containing only [CRON_FAILURE], then the evidence.
 - Reply format: a headline of 1–6 lines (shown in the channel), then a line containing only ---, then the full details (posted in the thread). Use Slack mrkdwn and keep it phone-friendly.
 - Temporary files (helper scripts, request bodies, downloads) go in $TARA_SCRATCH, never in the repo; it is deleted automatically later. Data this job needs on its next run goes in $TARA_JOB_DATA. A script that would make every run faster is code: propose it in your reply instead of saving it.`;
+
+/** For a job's `steps`: sessions that run before the main prompt and only feed it. */
+export const STEP_SYSTEM_PROMPT = `You are one step of a scheduled job, running unattended through tara-agent. Nobody is watching live and nobody reads your reply but the job's next session.
+- Do only this step, all the way through, then reply with its result in the form the step asks for. Never wait for input or ask questions.
+- You have no Slack tools: don't try to post, send files or ask for approval. The job's main session does that with your result.
+- Temporary files go in $TARA_SCRATCH (named below); the main session can read them there.`;
 
 /** The follow-up turn after a job run that had trouble (`selfImprove`); `reasons` say what went wrong. */
 export function learnPrompt(reasons: string[]): string {
@@ -66,12 +72,49 @@ export function foldersNote(folders: RunFolders): string {
   return `Your folders:\n${lines.join('\n')}`;
 }
 
+/** The card a decision was made on, passed along so a session that never saw it (a handoff) knows it. */
+export interface DecidedCard {
+  title: string;
+  body: string;
+  /** Rejected, skipped or otherwise not approved. */
+  declined: boolean;
+}
+
+const cardSection = (card: DecidedCard) =>
+  `## The card\n### ${card.title}\n${card.body.trim() || '(no details)'}`;
+
+/**
+ * The first prompt of a session a decision hands the run over to (job `handoff`): it has none of the
+ * run's history, so it gets the card, the decision and the job's own instructions.
+ */
+export function buildHandoffPrompt(
+  job: JobConfig,
+  from: Harness,
+  card: DecidedCard,
+  decision: string,
+  folders: RunFolders,
+): string {
+  return [
+    `This run of the job "${job.name}" ran on ${from} until now. It continues here, in a new session, after a decision on one of its approval cards. You don't have the earlier conversation: the card below and the job's instructions are what you have. Act on the decision only; the rest of the run is already done.`,
+    cardSection(card),
+    `## The decision\n${decision}`,
+    `## The job's instructions\n${job.prompt ?? ''}`,
+    foldersNote(folders),
+  ].join('\n\n');
+}
+
+/** A later decision in a handed-over session: that session never saw this card, so it comes along. */
+export const decisionWithCard = (card: DecidedCard, decision: string) =>
+  `${cardSection(card)}\n\n${decision}`;
+
 /** The user prompt for one run: script data first (as Hermes does), then the job prompt, its skills and folders. */
 export function buildJobPrompt(
   job: JobConfig,
   script?: ScriptResult,
   folders?: RunFolders,
   items?: Item[],
+  /** The `## Step Output` section from the job's steps. */
+  stepOutput?: string,
 ): string {
   const parts: string[] = [];
   if (items?.length) parts.push(approvedItemsBlock(items));
@@ -84,6 +127,7 @@ export function buildJobPrompt(
       : ['Script Error', 'The data-collection script failed. Report this to the user.'];
     parts.push(`## ${heading}\n${intro}\n\n\`\`\`\n${script.output}\n\`\`\``);
   }
+  if (stepOutput) parts.push(stepOutput);
   parts.push(job.prompt ?? '');
   if (job.skills.length > 0) {
     parts.push(

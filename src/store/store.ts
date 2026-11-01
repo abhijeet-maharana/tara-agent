@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import type { Harness } from '../config/schema.js';
 
 export interface SessionRow {
   /** `<channel>:<thread ts>` */
@@ -11,6 +12,13 @@ export interface SessionRow {
   model: string;
   /** The CLI has created the session, so the next turn uses `--resume`. */
   started: boolean;
+  /** The CLI the session lives in (unset: claude); a later turn must use the same one. */
+  harness?: Harness;
+  /**
+   * The id the job's scratch folder is named after (unset: `sessionId`): the id the run started with,
+   * kept when agy reports its own conversation id or a handoff starts a new session.
+   */
+  scratchId?: string;
 }
 
 export interface RunRecord {
@@ -185,6 +193,10 @@ const MIGRATIONS = [
   `DROP TABLE inbox;`,
   // An approved item's place in its queue once a person moved it (otherwise its approval time).
   `ALTER TABLE items ADD COLUMN queue_rank REAL;`,
+  // Sessions of jobs that run on agy (Antigravity CLI) continue on agy.
+  `ALTER TABLE sessions ADD COLUMN harness TEXT NOT NULL DEFAULT 'claude';`,
+  // A job's scratch folder outlives a change of session id (agy's own id, a handoff).
+  `ALTER TABLE sessions ADD COLUMN scratch_id TEXT;`,
 ];
 
 export const ITEM_STATUSES = [
@@ -396,9 +408,19 @@ export class Store {
 
   getSession(threadKey: string): SessionRow | undefined {
     const row = this.db
-      .prepare('SELECT thread_key, project, session_id, model, started FROM sessions WHERE thread_key = ?')
+      .prepare(
+        'SELECT thread_key, project, session_id, model, started, harness, scratch_id FROM sessions WHERE thread_key = ?',
+      )
       .get(threadKey) as
-      | { thread_key: string; project: string; session_id: string; model: string; started: number }
+      | {
+          thread_key: string;
+          project: string;
+          session_id: string;
+          model: string;
+          started: number;
+          harness: Harness;
+          scratch_id: string | null;
+        }
       | undefined;
     return row
       ? {
@@ -407,6 +429,8 @@ export class Store {
           sessionId: row.session_id,
           model: row.model,
           started: row.started === 1,
+          harness: row.harness,
+          scratchId: row.scratch_id ?? undefined,
         }
       : undefined;
   }
@@ -415,13 +439,24 @@ export class Store {
     const t = this.now();
     this.db
       .prepare(
-        `INSERT INTO sessions (thread_key, project, session_id, model, started, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO sessions (thread_key, project, session_id, model, started, harness, scratch_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (thread_key) DO UPDATE SET
            project = excluded.project, session_id = excluded.session_id, model = excluded.model,
-           started = excluded.started, updated_at = excluded.updated_at`,
+           started = excluded.started, harness = excluded.harness, scratch_id = excluded.scratch_id,
+           updated_at = excluded.updated_at`,
       )
-      .run(s.threadKey, s.project, s.sessionId, s.model, s.started ? 1 : 0, t, t);
+      .run(
+        s.threadKey,
+        s.project,
+        s.sessionId,
+        s.model,
+        s.started ? 1 : 0,
+        s.harness ?? 'claude',
+        s.scratchId ?? null,
+        t,
+        t,
+      );
   }
 
   /** Sessions, most recently active first, each with its latest run. */
@@ -438,7 +473,7 @@ export class Store {
     }
     const rows = this.db
       .prepare(
-        `SELECT s.thread_key, s.project, s.session_id, s.model, s.started, s.created_at, s.updated_at,
+        `SELECT s.thread_key, s.project, s.session_id, s.model, s.started, s.harness, s.created_at, s.updated_at,
            (SELECT COUNT(*) FROM runs x WHERE x.thread_key = s.thread_key) AS turns,
            (SELECT id FROM runs x WHERE x.thread_key = s.thread_key ORDER BY x.started_at DESC LIMIT 1) AS last_run_id
          FROM sessions s ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
@@ -452,6 +487,7 @@ export class Store {
       sessionId: r.session_id as string,
       model: r.model as string,
       started: r.started === 1,
+      harness: r.harness as Harness,
       createdAt: r.created_at as number,
       updatedAt: r.updated_at as number,
       turns: r.turns as number,

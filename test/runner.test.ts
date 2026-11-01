@@ -208,6 +208,23 @@ describe('runClaude', () => {
     expect(existsSync(args[at + 1] as string)).toBe(false);
   });
 
+  it("adds the job's MCP servers as another --mcp-config file, after tara's, and removes it after", async () => {
+    const withTara = await run('echo', {
+      args: [fakeClaude, '-p', '--mcp-config', '/tmp/tara.json', '--allowedTools', 'Read'],
+      mcpServers: { browser: { command: 'npx', args: ['mcp'], env: {} } },
+    }).outcome;
+    const a = (JSON.parse(withTara.text) as { args: string[] }).args;
+    const at = a.indexOf('--mcp-config');
+    expect(a.slice(at, at + 2)).toEqual(['--mcp-config', '/tmp/tara.json']);
+    expect(a[at + 2]).toMatch(/tara-mcp-job-.*mcp\.json$/);
+    expect(a.slice(at + 3)).toEqual(['--allowedTools', 'Read']);
+    expect(existsSync(a[at + 2] as string)).toBe(false);
+
+    const alone = await run('echo', { mcpServers: { browser: { command: 'npx', args: [], env: {} } } })
+      .outcome;
+    expect((JSON.parse(alone.text) as { args: string[] }).args.slice(0, 2)).toEqual(['-p', '--mcp-config']);
+  });
+
   it('reports a crash with the stderr tail', async () => {
     const o = await run('crash').outcome;
     expect(o.status).toBe('error');

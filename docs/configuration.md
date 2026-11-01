@@ -24,6 +24,7 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `claude.chatTimeoutMinutes` | `20` | Time limit per chat turn |
 | `claude.effort` | model's default | `--effort` for every run: `low`, `medium`, `high` or `xhigh` |
 | `claude.runAs` | none | Run Claude and pre-run scripts as this OS user through sudo ([split users](security.md#split-users-approvals)) |
+| `agy.bin` | `agy` | Antigravity CLI path, for [agy jobs](#agy-jobs). Under `claude.runAs` the run user's install, e.g. `/home/tara/.local/bin/agy` |
 | `stateDir` | `~/.local/state/tara-agent` | SQLite database, and default home of scratch and job data folders |
 | `scratchDays` | `3` | Days after its last use that a session's scratch folder is deleted (see [Files](#files)) |
 | `streaming` | `true` | Stream replies as a live task card and text. Needs the Slack app's "Agents & AI Apps" feature and the `assistant:write` scope; without them, tara-agent falls back to one edited status message |
@@ -95,7 +96,12 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `skills` | `[]` | Skills Claude should read first |
 | `preScript` | none | Runs first, from the repo root (`.py` → python3, `.sh` → bash) |
 | `agent` | `true` | `false`: the script is the whole job; its output is posted as-is |
-| `model` | `sonnet` | Model for this job |
+| `harness` | `claude` | The CLI the job runs on: `claude`, or `agy` ([agy jobs](#agy-jobs)) |
+| `model` | `sonnet` | Model for this job (for `agy`, an id from `agy models`, e.g. `gemini-3.8-flash-high`) |
+| `agyPermissions` | none | `agy` jobs only: `{allow, deny, ask}` rules ([agy jobs](#agy-jobs)) |
+| `handoff` | none | `{harness, model}`: an approved card continues in a fresh session on this harness ([handoff](#handoff)) |
+| `mcpServers` | none | The job's own stdio MCP servers by name (`{command, args, env}`), for every session of the job ([steps and MCP servers](#steps-and-mcp-servers)) |
+| `steps` | `[]` | Sessions run one after the other before the main prompt ([steps and MCP servers](#steps-and-mcp-servers)) |
 | `locks` | `[]` | Named locks held during the run, e.g. `["chrome"]` so jobs don't share a browser |
 | `timeoutMinutes` | `30` | Time limit for the script and for Claude, each |
 | `catchUp` | `true` | Run the latest missed slot after downtime |
@@ -122,6 +128,45 @@ Other rules:
   tara-agent import-hermes --from ~/.hermes/cron/jobs.json --out <repo>/.tara/jobs.json \
     --env REPO_ROOT=~/Projects/my-repo
   ```
+
+### agy jobs
+
+A job with `"harness": "agy"` runs on Google's Antigravity CLI (`agy`) instead of Claude Code, e.g. to use an idle Google AI Pro plan. Everything else works the same: pre-script, prompt, `[SILENT]`/`[CRON_FAILURE]`, Slack thread, tara's tools (`request_approval`, `send_file`, …), and a decision on its card or a reply in its thread continues the same agy conversation.
+
+- **Setup:** install agy as the run user and sign in once interactively (`agy`, then Google OAuth); check with `agy models`. Set host `agy.bin` if it isn't on the service's `PATH`.
+- **How it runs:** one `agy` process per turn in stream-json mode, the prompt on stdin (no TTY needed, nothing on the command line), `--print-timeout` 30 s inside `timeoutMinutes` so agy stops and reports by itself. tara's MCP server and the system prompt reach agy as a plugin `tara` in a per-run folder added with `--add-dir` (agy has no `--mcp-config`); agy names the server `tara_tara`.
+- **Permissions:** with `agyPermissions`, the job's rules go to agy as session-only settings (`--settings`), plus `mcp(tara_tara/*)`. Rules are `action(target)`: `command(npx tsc)`, `write_file(/home)`, `read_url(github.com)`, `mcp(server/*)`; deny beats allow, and headless agy denies anything not allowed. Without `agyPermissions`, a `bypassPermissions` project passes `--dangerously-skip-permissions` (like Claude's bypass); other modes allow only tara's tools. Note agy's file tool writes anywhere the user can unless a deny rule says otherwise.
+- **Not on agy (yet):** self-improvement turns (they resume with Claude), the Session transcript page, cost in USD. Usage counts thinking tokens as output.
+
+### Handoff
+
+`"handoff": {"harness": "claude", "model": "claude-opus-5-5"}` splits a job between two CLIs: the run (steps and main prompt) reports on its own harness, e.g. agy on a Google plan, and an **approved** card carries on in a fresh session on the handoff's harness and model, e.g. Claude Code making the fix.
+
+- That session never saw the run, so its first prompt has the card (title and details), the decision and the job's `prompt`; write the job prompt so its "on approval" part stands on its own, and put everything the fix needs (page, steps, screenshot path, suspected file) in the card's details.
+- It uses the run's scratch folder, so files the run saved there (screenshots) are still at the paths on the card.
+- Later approvals and thread replies continue that session; each later card comes with its details, since that session never saw it either. A declined card (Skip, Reject, …) runs no model at all: the card and its Slack message already show the decision.
+- The session is a normal job session on its harness: Claude gets the project's permission mode and `allowedTools`, self-improvement and the transcript page.
+
+### Steps and MCP servers
+
+For a long job that is better split, e.g. a UI test of five journeys where one long session would fill its context and a timeout would lose everything:
+
+```json
+{
+  "mcpServers": {
+    "browser": { "command": "npx", "args": ["-y", "chrome-devtools-mcp@1.12.0", "--isolated", "--headless", "--workspace=${TARA_SCRATCH}"] }
+  },
+  "steps": [
+    { "name": "Home and menu", "promptFile": ".tara/prompts/ui-test.md", "prompt": "Test the home page and the menu." },
+    { "name": "Checkout", "promptFile": ".tara/prompts/ui-test.md", "prompt": "Test the cart and checkout.", "timeoutMinutes": 40 }
+  ],
+  "prompt": "Check the findings in Step Output, post them and raise a card per fix."
+}
+```
+
+- **`mcpServers`**: added next to tara's own server in every session of the job (steps and main), on both harnesses. `${VAR}` in `command`, `args` and `env` is replaced from the run's environment (`TARA_SCRATCH`, `TARA_JOB_DATA`, the job's `env`). Under agy the tools are named `tara_<name>` (permission rule `mcp(tara_<name>/*)`).
+- **`steps`**: each runs in a fresh session of the job's harness and model, after the pre-script and before the main prompt, with `promptFile` (read from the repo) + `prompt` + the folders note. Steps get the job's MCP servers but no Slack tools, and share the run's `$TARA_SCRATCH`, so files they save there can be sent by the main session. `timeoutMinutes` and `model` default to the job's (same harness); agy steps can have their own `agyPermissions`. The status line shows `step i/n`.
+- **Main prompt**: gets every step's reply under `## Step Output` (`### <name>`, marked `(timeout)` or `(error)` if it didn't finish; the next step still runs). Steps don't run again when the run continues after a decision. Their tokens and tool calls count towards the run.
 
 ### Self-improvement
 

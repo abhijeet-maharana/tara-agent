@@ -2,6 +2,7 @@ import { createHmac } from 'node:crypto';
 import { loadQueues } from '../config/load.js';
 import type { Project } from '../config/schema.js';
 import type { Privileged, PrivilegedResult } from '../privileged/privileged.js';
+import type { DecidedCard } from '../scheduler/prompt.js';
 import type { ChatPort, IncomingMessage, Logger, SlackBlock } from '../sessions/manager.js';
 import { splitMessage, toSlackMrkdwn } from '../slack/format.js';
 import type { Item, ItemCheck, ItemField, ItemMedia, Store } from '../store/store.js';
@@ -93,7 +94,7 @@ export class Approvals {
   onJob?: (
     project: string,
     jobId: string,
-    r: { threadTs: string; text: string; by: string },
+    r: { threadTs: string; text: string; by: string; card?: DecidedCard },
   ) => Promise<unknown>;
 
   private readonly now: () => number;
@@ -405,7 +406,11 @@ export class Approvals {
         d.fields && Object.keys(d.fields).length ? `\nEdited values: ${JSON.stringify(d.fields)}` : '';
       const note = d.reply?.trim() ? `\nNote: ${d.reply.trim()}` : '';
       const text = `USER DECISION on "${decided.title}": ${d.option}${note}${edits} (${d.via === 'slack' ? 'tapped' : 'chosen on the Approvals page'} at ${when})${ran}`;
-      await this.continueConversation(project, decided, d.by, text);
+      await this.continueConversation(project, decided, d.by, text, {
+        title: decided.title,
+        body: decided.body ?? '',
+        declined: negative,
+      });
     }
     const final = action ? (store.getItem(id) as Item) : decided;
     this.notify(final, 'decided');
@@ -599,10 +604,16 @@ export class Approvals {
   }
 
   /** Puts a decision (or a revise request) into the conversation that asked: the job's run, or a chat. */
-  private async continueConversation(project: Project, item: Item, by: string, text: string): Promise<void> {
+  private async continueConversation(
+    project: Project,
+    item: Item,
+    by: string,
+    text: string,
+    card?: DecidedCard,
+  ): Promise<void> {
     const user = /^[UW][A-Z0-9]+$/.test(by) ? by : (project.config.owner ?? by);
     if (item.jobId && item.threadTs && item.mode === 'resume' && this.onJob) {
-      await this.onJob(project.config.name, item.jobId, { threadTs: item.threadTs, text, by: user });
+      await this.onJob(project.config.name, item.jobId, { threadTs: item.threadTs, text, by: user, card });
       return;
     }
     let channel = item.channel ?? project.config.slackChannel;

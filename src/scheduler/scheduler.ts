@@ -3,7 +3,7 @@ import path from 'node:path';
 import { Cron } from 'croner';
 import type { Bridge } from '../bridge/bridge.js';
 import { JOBS_FILE, loadJobs } from '../config/load.js';
-import type { HostConfig, Project, ScheduledJob } from '../config/schema.js';
+import type { Harness, HostConfig, Project, ScheduledJob } from '../config/schema.js';
 import type { Runner } from '../runner/run.js';
 import type { ChatPort, Logger } from '../sessions/manager.js';
 import { Threads } from '../sessions/threads.js';
@@ -12,6 +12,7 @@ import type { Item, Store } from '../store/store.js';
 import { Locks, Semaphore } from '../util/concurrency.js';
 import { buildDigest, type MissedJob } from './health.js';
 import { type JobStatus, type JobTrigger, runJob } from './job-runner.js';
+import type { DecidedCard } from './prompt.js';
 import type { runScript } from './script.js';
 
 export interface JobInfo {
@@ -24,6 +25,8 @@ export interface JobInfo {
   tz: string;
   skills: string[];
   model: string;
+  /** The CLI the job runs on (unset: claude). */
+  harness?: Harness;
   /** Script run before the model, relative to the repo root. */
   preScript?: string;
   /** Typical run time from the jobs file. */
@@ -131,6 +134,7 @@ export class Scheduler implements JobControl {
           tz: job.tz ?? this.deps.host.timezone,
           skills: job.skills,
           model: job.model,
+          harness: job.harness,
           preScript: job.preScript,
           durationMinutes: job.durationMinutes,
           nextRun: cron?.nextRun() ?? undefined,
@@ -359,8 +363,11 @@ export class Scheduler implements JobControl {
   async resume(
     project: string,
     id: string,
-    r: { threadTs: string; text: string; by: string },
+    r: { threadTs: string; text: string; by: string; card?: DecidedCard },
   ): Promise<JobStatus | 'unknown'> {
+    // A job with a handoff runs no model for a declined card: the card and its Slack message already
+    // show the decision, and a turn would only say "skipped" (on the paid harness, after a handoff).
+    if (r.card?.declined && this.entries.get(jobKey(project, id))?.scheduled.job.handoff) return 'silent';
     return this.whenFree(project, id, { kind: 'resume', ...r });
   }
 

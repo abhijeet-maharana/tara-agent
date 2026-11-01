@@ -3,6 +3,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { type Bridge, JOB_TOOLS_PROMPT, type RunContext, wantsPermissionPrompts } from '../bridge/bridge.js';
 import type { HostConfig, Project } from '../config/schema.js';
+import { buildAgyArgs } from '../runner/agy.js';
 import { buildClaudeArgs } from '../runner/args.js';
 import { buildChildEnv } from '../runner/env.js';
 import type { Runner, RunOutcome } from '../runner/run.js';
@@ -305,24 +306,39 @@ export class SessionManager {
       const files = await this.saveAttachments(scratch, msg);
       // The first message of a session says where the folder is (the Write tool needs absolute paths).
       const prompt = `<@${msg.user}>: ${msg.text}${files}${session.started ? '' : `\n\n${foldersNote({ scratch })}`}`;
+      // A reply in the thread of a job that ran on agy continues that agy conversation.
+      const timeoutMs = host.claude.chatTimeoutMinutes * 60_000;
+      const agy =
+        session.harness === 'agy'
+          ? buildAgyArgs({
+              conversationId: session.started ? session.sessionId : undefined,
+              model: session.model,
+              permissionMode: project.config.permissionMode,
+              timeoutMs,
+            })
+          : undefined;
       outcome = await this.deps.run({
-        bin: host.claude.bin,
-        args: buildClaudeArgs({
-          sessionId: session.sessionId,
-          resume: session.started,
-          permissionMode: project.config.permissionMode,
-          model: session.model,
-          effort: host.claude.effort,
-          allowedTools: project.config.allowedTools,
-          mcpConfig: bridged?.mcpConfigPath,
-          permissionPrompts,
-          partialMessages: Boolean(streaming),
-        }),
+        harness: session.harness,
+        bin: agy ? host.agy.bin : host.claude.bin,
+        args:
+          agy?.args ??
+          buildClaudeArgs({
+            sessionId: session.sessionId,
+            resume: session.started,
+            permissionMode: project.config.permissionMode,
+            model: session.model,
+            effort: host.claude.effort,
+            allowedTools: project.config.allowedTools,
+            mcpConfig: bridged?.mcpConfigPath,
+            permissionPrompts,
+            partialMessages: Boolean(streaming),
+          }),
+        agy: agy && { mcpConfig: bridged?.mcpConfigPath, settings: agy.settings },
         cwd: project.dir,
         env,
         prompt,
         systemPrompt: appendSystemPrompt,
-        timeoutMs: host.claude.chatTimeoutMinutes * 60_000,
+        timeoutMs,
         signal,
         label: {
           project: name,
@@ -332,7 +348,7 @@ export class SessionManager {
         },
         onEvent: (event) => {
           if (event.kind === 'init' && !session.started) {
-            session = { ...session, started: true };
+            session = { ...session, sessionId: event.sessionId || session.sessionId, started: true };
             store.saveSession(session);
           }
           // Sub-agents work out of sight; their parent "Agent" step stands for them.
@@ -390,7 +406,11 @@ export class SessionManager {
     // Learn from a turn that had trouble (selfImprove). Still inside this thread's queue, so the next
     // message waits for it instead of resuming the same session at the same time.
     // Only when the CLI really started the session (setup errors have nothing to learn from).
-    const reasons = project.config.selfImprove && session.started ? troubleReasons(outcome, toolErrors) : [];
+    // Learning turns resume with Claude, so agy sessions don't get one.
+    const reasons =
+      project.config.selfImprove && session.started && session.harness !== 'agy'
+        ? troubleReasons(outcome, toolErrors)
+        : [];
     if (reasons.length) {
       const releaseLearn = await this.slots.acquire();
       try {

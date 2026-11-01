@@ -13,7 +13,7 @@ Node ≥ 22.13. Tests don't need Slack or a Claude login: the CLI is replaced by
 
 ## Guidelines
 
-- **All model work goes through the `claude` CLI.** Don't add direct API calls.
+- **All model work goes through an agent CLI**: `claude`, or `agy` for `harness: "agy"` jobs (`src/runner/agy.ts`). Don't add direct API calls.
 - Keep it small and dependency-light. New runtime dependencies need a good reason.
 - Add tests for behaviour changes. Fixtures of CLI output must be sanitised (no real paths, ids or content).
 - Match the existing style: Biome formats and lints (`npm run format`), comments explain why rather than what.

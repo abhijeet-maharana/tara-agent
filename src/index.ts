@@ -19,6 +19,7 @@ import { gatherAttention, githubPullRequests } from './live/attention.js';
 import { LiveSession } from './live/session.js';
 import type { JobSummary, LiveDeps, LiveState } from './live/tools.js';
 import { Privileged } from './privileged/privileged.js';
+import { runAgy } from './runner/agy.js';
 import { resolveRunAs } from './runner/as-user.js';
 import { type Runner, runClaude } from './runner/run.js';
 import { sweepScratch } from './runner/workspace.js';
@@ -132,7 +133,10 @@ async function serve(configFlag: string | undefined) {
   };
   // Every labelled run, live, for Command's Live tasks (and its Stop).
   const activity = new Activity({ threadUrl });
-  const run: Runner = activity.wrap(runAs ? (o) => runClaude({ ...o, runAs }) : runClaude);
+  // Each run goes through the CLI it names (`harness`): Claude Code, or agy for agy jobs.
+  const run: Runner = activity.wrap((o) =>
+    (o.harness === 'agy' ? runAgy : runClaude)(runAs ? { ...o, runAs } : o),
+  );
   let manager: SessionManager | undefined;
   let bridge: Bridge | undefined;
   const slack = createSlackGateway({

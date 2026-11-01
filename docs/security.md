@@ -32,6 +32,7 @@ The agent then can't use your sudo, docker group, browser profiles, other projec
 - Remove the group's access to `.env*`, session and key files in the repos, and give the user only pass-through (`--x`) on the owner's home.
 - Tokens in a root-only env file that systemd reads before switching user (`deploy/systemd/tara-agent-dedicated-user.service`).
 - A periodic root job that re-applies the ACLs to new files is a cheap safety net. Run it from a root-owned copy, never from a path the agent can write.
+- **agy jobs** run as the same user with agy's own Google login (`~/.gemini/antigravity-cli`). agy's file tool writes anywhere that user can unless a deny rule stops it, and with `bypassPermissions` and no `agyPermissions` a job passes `--dangerously-skip-permissions`. For agy jobs that read untrusted pages, give them `agyPermissions` with deny rules for the places that matter (e.g. `write_file(/home)`) and only the commands they need.
 
 ## Split users (approvals)
 

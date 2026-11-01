@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Bridge, RunContext } from '../bridge/bridge.js';
 import type { HostConfig, ScheduledJob } from '../config/schema.js';
+import { buildAgyArgs } from '../runner/agy.js';
 import { buildClaudeArgs } from '../runner/args.js';
 import { buildChildEnv } from '../runner/env.js';
 import type { Runner, RunOutcome } from '../runner/run.js';
@@ -13,8 +14,11 @@ import { StreamReply } from '../slack/reply.js';
 import type { Item, RunRecord, Store } from '../store/store.js';
 import { type Locks, type Semaphore, Throttle } from '../util/concurrency.js';
 import {
+  buildHandoffPrompt,
   buildJobPrompt,
   cronFailure,
+  type DecidedCard,
+  decisionWithCard,
   identityPrompt,
   isSilentReply,
   JOB_SYSTEM_PROMPT,
@@ -22,6 +26,7 @@ import {
   splitHeadline,
 } from './prompt.js';
 import { runScript, type ScriptResult } from './script.js';
+import { expandMcpServers, runSteps, type StepsResult } from './steps.js';
 
 export type JobTrigger =
   | { kind: 'schedule' }
@@ -29,7 +34,7 @@ export type JobTrigger =
   /** `thread`: the chat message that asked for the run; the run then happens in its thread. */
   | { kind: 'manual'; by: string; thread?: { channel: string; ts: string } }
   /** A decision on the run's approval card: the same session continues in its thread. */
-  | { kind: 'resume'; by: string; threadTs: string; text: string }
+  | { kind: 'resume'; by: string; threadTs: string; text: string; card?: DecidedCard }
   /** Approved items from one of the project's queues, handed to this (executor) job. */
   | { kind: 'queue'; queue: string; items: Item[] };
 
@@ -64,6 +69,9 @@ export interface JobRunnerDeps {
 }
 
 const SLACK_USER = /^[UW][A-Z0-9]+$/;
+
+/** Adds token counts; unset when neither is known. */
+const sum = (a?: number, b?: number) => (a === undefined && !b ? a : (a ?? 0) + (b ?? 0));
 
 /**
  * Who a run streams live to. Scheduled runs don't stream (nobody is waiting); a run someone started
@@ -196,17 +204,41 @@ export async function runJob(
       await chat.update(channel, statusTs, `❌ ${title}: the run's session is gone, so it can't continue`);
       return record('error', { error: 'no session to continue' });
     }
+    const newId = (deps.newSessionId ?? randomUUID)();
     let session = earlier ?? {
       threadKey: key,
       project: project.config.name,
-      sessionId: (deps.newSessionId ?? randomUUID)(),
+      sessionId: newId,
       model: job.model,
       started: false,
+      harness: job.harness,
+      scratchId: newId,
     };
+    // The run keeps its scratch folder (and the files in it, e.g. screenshots) across agy's own
+    // conversation id and a handoff.
+    const scratchId = session.scratchId ?? session.sessionId;
+    const ranOn = session.harness ?? 'claude';
+    // An approved card of a job with a handoff carries on in a fresh session on the handoff's harness.
+    const card = trigger.kind === 'resume' ? trigger.card : undefined;
+    const handoff =
+      job.handoff && card && !card.declined && ranOn !== job.handoff.harness ? job.handoff : undefined;
+    if (handoff)
+      session = {
+        threadKey: key,
+        project: project.config.name,
+        sessionId: newId,
+        model: handoff.model,
+        started: false,
+        harness: handoff.harness,
+        scratchId,
+      };
+    // Otherwise a continued run stays on the CLI its session lives in.
+    const harness = session.harness ?? 'claude';
+    const resuming = trigger.kind === 'resume' && !handoff;
     store.saveSession(session);
     // Made only now, when the model runs: gate-skipped runs leave no empty folders behind.
     const folders = {
-      scratch: sessionScratch(project, stateDir, job.id, session.sessionId),
+      scratch: sessionScratch(project, stateDir, job.id, scratchId),
       jobData: env.TARA_JOB_DATA,
     };
     env = { ...env, TARA_SCRATCH: folders.scratch };
@@ -219,6 +251,29 @@ export async function runJob(
       recipient && chat.stream && !chat.stream.disabled
         ? new StreamReply(chat, chat.stream, channel, rootTs, recipient, false, Math.min(intervalMs, 1000))
         : undefined;
+
+    const mcpServers = expandMcpServers(job.mcpServers, env);
+    // Steps run first (not when continuing after a decision or running queue items), each in its own session.
+    let stepsDone: StepsResult | undefined;
+    if (job.steps.length && trigger.kind !== 'resume' && trigger.kind !== 'queue') {
+      stepsDone = await runSteps({
+        host: deps.host,
+        run: deps.run,
+        project,
+        job,
+        harness,
+        env,
+        folders,
+        mcpServers,
+        signal: stop,
+        onStep: (i, name) => status.push(`⏳ ${title} · step ${i}/${job.steps.length}: ${name}`),
+      });
+      if (stop.aborted) {
+        await status.flush();
+        await chat.update(channel, statusTs, `${title} · ⏹ stopped`);
+        return record('aborted');
+      }
+    }
 
     // Jobs get approval buttons and file uploads, never permission prompts: nobody is watching live.
     const bridgeContext: RunContext = {
@@ -240,26 +295,51 @@ export async function runJob(
       .filter(Boolean)
       .join('\n\n');
     const allowedTools = job.allowedTools ?? project.config.allowedTools;
+    const agy =
+      harness === 'agy'
+        ? buildAgyArgs({
+            conversationId: resuming ? session.sessionId : undefined,
+            model: session.model,
+            permissionMode: project.config.permissionMode,
+            permissions: job.agyPermissions,
+            timeoutMs,
+          })
+        : undefined;
     const outcome: RunOutcome = await deps
       .run({
-        bin: deps.host.claude.bin,
-        args: buildClaudeArgs({
-          sessionId: session.sessionId,
-          resume: trigger.kind === 'resume',
-          permissionMode: project.config.permissionMode,
-          model: session.model,
-          effort: deps.host.claude.effort,
-          allowedTools,
-          mcpConfig: bridged?.mcpConfigPath,
-          partialMessages: Boolean(live),
-        }),
+        harness,
+        bin: agy ? deps.host.agy.bin : deps.host.claude.bin,
+        args:
+          agy?.args ??
+          buildClaudeArgs({
+            sessionId: session.sessionId,
+            resume: resuming,
+            permissionMode: project.config.permissionMode,
+            model: session.model,
+            effort: deps.host.claude.effort,
+            allowedTools,
+            mcpConfig: bridged?.mcpConfigPath,
+            partialMessages: Boolean(live),
+          }),
+        agy: agy && { mcpConfig: bridged?.mcpConfigPath, settings: agy.settings },
+        mcpServers,
         cwd: project.dir,
         env,
         systemPrompt: appendSystemPrompt,
         prompt:
           trigger.kind === 'resume'
-            ? trigger.text
-            : buildJobPrompt(job, script, folders, trigger.kind === 'queue' ? trigger.items : undefined),
+            ? handoff && card
+              ? buildHandoffPrompt(job, ranOn, card, trigger.text, folders)
+              : job.handoff && card && harness === job.handoff.harness
+                ? decisionWithCard(card, trigger.text)
+                : trigger.text
+            : buildJobPrompt(
+                job,
+                script,
+                folders,
+                trigger.kind === 'queue' ? trigger.items : undefined,
+                stepsDone?.section,
+              ),
         timeoutMs,
         signal: stop,
         label: {
@@ -271,7 +351,8 @@ export async function runJob(
         },
         onEvent: (event) => {
           if (event.kind === 'init' && !session.started) {
-            session = { ...session, started: true };
+            // agy picks its own conversation id; Claude echoes the one it was given.
+            session = { ...session, sessionId: event.sessionId || session.sessionId, started: true };
             store.saveSession(session);
           }
           if ('parent' in event && event.parent) return;
@@ -292,11 +373,12 @@ export async function runJob(
     /** Sets up a learning turn when this run had trouble; it runs once the job's locks are released. */
     const learnIf = (failure: string | undefined, threadTs: string | undefined) => {
       const reasons = troubleReasons(outcome, toolErrors, failure);
-      if (!project.config.selfImprove || !reasons.length) return;
+      // Learning turns resume the session with Claude, so agy runs don't get one.
+      if (!project.config.selfImprove || harness !== 'claude' || !reasons.length) return;
       lesson = {
         project,
         sessionId: outcome.sessionId ?? session.sessionId,
-        model: job.model,
+        model: session.model,
         appendSystemPrompt,
         bridge: bridged ? bridgeContext : undefined,
         allowedTools,
@@ -315,11 +397,12 @@ export async function runJob(
       model: outcome.model ?? job.model,
       threadKey: key,
       costUsd: outcome.costUsd,
-      inputTokens: outcome.usage?.input,
-      outputTokens: outcome.usage?.output,
-      cacheReadTokens: outcome.usage?.cacheRead,
-      cacheCreationTokens: outcome.usage?.cacheCreation,
-      toolCalls: outcome.toolCalls,
+      // Steps count towards the run.
+      inputTokens: sum(outcome.usage?.input, stepsDone?.usage.input),
+      outputTokens: sum(outcome.usage?.output, stepsDone?.usage.output),
+      cacheReadTokens: sum(outcome.usage?.cacheRead, stepsDone?.usage.cacheRead),
+      cacheCreationTokens: sum(outcome.usage?.cacheCreation, stepsDone?.usage.cacheCreation),
+      toolCalls: outcome.toolCalls + (stepsDone?.toolCalls ?? 0),
       rateLimitUtilization: outcome.rateLimit?.utilization,
     };
     const meta = [
@@ -332,7 +415,7 @@ export async function runJob(
     if (outcome.status !== 'ok') {
       const reason =
         outcome.status === 'limit'
-          ? '⏸ skipped: Claude usage limit reached'
+          ? `⏸ skipped: ${harness === 'agy' ? 'agy (Google) quota' : 'Claude usage limit'} reached`
           : outcome.status === 'timeout'
             ? `⌛ timed out after ${formatDuration(outcome.durationMs)}`
             : outcome.status === 'aborted'

@@ -60,6 +60,8 @@ function setup(opts: {
   selfImprove?: boolean;
   /** Tool calls that fail in the first run. */
   toolErrors?: number;
+  /** The session id the CLI reports (agy picks its own conversation id). */
+  initSessionId?: string;
 }) {
   const chat = new FakeChat('ts');
   chat.stream = opts.stream;
@@ -85,7 +87,7 @@ function setup(opts: {
     run: async (o) => {
       calls.push(o);
       callTimes.push(Date.now());
-      o.onEvent?.({ kind: 'init', sessionId: 'sid', model: 'claude-haiku-5-5' });
+      o.onEvent?.({ kind: 'init', sessionId: opts.initSessionId ?? 'sid', model: 'claude-haiku-5-5' });
       o.onEvent?.({ kind: 'tool', id: 't1', name: 'Bash', status: 'Bash: curl' });
       o.onEvent?.({ kind: 'tool_result', id: 't1', isError: false });
       if (calls.length === 1) {
@@ -166,6 +168,139 @@ describe('Scheduler', () => {
     // Replies in the job thread resume the job's session.
     expect(store.getSession('C1:ts1')).toMatchObject({ sessionId: 'sid', model: 'haiku', started: true });
     expect(scheduler.list('shop')[0]).toMatchObject({ id: 'sla', lastStatus: 'ok', running: false });
+    await scheduler.stop();
+  });
+
+  it('runs an agy job through agy and continues its conversation after a decision', async () => {
+    const { calls, scheduler, store } = setup({
+      jobs: [{ ...baseJob, harness: 'agy', model: 'gemini-x' }],
+      initSessionId: 'conv-1',
+    });
+    scheduler.start();
+    scheduler.trigger('shop', 'sla', 'U1');
+    await scheduler.idle();
+    const first = calls[0] as RunOptions;
+    expect(first.harness).toBe('agy');
+    expect(first.bin).toBe('agy');
+    expect(first.args).toEqual(
+      expect.arrayContaining(['--input-format', 'stream-json', '--model', 'gemini-x']),
+    );
+    // The project runs in bypassPermissions and the job has no rules of its own.
+    expect(first.args).toContain('--dangerously-skip-permissions');
+    expect(first.args).not.toContain('--session-id');
+    expect(store.getSession('C1:ts1')).toMatchObject({ sessionId: 'conv-1', harness: 'agy', started: true });
+
+    await scheduler.resume('shop', 'sla', { threadTs: 'ts1', text: 'USER DECISION: Fix it', by: 'U1' });
+    const second = calls[1] as RunOptions;
+    expect(second.harness).toBe('agy');
+    expect(second.args).toEqual(expect.arrayContaining(['--conversation', 'conv-1']));
+    expect(second.prompt).toBe('USER DECISION: Fix it');
+    await scheduler.stop();
+  });
+
+  it('hands an approved card over to a fresh session on the handoff harness, and runs nothing for a decline', async () => {
+    const { calls, scheduler, store } = setup({
+      jobs: [
+        {
+          ...baseJob,
+          harness: 'agy',
+          model: 'gemini-x',
+          handoff: { harness: 'claude', model: 'claude-opus-5-5' },
+        },
+      ],
+      initSessionId: 'conv-1',
+    });
+    scheduler.start();
+    scheduler.trigger('shop', 'sla', 'U1');
+    await scheduler.idle();
+    const scratch = (calls[0] as RunOptions).env.TARA_SCRATCH;
+
+    // A declined card runs no model at all.
+    const skip = {
+      threadTs: 'ts1',
+      text: 'USER DECISION on "Overflow": Skip',
+      by: 'U1',
+      card: { title: 'Overflow', body: 'Menu overflows.', declined: true },
+    };
+    expect(await scheduler.resume('shop', 'sla', skip)).toBe('silent');
+    expect(calls).toHaveLength(1);
+
+    // An approved one starts Claude with the card, the decision and the job's prompt, in the same scratch folder.
+    await scheduler.resume('shop', 'sla', {
+      threadTs: 'ts1',
+      text: 'USER DECISION on "Footer": Fix it',
+      by: 'U1',
+      card: {
+        title: 'Footer',
+        body: 'WhatsApp button covers the footer.\nScreenshot: /s/ui-1.png',
+        declined: false,
+      },
+    });
+    const fix = calls[1] as RunOptions;
+    expect(fix.harness).toBe('claude');
+    expect(fix.bin).toBe('claude');
+    expect(fix.args).toEqual(expect.arrayContaining(['--model', 'claude-opus-5-5', '--session-id', 'sid']));
+    expect(fix.args).not.toContain('--resume');
+    expect(fix.env.TARA_SCRATCH).toBe(scratch);
+    expect(fix.prompt).toContain('ran on agy');
+    expect(fix.prompt).toContain('### Footer\nWhatsApp button covers the footer.');
+    expect(fix.prompt).toContain('## The decision\nUSER DECISION on "Footer": Fix it');
+    expect(fix.prompt).toContain("## The job's instructions\nRun the report.");
+    expect(store.getSession('C1:ts1')).toMatchObject({
+      harness: 'claude',
+      model: 'claude-opus-5-5',
+      started: true,
+    });
+
+    // The next approval resumes that Claude session, with its card since that session never saw it.
+    await scheduler.resume('shop', 'sla', {
+      threadTs: 'ts1',
+      text: 'USER DECISION on "Menu": Fix it',
+      by: 'U1',
+      card: { title: 'Menu', body: 'Search overlaps the menu.', declined: false },
+    });
+    const next = calls[2] as RunOptions;
+    expect(next.harness).toBe('claude');
+    expect(next.args).toEqual(expect.arrayContaining(['--resume', 'conv-1']));
+    expect(next.prompt).toBe(
+      '## The card\n### Menu\nSearch overlaps the menu.\n\nUSER DECISION on "Menu": Fix it',
+    );
+    await scheduler.stop();
+  });
+
+  it('runs steps in their own sessions before the main prompt, with the job MCP servers', async () => {
+    const { calls, scheduler, project } = setup({
+      jobs: [
+        {
+          ...baseJob,
+          // biome-ignore lint/suspicious/noTemplateCurlyInString: a literal ${VAR} placeholder, expanded by tara-agent
+          mcpServers: { browser: { command: 'npx', args: ['mcp', '--workspace=${TARA_SCRATCH}/shots'] } },
+          steps: [
+            { name: 'Home', promptFile: 'shared.md', prompt: 'Test the home page.' },
+            { name: 'Cart', prompt: 'Test the cart.', timeoutMinutes: 5, model: 'sonnet' },
+          ],
+        },
+      ],
+      replies: ['home: 1 finding', 'cart: fine', 'Headline\n---\nAll steps done'],
+    });
+    writeFileSync(path.join(project.dir, 'shared.md'), 'Shared rules.');
+    scheduler.start();
+    scheduler.trigger('shop', 'sla', 'U1');
+    await scheduler.idle();
+    expect(calls).toHaveLength(3);
+    const [home, cart, main] = calls as [RunOptions, RunOptions, RunOptions];
+    expect(home.prompt).toMatch(/^Shared rules\.\n\nTest the home page\.\n\nYour folders:/);
+    expect(home.systemPrompt).toContain('one step of a scheduled job');
+    expect(home.mcpServers).toEqual({
+      browser: { command: 'npx', args: ['mcp', '--workspace=/tmp/scratch/shop/sla-sid/shots'], env: {} },
+    });
+    expect(cart.timeoutMs).toBe(5 * 60_000);
+    expect(home.args).toEqual(expect.arrayContaining(['--model', 'haiku']));
+    expect(cart.args).toEqual(expect.arrayContaining(['--model', 'sonnet']));
+    expect(main.prompt).toMatch(
+      /## Step Output[\s\S]*### Home\nhome: 1 finding[\s\S]*### Cart\ncart: fine[\s\S]*Run the report\./,
+    );
+    expect(main.mcpServers).toEqual(home.mcpServers);
     await scheduler.stop();
   });
 

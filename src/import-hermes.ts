@@ -74,6 +74,8 @@ export function convertHermesJobs(source: unknown, options: ImportOptions): Jobs
       skills: skills.filter(Boolean),
       ...(h.script ? { preScript: path.posix.join(options.scriptsDir, h.script) } : {}),
       agent: true,
+      harness: 'claude',
+      steps: [],
       model: model(h.model, options.defaultModel),
       locks: browser ? ['chrome'] : [],
       timeoutMinutes: browser ? 40 : 30,

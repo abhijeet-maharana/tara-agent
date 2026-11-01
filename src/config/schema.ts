@@ -12,6 +12,53 @@ export const permissionModes = [
   'bypassPermissions',
 ] as const;
 
+/** The agent CLI a run goes through: Claude Code, or Google's Antigravity CLI (`agy`). */
+export const harnesses = ['claude', 'agy'] as const;
+export type Harness = (typeof harnesses)[number];
+
+/**
+ * agy permission rules (`action(target)`, e.g. `command(npx tsc)`, `write_file(/tmp)`, `mcp(server/*)`),
+ * passed as session-only settings. Headless agy can't ask, so anything not allowed is denied.
+ */
+export const agyPermissionsSchema = z.object({
+  allow: z.array(z.string().min(1)).default([]),
+  deny: z.array(z.string().min(1)).default([]),
+  ask: z.array(z.string().min(1)).default([]),
+});
+export type AgyPermissions = z.infer<typeof agyPermissionsSchema>;
+
+/**
+ * A job's own stdio MCP server, added to tara's for every session of the job (both harnesses).
+ * `${VAR}` in `command`, `args` and `env` is replaced from the run's environment (`TARA_SCRATCH`,
+ * `TARA_JOB_DATA`, the job's `env`). Under agy its tools are named `tara_<name>`.
+ */
+export const mcpServerSchema = z.object({
+  command: z.string().min(1),
+  args: z.array(z.string()).default([]),
+  env: z.record(z.string(), z.string()).default({}),
+});
+export type McpServer = z.infer<typeof mcpServerSchema>;
+
+/**
+ * One step of a job: a fresh session of the job's harness and model that runs before the main prompt,
+ * with the job's MCP servers but no Slack tools. Its reply goes into the main prompt.
+ */
+export const jobStepSchema = z
+  .object({
+    name: z.string().min(1).max(80),
+    prompt: z.string().optional(),
+    /** Read from the repo and put before `prompt` (shared instructions for several steps). */
+    promptFile: z.string().optional(),
+    /** Defaults to the job's `timeoutMinutes`. */
+    timeoutMinutes: z.number().positive().optional(),
+    /** Defaults to the job's `model` (same harness), e.g. a faster model for long browser steps. */
+    model: z.string().min(1).optional(),
+    /** `agy` jobs: rules for this step instead of the job's `agyPermissions`. */
+    agyPermissions: agyPermissionsSchema.optional(),
+  })
+  .refine((s) => s.prompt || s.promptFile, { message: 'a step needs a prompt or a promptFile' });
+export type JobStep = z.infer<typeof jobStepSchema>;
+
 /** `~/.config/tara-agent/config.yaml`: host-level settings. Never committed; secrets come from env. */
 export const hostConfigSchema = z.object({
   /**
@@ -37,6 +84,15 @@ export const hostConfigSchema = z.object({
       runAs: z.string().optional(),
     })
     .default({ bin: 'claude', chatTimeoutMinutes: 20 }),
+  /**
+   * Antigravity CLI, for jobs with `harness: "agy"`. Log it in once as the run user (`agy`, then
+   * Google sign-in). See docs/configuration.md "agy jobs".
+   */
+  agy: z
+    .object({
+      bin: z.string().default('agy'),
+    })
+    .default({ bin: 'agy' }),
   /**
    * Root actions a run may ask for (`request_privileged`), through the root-owned helper
    * deploy/tara-priv.mjs. Unset = off. See docs/security.md "Privileged actions".
@@ -290,7 +346,28 @@ export const jobSchema = z
     preScript: z.string().optional(),
     /** false = the script is the job: its stdout is posted as-is and no model runs. */
     agent: z.boolean().default(true),
+    /** The CLI the job runs on. `agy` jobs need an agy `model` (`agy models` lists them). */
+    harness: z.enum(harnesses).default('claude'),
     model: z.string().min(1).default('sonnet'),
+    /**
+     * `agy` jobs only: allow/deny rules for this job. Without them the project's permission mode
+     * applies (`bypassPermissions` skips agy's checks, any other mode allows only tara's own tools).
+     */
+    agyPermissions: agyPermissionsSchema.optional(),
+    /**
+     * When a card of the run is approved, carry on in a fresh session on this harness and model instead
+     * of the run's own, e.g. an `agy` job that reports findings and leaves approved fixes to Claude. That
+     * session gets the card, the decision and the job's prompt; later decisions and thread replies stay
+     * on it. A declined card (Skip, Reject, …) runs no model at all.
+     */
+    handoff: z.object({ harness: z.enum(harnesses), model: z.string().min(1) }).optional(),
+    /** The job's own MCP servers, by name (not `tara`). */
+    mcpServers: z
+      .record(z.string().regex(/^[a-z0-9_-]+$/, 'lowercase letters, digits, _ and -'), mcpServerSchema)
+      .refine((m) => !('tara' in m), { message: '"tara" is tara-agent\'s own server' })
+      .optional(),
+    /** Sessions run one after the other before the main prompt, e.g. one per part of a long check. */
+    steps: z.array(jobStepSchema).default([]),
     /** Named locks held for the whole run, e.g. ["chrome"] for jobs that drive the shared browser. */
     locks: z.array(z.string()).default([]),
     timeoutMinutes: z.number().positive().default(30),

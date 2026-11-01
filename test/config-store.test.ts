@@ -107,7 +107,18 @@ describe('Store', () => {
       sessionId: 's1',
       model: 'opus',
       started: true,
+      harness: 'claude',
     });
+    // A session started by an agy job keeps its harness, so later turns stay on agy.
+    store.saveSession({
+      threadKey: 'C1:2',
+      project: 'p',
+      sessionId: 'c1',
+      model: 'gemini',
+      started: true,
+      harness: 'agy',
+    });
+    expect(store.getSession('C1:2')?.harness).toBe('agy');
     store.deleteSession('C1:1');
     expect(store.getSession('C1:1')).toBeUndefined();
   });

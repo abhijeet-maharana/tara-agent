@@ -682,8 +682,8 @@ export function jobsPage(ctx: DashboardContext, jobs: JobView[], now = Date.now(
 ${state === 'failing' && j.lastError ? `<div class="meta error">Last error: ${esc(j.lastError)}</div>` : ''}
 <details><summary>Details and run history</summary><dl class="facts">
 <dt>Skills</dt><dd>${j.skills.length ? esc(j.skills.join(', ')) : '—'}</dd>
-<dt>Runs first</dt><dd>${j.preScript ? `<code>${esc(j.preScript)}</code>` : 'Nothing: Claude starts straight away'}</dd>
-<dt>Model</dt><dd>${esc(j.model)}</dd>
+<dt>Runs first</dt><dd>${j.preScript ? `<code>${esc(j.preScript)}</code>` : 'Nothing: the model starts straight away'}</dd>
+<dt>Model</dt><dd>${j.harness === 'agy' ? 'agy (Antigravity CLI) · ' : ''}${esc(j.model)}</dd>
 ${j.durationMinutes ? `<dt>Usual length</dt><dd>${j.durationMinutes} min</dd>` : ''}
 <dt>Schedule</dt><dd>${j.cron ? `<code>${esc(j.cron)}</code> ${esc(j.tz)}` : 'none (a queue executor)'}</dd>
 <dt>Job id</dt><dd><code>${esc(j.id)}</code></dd></dl>${history}</details></article>`;

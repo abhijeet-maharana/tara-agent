@@ -23,10 +23,10 @@ tara-agent is one Node process per host. It never calls the Anthropic API: every
 | Path | Responsibility |
 |---|---|
 | `src/config/` | Host config (YAML), project config and jobs files (JSON), all validated with zod |
-| `src/runner/` | Builds `claude` arguments, strips credentials from the environment, spawns the CLI, parses `stream-json`, kills the process group on timeout or stop |
+| `src/runner/` | Builds CLI arguments, strips credentials from the environment, spawns the CLI, parses its stream, kills the process group on timeout or stop. `run.ts` is Claude Code; `agy.ts` is the Antigravity CLI harness for `harness: "agy"` jobs (stream-json in and out, tara's MCP tools through a per-run plugin) |
 | `src/sessions/manager.ts` | Slack thread ↔ Claude session, chat concurrency cap, live status message, "stop" and "run <job name>" |
 | `src/sessions/threads.ts` | One run at a time per Slack thread, shared by chat turns and jobs: replies wait for the run, "stop" ends it |
-| `src/scheduler/` | Job timing (croner), slot claims, catch-up, locks, pre-scripts, job delivery, health digest |
+| `src/scheduler/` | Job timing (croner), slot claims, catch-up, locks, pre-scripts, job `steps` (`steps.ts`), job delivery, health digest |
 | `src/bridge/bridge.ts` | Per-run MCP config and token, approval buttons, permission prompts, file uploads |
 | `src/mcp/server.ts` | The stdio MCP server Claude starts: `request_approval`, `request_privileged`, `send_file`, `permission`, items and tasks |
 | `src/privileged/` | Root actions through the root-owned helper `deploy/tara-priv.mjs` (list, plan, run) |
@@ -65,7 +65,7 @@ Permission prompts work the same way, except the MCP call blocks (polling every 
 
 ## Design choices
 
-- **One CLI process per turn**, not a long-lived process: sessions live in Claude Code's own storage, so restarts lose nothing.
+- **One CLI process per turn**, not a long-lived process: sessions live in the CLI's own storage (Claude Code sessions, agy conversations), so restarts lose nothing. A session remembers its harness, so later turns use the same CLI.
 - **Hermes-compatible cron conventions** (wake gate, `## Script Output`, `[SILENT]`, `[CRON_FAILURE]`) so existing jobs and gate scripts move over unchanged.
 - **Local HTTP for the MCP bridge** instead of a socket per session: one code path, easy to test, token per run.
 - **No outbound calls except Slack and the CLI.** No telemetry.
