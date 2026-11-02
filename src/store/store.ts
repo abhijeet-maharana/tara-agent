@@ -435,6 +435,16 @@ export class Store {
       : undefined;
   }
 
+  /** The job that ran in this thread most recently (unset: a chat-only thread). */
+  threadJob(threadKey: string): string | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT job_id FROM runs WHERE thread_key = ? AND kind = 'job' AND job_id IS NOT NULL ORDER BY started_at DESC LIMIT 1",
+      )
+      .get(threadKey) as { job_id: string } | undefined;
+    return row?.job_id;
+  }
+
   saveSession(s: SessionRow): void {
     const t = this.now();
     this.db

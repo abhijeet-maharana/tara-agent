@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560" font-family="Inter, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#38bdf8"/>
+    </marker>
+  </defs>
+  <rect width="1200" height="560" rx="16" fill="#090d16"/>
+  <rect x="0.5" y="0.5" width="1199" height="559" rx="16" fill="none" stroke="#1f293d"/>
+
+  <!-- Column headings -->
+  <g font-size="12" font-weight="700" fill="#94a3b8" letter-spacing="1.2">
+    <text x="48" y="52">YOU</text>
+    <text x="420" y="52">TARA-AGENT  (YOUR SERVER)</text>
+    <text x="872" y="52">YOUR PROJECTS</text>
+  </g>
+
+  <!-- You -->
+  <g>
+    <rect x="48" y="80" width="260" height="104" rx="12" fill="#111827" stroke="#1f293d"/>
+    <rect x="48" y="80" width="4" height="104" rx="2" fill="#38bdf8"/>
+    <text x="70" y="112" font-size="17" font-weight="700" fill="#f8fafc">Slack</text>
+    <text x="70" y="138" font-size="13" fill="#94a3b8">One channel per project.</text>
+    <text x="70" y="158" font-size="13" fill="#94a3b8">Chat, job reports, buttons.</text>
+
+    <rect x="48" y="204" width="260" height="104" rx="12" fill="#111827" stroke="#1f293d"/>
+    <rect x="48" y="204" width="4" height="104" rx="2" fill="#f59e0b"/>
+    <text x="70" y="236" font-size="17" font-weight="700" fill="#f8fafc">Dashboard</text>
+    <text x="70" y="262" font-size="13" fill="#94a3b8">Approvals, jobs, schedule,</text>
+    <text x="70" y="282" font-size="13" fill="#94a3b8">transcripts. Works on a phone.</text>
+
+    <rect x="48" y="328" width="260" height="104" rx="12" fill="#111827" stroke="#1f293d"/>
+    <rect x="48" y="328" width="4" height="104" rx="2" fill="#10b981"/>
+    <text x="70" y="360" font-size="17" font-weight="700" fill="#f8fafc">Command <tspan font-size="12" font-weight="500" fill="#94a3b8">(optional)</tspan></text>
+    <text x="70" y="386" font-size="13" fill="#94a3b8">Talk to it out loud: what needs</text>
+    <text x="70" y="406" font-size="13" fill="#94a3b8">you, run a job, decide a card.</text>
+  </g>
+
+  <!-- tara-agent -->
+  <rect x="404" y="70" width="392" height="420" rx="16" fill="#0d1320" stroke="#2e3e5c"/>
+  <rect x="428" y="94" width="344" height="58" rx="10" fill="#111827" stroke="#1f293d"/>
+  <text x="446" y="119" font-size="15" font-weight="700" fill="#f8fafc">Sessions</text>
+  <text x="446" y="139" font-size="12" fill="#94a3b8">One Claude session per Slack thread</text>
+
+  <rect x="428" y="162" width="344" height="58" rx="10" fill="#111827" stroke="#1f293d"/>
+  <text x="446" y="187" font-size="15" font-weight="700" fill="#f8fafc">Scheduler</text>
+  <text x="446" y="207" font-size="12" fill="#94a3b8">Cron jobs, pre-run scripts, missed-run catch up</text>
+
+  <rect x="428" y="230" width="344" height="58" rx="10" fill="#111827" stroke="#1f293d"/>
+  <rect x="428" y="230" width="4" height="58" rx="2" fill="#f59e0b"/>
+  <text x="446" y="255" font-size="15" font-weight="700" fill="#f8fafc">Approvals and queues</text>
+  <text x="446" y="275" font-size="12" fill="#94a3b8">Cards, send windows, daily caps</text>
+
+  <rect x="428" y="298" width="344" height="58" rx="10" fill="#111827" stroke="#1f293d"/>
+  <text x="446" y="323" font-size="15" font-weight="700" fill="#f8fafc">MCP tools for Claude</text>
+  <text x="446" y="343" font-size="12" fill="#94a3b8">request_approval, propose_item, send_file, run_job</text>
+
+  <rect x="428" y="366" width="344" height="58" rx="10" fill="#111827" stroke="#1f293d"/>
+  <text x="446" y="391" font-size="15" font-weight="700" fill="#f8fafc">Local store</text>
+  <text x="446" y="411" font-size="12" fill="#94a3b8">SQLite: sessions, runs, approvals</text>
+
+  <text x="600" y="462" text-anchor="middle" font-size="12" fill="#94a3b8">No sudo. Root actions only from an allowlist, on approval.</text>
+
+  <!-- Projects -->
+  <g>
+    <rect x="872" y="80" width="280" height="104" rx="12" fill="#111827" stroke="#1f293d"/>
+    <text x="892" y="110" font-size="16" font-weight="700" fill="#f8fafc">~/Projects/shop</text>
+    <text x="892" y="136" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" fill="#38bdf8">claude -p --resume</text>
+    <text x="892" y="160" font-size="12" fill="#94a3b8">.tara/config.json · jobs.json · skills</text>
+
+    <rect x="872" y="204" width="280" height="104" rx="12" fill="#111827" stroke="#1f293d"/>
+    <text x="892" y="234" font-size="16" font-weight="700" fill="#f8fafc">~/Projects/blog</text>
+    <text x="892" y="260" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" fill="#38bdf8">claude -p --resume</text>
+    <text x="892" y="284" font-size="12" fill="#94a3b8">.tara/config.json · jobs.json · skills</text>
+
+    <rect x="872" y="328" width="280" height="104" rx="12" fill="#111827" stroke="#1f293d" stroke-dasharray="5 5"/>
+    <text x="892" y="372" font-size="16" font-weight="700" fill="#94a3b8">+ any repo you add</text>
+    <text x="892" y="398" font-size="12" fill="#94a3b8">Own instructions, skills and tools</text>
+  </g>
+
+  <!-- Arrows: you <-> agent -->
+  <g stroke="#38bdf8" stroke-width="2" fill="none">
+    <path d="M308 132 H398" marker-end="url(#a)" marker-start="url(#a)"/>
+    <path d="M308 256 H398" marker-end="url(#a)" marker-start="url(#a)"/>
+    <path d="M308 380 H398" marker-end="url(#a)" marker-start="url(#a)"/>
+    <path d="M796 132 H866" marker-end="url(#a)" marker-start="url(#a)"/>
+    <path d="M796 256 H866" marker-end="url(#a)" marker-start="url(#a)"/>
+    <path d="M796 380 H866" marker-end="url(#a)" marker-start="url(#a)" stroke-dasharray="5 5"/>
+  </g>
+
+  <!-- Footer -->
+  <text x="48" y="524" font-size="13" fill="#94a3b8">Slack connects over Socket Mode, so the server needs no public URL. Claude never sees your Slack tokens or other secrets.</text>
+</svg>

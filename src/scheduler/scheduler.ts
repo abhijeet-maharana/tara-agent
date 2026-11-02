@@ -3,7 +3,7 @@ import path from 'node:path';
 import { Cron } from 'croner';
 import type { Bridge } from '../bridge/bridge.js';
 import { JOBS_FILE, loadJobs } from '../config/load.js';
-import type { Harness, HostConfig, Project, ScheduledJob } from '../config/schema.js';
+import type { AgyPermissions, Harness, HostConfig, Project, ScheduledJob } from '../config/schema.js';
 import type { Runner } from '../runner/run.js';
 import type { ChatPort, Logger } from '../sessions/manager.js';
 import { Threads } from '../sessions/threads.js';
@@ -47,6 +47,8 @@ export interface JobControl {
     by: string,
     thread?: { channel: string; ts: string },
   ): 'started' | 'unknown' | 'running';
+  /** A job's `agyPermissions`, for a thread reply that continues its agy session. */
+  agyPermissions?(project: string, id: string): AgyPermissions | undefined;
 }
 
 export interface SchedulerDeps {
@@ -118,6 +120,10 @@ export class Scheduler implements JobControl {
     this.entries.clear();
     this.controller.abort();
     await Promise.allSettled([...this.inflight]);
+  }
+
+  agyPermissions(project: string, id: string): AgyPermissions | undefined {
+    return this.entries.get(jobKey(project, id))?.scheduled.job.agyPermissions;
   }
 
   list(project: string): JobInfo[] {

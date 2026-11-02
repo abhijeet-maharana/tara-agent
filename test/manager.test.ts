@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { HostConfig, Project, ProjectConfig } from '../src/config/schema.js';
 import type { RunOptions, RunOutcome } from '../src/runner/run.js';
+import type { JobControl } from '../src/scheduler/scheduler.js';
 import { type IncomingMessage, isStopRequest, SessionManager } from '../src/sessions/manager.js';
 import { Threads } from '../src/sessions/threads.js';
 import { Store } from '../src/store/store.js';
@@ -39,7 +40,13 @@ const ok = (o: Partial<RunOutcome> = {}): RunOutcome => ({
 });
 
 function setup(
-  opts: { project?: Project; outcomes?: RunOutcome[]; env?: NodeJS.ProcessEnv; host?: HostConfig } = {},
+  opts: {
+    project?: Project;
+    outcomes?: RunOutcome[];
+    env?: NodeJS.ProcessEnv;
+    host?: HostConfig;
+    jobs?: JobControl;
+  } = {},
 ) {
   const chat = new FakeChat('bot.');
   const store = new Store(':memory:');
@@ -54,6 +61,7 @@ function setup(
     env: opts.env ?? { PATH: '/bin', CLAUDE_CODE_OAUTH_TOKEN: 'secret' },
     log: { info() {}, warn() {}, error() {} },
     newSessionId: () => `sid-${++ids}`,
+    jobs: opts.jobs,
     run: async (options) => {
       calls.push(options);
       options.onEvent?.({ kind: 'init', sessionId: 'sid-1', model: 'claude-sonnet-5-5' });
@@ -74,6 +82,57 @@ const msg = (text: string, o: Partial<IncomingMessage> = {}): IncomingMessage =>
 });
 
 describe('SessionManager', () => {
+  it("continues an agy job's session under the job's rules, never skipping agy's checks", async () => {
+    const rules = { allow: ['command(grep)'], deny: ['write_file(*)'], ask: [] };
+    const jobs: JobControl = {
+      list: () => [],
+      trigger: () => 'unknown',
+      agyPermissions: (_p, id) => (id === 'ui-test' ? rules : undefined),
+    };
+    const { store, calls, manager } = setup({
+      project: project({ permissionMode: 'bypassPermissions' }),
+      jobs,
+    });
+    const now = Date.now();
+    for (const [ts, jobId] of [
+      ['100.1', 'ui-test'],
+      ['200.1', 'gone'],
+    ] as const) {
+      store.saveSession({
+        threadKey: `C1:${ts}`,
+        project: 'shop',
+        sessionId: `conv-${ts}`,
+        model: 'gemini-x',
+        started: true,
+        harness: 'agy',
+      });
+      store.recordRun({
+        kind: 'job',
+        project: 'shop',
+        jobId,
+        threadKey: `C1:${ts}`,
+        startedAt: now,
+        endedAt: now,
+        status: 'error',
+      });
+    }
+
+    await manager.handle(msg('raise the cards', { ts: '100.2' }));
+    expect(calls[0]?.harness).toBe('agy');
+    expect(calls[0]?.args).toEqual(expect.arrayContaining(['--conversation', 'conv-100.1']));
+    expect(calls[0]?.args).not.toContain('--dangerously-skip-permissions');
+    expect(calls[0]?.agy?.settings).toEqual({
+      permissions: { allow: ['command(grep)', 'mcp(tara_tara/*)'], deny: ['write_file(*)'], ask: [] },
+    });
+
+    // A job that's gone (or has no rules): only tara's tools.
+    await manager.handle(msg('and this one?', { threadTs: '200.1', ts: '200.2' }));
+    expect(calls[1]?.args).not.toContain('--dangerously-skip-permissions');
+    expect(calls[1]?.agy?.settings).toEqual({
+      permissions: { allow: ['mcp(tara_tara/*)'], deny: [], ask: [] },
+    });
+  });
+
   it('starts a session, then resumes it on a thread reply', async () => {
     const { chat, calls, manager } = setup();
     await manager.handle(msg('hello'));

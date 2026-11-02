@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="340" viewBox="0 0 1200 340" font-family="Inter, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0L10 5L0 10z" fill="#38bdf8"/>
+    </marker>
+    <marker id="g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0L10 5L0 10z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+  <rect width="1200" height="340" rx="16" fill="#090d16"/>
+  <rect x="0.5" y="0.5" width="1199" height="339" rx="16" fill="none" stroke="#1f293d"/>
+  <text x="40" y="46" font-size="12" font-weight="700" fill="#94a3b8" letter-spacing="1.2">HOW A DRAFT GOES OUT</text>
+
+  <!-- Steps: x = 40 + i*228, width 196 -->
+  <g>
+    <rect x="40" y="72" width="196" height="132" rx="12" fill="#111827" stroke="#1f293d"/>
+    <circle cx="66" cy="100" r="13" fill="rgba(56,189,248,.12)"/><text x="66" y="105" text-anchor="middle" font-size="13" font-weight="700" fill="#38bdf8">1</text>
+    <text x="88" y="105" font-size="15" font-weight="700" fill="#f8fafc">Job drafts</text>
+    <text x="58" y="136" font-size="13" fill="#94a3b8">A scheduled job writes</text>
+    <text x="58" y="156" font-size="13" fill="#94a3b8">an email, a post or a</text>
+    <text x="58" y="176" font-size="13" fill="#94a3b8">reply, then stops.</text>
+
+    <rect x="268" y="72" width="196" height="132" rx="12" fill="#111827" stroke="#1f293d"/>
+    <rect x="268" y="72" width="4" height="132" rx="2" fill="#f59e0b"/>
+    <circle cx="294" cy="100" r="13" fill="rgba(245,158,11,.12)"/><text x="294" y="105" text-anchor="middle" font-size="13" font-weight="700" fill="#f59e0b">2</text>
+    <text x="316" y="105" font-size="15" font-weight="700" fill="#f8fafc">Card waits</text>
+    <text x="286" y="136" font-size="13" fill="#94a3b8">On the Approvals page</text>
+    <text x="286" y="156" font-size="13" fill="#94a3b8">and in Slack, with the</text>
+    <text x="286" y="176" font-size="13" fill="#94a3b8">exact text.</text>
+
+    <rect x="496" y="72" width="196" height="132" rx="12" fill="#111827" stroke="#10b981"/>
+    <circle cx="522" cy="100" r="13" fill="rgba(16,185,129,.15)"/><text x="522" y="105" text-anchor="middle" font-size="13" font-weight="700" fill="#10b981">3</text>
+    <text x="544" y="105" font-size="15" font-weight="700" fill="#f8fafc">You decide</text>
+    <text x="514" y="136" font-size="13" fill="#94a3b8">Edit it, then Approve,</text>
+    <text x="514" y="156" font-size="13" fill="#94a3b8">Reject, or Revise with</text>
+    <text x="514" y="176" font-size="13" fill="#94a3b8">a note. One tap.</text>
+
+    <rect x="724" y="72" width="196" height="132" rx="12" fill="#111827" stroke="#1f293d"/>
+    <circle cx="750" cy="100" r="13" fill="rgba(56,189,248,.12)"/><text x="750" y="105" text-anchor="middle" font-size="13" font-weight="700" fill="#38bdf8">4</text>
+    <text x="772" y="105" font-size="15" font-weight="700" fill="#f8fafc">Queue</text>
+    <text x="742" y="136" font-size="13" fill="#94a3b8">Waits for its send</text>
+    <text x="742" y="156" font-size="13" fill="#94a3b8">window, in your order,</text>
+    <text x="742" y="176" font-size="13" fill="#94a3b8">within daily caps.</text>
+
+    <rect x="952" y="72" width="208" height="132" rx="12" fill="#111827" stroke="#1f293d"/>
+    <circle cx="978" cy="100" r="13" fill="rgba(16,185,129,.15)"/><text x="978" y="105" text-anchor="middle" font-size="13" font-weight="700" fill="#10b981">5</text>
+    <text x="1000" y="105" font-size="15" font-weight="700" fill="#f8fafc">Sent</text>
+    <text x="970" y="136" font-size="13" fill="#94a3b8">Exactly as approved.</text>
+    <text x="970" y="156" font-size="13" fill="#94a3b8">The result is reported</text>
+    <text x="970" y="176" font-size="13" fill="#94a3b8">back on the card.</text>
+  </g>
+
+  <g stroke="#38bdf8" stroke-width="2" fill="none">
+    <path d="M236 138 H262" marker-end="url(#a)"/>
+    <path d="M464 138 H490" marker-end="url(#a)"/>
+    <path d="M692 138 H718" marker-end="url(#a)"/>
+    <path d="M920 138 H946" marker-end="url(#a)"/>
+  </g>
+
+  <!-- Revise loop: from 3 back to 2 -->
+  <path d="M594 204 V250 H366 V210" stroke="#94a3b8" stroke-width="2" fill="none" stroke-dasharray="5 5" marker-end="url(#g)"/>
+  <text x="480" y="272" text-anchor="middle" font-size="13" fill="#94a3b8">Revise: the agent redrafts in the same session</text>
+
+  <text x="40" y="314" font-size="13" fill="#94a3b8">What goes out is exactly what you approved. Questions that need you mid-run (a login, a risky change) use the same cards.</text>
+</svg>

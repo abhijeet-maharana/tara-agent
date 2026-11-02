@@ -279,6 +279,9 @@ export class SessionManager {
     let session = store.getSession(key) ?? this.freshSession(project, key);
     store.saveSession(session);
     const permissionPrompts = wantsPermissionPrompts(project.config.permissionMode);
+    // A reply in a job's thread: cards it raises belong to that job, so their decisions continue as the
+    // job (its locks, timeout and `handoff`), like the cards of the run itself.
+    const jobId = store.threadJob(key);
     const bridgeContext: RunContext = {
       project,
       channel: msg.channel,
@@ -286,6 +289,7 @@ export class SessionManager {
       kind: 'chat',
       permissionPrompts,
       user: msg.user,
+      jobId,
     };
     const bridged = this.deps.bridge?.open(bridgeContext);
     const appendSystemPrompt = [
@@ -306,7 +310,9 @@ export class SessionManager {
       const files = await this.saveAttachments(scratch, msg);
       // The first message of a session says where the folder is (the Write tool needs absolute paths).
       const prompt = `<@${msg.user}>: ${msg.text}${files}${session.started ? '' : `\n\n${foldersNote({ scratch })}`}`;
-      // A reply in the thread of a job that ran on agy continues that agy conversation.
+      // A reply in the thread of a job that ran on agy continues that agy conversation, under the job's
+      // own rules. Without them (the job is gone or has none) only tara's tools are allowed: a reply must
+      // never get more than the run had, so it never skips agy's checks.
       const timeoutMs = host.claude.chatTimeoutMinutes * 60_000;
       const agy =
         session.harness === 'agy'
@@ -314,6 +320,11 @@ export class SessionManager {
               conversationId: session.started ? session.sessionId : undefined,
               model: session.model,
               permissionMode: project.config.permissionMode,
+              permissions: (jobId && this.deps.jobs?.agyPermissions?.(name, jobId)) || {
+                allow: [],
+                deny: [],
+                ask: [],
+              },
               timeoutMs,
             })
           : undefined;

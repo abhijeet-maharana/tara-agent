@@ -1,5 +1,7 @@
 # tara-agent
 
+![tara-agent: a 24/7 AI agent that works on your projects and asks you before it acts](docs/images/hero.svg)
+
 **A 24/7 AI agent that works on your projects, with a human in the loop through Slack and a web dashboard.**
 
 tara-agent runs on your own server around the clock. It runs scheduled jobs, answers you in Slack, and does real work in your project repos: reports, checks, outreach drafts, fixes. Whenever something needs a person (sending a message, a risky change, a login), it stops and asks. You approve from Slack or the dashboard, usually from your phone, and it carries on.
@@ -28,17 +30,17 @@ tara-agent runs on your own server around the clock. It runs scheduled jobs, ans
 
 ## How it works
 
-```
-Slack thread ──► tara-agent ──► claude -p --resume <session>   (runs inside the project repo)
-   ▲                 │
-   └── live progress, final answer, files, buttons
-```
+![How tara-agent connects Slack, the dashboard and your project repos](docs/images/how-it-works.svg)
 
 1. tara-agent connects to Slack (Socket Mode, so no public URL is needed).
 2. A message comes in. tara-agent finds the project for that channel and starts the `claude` CLI in headless mode inside that repo, or resumes the thread's session.
 3. Claude's progress streams into the thread as a task list, followed by the answer.
 4. Scheduled jobs use the same path: on their cron time, tara-agent runs the job's script and prompt and posts the result in the project channel. Replying to that post continues the job's session.
 5. Everything (sessions, runs, approvals) is stored in a local SQLite file. The dashboard and local API read from it.
+
+Anything that goes out to other people (an email, a post, a reply) waits as a card until you approve it:
+
+![How a draft goes out: job drafts, card waits, you decide, queue, sent](docs/images/approval-flow.svg)
 
 ## Quick start
 
@@ -108,6 +110,10 @@ No commands to remember: just write.
 ## Dashboard
 
 Open `http://127.0.0.1:4100` (or the address you set under `http`).
+
+![The Home page: what needs attention, coming up and just ran](docs/images/home.png)
+
+![The Approvals page: a login request, decisions with your own options, and drafts waiting to go out](docs/images/approvals.png)
 
 | Page | Shows |
 |---|---|
