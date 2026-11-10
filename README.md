@@ -117,7 +117,7 @@ Open `http://127.0.0.1:4100` (or the address you set under `http`).
 
 | Page | Shows |
 |---|---|
-| **Home** | What's running, what needs attention, upcoming and recent runs |
+| **Home** | What's running (each links to its live transcript), Claude usage, what needs attention (waiting cards by project and kind, the cards to start with, failing and paused jobs), recent runs that did something with their first line (each opens its transcript), and what's coming up (jobs every 30 min or more often on one line) |
 | **Command** | Talk to tara: every project's health, and a panel for each thing it looks up or does (with `live` set) |
 | **Approvals** | Cards waiting for a decision, scheduled drafts, and past decisions |
 | **Jobs** | Every job with its schedule, recent results, **Run now** and **Pause** |

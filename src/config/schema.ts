@@ -59,6 +59,16 @@ export const jobStepSchema = z
   .refine((s) => s.prompt || s.promptFile, { message: 'a step needs a prompt or a promptFile' });
 export type JobStep = z.infer<typeof jobStepSchema>;
 
+/** A project's GitHub repo for pull requests (host `github`). */
+export const githubRepoSchema = z.object({
+  project: z.string().min(1),
+  /** `owner/name`. */
+  repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/, 'repo must be "owner/name"'),
+  /** The branch PRs go into. */
+  base: z.string().min(1).default('main'),
+});
+export type GithubRepo = z.input<typeof githubRepoSchema>;
+
 /** `~/.config/tara-agent/config.yaml`: host-level settings. Never committed; secrets come from env. */
 export const hostConfigSchema = z.object({
   /**
@@ -103,6 +113,23 @@ export const hostConfigSchema = z.object({
       command: z.array(z.string().min(1)).min(1).default(['sudo', '-n', '/usr/local/sbin/tara-priv']),
     })
     .optional(),
+  /**
+   * Draft cards a project's own server may approve without a person. For a `kind` card of `project`
+   * proposed over `POST /items` with `autoApprove: true`, tara-agent asks `url` (POST {kind, key,
+   * fields} → {approve, reason}) and approves it as `auto` on a yes. Only a key's first card (also on a
+   * refresh while it is still pending), and only one with no checks. Lives here, not in the repo's `.tara/config.json`, so a run can't turn it on
+   * or point it at its own server. See docs/security.md "Auto-approved cards".
+   */
+  autoApprove: z
+    .array(z.object({ project: z.string().min(1), kind: z.string().min(1), url: z.string().url() }))
+    .default([]),
+  /**
+   * Projects whose runs may open pull requests (`start_pull_request`, `open_pull_request`) on GitHub,
+   * on `<agentName>/<name>` branches into `base`. The token comes from TARA_GITHUB_TOKEN and never
+   * reaches a run. Lives here, not in the repo, so a run can't point it at another repo or branch.
+   * See docs/security.md "Pull requests".
+   */
+  github: z.array(githubRepoSchema).default([]),
   /** Where the SQLite state lives. Defaults to `~/.local/state/tara-agent`. */
   stateDir: z.string().optional(),
   /** Days after its last use that a session's scratch folder (`TARA_SCRATCH`) is deleted. */
@@ -284,8 +311,25 @@ export const projectConfigSchema = z.object({
   allowedUsers: z.array(z.string()).default([]),
   /** `api` runs the CLI with ANTHROPIC_API_KEY instead of the host's Claude login. */
   billing: z.enum(['subscription', 'api']).default('subscription'),
-  /** The project's own web dashboard, if it has one; the tara-agent dashboard links to it. */
+  /**
+   * The project's own web dashboard, if it has one. Without `tabs` the sidebar links to it. With `tabs`
+   * it is the app's origin as tara-agent reaches it (e.g. http://127.0.0.1:4001), and its pages show
+   * inside tara-agent's dashboard (see docs/dashboard-look.md).
+   */
   dashboardUrl: z.string().url().optional(),
+  /**
+   * Pages of the project's app (`dashboardUrl`) listed in tara-agent's sidebar, in order. Each opens at
+   * `/p/<name><path>`, with the app proxied from `/app/<name>/`. The first is the project's landing page.
+   */
+  tabs: z
+    .array(
+      z.object({
+        path: z.string().regex(/^\/[^\s]*$/, 'an app path starting with /'),
+        label: z.string().min(1).max(30),
+        icon: z.string().max(8).optional(),
+      }),
+    )
+    .optional(),
   /** Approval items (the Approvals page). */
   approvals: z
     .object({
@@ -420,6 +464,11 @@ export const queueSchema = z
     slots: z.string().optional(),
     /** With slots: take turns between these kinds (oldest approval first within a kind). */
     alternate: z.array(z.string()).optional(),
+    /**
+     * Instead of slots or windows: run only in the slots of this other queue that it leaves empty
+     * (nothing of its own due), e.g. extra posts that go out only when no main post is waiting.
+     */
+    fills: z.string().regex(jobIdPattern).optional(),
     caps: z
       .object({
         perDay: z.number().int().positive().optional(),
@@ -439,9 +488,22 @@ export const queueSchema = z
     /** Timezone for slots, window defaults and the cap day. Defaults to the jobs file `tz`, then the host. */
     tz: z.string().optional(),
   })
-  .refine((q) => !(q.windows && q.slots), { message: 'use windows or slots, not both' });
+  .refine((q) => !(q.windows && q.slots), { message: 'use windows or slots, not both' })
+  .refine((q) => !(q.fills && (q.windows || q.slots)), {
+    message: 'a queue that fills another has no windows or slots',
+  });
 
-export const queuesFileSchema = z.object({ queues: z.record(z.string().regex(jobIdPattern), queueSchema) });
+export const queuesFileSchema = z
+  .object({ queues: z.record(z.string().regex(jobIdPattern), queueSchema) })
+  .superRefine(({ queues }, ctx) => {
+    for (const [name, q] of Object.entries(queues))
+      if (q.fills && !queues[q.fills]?.slots)
+        ctx.addIssue({
+          code: 'custom',
+          path: ['queues', name, 'fills'],
+          message: `"${q.fills}" is not a queue with slots`,
+        });
+  });
 
 export type QueueWindow = z.infer<typeof queueWindowSchema>;
 export type QueueConfig = z.infer<typeof queueSchema>;

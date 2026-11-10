@@ -33,6 +33,8 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `catchUpHours` | `6` | After downtime, run a job's latest missed slot if it is at most this old (`0` = never) |
 | `timezone` | host's | Default timezone for job schedules and times shown in Slack |
 | `healthDigest` | on, `0 9 * * *` | Daily summary per project channel (`enabled`, `cron`): runs, problems, missed slots, peak usage. Silent when there is nothing to report |
+| `autoApprove` | none | Draft cards a project's own server may approve without a person: a list of `{project, kind, url}`. A card of that kind proposed over `POST /items` with `autoApprove: true` is approved as `auto` (sealed, then queued as usual) when `url` answers `{approve: true, reason}` to `POST {kind, key, fields}`. Only a key's first card and only one with no checks; anything else waits for a person. Host config only, so a run can't turn it on ([auto-approved cards](security.md#auto-approved-cards)) |
+| `github` | none | Projects whose runs may open pull requests: a list of `{project, repo, base}` (`repo` is `owner/name`, `base` defaults to `main`). Token: `TARA_GITHUB_TOKEN` in tara-agent's env, never given to a run. Runs get `start_pull_request` (a fresh copy of `base`, or of the PR's branch, in a temp folder) and `open_pull_request` (commit, push to `<agentName>/<name>`, open or update the PR). No merges, no force pushes, no `.github/`, env or key files ([pull requests](security.md#pull-requests)). They also get `read_ci_job` (read-only: a job's failed steps and log excerpt; the token needs **Actions** read) ([CI jobs](security.md#ci-jobs)) |
 | `privileged.command` | off | Root actions a run may ask for through the root-owned helper `deploy/tara-priv.mjs`, usually `["sudo", "-n", "/usr/local/sbin/tara-priv"]` ([privileged actions](security.md#privileged-actions)) |
 | `http` | `127.0.0.1:4100` | Local API and dashboard (`enabled`, `bind`, `port`, `allowFrom`). Set `TARA_HTTP_TOKEN` to require a bearer token (open a page once with `?token=…` to sign a browser in). The MCP tools need it enabled |
 | `http.allowFrom` | `127.0.0.0/8`, `::1/128` | CIDR ranges allowed to connect. Transcripts hold everything Claude saw, so keep this to a trusted network, e.g. add `100.64.0.0/10` and `fd7a:115c:a1e0::/48` for Tailscale |
@@ -56,7 +58,8 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `systemPromptFile` | none | Extra instructions added to every session |
 | `owner` | none | Slack user ID that receives live progress of jobs started from the API or dashboard |
 | `billing` | `subscription` | `api` runs the CLI with `ANTHROPIC_API_KEY` |
-| `dashboardUrl` | none | The project's own web dashboard, linked from the sidebar |
+| `dashboardUrl` | none | The project's own web dashboard. Without `tabs`: linked from the sidebar. With `tabs`: the app's origin as tara-agent reaches it (`http://127.0.0.1:4001`) |
+| `tabs` | none | `[{path, label, icon?}]`: pages of that app shown in tara-agent's sidebar at `/p/<name><path>`, proxied from `/app/<name>/` (see [dashboard-look.md](dashboard-look.md#project-tabs)) |
 | `scratchDir` | `<stateDir>/scratch/<name>` | Parent of per-session scratch folders, relative to the repo. Keep it out of git |
 | `jobDataDir` | `<stateDir>/job-data/<name>` | Parent of per-job data folders, relative to the repo |
 | `selfImprove` | `true` | After a run with trouble, let Claude fix the skill it followed (see [Self-improvement](#self-improvement)) |
@@ -203,6 +206,8 @@ Every run gets tara-agent's own MCP server alongside the repo's `.mcp.json` serv
 | `propose_item`, `list_items`, `finish_item` | Drafts that go out later (a message, email, post): each becomes a card on the Approvals page and, once approved, runs through a [queue](#queues) |
 | `withdraw_card` | Closes a waiting card raised in the same thread (the person did it themselves, or it no longer applies). It ends as cancelled with the reason; cards of other threads are refused |
 | `run_job` | Starts one of the project's jobs |
+| `start_pull_request`, `open_pull_request` | Only for host `github` projects: a workspace copy of the base branch (or of the PR's branch), then a commit pushed to `<agentName>/<name>` and the PR opened or updated. See [pull requests](security.md#pull-requests) |
+| `read_ci_job` | Only for host `github` projects, read-only: a GitHub Actions job (URL or id) of the project's repo: workflow, branch, commit, conclusion, failed steps, the lines around the first `##[error]` and the last 300 log lines. Other repos are refused. See [CI jobs](security.md#ci-jobs) |
 
 The tools reach tara-agent through the local API with a per-run token, so `http.enabled` must stay on.
 
@@ -223,6 +228,7 @@ Approved drafts are sent through queues declared in `<repo>/.tara/queues.json`:
 
 - One batch at a time per queue, oldest approval first. With `"reorder": true`, a person sets the order on the **Queue** page instead (drag a row, or **Top**, **↑**, **↓**, **Bottom** per item). Items approved after a move go to the end. In a queue with `alternate`, an item moves among items of its own kind, because kinds take turns.
 - `windows`: items run only while their window is open. `slots`: one batch per cron slot instead, rotating through the `alternate` kinds.
+- `fills`: instead of windows or slots, the queue runs only in the slots of the named queue that it leaves empty (nothing of its own due), e.g. `"channel": { "executor": { "job": "publisher" }, "fills": "content" }` posts only on `content` slots with no approved item waiting. The filled queue must have `slots`.
 - `caps` (per day, per rolling week) and `gapMinutes` limit how fast items go out.
 - "Approve & run now" skips windows and slots.
 
@@ -296,7 +302,7 @@ For scripts and dashboards on the same host (`127.0.0.1:4100` by default).
 | `GET /items?project=&status=&kind=` | Approval items |
 | `GET /items/<id>` | One item, with its seal |
 | `POST /items` `{project, kind, key?, title, body?, fields?, media?, checks?, queue, window?, runAfter?}` | Propose a draft |
-| `POST /items/ask` `{project, title, details?, options?, kind?, key?}` | Ask a person something outside any run; the answer goes to Claude in a thread |
+| `POST /items/ask` `{project, title, details?, options?, kind?, key?}` | Ask a person something outside any run; the answer goes to Claude in a thread. With `kind: "notice"` the first option only acknowledges it (no run) |
 | `POST /items/<id>/withdraw` `{reason?}` | Take back a waiting card |
 | `POST /items/<id>/report` `{status, result?}` | Report an `external` queue item: done, failed or waiting |
 | `GET /queues?project=<p>&upcoming=<n>` | A project's queues with their next slots |

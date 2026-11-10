@@ -8,7 +8,8 @@ import { addDays, dayKey, dayMatches, midnight, minutesOf, zonedClock } from '..
 /**
  * Runs approved items (approvals/approvals.ts) through each project's queues (`.tara/queues.json`),
  * one batch at a time per queue: inside the item's window (or at the queue's cron slots, taking turns
- * between kinds), within the daily and weekly caps, with a gap between runs. A job executor gets the
+ * between kinds, and handing a slot with nothing due to a queue that `fills` it), within the daily and
+ * weekly caps, with a gap between runs. A job executor gets the
  * items in its prompt; a URL executor gets one POST per item with its seal and answers done, failed,
  * or later (it can't take the item yet: back in the queue until `retryAt`). Items an executor never
  * reports end as failed and are never run again, so nothing goes out twice.
@@ -66,7 +67,10 @@ export function nextWindowStart(window: QueueWindow, defaultTz: string, now: num
   return undefined;
 }
 
-/** When an approved item can next run, for the page ("goes out Tue 14:40"). */
+/**
+ * When an approved item can next run, for the page ("goes out Tue 14:40"). For a queue that fills
+ * another, pass the filled queue: its next slot, at the earliest.
+ */
 export function nextRun(
   item: Pick<Item, 'runAfter' | 'runNow' | 'window'>,
   queue: QueueConfig | undefined,
@@ -140,14 +144,18 @@ export class QueueWorker {
     while (this.inflight.size) await Promise.allSettled([...this.inflight]);
   }
 
-  private consider(project: Project, name: string, queue: QueueConfig, now: number): void {
+  /**
+   * Starts what is due in one queue; true when it started a batch. `gap`: a slot of the queue this
+   * one fills is empty, so its items run now (otherwise only "run now" items do).
+   */
+  private consider(project: Project, name: string, queue: QueueConfig, now: number, gap = false): boolean {
     const p = project.config.name;
     const key = `${p}:${name}`;
-    if (this.running.has(key)) return;
+    if (this.running.has(key)) return false;
     // The project's server runs these itself and reports them (Approvals.report).
-    if ('external' in queue.executor) return;
+    if ('external' in queue.executor) return false;
     // A paused executor (Pause, or a project's emergency stop) holds its queue.
-    if ('job' in queue.executor && !this.deps.jobs.enabled(p, queue.executor.job)) return;
+    if ('job' in queue.executor && !this.deps.jobs.enabled(p, queue.executor.job)) return false;
     const { store } = this.deps;
     const tz = queue.tz ?? this.deps.timeZone;
 
@@ -166,10 +174,18 @@ export class QueueWorker {
       }
     }
 
+    // A slot with nothing of this queue's own due goes to the first queue that fills it.
+    const fill = () => {
+      if (!slotFired) return false;
+      for (const [other, q] of Object.entries(this.queues(project)))
+        if (q.fills === name && this.consider(project, other, q, now, true)) return true;
+      return false;
+    };
+
     const approved = store.items({ project: p, queue: name, statuses: ['approved'] });
-    if (!approved.length) return;
+    if (!approved.length) return fill();
     const last = store.lastQueueStart(p, name);
-    if (queue.gapMinutes && last?.startedAt && now - last.startedAt < queue.gapMinutes * 60_000) return;
+    if (queue.gapMinutes && last?.startedAt && now - last.startedAt < queue.gapMinutes * 60_000) return false;
 
     let room = queue.batch;
     if (queue.caps.perDay) {
@@ -178,10 +194,12 @@ export class QueueWorker {
     }
     if (queue.caps.perWeek)
       room = Math.min(room, queue.caps.perWeek - store.queueStarts(p, name, now - 7 * DAY_MS).length);
-    if (room <= 0) return;
+    if (room <= 0) return false;
 
     let due = approved.filter((i) => (i.runAfter ?? 0) <= now);
-    if (queue.slots) {
+    if (queue.fills) {
+      due = gap ? due : due.filter((i) => i.runNow);
+    } else if (queue.slots) {
       due = slotFired ? due : due.filter((i) => i.runNow);
       if (slotFired && queue.alternate?.length) {
         const order = queue.alternate;
@@ -201,7 +219,7 @@ export class QueueWorker {
       );
     }
     const batch = store.startItems(due.slice(0, room).map((i) => i.id));
-    if (!batch.length) return;
+    if (!batch.length) return fill();
 
     this.running.add(key);
     const task = this.execute(project, name, queue, batch)
@@ -211,6 +229,7 @@ export class QueueWorker {
         this.inflight.delete(task);
       });
     this.inflight.add(task);
+    return true;
   }
 
   private finished(item: Item | undefined): void {

@@ -18,9 +18,10 @@ import { type Bridge, BridgeError } from '../bridge/bridge.js';
 import { CodeError, type CodeRepo, MIN_QUERY, type RepoReader } from '../code/repo.js';
 import { loadQueues } from '../config/load.js';
 import type { Project, QueueConfig } from '../config/schema.js';
+import type { Activity } from '../live/activity.js';
 import type { Attention } from '../live/attention.js';
 import type { Scheduler } from '../scheduler/scheduler.js';
-import type { IncomingMessage as ChatMessage, Logger } from '../sessions/manager.js';
+import { type IncomingMessage as ChatMessage, type Logger, threadKey } from '../sessions/manager.js';
 import { ITEM_STATUSES, type ItemStatus, type Store } from '../store/store.js';
 import { addDays, dayKey, midnight } from '../util/time.js';
 import { allowList } from './access.js';
@@ -37,6 +38,7 @@ import { commandPage } from './command-page.js';
 import {
   type DashboardContext,
   errorPage,
+  type HomeUsage,
   homePage,
   type JobView,
   jobState,
@@ -44,6 +46,8 @@ import {
   runPage,
   sessionPage,
   sessionsPage,
+  tabbed,
+  tabPage,
 } from './dashboard.js';
 import { queuePage } from './queue.js';
 import { isDayKey, MAX_RUNS_PER_DAY, type PlanJob, planDay, schedulePage } from './schedule.js';
@@ -94,6 +98,8 @@ export interface HttpOptions {
   };
   /** What needs the owner (`GET /attention`). */
   attention?: () => Promise<Attention>;
+  /** Live Claude runs: links to a running job's transcript, and the usage figure on the home page. */
+  activity?: Pick<Activity, 'tasks' | 'usage'>;
   /**
    * A second, HTTPS listener on the same address (browsers only allow the microphone over HTTPS).
    * The certificate is re-read when its file changes.
@@ -131,6 +137,9 @@ const originHost = (origin: string) => {
 };
 /** Runs per job shown on the dashboard (recent-runs strip and history). */
 const RECENT_RUNS = 10;
+const DAY_MS = 86_400_000;
+/** Jobs that start this often or more are left out of the home page's "Coming up" list. */
+const FREQUENT_MS = 30 * 60_000;
 /** Most start times `GET /jobs?upcoming=` returns per job. */
 const MAX_UPCOMING = 60;
 
@@ -188,7 +197,7 @@ async function readJson(req: IncomingMessage, limit = 10_000): Promise<Record<st
  */
 /** Paths tara-agent serves itself; with a fallback, everything else is passed through. */
 const OWN_PATH =
-  /^\/(?:$|(?:health|reload|attention|command|live|jobs|runs|sessions|schedule|approvals|queue|items|unlock|code|internal)(?:\/|$))/;
+  /^\/(?:$|(?:health|reload|attention|command|live|jobs|runs|sessions|schedule|approvals|queue|items|unlock|code|internal|p|app)(?:\/|$))/;
 const TOKEN_COOKIE = 'tara_token';
 const ADMIN_COOKIE = 'tara_admin';
 /** Finished items shown on the Done tab. */
@@ -272,6 +281,22 @@ export function itemInput(body: Record<string, unknown>): ProposeInput {
 export async function startHttpServer(options: HttpOptions): Promise<Server> {
   const now = options.now ?? Date.now;
   const started = now();
+  /**
+   * How much of Claude's usage window is used: what the CLI reported last in this process, else the
+   * latest run's figure from the last 5 hours (one window), so a restart doesn't blank it.
+   */
+  const usageNow = (at: number): HomeUsage | undefined => {
+    const live = options.activity?.usage();
+    if (live?.utilization !== undefined) {
+      const resetsAt = live.resetsAt ? live.resetsAt * (live.resetsAt < 1e12 ? 1000 : 1) : undefined;
+      if (!resetsAt || resetsAt > at) return { share: live.utilization, window: live.window, resetsAt };
+    }
+    const last = options.store
+      .runsSince(at - 5 * 3_600_000)
+      .filter((r) => r.rateLimitUtilization !== undefined)
+      .at(-1);
+    return last ? { share: last.rateLimitUtilization as number, asOf: last.endedAt } : undefined;
+  };
   const timeZone = options.dashboard?.timeZone ?? 'UTC';
   const knownProject = (name: string | null) => {
     if (!name || !options.projects.includes(name))
@@ -473,6 +498,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
           executor: 'job' in q.executor ? 'job' : 'url' in q.executor ? 'url' : 'external',
           slots: q.slots,
           alternate: q.alternate,
+          fills: q.fills,
           windows: q.windows,
           nextSlots: q.slots
             ? new Cron(q.slots, { timezone: q.tz ?? timeZone, paused: true })
@@ -504,10 +530,12 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       }
       if (method === 'POST' && parts.length === 1) {
         // A project server proposing a draft (e.g. the next follow-up). Proposing is harmless: it still
-        // needs a person to approve it.
+        // needs a person to approve it, unless the host's `autoApprove` lets the project's own server
+        // say no person is needed (approvals.ts askAutoApprove).
         const body = await readJson(req, ITEM_BODY_LIMIT);
         const project = approvals.project(knownProject(str(body.project) ?? null));
-        return { item: await approvals.propose(project, itemInput(body), { source: str(body.source) }) };
+        const input = { ...itemInput(body), autoApprove: body.autoApprove === true };
+        return { item: await approvals.propose(project, input, { source: str(body.source) }) };
       }
       if (method === 'POST' && parts.length === 2 && parts[1] === 'ask') {
         // A project server asking a person outside any run (a login expired, a send bounced). It only
@@ -758,7 +786,8 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     }
     if (req.method === 'POST' && parts[1] === 'item' && parts.length === 2) {
       const body = await readJson(req, ITEM_BODY_LIMIT);
-      return bridge.proposeItem(token, itemInput(body));
+      // A run may ask too; the host `autoApprove` rule and the project's server still decide.
+      return bridge.proposeItem(token, { ...itemInput(body), autoApprove: body.autoApprove === true });
     }
     if (req.method === 'GET' && parts[1] === 'items' && parts.length === 2) {
       return {
@@ -776,6 +805,22 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         id: required(body.id, 'id'),
         status,
         result: typeof body.result === 'string' ? body.result : undefined,
+      });
+    }
+    if (req.method === 'POST' && parts[1] === 'pr-start' && parts.length === 2) {
+      const body = await readJson(req);
+      return bridge.startPullRequest(token, { branch: required(body.branch, 'branch') });
+    }
+    if (req.method === 'POST' && parts[1] === 'ci-job' && parts.length === 2) {
+      const body = await readJson(req);
+      return bridge.readCiJob(token, { job: required(body.job, 'job') });
+    }
+    if (req.method === 'POST' && parts[1] === 'pr-open' && parts.length === 2) {
+      const body = await readJson(req, 70_000);
+      return bridge.openPullRequest(token, {
+        branch: required(body.branch, 'branch'),
+        title: required(body.title, 'title'),
+        body: typeof body.body === 'string' ? body.body.slice(0, 60_000) : undefined,
       });
     }
     if (req.method === 'POST' && parts[1] === 'withdraw' && parts.length === 2) {
@@ -852,13 +897,38 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       );
     if (parts.length === 0) {
       const at = now();
+      const runs = options.store.recentJobRuns(400);
+      // Jobs every half hour or more often: one line under "Coming up" instead of filling it.
+      const every = new Map<string, number>();
+      for (const p of names)
+        for (const { id, starts } of options.scheduler.plannedRuns(p, at, at + DAY_MS, 2)) {
+          const gap = (starts[1] ?? Infinity) - (starts[0] ?? 0);
+          if (gap <= FREQUENT_MS) every.set(`${p}:${id}`, gap);
+        }
+      const tasks = options.activity?.tasks() ?? [];
+      // A running job's transcript, from the session its thread holds right now.
+      const liveSession = (project: string, jobId: string) => {
+        const task = tasks.find(
+          (t) => t.status === 'running' && t.kind === 'job' && t.project === project && t.jobId === jobId,
+        );
+        return task?.thread
+          ? options.store.getSession(threadKey(task.thread.channel, task.thread.ts))?.sessionId
+          : undefined;
+      };
       return homePage(ctx, {
-        jobs: jobViews(),
-        // Each job's latest run only, so a job that ran three times doesn't fill the list.
-        latest: options.store
-          .recentJobRuns(60)
+        jobs: jobViews().map((j) => ({
+          ...j,
+          everyMs: every.get(`${j.project}:${j.id}`),
+          liveSessionId: j.running ? liveSession(j.project, j.id) : undefined,
+        })),
+        // Each job's latest run that did something, so a job that ran three times doesn't fill the list.
+        latest: runs
+          .filter((r) => r.status !== 'silent')
           .filter((r, i, all) => all.findIndex((x) => x.project === r.project && x.jobId === r.jobId) === i)
           .slice(0, 8),
+        quietRuns: runs.filter((r) => r.status === 'silent' && r.startedAt >= at - DAY_MS).length,
+        pending: options.approvals ? options.store.items({ statuses: ['pending'], limit: 500 }) : [],
+        usage: usageNow(at),
         uptimeSeconds: Math.floor((at - started) / 1000),
         now: at,
       });
@@ -921,12 +991,25 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     if (parts[0] === 'sessions' && parts.length === 2) {
       const id = parts[1] as string;
       const session = options.store.sessionsOverview({ sessionId: id, limit: 1 })[0];
-      const dir = ctx.projects.find((p) => p.config.name === session?.project)?.dir;
+      // Its latest run, even when the session's thread was cleared (a silent job run).
+      const run = options.store.latestSessionRun(id) ?? session?.lastRun;
+      const project = session?.project ?? run?.project;
+      const dir = ctx.projects.find((p) => p.config.name === project)?.dir;
       // Sessions whose thread was cleared are still on disk: look in every project.
       const entries = transcript(id, dir);
-      const last = session?.lastRun;
-      const jobName = last?.jobId ? jobNames().get(`${last.project}:${last.jobId}`) : undefined;
-      return sessionPage(ctx, session, id, entries, jobName);
+      const jobName = run?.jobId ? jobNames().get(`${run.project}:${run.jobId}`) : undefined;
+      const running = Boolean(
+        session &&
+          options.activity
+            ?.tasks()
+            .some(
+              (t) =>
+                t.status === 'running' &&
+                t.thread &&
+                threadKey(t.thread.channel, t.thread.ts) === session.threadKey,
+            ),
+      );
+      return sessionPage(ctx, session, id, entries, { jobName, run, running });
     }
     if (parts[0] === 'jobs' && parts.length === 1) return jobsPage(ctx, jobViews(), now());
     if (parts[0] === 'runs' && parts.length === 2) {
@@ -986,9 +1069,13 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
   };
 
   const fallback = options.fallback ? new URL(options.fallback) : undefined;
-  /** Streams a request to the fallback service and its answer back. */
-  const passThrough = (req: IncomingMessage, res: ServerResponse) => {
-    const target = new URL(req.url ?? '/', fallback);
+  /** Streams a request to another service (the fallback, or a project's app) and its answer back. */
+  const passThrough = (
+    req: IncomingMessage,
+    res: ServerResponse,
+    target = new URL(req.url ?? '/', fallback),
+    extraHeaders: Record<string, string> = {},
+  ) => {
     const upstream = httpRequest(
       target,
       {
@@ -998,6 +1085,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
           host: target.host,
           'x-forwarded-for': req.socket.remoteAddress ?? '',
           'x-forwarded-host': req.headers.host ?? '',
+          ...extraHeaders,
         },
       },
       (answer) => {
@@ -1006,9 +1094,9 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       },
     );
     upstream.on('error', (err) => {
-      options.log.warn(`fallback ${req.method} ${req.url}: ${err.message}`);
+      options.log.warn(`proxy ${req.method} ${req.url} → ${target.origin}: ${err.message}`);
       if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
-      res.end(`Fallback service unreachable: ${err.message}`);
+      res.end(`${target.origin} is unreachable: ${err.message}`);
     });
     req.pipe(upstream);
   };
@@ -1046,6 +1134,38 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       });
       res.end();
       return;
+    }
+    // A project's app, shown in a tab: `/app/<name>/<rest>` is proxied to `<dashboardUrl>/<rest>`, and
+    // `/p/<name>/<rest>` is the dashboard page that frames it.
+    const tab = /^\/(app|p)\/([a-z0-9][a-z0-9-]*)(\/.*)?$/.exec(url.pathname);
+    const tabProject = tab && tabbed(options.dashboard?.projects ?? []).find((p) => p.config.name === tab[2]);
+    if (tab && tabProject) {
+      const name = tabProject.config.name;
+      const rest = tab[3] ?? '';
+      if (!authorized(req)) {
+        res.writeHead(401, { 'content-type': 'text/plain' });
+        res.end('Open the dashboard once with ?token=<TARA_HTTP_TOKEN> added to the address.');
+        return;
+      }
+      if (tab[1] === 'app') {
+        const target = new URL((rest || '/') + url.search, tabProject.config.dashboardUrl);
+        // The app gets its own cookies, never tara-agent's keys.
+        const cookies = (req.headers.cookie ?? '')
+          .split(/;\s*/)
+          .filter((c) => c && !c.startsWith(`${TOKEN_COOKIE}=`) && !c.startsWith(`${ADMIN_COOKIE}=`))
+          .join('; ');
+        passThrough(req, res, target, { 'x-tara-prefix': `/app/${name}`, cookie: cookies });
+        return;
+      }
+      if (!rest || rest === '/') {
+        const first = tabProject.config.tabs?.[0]?.path ?? '/';
+        res.writeHead(302, { location: `/p/${name}${first}` });
+        res.end();
+        return;
+      }
+      const ctxTab = pageContext();
+      if (req.method === 'GET' && ctxTab)
+        return sendHtml(res, 200, tabPage(ctxTab, tabProject, rest + url.search));
     }
     if (req.method === 'POST' && url.pathname === '/unlock' && options.dashboard && authorized(req)) {
       const ctxUnlock = pageContext() as DashboardContext;

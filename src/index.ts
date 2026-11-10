@@ -9,6 +9,8 @@ import { Approvals } from './approvals/approvals.js';
 import { Bridge } from './bridge/bridge.js';
 import { codeReaders } from './code/repo.js';
 import { DEFAULT_HOST_CONFIG, expandHome, loadHostConfig, loadJobs, loadProjects } from './config/load.js';
+import { CiJobs } from './github/actions.js';
+import { PullRequests } from './github/pull-requests.js';
 import { jobState } from './http/dashboard.js';
 import { startHttpServer } from './http/server.js';
 import { convertHermesJobs } from './import-hermes.js';
@@ -165,8 +167,28 @@ async function serve(configFlag: string | undefined) {
     timeZone: host.timezone,
     sealKey: process.env.APPROVAL_SEAL_KEY || undefined,
     privileged,
+    autoApprove: host.autoApprove,
   });
   if (!process.env.APPROVAL_SEAL_KEY) log.warn('APPROVAL_SEAL_KEY is not set: approved items are not sealed');
+  // Pull requests: the token stays here, runs only get the tools.
+  const githubToken = process.env.TARA_GITHUB_TOKEN || undefined;
+  if (host.github.length && !githubToken)
+    log.warn('github is set but TARA_GITHUB_TOKEN is not: pull requests are off');
+  const prRaiser =
+    host.github.length && githubToken
+      ? new PullRequests({
+          repos: host.github,
+          token: githubToken,
+          agentName: host.agentName,
+          stateDir: host.stateDir as string,
+          log,
+          runAs,
+          shareGid: runAs?.gid,
+        })
+      : undefined;
+  const ciJobs =
+    prRaiser && githubToken ? new CiJobs({ repos: host.github, token: githubToken, log }) : undefined;
+  if (prRaiser) log.info(`Pull requests: ${host.github.map((g) => `${g.project} → ${g.repo}`).join(', ')}`);
   // tara's MCP tools reach tara-agent through the local API, so they need it.
   if (host.http.enabled) {
     bridge = new Bridge({
@@ -175,6 +197,8 @@ async function serve(configFlag: string | undefined) {
       store,
       approvals,
       privileged,
+      pullRequests: prRaiser,
+      ciJobs,
       log,
       projects,
       timeZone: host.timezone,
@@ -319,7 +343,7 @@ async function serve(configFlag: string | undefined) {
                 changes: status.changes.length,
                 error: status.error,
               },
-              dashboardUrl: config.dashboardUrl,
+              dashboardUrl: config.tabs?.length ? `/p/${config.name}` : config.dashboardUrl,
             };
           }),
         );
@@ -380,6 +404,7 @@ async function serve(configFlag: string | undefined) {
         readAs: runAs?.user,
         continueThread: (msg) => (manager as SessionManager).handle(msg),
         attention,
+        activity,
         live: host.live && liveEndpoint(host.live),
         code: readers.length
           ? {

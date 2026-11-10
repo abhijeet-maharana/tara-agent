@@ -9,6 +9,8 @@
  *   permission        Allow/Deny buttons for tool calls (only when the run asks for prompts)
  *   propose_item, list_items, finish_item   approval cards for drafts that run later through a queue
  *   withdraw_card     close a waiting card of this thread (the person did it themselves)
+ *   start_pull_request, open_pull_request   a GitHub PR from a workspace (host `github` projects only)
+ *   read_ci_job       a GitHub Actions job: failed steps and log excerpt (read-only; host `github` projects only)
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -17,16 +19,19 @@ import { z } from 'zod';
 const API = process.env.TARA_API ?? 'http://127.0.0.1:4100';
 const TOKEN = process.env.TARA_RUN_TOKEN ?? '';
 const PERMISSION_PROMPTS = process.env.TARA_PERMISSION_PROMPTS === '1';
+const GITHUB_TOOLS = process.env.TARA_GITHUB_TOOLS === '1';
+/** Fetching or pushing a big repo can take minutes. */
+const GITHUB_TIMEOUT_MS = 10 * 60_000;
 /** Longest a permission prompt can wait in total (tara-agent itself denies after 10 minutes). */
 const PERMISSION_DEADLINE_MS = 11 * 60_000;
 const POLL_SECONDS = 45;
 
-async function api<T>(path: string, body?: unknown): Promise<T> {
+async function api<T>(path: string, body?: unknown, timeoutMs = (POLL_SECONDS + 15) * 1000): Promise<T> {
   const res = await fetch(`${API}${path}`, {
     method: body === undefined ? 'GET' : 'POST',
     headers: { 'content-type': 'application/json', 'x-tara-run': TOKEN },
     body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout((POLL_SECONDS + 15) * 1000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   const json = (await res.json().catch(() => ({}))) as T & { error?: string };
   if (!res.ok) throw new Error(json.error || `tara-agent answered ${res.status}`);
@@ -195,16 +200,27 @@ server.registerTool(
       queue: z.string().min(1).describe('Queue that runs it once approved'),
       window: z.string().optional().describe("Window key in the queue's config, e.g. a region like EU"),
       runAfter: z.string().optional().describe('ISO time it must not run before'),
+      autoApprove: z
+        .boolean()
+        .optional()
+        .describe(
+          "Ask for it to be approved without a person. Only works where the host's autoApprove rule covers this kind " +
+            "and the project's server says yes; otherwise it waits like any card.",
+        ),
     },
   },
   async ({ runAfter, ...args }) => {
     try {
       const at = runAfter ? Date.parse(runAfter) : undefined;
       if (at !== undefined && Number.isNaN(at)) return text('runAfter is not an ISO time', true);
-      const { id, checks } = await api<{ id: string; checks: Array<{ text: string; blocking: boolean }> }>(
-        '/internal/item',
-        { ...args, runAfter: at },
-      );
+      const { id, status, reply, checks } = await api<{
+        id: string;
+        status?: string;
+        reply?: string;
+        checks: Array<{ text: string; blocking: boolean }>;
+      }>('/internal/item', { ...args, runAfter: at });
+      if (status === 'approved')
+        return text(`Card ${id} was approved without a person (${reply ?? 'auto'}); its queue runs it.`);
       const blocking = checks.filter((c) => c.blocking);
       return text(
         `Card ${id} is waiting for approval.${
@@ -329,6 +345,142 @@ if (process.env.TARA_JOB_TOOLS === '1') {
         return text(`Could not start "${what}": ${result}`, true);
       } catch (err) {
         return text(`Could not start the job: ${(err as Error).message}`, true);
+      }
+    },
+  );
+}
+
+if (GITHUB_TOOLS) {
+  const branch = z
+    .string()
+    .min(2)
+    .max(80)
+    .describe('Short name for the change, e.g. "fix-otp-retry"; the branch is <agent name>/<this>');
+  server.registerTool(
+    'start_pull_request',
+    {
+      title: 'Start a pull request',
+      description:
+        'When someone asks for a pull request (PR), call this first. It returns a workspace folder: a fresh copy ' +
+        "of the base branch from GitHub, or of the branch's open PR to add to it. Make the change THERE, not in " +
+        'the project folder (that one has uncommitted local work and is not what GitHub has). The workspace has ' +
+        'no node_modules. Then call open_pull_request with the same branch. You cannot push, merge or change ' +
+        '.github/, env or key files.',
+      inputSchema: { branch },
+    },
+    async (args) => {
+      try {
+        const r = await api<{ dir: string; branch: string; base: string; existing: boolean; commit: string }>(
+          '/internal/pr-start',
+          args,
+          GITHUB_TIMEOUT_MS,
+        );
+        return text(
+          `Workspace for ${r.branch}: ${r.dir}\n` +
+            (r.existing
+              ? `A copy of the existing branch ${r.branch} (${r.commit}); open_pull_request adds a commit to its PR.`
+              : `A copy of ${r.base} (${r.commit}).`) +
+            ' Edit files there, then call open_pull_request.',
+        );
+      } catch (err) {
+        return text(`Could not start the pull request: ${(err as Error).message}`, true);
+      }
+    },
+  );
+  server.registerTool(
+    'open_pull_request',
+    {
+      title: 'Open the pull request',
+      description:
+        'Commits everything changed in the workspace from start_pull_request, pushes it and opens the PR (or adds ' +
+        'the commit to its open PR). Reply with the PR link. Nobody merges it but a person.',
+      inputSchema: {
+        branch,
+        title: z
+          .string()
+          .min(3)
+          .max(200)
+          .describe('PR title and commit message, e.g. "fix: retry OTP send once"'),
+        body: z
+          .string()
+          .max(60_000)
+          .optional()
+          .describe('PR description (markdown): what changed, why, and how it was checked'),
+      },
+    },
+    async (args) => {
+      try {
+        const r = await api<{ url: string; branch: string; files: string[]; updated: boolean }>(
+          '/internal/pr-open',
+          args,
+          GITHUB_TIMEOUT_MS,
+        );
+        return text(
+          `${r.updated ? 'Added a commit to' : 'Opened'} ${r.url} (${r.branch}, ${r.files.length} files: ` +
+            `${r.files.slice(0, 20).join(', ')}${r.files.length > 20 ? ', …' : ''}). The workspace was deleted.`,
+        );
+      } catch (err) {
+        return text(`Could not open the pull request: ${(err as Error).message}`, true);
+      }
+    },
+  );
+  server.registerTool(
+    'read_ci_job',
+    {
+      title: 'Read a CI job',
+      description:
+        "Reads a GitHub Actions job of this project's repo (read-only): its workflow, branch, commit, conclusion, " +
+        'the steps that failed, the lines around the first ##[error] and the last ~300 log lines. Use it when ' +
+        'someone shares a failed CI job. It cannot rerun or cancel anything, and refuses other repos.',
+      inputSchema: {
+        job: z
+          .string()
+          .min(1)
+          .max(500)
+          .describe(
+            'The job URL (https://github.com/<owner>/<repo>/actions/runs/<run>/job/<job>) or the job id',
+          ),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async (args) => {
+      try {
+        const r = await api<{
+          id: string;
+          name: string;
+          workflow: string;
+          branch: string;
+          sha: string;
+          status: string;
+          conclusion: string | null;
+          url: string;
+          failedSteps: Array<{ number: number; name: string; conclusion: string }>;
+          firstError?: { line: number; lines: string[] };
+          tail: string[];
+          logLines: number;
+          logMissing?: string;
+        }>('/internal/ci-job', args, 3 * 60_000);
+        const out = [
+          `Job ${r.id}: ${r.name}${r.workflow ? ` (workflow "${r.workflow}")` : ''}`,
+          `Branch ${r.branch || '?'} at ${r.sha.slice(0, 12)}; ${r.status}${r.conclusion ? `, ${r.conclusion}` : ''}`,
+          r.url,
+          r.failedSteps.length
+            ? `Failed steps: ${r.failedSteps.map((s) => `#${s.number} ${s.name} (${s.conclusion})`).join('; ')}`
+            : 'No failed steps.',
+        ];
+        if (r.logMissing) out.push(`No log: ${r.logMissing}.`);
+        const tailFrom = r.logLines - r.tail.length + 1;
+        if (r.firstError && r.firstError.line < tailFrom)
+          out.push(
+            '',
+            `--- Around the first ##[error] (log line ${r.firstError.line}) ---`,
+            ...r.firstError.lines,
+          );
+        if (r.tail.length)
+          out.push('', `--- Last ${r.tail.length} of ${r.logLines} log lines ---`, ...r.tail);
+        return text(out.join('\n'));
+      } catch (err) {
+        return text(`Could not read the CI job: ${(err as Error).message}`, true);
       }
     },
   );

@@ -2,7 +2,7 @@ import { closeSync, openSync, readSync } from 'node:fs';
 import type { Project } from '../config/schema.js';
 import type { JobInfo } from '../scheduler/scheduler.js';
 import { formatDuration } from '../slack/format.js';
-import type { SessionOverview, StoredRun } from '../store/store.js';
+import type { Item, SessionOverview, StoredRun } from '../store/store.js';
 import { cronText } from './cron-text.js';
 import { SWITCHER_CSS, TOKENS } from './look.js';
 import { firstPrompt, parseTranscript, type TranscriptEntry, transcriptPath } from './transcript.js';
@@ -36,12 +36,32 @@ export interface DashboardContext {
 export interface JobView extends JobInfo {
   project: string;
   recent: StoredRun[];
+  /** Home page: the gap between starts, for jobs that run every half hour or more often. */
+  everyMs?: number;
+  /** Home page: the session a running job is working in, for a link to its live transcript. */
+  liveSessionId?: string;
+}
+
+/** How much of Claude's usage window is used, from the CLI's last report or the latest run. */
+export interface HomeUsage {
+  /** 0–1. */
+  share: number;
+  /** e.g. `five_hour`, when the CLI said. */
+  window?: string;
+  resetsAt?: number;
+  /** Set when the figure is a past run's, not this process's latest report. */
+  asOf?: number;
 }
 
 export interface HomeData {
   jobs: JobView[];
-  /** Latest job runs across projects, newest first. */
+  /** Latest job runs that did something (not "nothing to do"), one per job, newest first. */
   latest: StoredRun[];
+  /** Runs in the last 24 hours that found nothing to do. */
+  quietRuns: number;
+  /** Waiting approval cards. */
+  pending: Item[];
+  usage?: HomeUsage;
   uptimeSeconds: number;
   now: number;
 }
@@ -179,6 +199,23 @@ const runTone = (status: string) => (FAILED.includes(status) ? 'bad' : status ==
 export const runTag = (status?: string) =>
   status ? `<span class="tag ${runTone(status)}">${esc(RUN_LABEL[status] ?? status)}</span>` : '';
 
+/** Where a run opens: its transcript when a model ran (a session), else the run's record. */
+export const runHref = (r: StoredRun) => (r.sessionId ? `/sessions/${esc(r.sessionId)}` : `/runs/${r.id}`);
+
+/** A run's first line, as plain text: the headline of its reply, or of its error when it failed. */
+export function headline(r: StoredRun): string {
+  const text = (FAILED.includes(r.status) && r.error) || r.output || r.error || '';
+  const line = text.split('\n').find((l) => l.trim()) ?? '';
+  return line
+    .replace(/<[^|>]+\|([^>]+)>/g, '$1') // Slack links
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1') // Markdown links
+    .replace(/^\s*(#+|>|[-•*])\s+/, '')
+    .replace(/[*`]/g, '')
+    .replace(/(^|\s)_([^_]+)_(?=\s|$|[.,:;])/g, '$1$2')
+    .trim()
+    .slice(0, 200);
+}
+
 export type JobState = 'running' | 'failing' | 'paused' | 'ok' | 'new';
 export function jobState(j: JobInfo): JobState {
   if (j.running) return 'running';
@@ -272,9 +309,12 @@ nav{display:flex;flex-direction:column;gap:2px;padding:4px 8px}
 .nav-item:hover{background:var(--card-bg)}.nav-item.on{background:var(--accent-dim);color:var(--accent);font-weight:600}
 .nav-item span:nth-child(2){flex:1}.badge{min-width:22px;padding:0 7px;border-radius:999px;background:var(--red);color:#fff;font-size:12px;font-weight:600;text-align:center}
 ${SWITCHER_CSS}
+.nav-group{padding:14px 10px 4px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--text-dim)}
 .side-foot{margin-top:auto;padding:12px 16px 16px;border-top:1px solid var(--border);font-size:12px}
 .side-foot a{color:var(--text-dim);text-decoration:none}.side-foot a:hover{color:var(--accent)}
 .main{flex:1;min-width:0;padding:28px 32px 80px}.main>*{max-width:980px}
+.main.framed{padding:0;display:flex}.main.framed>*{max-width:none}
+.app-frame{flex:1;width:100%;height:100vh;border:0;display:block;background:var(--bg)}
 .page-head{margin-bottom:18px}.page-head h1{margin:0;font-size:24px;color:var(--text-heading);letter-spacing:-.01em;overflow-wrap:anywhere}
 .sub{margin:4px 0 0;color:var(--text-dim);font-size:14px}
 .section{margin:0 0 28px}.sec-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:10px}
@@ -298,6 +338,9 @@ a.row:hover{border-color:var(--border-light);background:var(--card-hover)}.row .
 .timeline .when{color:var(--text-heading);font-variant-numeric:tabular-nums}
 .timeline li.free{color:var(--text-dim);font-size:13px}.timeline li.free .when{color:var(--text-dim)}
 .timeline li.clash .when{color:var(--amber)}
+.timeline .what{min-width:0}.timeline .line{display:block;color:var(--text-dim);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.nowbar a{color:var(--text-heading)}.nowbar a:hover{color:var(--accent)}
+.card:target{outline:2px solid var(--accent);outline-offset:2px}.card[id]{scroll-margin-top:72px}
 .card{background:var(--card-bg);border:1px solid var(--border);border-left:3px solid var(--rc,var(--border-light));border-radius:var(--radius);padding:13px 15px;margin-bottom:10px}
 .card.bad{--rc:var(--red)}.card.warn{--rc:var(--amber)}.card.ok{--rc:var(--green)}.card.accent{--rc:var(--accent)}
 .card-head{display:flex;gap:12px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap}.card-head .grow{flex:1;min-width:0}
@@ -339,7 +382,7 @@ details{margin-top:8px;font-size:13.5px}summary{cursor:pointer;color:var(--text-
 .sidebar{position:sticky;top:0;z-index:20;width:auto;height:auto;border-right:0;border-bottom:1px solid var(--border)}
 .brand{padding:12px 16px}.menu-btn{display:flex}.sidebar nav,.sidebar .switcher,.sidebar .side-foot{display:none}
 .sidebar.open nav,.sidebar.open .switcher{display:flex}.sidebar.open .side-foot{display:block}
-.main{padding:18px 16px 80px}.page-head h1{font-size:21px}.timeline li{grid-template-columns:1fr auto}.timeline .when{grid-column:1/-1}
+.main{padding:18px 16px 80px}.main.framed{padding:0}.app-frame{height:calc(100dvh - var(--bar,53px))}.page-head h1{font-size:21px}.timeline li{grid-template-columns:1fr auto}.timeline .when{grid-column:1/-1}
 .input{min-width:0;width:100%}.row{flex-wrap:wrap}.fields{grid-template-columns:1fr}}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 `;
@@ -447,9 +490,13 @@ export type Page =
   | 'Code'
   | '';
 
-/** The "Dashboards" switcher: this dashboard first, then each project's own dashboard. */
+/** Projects whose app pages show here as tabs (`tabs` plus `dashboardUrl`). */
+export const tabbed = (projects: Project[]) =>
+  projects.filter((p) => p.config.dashboardUrl && p.config.tabs?.length);
+
+/** The "Dashboards" switcher: this dashboard first, then each project dashboard that isn't shown as tabs. */
 function switcher(ctx: DashboardContext): string {
-  const own = ctx.projects.filter((p) => p.config.dashboardUrl);
+  const own = ctx.projects.filter((p) => p.config.dashboardUrl && !p.config.tabs?.length);
   if (!own.length) return '';
   const link = (p: Project) => {
     const url = new URL(p.config.dashboardUrl as string);
@@ -469,7 +516,7 @@ export function layout(
   title: string,
   active: Page,
   body: string,
-  opts: { refresh?: boolean; script?: string } = {},
+  opts: { refresh?: boolean; script?: string; framed?: boolean } = {},
 ): string {
   const waiting = ctx.waiting ?? 0;
   const failing = ctx.failing ?? 0;
@@ -492,6 +539,21 @@ export function layout(
         }</a>`,
     )
     .join('');
+  // Each project's app pages, under the project's title; the tab script marks the current one.
+  const tabs = tabbed(ctx.projects)
+    .map((p) => {
+      const name = p.config.name;
+      const items = (p.config.tabs ?? [])
+        .map(
+          (t) =>
+            `<a href="/p/${esc(name)}${esc(t.path)}" class="nav-item" data-app="${esc(name)}" data-tab="${esc(t.path)}"><span aria-hidden="true">${esc(
+              t.icon ?? '•',
+            )}</span><span>${esc(t.label)}</span></a>`,
+        )
+        .join('');
+      return `<div class="nav-group">${esc(p.config.title ?? name)}</div>${items}`;
+    })
+    .join('');
   const updated = clock(Date.now(), ctx.timeZone);
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -502,8 +564,8 @@ export function layout(
 <button type="button" class="menu-btn" aria-label="Menu" aria-expanded="false">${
     waiting + failing ? `<span class="badge">${waiting + failing}</span>` : ''
   }☰</button></div>
-<nav>${nav}</nav>${switcher(ctx)}<div class="side-foot"><a href="" title="Refresh now">Updated ${esc(updated)} ↻</a></div></aside>
-<main class="main">${body}</main></div>
+<nav>${nav}${tabs}</nav>${switcher(ctx)}<div class="side-foot"><a href="" title="Refresh now">Updated ${esc(updated)} ↻</a></div></aside>
+<main class="main${opts.framed ? ' framed' : ''}">${body}</main></div>
 <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 <script>${SCRIPT}${opts.script ?? ''}</script></body></html>`;
 }
@@ -521,39 +583,83 @@ const stat = (label: string, value: string | number, tone = '', href = '') =>
     ? `<a class="stat ${tone}" href="${href}"><b>${esc(value)}</b><span>${esc(label)}</span></a>`
     : `<div class="stat ${tone}"><b>${esc(value)}</b><span>${esc(label)}</span></div>`;
 
+/** "every 10m", for the frequent jobs line. */
+const every = (ms: number) => `every ${span(Math.round(ms / 60_000))}`;
+const plural = (n: number, kind: string) => `${n} ${kind.replace(/-/g, ' ')}${n === 1 ? '' : 's'}`;
+const USAGE_WINDOW: Record<string, string> = {
+  five_hour: '5h window',
+  seven_day: '7-day window',
+  seven_day_opus: '7-day Opus window',
+};
+
 export function homePage(ctx: DashboardContext, data: HomeData): string {
-  const { jobs, now } = data;
+  const { jobs, now, pending } = data;
   const tz = ctx.timeZone;
   const failing = jobs.filter((j) => jobState(j) === 'failing');
   const paused = jobs.filter((j) => !j.enabled);
   const running = jobs.filter((j) => j.running);
+  const frequent = jobs.filter((j) => j.enabled && j.everyMs !== undefined);
   const upcoming = jobs
-    .filter((j) => j.enabled && j.nextRun)
+    .filter((j) => j.enabled && j.nextRun && j.everyMs === undefined)
     .sort((a, b) => (a.nextRun?.getTime() ?? 0) - (b.nextRun?.getTime() ?? 0))
     .slice(0, 8);
   const names = new Map(jobs.map((j) => [`${j.project}:${j.id}`, j.name]));
   const uptime = span(Math.floor(data.uptimeSeconds / 60));
 
+  // Each running job links to its live transcript when its session is known.
+  const runningLinks = running
+    .map(
+      (j) =>
+        `<a href="${j.liveSessionId ? `/sessions/${esc(j.liveSessionId)}` : `/jobs#${anchor(j)}`}">${esc(j.name)}</a>`,
+    )
+    .join(', ');
   const nowbar = `<div class="nowbar${running.length ? ' live' : ''}"><b>${
-    running.length ? `● Running now: ${esc(running.map((j) => j.name).join(', '))}` : '○ Nothing running'
+    running.length ? `● Running now: ${runningLinks}` : '○ Nothing running'
   }</b><span class="dim">· up ${uptime} · ${jobs.length - paused.length} of ${jobs.length} jobs on</span></div>`;
 
-  const waiting = ctx.waiting ?? 0;
+  const waiting = ctx.waiting ?? pending.length;
+  const usage = data.usage;
+  const usageStat = usage
+    ? stat(
+        `Claude usage · ${
+          usage.asOf !== undefined
+            ? `as of ${relative(usage.asOf, now)}`
+            : usage.resetsAt
+              ? `resets ${clock(usage.resetsAt, tz)}`
+              : (USAGE_WINDOW[usage.window ?? ''] ?? 'current window')
+        }`,
+        `${Math.round(usage.share * 100)}%`,
+        usage.share >= 0.9 ? 'bad' : usage.share >= 0.7 ? 'warn' : 'ok',
+      )
+    : '';
   const stats = `<div class="stats">${stat('Waiting approvals', waiting, waiting ? 'warn' : 'ok', '/approvals')}${stat(
     'Failing jobs',
     failing.length,
     failing.length ? 'bad' : 'ok',
     '/jobs?state=failing',
-  )}</div>`;
+  )}${usageStat}</div>`;
+
+  // Waiting cards per project: what kinds, and how long the oldest has waited.
+  const byProject = new Map<string, Item[]>();
+  for (const item of pending) byProject.set(item.project, [...(byProject.get(item.project) ?? []), item]);
+  const approvalRows = [...byProject.entries()]
+    .sort((a, b) => b[1].length - a[1].length)
+    .map(([project, items]) => {
+      const kinds = new Map<string, number>();
+      for (const i of items) kinds.set(i.kind, (kinds.get(i.kind) ?? 0) + 1);
+      const sorted = [...kinds.entries()].sort((a, b) => b[1] - a[1]);
+      const shown = sorted.slice(0, 4).map(([k, n]) => plural(n, k));
+      if (sorted.length > 4) shown.push(`${sorted.slice(4).reduce((t, [, n]) => t + n, 0)} more`);
+      const oldest = Math.min(...items.map((i) => i.createdAt));
+      return `<a class="row" href="/approvals?project=${esc(project)}"><span class="dot warn"></span><span class="grow"><b class="title">${esc(
+        projectTitle(ctx, project),
+      )}: ${items.length} waiting</b><span class="meta"><span>${esc(shown.join(' · '))}</span><span>oldest ${esc(
+        relative(oldest, now).replace(' ago', ''),
+      )}</span></span></span><span class="dim">Approvals →</span></a>`;
+    });
 
   const attention = [
-    ...(waiting
-      ? [
-          `<a class="row" href="/approvals"><span class="dot warn"></span><span class="grow"><b class="title">${waiting} ${
-            waiting === 1 ? 'approval' : 'approvals'
-          } waiting for you</b></span><span class="dim">Approvals →</span></a>`,
-        ]
-      : []),
+    ...approvalRows,
     ...failing.map(
       (
         j,
@@ -562,7 +668,7 @@ export function homePage(ctx: DashboardContext, data: HomeData): string {
       )}<span class="meta">${projectTag(ctx, j.project)}${
         failureStreak(j.recent) > 1 ? `<span class="tag bad">${failureStreak(j.recent)} in a row</span>` : ''
       }${j.lastError ? `<span>${esc(j.lastError.slice(0, 160))}</span>` : ''}</span></span>
-<span class="actions">${actionButton(j, 'run', 'Run now', 'ghost')}</span></div>`,
+<span class="actions">${j.recent[0] ? `<a class="btn quiet" href="${runHref(j.recent[0])}">See what happened</a>` : ''}${actionButton(j, 'run', 'Run now', 'ghost')}</span></div>`,
     ),
     ...paused.map(
       (j) =>
@@ -573,27 +679,59 @@ export function homePage(ctx: DashboardContext, data: HomeData): string {
     ),
   ].join('');
 
-  const coming = upcoming.length
-    ? `<ul class="timeline">${upcoming
-        .map(
-          (j) =>
-            `<li><span class="when">${esc(clock(j.nextRun as Date, tz))} <span class="dim">· ${esc(
-              relative(j.nextRun, now),
-            )}</span></span><a href="/jobs#${anchor(j)}">${esc(j.name)}</a>${projectTag(ctx, j.project)}</li>`,
-        )
-        .join('')}</ul>`
-    : '<div class="empty">Nothing scheduled.</div>';
+  // The cards to start with: those a paused run is waiting on, then the oldest.
+  const first = [...pending]
+    .sort(
+      (a, b) => (a.mode === 'resume' ? 0 : 1) - (b.mode === 'resume' ? 0 : 1) || a.createdAt - b.createdAt,
+    )
+    .slice(0, 3)
+    .map(
+      (i) =>
+        `<a class="row" href="/approvals?project=${esc(i.project)}#item-${esc(i.id)}"><span class="dot warn"></span><span class="grow"><span class="title">${esc(
+          i.title,
+        )}</span><span class="meta">${projectTag(ctx, i.project)}<span>${esc(plural(1, i.kind))}</span>${
+          i.mode === 'resume' ? '<span class="tag warn">a run is waiting</span>' : ''
+        }<span>${esc(relative(i.createdAt, now))}</span></span></span></a>`,
+    )
+    .join('');
 
-  const ran = data.latest.length
-    ? `<ul class="timeline">${data.latest
-        .map(
-          (r) =>
-            `<li><span class="when">${esc(relative(r.startedAt, now))}</span><a href="/runs/${r.id}">${esc(
+  const coming =
+    upcoming.length || frequent.length
+      ? `<ul class="timeline">${upcoming
+          .map(
+            (j) =>
+              `<li><span class="when">${esc(clock(j.nextRun as Date, tz))} <span class="dim">· ${esc(
+                relative(j.nextRun, now),
+              )}</span></span><a href="/jobs#${anchor(j)}">${esc(j.name)}</a>${projectTag(ctx, j.project)}</li>`,
+          )
+          .join('')}${[...new Set(frequent.map((j) => j.everyMs as number))]
+          .sort((a, b) => a - b)
+          .map(
+            (ms) =>
+              `<li class="free"><span class="when">Also ${esc(every(ms))}</span><span>${frequent
+                .filter((j) => j.everyMs === ms)
+                .map((j) => `<a href="/jobs#${anchor(j)}">${esc(j.name)}</a>`)
+                .join(', ')}</span></li>`,
+          )
+          .join('')}</ul>`
+      : '<div class="empty">Nothing scheduled.</div>';
+
+  const quiet = data.quietRuns
+    ? `<li class="free"><span class="when"></span><span>${data.quietRuns} more ${
+        data.quietRuns === 1 ? 'run' : 'runs'
+      } in the last 24 hours found nothing to do</span></li>`
+    : '';
+  const ran =
+    data.latest.length || quiet
+      ? `<ul class="timeline">${data.latest
+          .map((r) => {
+            const line = headline(r);
+            return `<li><span class="when">${esc(relative(r.startedAt, now))}</span><span class="what"><a href="${runHref(r)}">${esc(
               names.get(`${r.project}:${r.jobId}`) ?? r.jobId,
-            )}</a>${runTag(r.status)}</li>`,
-        )
-        .join('')}</ul>`
-    : '<div class="empty">No runs yet.</div>';
+            )}</a>${line ? `<span class="line" title="${esc(line)}">${esc(line)}</span>` : ''}</span>${runTag(r.status)}</li>`;
+          })
+          .join('')}${quiet}</ul>`
+      : '<div class="empty">No runs yet.</div>';
 
   return layout(
     ctx,
@@ -604,8 +742,9 @@ ${section(
   'Needs attention',
   attention ? `<div class="todo">${attention}</div>` : '<div class="clear">✓ Nothing needs attention.</div>',
 )}
-${section('Coming up', coming, { more: '<a class="more" href="/schedule">Schedule →</a>' })}
-${section('Just ran', ran, { more: '<a class="more" href="/jobs">All jobs →</a>' })}`,
+${first ? section('Start with these', `<div class="todo">${first}</div>`, { more: '<a class="more" href="/approvals">All approvals →</a>' }) : ''}
+${section('Just ran', ran, { more: '<a class="more" href="/jobs">All jobs →</a>' })}
+${section('Coming up', coming, { more: '<a class="more" href="/schedule">Schedule →</a>' })}`,
     { refresh: true },
   );
 }
@@ -660,7 +799,7 @@ export function jobsPage(ctx: DashboardContext, jobs: JobView[], now = Date.now(
         ? `<ul class="runs">${j.recent
             .map(
               (r) =>
-                `<li><a href="/runs/${r.id}"><span class="dot ${runTone(r.status)}"></span>${esc(when(r.startedAt, tz))}<span class="dim">· ${esc(
+                `<li><a href="${runHref(r)}"><span class="dot ${runTone(r.status)}"></span>${esc(when(r.startedAt, tz))}<span class="dim">· ${esc(
                   RUN_LABEL[r.status] ?? r.status,
                 )} · ${formatDuration(r.endedAt - r.startedAt)}</span></a></li>`,
             )
@@ -706,11 +845,14 @@ export function runPage(ctx: DashboardContext, run: StoredRun, job?: JobInfo): s
   const name = run.jobId ? (job?.name ?? run.jobId) : 'Chat turn';
   const links = [
     run.jobId ? `<a href="/jobs#${anchor({ project: run.project, id: run.jobId })}">Job</a>` : '',
-    run.sessionId ? `<a href="/sessions/${esc(run.sessionId)}">Transcript</a>` : '',
     run.threadKey ? threadLink(ctx, run.threadKey) : '',
   ]
     .filter(Boolean)
     .join('');
+  const actions = [
+    run.sessionId ? `<a class="btn" href="/sessions/${esc(run.sessionId)}">Open transcript →</a>` : '',
+    job ? actionButton({ ...job, project: run.project }, 'run', 'Run now', 'ghost') : '',
+  ].join('');
   return layout(
     ctx,
     name,
@@ -718,11 +860,7 @@ export function runPage(ctx: DashboardContext, run: StoredRun, job?: JobInfo): s
     `${pageHead(name)}<div class="card-head"><div class="meta">${runTag(run.status)}${projectTag(ctx, run.project)}
 <span>${esc(when(run.startedAt, ctx.timeZone))}</span><span>${formatDuration(run.endedAt - run.startedAt)}</span>${
       run.toolCalls ? `<span>${run.toolCalls} tool calls</span>` : ''
-    }${links}</div>${
-      job
-        ? `<div class="actions">${actionButton({ ...job, project: run.project }, 'run', 'Run now', 'ghost')}</div>`
-        : ''
-    }</div>
+    }${links}</div>${actions ? `<div class="actions">${actions}</div>` : ''}</div>
 ${run.error ? `<article class="card bad spaced"><div class="title">Error</div><pre>${esc(run.error)}</pre></article>` : ''}
 ${section(
   'Reply',
@@ -815,22 +953,100 @@ export function sessionPage(
   session: SessionOverview | undefined,
   sessionId: string,
   entries: TranscriptEntry[] | undefined,
-  jobName?: string,
+  opts: {
+    jobName?: string;
+    /** The session's latest run: its error, and its reply when there is no transcript. */
+    run?: StoredRun;
+    /** A run is working in this session now: the page shows so and refreshes itself. */
+    running?: boolean;
+  } = {},
 ): string {
-  const title = jobName ?? (entries ? firstPrompt(entries)?.slice(0, 80) : undefined) ?? 'Conversation';
-  const head = session
-    ? `<div class="meta">${projectTag(ctx, session.project)}${runTag(session.lastRun?.status)}<span>${esc(session.model)}</span>
-<span>${session.turns} ${session.turns === 1 ? 'turn' : 'turns'}</span>${threadLink(ctx, session.threadKey)}<span class="dim" title="${esc(sessionId)}">id ${esc(
-        sessionId.slice(0, 8),
-      )}</span></div>`
+  const { run, running } = opts;
+  const title = opts.jobName ?? (entries ? firstPrompt(entries)?.slice(0, 80) : undefined) ?? 'Conversation';
+  const project = session?.project ?? run?.project;
+  const status = running
+    ? '<span class="tag">● running</span>'
+    : runTag(run?.status ?? session?.lastRun?.status);
+  const head = project
+    ? `<div class="meta">${projectTag(ctx, project)}${status}${
+        session
+          ? `<span>${esc(session.model)}</span>
+<span>${session.turns} ${session.turns === 1 ? 'turn' : 'turns'}</span>${threadLink(ctx, session.threadKey)}`
+          : ''
+      }${
+        run && !running ? `<a href="/runs/${run.id}">Run details</a>` : ''
+      }<span class="dim" title="${esc(sessionId)}">id ${esc(sessionId.slice(0, 8))}</span></div>`
     : '';
+  const error =
+    !running && run?.error && FAILED.includes(run.status)
+      ? `<article class="card bad spaced"><div class="title">Error</div><pre>${esc(run.error)}</pre></article>`
+      : '';
   const body = entries?.length
     ? entries.map((e) => entryHtml(e, ctx.timeZone)).join('')
-    : '<div class="empty">No transcript for this session on this machine.</div>';
-  return layout(ctx, title, 'Sessions', `${pageHead(title)}${head}${body}`);
+    : run?.output
+      ? `<div class="empty">No transcript for this session on this machine (old, or run on another CLI). The run's reply:</div><div class="msg">${md(run.output)}</div>`
+      : `<div class="empty">${running ? 'Starting… this page refreshes every minute.' : 'No transcript for this session on this machine.'}</div>`;
+  return layout(ctx, title, 'Sessions', `${pageHead(title)}${head}${error}${body}`, { refresh: running });
 }
 
 /** 404 and 500 pages, inside the normal layout so the way back is always there. */
+/**
+ * A project's app page inside this dashboard: the sidebar plus a frame on `/app/<name><rest>`, which the
+ * server proxies to the project's `dashboardUrl`. As the app moves between its pages, the script keeps
+ * this page's address on `/p/<name>/…` and the matching tab marked, so links and reloads land back there.
+ */
+export function tabPage(ctx: DashboardContext, project: Project, rest: string): string {
+  const name = project.config.name;
+  const title = project.config.title ?? name;
+  const app = `/app/${name}`;
+  return layout(
+    ctx,
+    title,
+    '',
+    `<iframe class="app-frame" src="${esc(app + rest)}" title="${esc(title)}" data-app="${esc(name)}"></iframe>`,
+    { framed: true, script: TAB_SCRIPT },
+  );
+}
+
+const TAB_SCRIPT = `
+(() => {
+  const frame = document.querySelector('.app-frame');
+  const name = frame.dataset.app, app = '/app/' + name, shell = '/p/' + name;
+  const under = (path, base) => path === base || path.startsWith(base.endsWith('/') ? base : base + '/');
+  const mark = (rest) => {
+    const tabs = [...document.querySelectorAll('.nav-item[data-app="' + name + '"]')];
+    const best = tabs.filter((a) => under(rest, a.dataset.tab)).sort((a, b) => b.dataset.tab.length - a.dataset.tab.length)[0];
+    tabs.forEach((a) => { a.classList.toggle('on', a === best); if (a === best) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
+  };
+  const sync = () => {
+    let loc;
+    try { loc = frame.contentWindow.location; } catch { return; }
+    if (!under(loc.pathname, app)) return;
+    const rest = loc.pathname.slice(app.length) || '/';
+    const next = shell + rest + loc.search + loc.hash;
+    if (next !== location.pathname + location.search + location.hash) history.replaceState(null, '', next);
+    mark(rest);
+    try { if (frame.contentDocument.title) document.title = frame.contentDocument.title; } catch {}
+  };
+  mark(location.pathname.slice(shell.length) || '/');
+  frame.addEventListener('load', () => {
+    sync();
+    const w = frame.contentWindow;
+    try {
+      for (const m of ['pushState', 'replaceState']) {
+        const orig = w.history[m];
+        w.history[m] = function (...args) { const r = orig.apply(this, args); sync(); return r; };
+      }
+      w.addEventListener('popstate', sync);
+      w.addEventListener('hashchange', sync);
+    } catch {}
+  });
+  // On phones the sidebar is a top bar: the frame takes the rest of the screen.
+  const bar = () => frame.style.setProperty('--bar', document.querySelector('.brand').offsetHeight + 1 + 'px');
+  bar(); addEventListener('resize', bar);
+})();
+`;
+
 export function errorPage(ctx: DashboardContext, status: 404 | 500, detail?: string): string {
   const [title, text] =
     status === 404

@@ -51,6 +51,13 @@ const QUEUES = {
     caps: { perDay: 5 },
     gapMinutes: 0,
   },
+  channel: {
+    executor: { url: 'http://board/send' },
+    batch: 1,
+    fills: 'content',
+    caps: {},
+    gapMinutes: 0,
+  },
   replies: {
     executor: { job: 'sender' },
     batch: 1,
@@ -87,7 +94,14 @@ function makeProject(extra: object = {}): Project {
   };
 }
 
-function setup(opts: { now?: () => number; fetch?: typeof fetch; project?: Project } = {}) {
+function setup(
+  opts: {
+    now?: () => number;
+    fetch?: typeof fetch;
+    project?: Project;
+    autoApprove?: { project: string; kind: string; url: string }[];
+  } = {},
+) {
   const project = opts.project ?? makeProject();
   const store = new Store(':memory:', opts.now);
   const chat = new FakeChat('ts');
@@ -100,6 +114,7 @@ function setup(opts: { now?: () => number; fetch?: typeof fetch; project?: Proje
     sealKey: KEY,
     fetch: opts.fetch,
     now: opts.now,
+    autoApprove: opts.autoApprove,
   });
   const chats: IncomingMessage[] = [];
   const jobs: Array<{ jobId: string; text: string }> = [];
@@ -217,6 +232,108 @@ describe('proposing and deciding', () => {
         text: expect.stringContaining('USER DECISION on "Cut bids": Approve\nNote: only two'),
       },
     ]);
+  });
+
+  it('closes a notice on its first option without a run; its other options go to the agent', async () => {
+    const { project, store, approvals, jobs } = setup();
+    const ask = (key: string) =>
+      approvals.requestDecision(
+        { project, channel: 'C1', threadTs: '70.1', jobId: 'sender' },
+        {
+          title: 'Applied: Acme',
+          details: 'D',
+          kind: 'notice',
+          key,
+          options: ['Seen', 'Something is wrong'],
+        },
+      );
+    const seen = await ask('n1');
+    await approvals.decide(seen.id, { option: 'Seen', by: 'U1', via: 'dashboard' });
+    expect(store.getItem(seen.id)).toMatchObject({ status: 'done', decision: 'Seen' });
+    expect(jobs).toEqual([]);
+    const wrong = await ask('n2');
+    await approvals.decide(wrong.id, {
+      option: 'Something is wrong',
+      by: 'U1',
+      via: 'dashboard',
+      reply: 'not remote',
+    });
+    expect(jobs[0]?.text).toContain('USER DECISION on "Applied: Acme": Something is wrong');
+  });
+});
+
+describe('auto-approved cards', () => {
+  const RULE = [{ project: 'shop', kind: 'application', url: 'http://board/auto' }];
+  const answer = (approve: boolean) => {
+    const asked: unknown[] = [];
+    const fetchFake = (async (url: string, init: RequestInit) => {
+      if (url === 'http://board/auto') {
+        asked.push(JSON.parse(String(init.body)));
+        return new Response(JSON.stringify({ approve, reason: 'every answer is from the profile' }));
+      }
+      return new Response('{}');
+    }) as typeof fetch;
+    return { asked, fetchFake };
+  };
+  const app = (key: string, extra: object = {}) => ({
+    kind: 'application',
+    key,
+    title: 'Acme · Engineer',
+    queue: 'replies',
+    options: ['Approve', 'Skip'],
+    fields: [note('Hi Acme')],
+    autoApprove: true,
+    ...extra,
+  });
+
+  it("approves a key's first card, sealed, when the project's server says yes", async () => {
+    const { asked, fetchFake } = answer(true);
+    const { project, store, chat, approvals } = setup({ fetch: fetchFake, autoApprove: RULE });
+    const item = await approvals.propose(project, app('application:1'));
+    expect(item).toMatchObject({ status: 'approved', decision: 'Approve', decidedBy: 'auto' });
+    expect(item.reply).toBe('Auto-approved: every answer is from the profile');
+    expect(verifySeal(item, KEY)).toBe(true);
+    expect(asked).toEqual([{ kind: 'application', key: 'application:1', fields: { note: 'Hi Acme' } }]);
+    expect(JSON.stringify(chat.blockPosts[0]?.blocks)).toContain(
+      'Auto-approved: every answer is from the profile',
+    );
+    // A key that had a decided card before (failed, rejected, done) always waits for a person.
+    store.finishItem(item.id, 'failed', 'captcha');
+    const retry = await approvals.propose(project, app('application:1'));
+    expect(retry.status).toBe('pending');
+    expect(asked).toHaveLength(1);
+  });
+
+  it('approves a still-pending first card once a refresh or revise leaves nothing for a person', async () => {
+    let approve = false;
+    const fetchFake = (async () =>
+      new Response(JSON.stringify({ approve, reason: 'answered in Slack' }))) as unknown as typeof fetch;
+    const { project, approvals } = setup({ fetch: fetchFake, autoApprove: RULE });
+    const first = await approvals.propose(project, app('application:7'));
+    expect(first.status).toBe('pending');
+    approve = true;
+    const refreshed = await approvals.propose(project, app('application:7'));
+    expect(refreshed).toMatchObject({ id: first.id, status: 'approved', decidedBy: 'auto' });
+  });
+
+  it('leaves the card to a person on a no, without the host rule or the flag, or with any check', async () => {
+    const no = answer(false);
+    const a = setup({ fetch: no.fetchFake, autoApprove: RULE });
+    expect((await a.approvals.propose(a.project, app('application:1'))).status).toBe('pending');
+
+    const yes = answer(true);
+    const b = setup({ fetch: yes.fetchFake });
+    expect((await b.approvals.propose(b.project, app('application:2'))).status).toBe('pending');
+    const c = setup({ fetch: yes.fetchFake, autoApprove: RULE });
+    expect((await c.approvals.propose(c.project, app('application:3', { autoApprove: false }))).status).toBe(
+      'pending',
+    );
+    expect((await c.approvals.propose(c.project, app('application:4', { kind: 'email' }))).status).toBe(
+      'pending',
+    );
+    const long = app('application:5', { fields: [note('x'.repeat(30))] });
+    expect((await c.approvals.propose(c.project, long)).status).toBe('pending');
+    expect(yes.asked).toHaveLength(0);
   });
 });
 
@@ -453,6 +570,68 @@ describe('queue worker', () => {
     expect(store.items({ statuses: ['approved'] }).map((i) => i.title)).toEqual(['Post B']);
     expect(store.items({ statuses: ['done'] })[0]?.result).toBe('https://live');
     for (const p of posted) expect(verifySeal(p.item, KEY)).toBe(true);
+  });
+
+  it('hands a slot with nothing due to the queue that fills it, and only then', async () => {
+    let now = Date.parse('2026-10-26T18:00:00Z'); // Monday before the 18:30 slot
+    const posted: string[] = [];
+    const fetchFake = (async (_url: string, init: RequestInit) => {
+      posted.push(JSON.parse(init.body as string).item.title);
+      return new Response(JSON.stringify({ status: 'done' }));
+    }) as unknown as typeof fetch;
+    const { project, store, approvals } = setup({ now: () => now });
+    const worker = new QueueWorker({
+      projects: [project],
+      store,
+      log: silent,
+      timeZone: 'UTC',
+      now: () => now,
+      fetch: fetchFake,
+      jobs: { runQueue: async () => 'ok', enabled: () => true },
+    });
+    const approve = async (title: string, queue: string) => {
+      const i = await approvals.propose(project, { kind: 'reel', title, queue });
+      await approvals.decide(i.id, { option: 'Approve', by: 'U1', via: 'dashboard' });
+    };
+    await approve('Short A', 'channel');
+    await approve('Short B', 'channel');
+    await approve('Reel A', 'content');
+    const at = async (iso: string) => {
+      now = Date.parse(iso);
+      await worker.tick();
+      await worker.idle();
+    };
+    await at('2026-10-26T18:00:00Z'); // first look: only records the past slot
+    await at('2026-10-26T18:10:00Z'); // before the slot: a filler never runs on its own
+    expect(posted).toEqual([]);
+    await at('2026-10-26T18:31:00Z'); // Monday's slot: the content reel goes first
+    await at('2026-10-27T18:31:00Z'); // no slot on Tuesday
+    expect(posted).toEqual(['Reel A']);
+    await at('2026-10-28T18:31:00Z'); // Wednesday's slot is empty: one Short fills it
+    await at('2026-10-28T18:45:00Z'); // same slot: nothing more
+    expect(posted).toEqual(['Reel A', 'Short A']);
+    await approve('Reel B', 'content');
+    await at('2026-10-30T18:31:00Z'); // Friday: content again ahead of the waiting Short
+    expect(posted).toEqual(['Reel A', 'Short A', 'Reel B']);
+    expect(store.items({ statuses: ['approved'] }).map((i) => i.title)).toEqual(['Short B']);
+  });
+
+  it('rejects a queue that fills a queue without slots, or has slots of its own', async () => {
+    const { queuesFileSchema } = await import('../src/config/schema.js');
+    const exec = { executor: { job: 'sender' } };
+    expect(
+      queuesFileSchema.safeParse({
+        queues: { a: { ...exec, slots: '0 9 * * *' }, b: { ...exec, fills: 'a' } },
+      }).success,
+    ).toBe(true);
+    expect(queuesFileSchema.safeParse({ queues: { a: exec, b: { ...exec, fills: 'a' } } }).success).toBe(
+      false,
+    );
+    expect(
+      queuesFileSchema.safeParse({
+        queues: { a: { ...exec, slots: '0 9 * * *' }, b: { ...exec, fills: 'a', slots: '0 10 * * *' } },
+      }).success,
+    ).toBe(false);
   });
 
   it('puts an item back in the queue when a URL executor answers later', async () => {

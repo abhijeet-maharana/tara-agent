@@ -207,6 +207,60 @@ describe('approvals', () => {
   });
 });
 
+describe('a run asking for auto-approval', () => {
+  it("passes the ask on; only the host rule and the project's server approve", async () => {
+    const p = project();
+    mkdirSync(path.join(p.dir, '.tara'), { recursive: true });
+    writeFileSync(
+      path.join(p.dir, '.tara', 'queues.json'),
+      JSON.stringify({ queues: { replies: { executor: { job: 'sender' }, batch: 1 } } }),
+    );
+    const asked: unknown[] = [];
+    const fetchFake = (async (_url: string, init: RequestInit) => {
+      asked.push(JSON.parse(String(init.body)));
+      return new Response(JSON.stringify({ approve: true, reason: 'lint passed' }));
+    }) as typeof fetch;
+    const store = new Store(':memory:');
+    const chat = new FakeChat('ts');
+    const approvals = new Approvals({
+      store,
+      chat,
+      log: silent,
+      projects: [p],
+      timeZone: 'UTC',
+      sealKey: 'k'.repeat(32),
+      fetch: fetchFake,
+      autoApprove: [{ project: 'shop', kind: 'reddit-comment', url: 'http://board/auto' }],
+    });
+    const bridge = new Bridge({
+      apiUrl: 'http://127.0.0.1:1',
+      chat,
+      store,
+      approvals,
+      log: silent,
+      projects: [p],
+      timeZone: 'UTC',
+      permissionTimeoutMs: 200,
+    });
+    const { token } = openRun(bridge, {
+      project: p,
+      channel: 'C1',
+      threadTs: '1.1',
+      kind: 'chat',
+      permissionPrompts: false,
+    });
+    const card = (kind: string, key: string, autoApprove: boolean) =>
+      bridge.proposeItem(token, { kind, key, title: 'Comment', queue: 'replies', autoApprove });
+    expect(await card('reddit-comment', 'karma:1', true)).toMatchObject({
+      status: 'approved',
+      reply: 'Auto-approved: lint passed',
+    });
+    expect((await card('reddit-comment', 'karma:2', false)).status).toBe('pending');
+    expect((await card('email', 'email:1', true)).status).toBe('pending');
+    expect(asked).toHaveLength(1);
+  });
+});
+
 describe('send_file', () => {
   it('uploads files inside the project and refuses anything outside, including via symlinks', async () => {
     const { chat, bridge, ctx, project: p } = setup();

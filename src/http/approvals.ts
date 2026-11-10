@@ -169,7 +169,9 @@ export function goesOut(
   withQueue = true,
 ): string {
   if (item.mode !== 'queue') return '';
-  const at = nextRun(item, queues(item.project)[item.queue ?? ''], ctx.timeZone, now);
+  const all = queues(item.project);
+  const cfg = all[item.queue ?? ''];
+  const at = nextRun(item, cfg?.fills ? all[cfg.fills] : cfg, ctx.timeZone, now);
   const where = [withQueue && item.queue, item.window].filter(Boolean).join(' · ');
   return `<span>${at ? `goes out ${esc(at <= now + 60_000 ? 'now' : when(at, ctx.timeZone))}` : 'no window coming up'}${where ? ` · ${esc(where)}` : ''}</span>`;
 }
@@ -190,7 +192,7 @@ function waitingCard(ctx: DashboardContext, item: Item, data: ApprovalsData, mul
         `<button type="button" class="btn quiet" data-toggle-reply>${item.mode === 'queue' ? 'Revise…' : 'Add a note…'}</button>`,
       ].join('')
     : '';
-  return `<article class="card item${blocking ? ' bad' : ''}" data-item="${esc(item.id)}" data-title="${esc(item.title)}"${
+  return `<article class="card item${blocking ? ' bad' : ''}" id="item-${esc(item.id)}" data-item="${esc(item.id)}" data-title="${esc(item.title)}"${
     blocking ? '' : ' data-clean'
   }>
 <div class="card-head"><div class="grow"><div class="title">${esc(item.title)}</div>

@@ -48,6 +48,37 @@ With approval cards (the Approvals page), a run must never be able to approve it
 
 `deploy/split-users.sh` sets this up on a dedicated-user install (user, sudoers, ACLs, config, keys, database move, unit) and checks at the end that the run user can't read the state, config or env file. `--rollback` goes back to the single-user unit.
 
+## Auto-approved cards
+
+Some drafts need no person once a project's own server has checked them (an application whose every answer came from the applicant's profile, say). Host `autoApprove` lists them as `{project, kind, url}`:
+
+- **The host config holds the rule.** It sits in `/etc/tara-agent/` with the other settings a run can't read or change. The repo's `.tara/config.json` can't add one or point it somewhere else.
+- **The project's server decides, tara-agent records.** A card proposed over `POST /items` with `autoApprove: true` and a matching rule is sent to `url` (`POST {kind, key, fields}`). Only `{approve: true}` approves it: an error, a timeout or anything else leaves it waiting. The answer's `reason` is kept on the card.
+- **Only a key's first card, and only with no checks.** The first card is asked again each time it is refreshed or revised while still pending (a person supplied a missing answer, say). A key that ever had a decided or closed card (approved, failed, rejected, expired, withdrawn) and any card with a check, blocking or not, waits for a person, so a failed send never retries on its own.
+- **It is a normal approval otherwise**: sealed, decided by `auto`, shown on the Approvals page and in Slack ("Auto-approved: …"), told to the project's hook, and run by its queue.
+- A run can ask too (`propose_item` with `autoApprove: true`, or `POST /items`), but the project's server answers for what it would propose, so the server must say yes only to content it built (compare the fields with its own draft) and only when nothing needs a person. For a kind whose content only a run writes (a comment, say), the server can only lint it: turn that on only for content the owner is willing to let a run publish.
+
+## Pull requests
+
+Host `github` lets a project's runs open pull requests (`start_pull_request`, then `open_pull_request`) without ever holding a GitHub token. A private repo on GitHub Free has no branch protection, so a token a run could read would let it push to `main` with `curl`; the rules live in tara-agent instead:
+
+- **The token stays in tara-agent.** `TARA_GITHUB_TOKEN` (in tara-agent's env file) is stripped from every run's environment along with `GITHUB_TOKEN` and `GH_TOKEN`. Git gets it through its environment, never a command line. Use a fine-grained token for the listed repos only, with **Contents** and **Pull requests** read/write, and **Actions** read-only (for `read_ci_job`, below).
+- **Host config holds the repo.** `github: [{project, repo, base}]` sits in `/etc/tara-agent/`, so a run can't point it at another repo or base branch.
+- **Only `<agentName>/<name>` branches.** The name is checked (lowercase letters, digits, dashes) and always prefixed, so a push can never land on `base`. Pushes are never forced: a branch that moved on GitHub is rejected, not overwritten. Nothing merges; a person does.
+- **Workspaces, not the project folder.** `start_pull_request` fetches the base (or the PR's branch) into tara-agent's own bare repo under `<stateDir>/github/` and checks it out into a temp folder the run user can write. `open_pull_request` commits what changed there. The project folder (with its local, unpushed work) is never touched.
+- **Nothing a run writes can run code as tara-agent.** Git runs with no system or global config, no hooks and no fsmonitor, and its config and git data are where the run user can't write. Symlinks are committed as links, never followed.
+- **Refused paths**: `.github/` (a pushed branch runs its own workflows with the repo's secrets), `.env*`, key and certificate files, SSH keys, `*credentials*`, `.npmrc`. At most 200 files per commit.
+- Every PR is logged (`pull request <url> (<n> files)`) and the run replies with its link.
+
+## CI jobs
+
+The same host `github` projects get `read_ci_job`, so a run can see why a GitHub Actions job failed without holding the token:
+
+- **Read-only.** tara-agent only sends `GET /repos/{repo}/actions/jobs/{id}` and `GET …/jobs/{id}/logs`. There is no tool to rerun, cancel or dispatch a workflow, and the token's **Actions** permission is read-only, so GitHub would refuse those anyway.
+- **Only the project's own repo.** The input is a job id or a job URL (`github.com/<repo>/actions/runs/<run>/job/<job>`, `github.com/<repo>/runs/<job>`, or its `api.github.com` URL). A URL for any other repo (or host) is refused before any request; a bare id is always looked up in the host-config repo.
+- **The token goes only to `api.github.com`.** The log endpoint redirects to a short-lived signed download URL; tara-agent follows it by hand without the `Authorization` header. The token is removed from errors and from the returned log lines.
+- **What the run gets**: job name, workflow, branch, commit, status and conclusion, the failed steps, the lines around the first `##[error]` and the last 300 log lines, with timestamps and ANSI codes removed (lines cut at 1000 characters). GitHub masks the repo's secrets in logs, but anything a workflow prints unmasked reaches the run, so don't echo secrets in CI.
+
 ## Privileged actions
 
 Runs have no sudo, yet some failures need root: a file a sync wrote with a tight mode, a project server that needs a restart after a code change. `request_privileged` covers them without giving Claude root:
@@ -68,6 +99,10 @@ Runs have no sudo, yet some failures need root: a file a sync wrote with a tight
 ## Code page
 
 The Code page (`/code`) shows source code, so it is only as private as the dashboard: keep `http.allowFrom` to your own network and set `TARA_HTTP_TOKEN`. It serves only files git lists (never ignored ones), never `.git`, paths outside the repo or symlinks out of it, and hides `code.exclude` globs (`.env*`, keys) even when tracked. Git runs read-only (no optional locks, a private index copy, no hooks, external diff or textconv). Asking about a file starts a Claude run, so it needs the unlock cookie from another device. See [code-view.md](code-view.md).
+
+## Project tabs
+
+`/app/<name>/…` proxies to the project's `dashboardUrl`, so a project app shown as tabs is as private as the dashboard: it needs `http.allowFrom` and `TARA_HTTP_TOKEN` like every page. Only projects with `tabs` are proxied, and only to their configured origin. The app's server never receives `tara_token` or the `tara_admin` unlock cookie. Its pages, though, run on tara-agent's origin, so their scripts can call tara-agent with your browser's cookies just like tara-agent's own pages. Serve only apps you trust as much as tara-agent itself. Actions that only a person may take keep their own check in the app. The app's port can then stay closed to browsers.
 
 ## Reporting a vulnerability
 

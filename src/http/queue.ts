@@ -83,14 +83,28 @@ const CSS = `<style>
 
 const queueTitle = (name: string) => (name.charAt(0).toUpperCase() + name.slice(1)).replace(/-/g, ' ');
 
-/** How the queue runs, for the section head: "next slot Tue 14:40 · 2 per run · 3 a day". */
-function howItRuns(ctx: DashboardContext, cfg: QueueConfig | undefined, now: number): string {
+/**
+ * How the queue runs, for the section head: "next slot Tue 14:40 · 2 per run · 3 a day" (`filled`:
+ * the queue whose empty slots it fills).
+ */
+function howItRuns(
+  ctx: DashboardContext,
+  cfg: QueueConfig | undefined,
+  filled: QueueConfig | undefined,
+  now: number,
+): string {
   if (!cfg) return 'not in .tara/queues.json';
   const parts: string[] = [];
   if ('external' in cfg.executor) parts.push('run by the project');
   else {
-    const at = nextRun({ runNow: false }, cfg, ctx.timeZone, now);
-    const what = cfg.slots ? 'next slot' : cfg.windows ? 'next window' : 'next';
+    const at = nextRun({ runNow: false }, filled ?? cfg, ctx.timeZone, now);
+    const what = cfg.fills
+      ? `fills empty ${cfg.fills} slots, next`
+      : cfg.slots
+        ? 'next slot'
+        : cfg.windows
+          ? 'next window'
+          : 'next';
     parts.push(at ? `${what} ${at <= now + 60_000 ? 'now' : when(at, ctx.timeZone)}` : 'no window coming up');
   }
   if (cfg.batch > 1) parts.push(`${cfg.batch} per run`);
@@ -193,7 +207,7 @@ export function queuePage(ctx: DashboardContext, data: QueueData): string {
       : list(approved);
     const approvals = `/approvals?project=${encodeURIComponent(project)}`;
     const head = `<div class="sec-head"><h2>${esc(queueTitle(queue))}</h2>${multi ? projectTag(ctx, project) : ''}<span>${approved.length} in line · ${esc(
-      howItRuns(ctx, cfg, data.now),
+      howItRuns(ctx, cfg, cfg?.fills ? data.queues(project)[cfg.fills] : undefined, data.now),
     )}</span>${pending ? `<a class="more" href="${approvals}">${pending} to approve →</a>` : ''}</div>`;
     return `<section class="section">${head}${
       running.length

@@ -14,7 +14,7 @@ export interface ProjectOverview {
   approvals: number;
   /** Absent when the Code page doesn't read this project's repo. */
   repo?: { branch?: string; changes: number; error?: string };
-  /** The project's own dashboard (`dashboardUrl`). */
+  /** The project's own dashboard: its tabs here (`/p/<name>`), else its `dashboardUrl`. */
   dashboardUrl?: string;
 }
 

@@ -1,6 +1,30 @@
 # Dashboard look
 
-tara-agent's dashboard is the home for everything about the agent: jobs, runs, the schedule, sessions and approval cards. A project can have its own dashboard for its own work (set `dashboardUrl` in `.tara/config.json`). These rules keep the dashboards feeling like one app.
+tara-agent's dashboard is the home for everything about the agent: jobs, runs, the schedule, sessions and approval cards. A project can have its own app for its own work (set `dashboardUrl` in `.tara/config.json`). With `tabs` its pages show inside tara-agent's dashboard (see [Project tabs](#project-tabs)); without, the sidebar's Dashboards switcher links to it. These rules keep everything feeling like one app.
+
+## Project tabs
+One dashboard for everything: a project lists its app's pages in `.tara/config.json`, and they open in tara-agent's sidebar under the project's title.
+
+```json
+"dashboardUrl": "http://127.0.0.1:4001",
+"tabs": [
+  { "path": "/posted", "label": "Posted", "icon": "📣" },
+  { "path": "/media", "label": "Media", "icon": "🖼️" }
+]
+```
+
+- `dashboardUrl` is the app's **origin** as tara-agent reaches it on the same machine; any path is ignored. The browser never talks to it.
+- `/p/<name><path>` is the page: the sidebar plus a frame that fills the rest. `/p/<name>` opens the first tab.
+- `/app/<name>/<rest>` is proxied to `<dashboardUrl>/<rest>` with every method, body and header. It is behind the dashboard token, and it adds `x-tara-prefix: /app/<name>`. tara-agent's own cookies (`tara_token`, `tara_admin`) are removed. The app's `Set-Cookie` comes back unchanged, so use `Path=/`.
+- As the app moves between its pages (`pushState` or a full load), the page's address follows on `/p/<name>/…` and the matching tab lights up. The app needs no code for this.
+
+What the app does:
+- **Works under `/app/<name>/`.** Its assets, API calls, router base and server-side redirects use the prefix (Vite `base: '/app/<name>/'`). Its routes stay at its own root, since tara-agent strips the prefix. APIs that other programs call stay exactly where they are.
+- **Content only:** no sidebar, brand, switcher or ☰ menu of its own. The page fills the frame's width and scrolls by itself.
+- **Links to tara-agent pages** are same-origin: `/approvals?project=<name>` with `target="_top"`, or `window.top.location` from scripts.
+- **A browser opening the app's port directly** (no `x-tara-prefix`) is redirected to `http://<host>:<tara port>/p/<name><path>`. Only page routes do this; APIs and files are served as usual.
+- **Shows nothing tara-agent already shows**: jobs, failing runs, Run now, approvals, queue, schedule, sessions.
+
 
 ## One home for each thing
 - **Agent things live in tara-agent only.** That covers job lists, Run now, Pause and Resume, run history, the schedule, sessions and **approval cards** (everything that needs a person: every decision, suggestion, login and draft). A project dashboard may show a one-line summary, e.g. "41 jobs · 0 failing". It links to tara-agent for the rest and never re-implements those pages.
@@ -8,7 +32,7 @@ tara-agent's dashboard is the home for everything about the agent: jobs, runs, t
 - **Change jobs and cards only through tara-agent's API** (`POST /jobs/…`, `POST /items…`). Never write another repo's `.tara/jobs.json`.
 
 ## Tokens
-- Copy `TOKENS` and `SWITCHER_CSS` from [`src/http/look.ts`](../src/http/look.ts) verbatim, with a comment `copied from tara-agent src/http/look.ts — edit there`.
+- Copy `TOKENS` from [`src/http/look.ts`](../src/http/look.ts) verbatim, with a comment `copied from tara-agent src/http/look.ts — edit there` (and `SWITCHER_CSS` too for a dashboard that isn't shown as tabs and draws its own shell).
 - The theme is dark only.
 - Use the variables (`--card-bg`, `--border`, `--text-dim`, `--accent`, `--red`…), not raw colours.
 
@@ -16,7 +40,8 @@ tara-agent's dashboard is the home for everything about the agent: jobs, runs, t
 - **Sidebar** of `var(--sidebar)` width. From top to bottom:
   - A brand row: a `.mark` letter plus the dashboard's name.
   - The page links (`.nav-item`, current page `.on`, red `.badge` for counts that need action).
-  - The **Dashboards** switcher.
+  - Each tabbed project: a `.nav-group` heading (its title), then its tabs.
+  - The **Dashboards** switcher, only for projects with a `dashboardUrl` and no `tabs`.
   - "Updated hh:mm ↻" at the foot.
 - **Switcher**, the same everywhere:
   - Order: the agent first, then the projects in the order tara-agent lists them.

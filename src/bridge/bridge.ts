@@ -21,6 +21,13 @@ import {
   privilegedNote,
 } from '../approvals/approvals.js';
 import type { PermissionMode, Project } from '../config/schema.js';
+import { type CiJob, CiJobError, type CiJobs } from '../github/actions.js';
+import {
+  type OpenedPullRequest,
+  PullRequestError,
+  type PullRequests,
+  type StartedPullRequest,
+} from '../github/pull-requests.js';
 import type { Privileged } from '../privileged/privileged.js';
 import { describeTool } from '../runner/stream.js';
 import type { JobControl } from '../scheduler/scheduler.js';
@@ -107,6 +114,10 @@ export interface BridgeDeps {
   approvals: Approvals;
   /** Root actions (`request_privileged`); unset = runs can only ask a person to run a command. */
   privileged?: Privileged;
+  /** Pull requests (host `github`); only projects listed there get the tools. */
+  pullRequests?: PullRequests;
+  /** Reading CI jobs (host `github`, read-only); same projects as pull requests. */
+  ciJobs?: CiJobs;
   log: Logger;
   projects: Project[];
   timeZone: string;
@@ -165,6 +176,7 @@ export class Bridge {
             TARA_RUN_TOKEN: token,
             TARA_PERMISSION_PROMPTS: ctx.permissionPrompts ? '1' : '0',
             TARA_JOB_TOOLS: ctx.kind === 'chat' && this.jobs ? '1' : '0',
+            TARA_GITHUB_TOOLS: this.deps.pullRequests?.has(ctx.project.config.name) ? '1' : '0',
           },
         },
       },
@@ -271,7 +283,7 @@ export class Bridge {
   async proposeItem(
     token: string | undefined,
     input: ProposeInput,
-  ): Promise<{ id: string; checks: unknown[] }> {
+  ): Promise<{ id: string; status: string; reply?: string; checks: unknown[] }> {
     const ctx = this.run(token);
     const item = await this.deps.approvals
       .propose(ctx.project, input, {
@@ -281,7 +293,7 @@ export class Bridge {
         source: ctx.jobId ?? (ctx.kind === 'chat' ? 'chat' : undefined),
       })
       .catch(asBridgeError);
-    return { id: item.id, checks: item.checks };
+    return { id: item.id, status: item.status, reply: item.reply, checks: item.checks };
   }
 
   /** The executor's report on one item it was given. */
@@ -370,6 +382,45 @@ export class Bridge {
     }
     await this.deps.chat.uploadFile(ctx.channel, ctx.threadTs, real, input.comment?.slice(0, 2_000));
     return { name: path.basename(real) };
+  }
+
+  /** A workspace for a pull request (`start_pull_request`). */
+  startPullRequest(token: string | undefined, input: { branch: string }): Promise<StartedPullRequest> {
+    const ctx = this.run(token);
+    return this.pullRequest(() => this.deps.pullRequests?.start(ctx.project.config.name, input.branch));
+  }
+
+  /** Commits the workspace and opens or updates the PR (`open_pull_request`). */
+  openPullRequest(
+    token: string | undefined,
+    input: { branch: string; title: string; body?: string },
+  ): Promise<OpenedPullRequest> {
+    const ctx = this.run(token);
+    return this.pullRequest(() => this.deps.pullRequests?.open(ctx.project.config.name, input));
+  }
+
+  /** A GitHub Actions job of the project's repo, with its failed steps and log excerpt (`read_ci_job`). */
+  async readCiJob(token: string | undefined, input: { job: string }): Promise<CiJob> {
+    const ctx = this.run(token);
+    if (!this.deps.ciJobs?.has(ctx.project.config.name))
+      throw new BridgeError(404, 'CI jobs are not set up for this project');
+    try {
+      return await this.deps.ciJobs.read(ctx.project.config.name, input.job);
+    } catch (err) {
+      if (err instanceof CiJobError) throw new BridgeError(400, err.message);
+      throw err;
+    }
+  }
+
+  private async pullRequest<T>(call: () => Promise<T> | undefined): Promise<T> {
+    try {
+      const result = await call();
+      if (result === undefined) throw new BridgeError(404, 'Pull requests are not set up on this host');
+      return result;
+    } catch (err) {
+      if (err instanceof PullRequestError) throw new BridgeError(400, err.message);
+      throw err;
+    }
   }
 
   listJobs(token: string | undefined) {

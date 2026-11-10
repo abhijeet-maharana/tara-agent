@@ -6,11 +6,19 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Project } from '../src/config/schema.js';
 import { allowList } from '../src/http/access.js';
 import { cronText } from '../src/http/cron-text.js';
-import { esc, md } from '../src/http/dashboard.js';
+import {
+  type DashboardContext,
+  esc,
+  headline,
+  homePage,
+  type JobView,
+  md,
+  sessionPage,
+} from '../src/http/dashboard.js';
 import { startHttpServer } from '../src/http/server.js';
 import { firstPrompt, parseTranscript, transcriptPath } from '../src/http/transcript.js';
 import type { Scheduler } from '../src/scheduler/scheduler.js';
-import { Store } from '../src/store/store.js';
+import { type Item, Store, type StoredRun } from '../src/store/store.js';
 
 const SID = '11111111-2222-4333-8444-555555555555';
 const lines = [
@@ -327,5 +335,207 @@ describe('fallback pass-through', () => {
     const down = await fetch(`${base}/api/indiapost/book`, { method: 'POST' });
     expect(down.status).toBe(502);
     server.close();
+  });
+});
+
+describe('project tabs', () => {
+  it('lists project pages in the sidebar, frames them on /p/ and proxies /app/ to the project app', async () => {
+    const { createServer } = await import('node:http');
+    const seen: { url?: string; prefix?: string; cookie?: string; body: string }[] = [];
+    const upstream = createServer((req, res) => {
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        seen.push({
+          url: req.url,
+          prefix: req.headers['x-tara-prefix'] as string | undefined,
+          cookie: req.headers.cookie,
+          body,
+        });
+        res.writeHead(200, { 'content-type': 'text/html', 'set-cookie': 'board=1; Path=/' });
+        res.end('<title>Posted</title>app page');
+      });
+    });
+    await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', r));
+    const upPort = (upstream.address() as AddressInfo).port;
+    const project = (name: string, extra: Partial<Project['config']>): Project => ({
+      dir: `/srv/${name}`,
+      config: {
+        name,
+        slackChannel: 'C1',
+        permissionMode: 'default',
+        chatModel: 'opus',
+        allowedTools: [],
+        allowedUsers: [],
+        billing: 'subscription',
+        selfImprove: true,
+        ...extra,
+      },
+    });
+    const server = await startHttpServer({
+      bind: '127.0.0.1',
+      port: 0,
+      scheduler: { list: () => [] } as unknown as Scheduler,
+      store: new Store(':memory:'),
+      projects: ['shop', 'blog'],
+      log: { info() {}, warn() {}, error() {} },
+      dashboard: {
+        projects: [
+          project('shop', {
+            title: 'Shop',
+            dashboardUrl: `http://127.0.0.1:${upPort}`,
+            tabs: [
+              { path: '/posted', label: 'Posted', icon: '📣' },
+              { path: '/media', label: 'Media' },
+            ],
+          }),
+          project('blog', { title: 'Blog', dashboardUrl: 'https://blog.example/' }),
+        ],
+        timeZone: 'UTC',
+        agentName: 'Jarvis',
+      },
+    });
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const html = { accept: 'text/html' };
+
+    const landing = await fetch(`${base}/p/shop`, { headers: html, redirect: 'manual' });
+    expect(landing.status).toBe(302);
+    expect(landing.headers.get('location')).toBe('/p/shop/posted');
+
+    const page = await (await fetch(`${base}/p/shop/media/b-roll?q=1`, { headers: html })).text();
+    expect(page).toContain('<iframe class="app-frame" src="/app/shop/media/b-roll?q=1"');
+    expect(page).toContain('<div class="nav-group">Shop</div>');
+    expect(page).toContain('href="/p/shop/posted" class="nav-item" data-app="shop" data-tab="/posted"');
+    // The switcher keeps only dashboards that aren't tabs.
+    expect(page).toContain('href="https://blog.example/"');
+    expect(page).not.toContain(`127.0.0.1:${upPort}`);
+
+    const proxied = await fetch(`${base}/app/shop/api/media?folder=x`, {
+      method: 'POST',
+      body: 'hello',
+      headers: { cookie: 'tara_token=secret; board=1; tara_admin=key' },
+    });
+    expect(proxied.status).toBe(200);
+    expect(proxied.headers.get('set-cookie')).toBe('board=1; Path=/');
+    expect(seen.at(-1)).toEqual({
+      url: '/api/media?folder=x',
+      prefix: '/app/shop',
+      cookie: 'board=1',
+      body: 'hello',
+    });
+    await fetch(`${base}/app/shop`);
+    expect(seen.at(-1)?.url).toBe('/');
+
+    // Unknown projects and projects without tabs aren't proxied.
+    expect((await fetch(`${base}/app/blog/x`)).status).toBe(404);
+    expect((await fetch(`${base}/app/nope/x`)).status).toBe(404);
+
+    upstream.close();
+    server.close();
+  });
+});
+
+describe('home page', () => {
+  const NOW = Date.parse('2026-11-10T05:00:00Z');
+  const ctx: DashboardContext = {
+    projects: [
+      { dir: '/r/shop', config: { name: 'shop', title: 'Shop' } },
+      { dir: '/r/jobs', config: { name: 'jobs', title: 'Job Search' } },
+    ] as unknown as Project[],
+    timeZone: 'UTC',
+    agentName: 'Jarvis',
+  };
+  const run = (id: number, jobId: string, status: string, extra: Partial<StoredRun> = {}): StoredRun => ({
+    id,
+    kind: 'job',
+    project: 'shop',
+    jobId,
+    startedAt: NOW - id * 60_000,
+    endedAt: NOW - id * 60_000 + 5000,
+    status,
+    ...extra,
+  });
+  const job = (id: string, extra: Partial<JobView> = {}): JobView => ({
+    id,
+    name: id.toUpperCase(),
+    enabled: true,
+    running: false,
+    tz: 'UTC',
+    skills: [],
+    model: 'opus',
+    project: 'shop',
+    recent: [],
+    nextRun: new Date(NOW + 10 * 60_000),
+    ...extra,
+  });
+  const item = (id: string, project: string, kind: string, mode: 'queue' | 'resume', age: number): Item =>
+    ({ id, project, kind, mode, title: `Card ${id}`, createdAt: NOW - age * 60_000 }) as Item;
+
+  const page = homePage(ctx, {
+    jobs: [
+      job('ga4', { running: true, liveSessionId: 'live-1' }),
+      job('watch', { everyMs: 10 * 60_000 }),
+      job('daily'),
+    ],
+    latest: [
+      run(1, 'ga4', 'ok', { sessionId: 'sess-1', output: '📊 *GA4 weekly:* 841 sessions\n• more' }),
+      run(2, 'sla', 'failed', { error: 'login expired\nstack', output: 'Portal down' }),
+    ],
+    quietRuns: 12,
+    pending: [
+      item('a', 'jobs', 'application', 'queue', 600),
+      item('b', 'jobs', 'application', 'queue', 30),
+      item('c', 'jobs', 'email', 'queue', 20),
+      item('d', 'shop', 'decision', 'resume', 5),
+    ],
+    usage: { share: 0.22, window: 'five_hour' },
+    uptimeSeconds: 600,
+    now: NOW,
+  });
+
+  it('links runs to their transcript, with the first line of what happened', () => {
+    expect(page).toContain(
+      'href="/sessions/sess-1">GA4</a><span class="line" title="📊 GA4 weekly: 841 sessions"',
+    );
+    expect(page).toContain('href="/runs/2">sla</a><span class="line" title="login expired"'); // no session: the run page
+    expect(page).toContain('12 more runs in the last 24 hours found nothing to do');
+    expect(page).toContain('● Running now: <a href="/sessions/live-1">GA4</a>');
+  });
+
+  it('keeps frequent jobs out of "Coming up" and shows usage', () => {
+    expect(page).toContain('Also every 10m</span><span><a href="/jobs#job-shop-watch">WATCH</a>');
+    expect(page).toContain('<a href="/jobs#job-shop-daily">DAILY</a><span class="tag dim">Shop</span></li>');
+    expect(page).not.toMatch(/<a href="\/jobs#job-shop-watch">WATCH<\/a><span class="tag/);
+    expect(page).toContain('<b>22%</b><span>Claude usage · 5h window</span>');
+  });
+
+  it('breaks waiting approvals down by project and kind, and lists the cards to start with', () => {
+    expect(page).toContain(
+      'Job Search: 3 waiting</b><span class="meta"><span>2 applications · 1 email</span><span>oldest 10h</span>',
+    );
+    expect(page.indexOf('Job Search: 3 waiting')).toBeLessThan(page.indexOf('Shop: 1 waiting'));
+    // A card a run waits on comes first, then the oldest.
+    const first = page.slice(page.indexOf('Start with these'));
+    expect(first.indexOf('#item-d')).toBeLessThan(first.indexOf('#item-a'));
+    expect(first).toContain('a run is waiting');
+    expect(first).not.toContain('#item-c');
+  });
+
+  it('reads a headline out of Slack-style Markdown', () => {
+    expect(
+      headline(run(3, 'x', 'ok', { output: '\n## *Done* with <https://a.b|the page> and _all_ of `it`' })),
+    ).toBe('Done with the page and all of it');
+    expect(headline(run(3, 'x', 'silent'))).toBe('');
+  });
+
+  it('shows a session without a transcript as its run, and a running one live', () => {
+    const r = run(4, 'ga4', 'failed', { sessionId: 's', error: 'timed out', output: 'Half **done**' });
+    const old = sessionPage(ctx, undefined, 's', undefined, { jobName: 'GA4', run: r });
+    expect(old).toContain('<a href="/runs/4">Run details</a>');
+    expect(old).toContain('<pre>timed out</pre>');
+    expect(old).toContain('Half <b>done</b>');
+    const live = sessionPage(ctx, undefined, 's', undefined, { run: { ...r, status: 'ok' }, running: true });
+    expect(live).toContain('● running');
+    expect(live).toContain('data-refresh="1"');
   });
 });

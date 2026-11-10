@@ -32,6 +32,8 @@ export const DEFAULT_OPTIONS = ['Approve', 'Reject'];
 export const NEGATIVE = /^(reject|deny|no|cancel|stop|decline|skip)/i;
 /** The option that asks for a new draft instead of deciding. */
 export const REVISE = 'Revise';
+/** Cards that tell rather than ask (`POST /items/ask` with this kind): the first option only acknowledges. */
+export const NOTICE_KIND = 'notice';
 /** Cards for root actions (`request_privileged`): approving one runs its action, then the run continues. */
 export const PRIVILEGED_KIND = 'privileged';
 const SECTION_MAX = 2_800;
@@ -50,6 +52,8 @@ export interface ProposeInput {
   window?: string;
   /** Not before this time (epoch ms). */
   runAfter?: number;
+  /** Ask the host's `autoApprove` entry for this kind to approve it (project servers only). */
+  autoApprove?: boolean;
 }
 
 /** Where a proposal came from, when a run made it. */
@@ -82,6 +86,8 @@ export interface ApprovalsDeps {
   sealKey?: string;
   /** Runs the action of an approved privileged card (host `privileged`). */
   privileged?: Privileged;
+  /** Host `autoApprove`: kinds a project's server may approve itself, and where to ask. */
+  autoApprove?: { project: string; kind: string; url: string }[];
   fetch?: typeof fetch;
   now?: () => number;
   newId?: () => string;
@@ -212,7 +218,16 @@ export class Approvals {
       throw new ApprovalError(400, `Queue "${input.queue}" has no window "${input.window}"`);
     const fields = (input.fields ?? []).map(cleanField);
     const checks = [...(input.checks ?? []), ...(await this.checks(project, input.kind, input.key, fields))];
-    const item = this.deps.store.proposeItem({
+    // Decided before the card is stored: only a key's first card can be approved without a person,
+    // also when it is refreshed or revised while still pending; never once a card for it was decided.
+    const auto =
+      input.autoApprove &&
+      input.key &&
+      !checks.length &&
+      !this.deps.store.hasDecidedKey(project.config.name, input.key)
+        ? await this.askAutoApprove(project, input.kind, input.key, fields)
+        : undefined;
+    const proposed = this.deps.store.proposeItem({
       id: this.deps.newId?.(),
       project: project.config.name,
       kind: input.kind,
@@ -232,8 +247,54 @@ export class Approvals {
       window: input.window,
       runAfter: input.runAfter,
     });
+    const options = proposed.options;
+    const item =
+      auto && !NEGATIVE.test(options[0] as string)
+        ? (this.deps.store.decideItem(proposed.id, {
+            status: 'approved',
+            decision: options[0] as string,
+            by: 'auto',
+            reply: auto,
+            seal: sealItem(proposed, this.deps.sealKey),
+          }) ?? proposed)
+        : proposed;
     if (queue.slack) await this.postCard(project, item);
+    if (item.status === 'approved') {
+      this.deps.log.info(`[${item.project}] ${item.kind} ${item.id} auto-approved: ${auto}`);
+      this.notify(item, 'decided');
+    }
     return this.deps.store.getItem(item.id) as Item;
+  }
+
+  /**
+   * Host `autoApprove`: asks the project's server whether this card needs a person. The reason when it
+   * says no person is needed, else undefined (no entry, a no, or no answer).
+   */
+  private async askAutoApprove(
+    project: Project,
+    kind: string,
+    key: string,
+    fields: ItemField[],
+  ): Promise<string | undefined> {
+    const rule = this.deps.autoApprove?.find((r) => r.project === project.config.name && r.kind === kind);
+    if (!rule) return undefined;
+    try {
+      const res = await (this.deps.fetch ?? fetch)(rule.url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ kind, key, fields: Object.fromEntries(fields.map((f) => [f.key, f.value])) }),
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = (await res.json()) as { approve?: unknown; reason?: unknown };
+      if (json.approve !== true) return undefined;
+      return `Auto-approved: ${typeof json.reason === 'string' && json.reason.trim() ? json.reason.trim().slice(0, 300) : 'nothing needed a person'}`;
+    } catch (err) {
+      this.deps.log.warn(
+        `[${project.config.name}] auto-approve check failed for ${key}: ${(err as Error).message}`,
+      );
+      return undefined;
+    }
   }
 
   /**
@@ -267,7 +328,10 @@ export class Approvals {
         elements: [
           {
             type: 'mrkdwn',
-            text: `Waiting on the Approvals page (${item.options.join(' · ')} · Revise). What happens next shows in this thread.`,
+            text:
+              item.status === 'approved' && item.decidedBy === 'auto'
+                ? `✅ ${item.reply ?? 'Auto-approved'}. Goes out with the ${item.queue} queue; what happens next shows in this thread.`
+                : `Waiting on the Approvals page (${item.options.join(' · ')} · Revise). What happens next shows in this thread.`,
           },
         ],
       },
@@ -401,7 +465,9 @@ export class Approvals {
         .catch((err: Error) => this.deps.log.warn(`could not update approval message: ${err.message}`));
     }
     const ran = action ? `\n${privilegedNote(await this.runPrivileged(decided.id, action))}` : '';
-    if (decided.mode === 'resume') {
+    // A notice's first option ("Seen") just closes it; any other option goes to the agent as usual.
+    const acknowledged = decided.kind === NOTICE_KIND && d.option === decided.options[0];
+    if (decided.mode === 'resume' && !acknowledged) {
       const edits =
         d.fields && Object.keys(d.fields).length ? `\nEdited values: ${JSON.stringify(d.fields)}` : '';
       const note = d.reply?.trim() ? `\nNote: ${d.reply.trim()}` : '';

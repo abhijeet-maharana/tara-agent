@@ -565,6 +565,14 @@ export class Store {
     return (rows as Record<string, unknown>[]).map(toRun);
   }
 
+  /** The latest run of a Claude (or agy) session, whatever thread it ran in. */
+  latestSessionRun(sessionId: string): StoredRun | undefined {
+    const row = this.db
+      .prepare('SELECT * FROM runs WHERE session_id = ? ORDER BY started_at DESC LIMIT 1')
+      .get(sessionId);
+    return row ? toRun(row as Record<string, unknown>) : undefined;
+  }
+
   getRun(id: number): StoredRun | undefined {
     const row = this.db.prepare('SELECT * FROM runs WHERE id = ?').get(id);
     return row ? toRun(row as Record<string, unknown>) : undefined;
@@ -671,6 +679,22 @@ export class Store {
   getItem(id: string): Item | undefined {
     const row = this.db.prepare('SELECT * FROM items WHERE id = ?').get(id);
     return row ? toItem(row as Record<string, unknown>) : undefined;
+  }
+
+  /** True when the project has ever had an item with this key (any status). */
+  hasKey(project: string, key: string): boolean {
+    return Boolean(
+      this.db.prepare('SELECT 1 FROM items WHERE project = ? AND key = ? LIMIT 1').get(project, key),
+    );
+  }
+
+  /** True when an item with this key was ever decided or closed (anything but pending). */
+  hasDecidedKey(project: string, key: string): boolean {
+    return Boolean(
+      this.db
+        .prepare("SELECT 1 FROM items WHERE project = ? AND key = ? AND status <> 'pending' LIMIT 1")
+        .get(project, key),
+    );
   }
 
   /** Items, newest first (or in queue order for `approved`, the order queues run them). */
