@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -46,7 +46,7 @@ function project(): Project {
       allowedTools: [],
       allowedUsers: [],
       billing: 'subscription',
-      selfImprove: true,
+      selfImprove: 'trouble',
     },
   };
 }
@@ -118,6 +118,22 @@ describe('tara-priv helper', () => {
     await expect(p.plan('fix-permissions', { path: '/srv/repos/shop/../../etc' })).rejects.toThrow('".."');
     await expect(p.plan('fix-permissions', {})).rejects.toThrow('needs "path"');
     await expect(p.plan('restart-shop', { extra: 'x' })).rejects.toThrow('takes no argument "extra"');
+  });
+
+  it('checks a path again with its symlinks resolved, and runs the resolved path', async () => {
+    const root = realpathSync(mkdtempSync(path.join(tmpdir(), 'tara-priv-links-')));
+    mkdirSync(path.join(root, 'shop'));
+    symlinkSync('/etc', path.join(root, 'shop', 'evil'));
+    mkdirSync(path.join(root, 'shop', 'data'));
+    const p = helper({
+      fix: { command: ['/bin/echo', '{path}'], args: { path: `${root}/shop(/.*)?` } },
+    });
+    await expect(p.plan('fix', { path: `${root}/shop/evil/passwd` })).rejects.toThrow(
+      /resolves to (\/private)?\/etc\/passwd/,
+    );
+    expect((await p.plan('fix', { path: `${root}/shop/data/new.txt` })).command).toBe(
+      `/bin/echo ${root}/shop/data/new.txt`,
+    );
   });
 
   it('runs an action and passes its output and exit code through', async () => {

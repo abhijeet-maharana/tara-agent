@@ -32,6 +32,7 @@ export interface RunRecord {
   startedAt: number;
   endedAt: number;
   status: string;
+  /** As the CLI reports it: the session's running total (recordRun stores this run's share). */
   costUsd?: number;
   inputTokens?: number;
   outputTokens?: number;
@@ -204,6 +205,24 @@ const MIGRATIONS = [
    CREATE INDEX runs_session ON runs (session_id, started_at);`,
   // A draft card with its own channel message keeps its full text in the first reply of its thread.
   `ALTER TABLE items ADD COLUMN detail_ts TEXT;`,
+  // The CLI's cost is the session's running total (it carries over --resume), so a thread of turns was
+  // counted again on every turn. Keep the total in session_cost_usd and make cost_usd each run's own
+  // share. A total lower than the one before (a counter that started over) is left as it is.
+  `ALTER TABLE runs ADD COLUMN session_cost_usd REAL;
+   UPDATE runs SET session_cost_usd = cost_usd WHERE session_id IS NOT NULL;
+   WITH d AS (
+     SELECT id, session_cost_usd - LAG(session_cost_usd) OVER (PARTITION BY session_id ORDER BY started_at, id) AS delta
+     FROM runs WHERE session_id IS NOT NULL AND session_cost_usd IS NOT NULL
+   )
+   UPDATE runs SET cost_usd = (SELECT delta FROM d WHERE d.id = runs.id)
+   WHERE id IN (SELECT id FROM d WHERE delta IS NOT NULL AND delta >= 0);`,
+  // One "Run <name>" thread per project, name and day for cards no run proposed (approvals.dayThread).
+  `CREATE TABLE day_threads (
+     key        TEXT PRIMARY KEY,
+     channel    TEXT NOT NULL,
+     ts         TEXT NOT NULL,
+     created_at INTEGER NOT NULL
+   );`,
 ];
 
 export const ITEM_STATUSES = [
@@ -517,18 +536,53 @@ export class Store {
     }));
   }
 
+  /**
+   * Forgets what is older than `before` (host `retentionDays`): runs, slot claims, and sessions not
+   * used since (Claude Code deletes its own session files after 30 days by default, so such a thread
+   * could not resume anyway; a reply there starts a new session). The latest run of each job is kept
+   * whatever its age, so a job that runs rarely still shows its last result. Approval cards stay.
+   */
+  prune(before: number): { runs: number; claims: number; sessions: number } {
+    const runs = this.db
+      .prepare(
+        `DELETE FROM runs WHERE started_at < ? AND id NOT IN (
+           SELECT MAX(id) FROM runs WHERE kind = 'job' AND job_id IS NOT NULL GROUP BY project, job_id
+         )`,
+      )
+      .run(before).changes;
+    // Catch-up only ever looks hours back, so no claim this old (even one left `running`) is needed.
+    const claims = this.db.prepare('DELETE FROM job_claims WHERE slot < ?').run(before).changes;
+    const sessions = this.db.prepare('DELETE FROM sessions WHERE updated_at < ?').run(before).changes;
+    this.db.prepare('DELETE FROM day_threads WHERE created_at < ?').run(before);
+    return { runs: Number(runs), claims: Number(claims), sessions: Number(sessions) };
+  }
+
   deleteSession(threadKey: string): void {
     this.db.prepare('DELETE FROM sessions WHERE thread_key = ?').run(threadKey);
   }
 
-  /** Stores a finished run and returns its id. */
+  /**
+   * Stores a finished run and returns its id. `costUsd` is what the CLI reports: the session's running total, which carries over `--resume`. The
+   * run is stored with its own share (the total minus the session's previous total), and the total
+   * itself in `session_cost_usd`, so summing runs never counts a turn twice.
+   */
   recordRun(r: RunRecord): number {
+    let cost = r.costUsd;
+    if (cost !== undefined && r.sessionId) {
+      const prev = this.db
+        .prepare(
+          `SELECT session_cost_usd t FROM runs WHERE session_id = ? AND session_cost_usd IS NOT NULL
+           ORDER BY started_at DESC, id DESC LIMIT 1`,
+        )
+        .get(r.sessionId) as { t: number } | undefined;
+      if (prev && r.costUsd !== undefined && r.costUsd >= prev.t) cost = r.costUsd - prev.t;
+    }
     const result = this.db
       .prepare(
         `INSERT INTO runs (kind, project, job_id, thread_key, session_id, model, started_at, ended_at, status,
            cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, tool_calls,
-           rate_limit_util, error, output, script_output)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           rate_limit_util, error, output, script_output, session_cost_usd)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         r.kind,
@@ -540,7 +594,7 @@ export class Store {
         r.startedAt,
         r.endedAt,
         r.status,
-        r.costUsd ?? null,
+        cost ?? null,
         r.inputTokens ?? null,
         r.outputTokens ?? null,
         r.cacheReadTokens ?? null,
@@ -550,6 +604,7 @@ export class Store {
         r.error ?? null,
         r.output?.slice(0, OUTPUT_CAP) ?? null,
         r.scriptOutput?.slice(0, OUTPUT_CAP) ?? null,
+        r.sessionId && r.costUsd !== undefined ? r.costUsd : null,
       );
     return Number(result.lastInsertRowid);
   }
@@ -583,6 +638,17 @@ export class Store {
       .prepare('SELECT * FROM runs WHERE session_id = ? ORDER BY started_at DESC LIMIT 1')
       .get(sessionId);
     return row ? toRun(row as Record<string, unknown>) : undefined;
+  }
+
+  /** Session id → the job it ran, for sessions with a job run started since `since`. */
+  sessionJobs(since: number): Map<string, string> {
+    const rows = this.db
+      .prepare(
+        `SELECT session_id, MIN(job_id) AS job_id FROM runs
+         WHERE session_id IS NOT NULL AND job_id IS NOT NULL AND started_at >= ? GROUP BY session_id`,
+      )
+      .all(since) as { session_id: string; job_id: string }[];
+    return new Map(rows.map((r) => [r.session_id, r.job_id]));
   }
 
   getRun(id: number): StoredRun | undefined {
@@ -742,6 +808,27 @@ export class Store {
       )
       .all(...args, filter.limit ?? 500);
     return (rows as Record<string, unknown>[]).map(toItem);
+  }
+
+  /** A card posted as a reply in a thread it doesn't own (a run's, or a day's `Run <queue>` thread). */
+  setItemThread(id: string, channel: string, threadTs: string, messageTs: string): void {
+    this.db
+      .prepare('UPDATE items SET channel = ?, thread_ts = ?, message_ts = ? WHERE id = ?')
+      .run(channel, threadTs, messageTs, id);
+  }
+
+  /** The `Run <name>` thread opened under `key` (project, name and day), if any. */
+  dayThread(key: string): { channel: string; ts: string } | undefined {
+    const row = this.db.prepare('SELECT channel, ts FROM day_threads WHERE key = ?').get(key) as
+      | { channel: string; ts: string }
+      | undefined;
+    return row ? { channel: row.channel, ts: row.ts } : undefined;
+  }
+
+  saveDayThread(key: string, channel: string, ts: string): void {
+    this.db
+      .prepare('INSERT OR REPLACE INTO day_threads (key, channel, ts, created_at) VALUES (?, ?, ?, ?)')
+      .run(key, channel, ts, this.now());
   }
 
   setItemMessage(id: string, messageTs: string): void {

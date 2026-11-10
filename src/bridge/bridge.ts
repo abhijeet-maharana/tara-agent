@@ -1,15 +1,16 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import {
-  accessSync,
   chmodSync,
   chownSync,
   constants,
   mkdtempSync,
+  readlinkSync,
   realpathSync,
   rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
+import { type FileHandle, open } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -366,21 +367,17 @@ export class Bridge {
     }
     // Resolved through symlinks, so a link can't point the upload outside these roots.
     const roots = [ctx.project.dir, tmpdir()].map((r) => realpathSync(r));
-    if (!roots.some((root) => real.startsWith(root + path.sep))) {
+    const inside = (p: string) => roots.some((root) => p.startsWith(root + path.sep));
+    if (!inside(real)) {
       throw new BridgeError(403, 'Only files inside the project or the temp directory can be sent');
     }
-    const stat = statSync(real);
-    if (!stat.isFile()) throw new BridgeError(400, 'Not a file');
-    if (stat.size > MAX_FILE_BYTES) throw new BridgeError(413, 'File is larger than 100 MB');
-    try {
-      accessSync(real, constants.R_OK);
-    } catch {
-      throw new BridgeError(
-        403,
-        `tara-agent cannot read this file: run \`chmod g+r ${input.path}\` and send it again`,
-      );
-    }
-    await this.deps.chat.uploadFile(ctx.channel, ctx.threadTs, real, input.comment?.slice(0, 2_000));
+    const data = await readChecked(real, inside, input.path);
+    await this.deps.chat.uploadFile(
+      ctx.channel,
+      ctx.threadTs,
+      { name: path.basename(real), data },
+      input.comment?.slice(0, 2_000),
+    );
     return { name: path.basename(real) };
   }
 
@@ -607,4 +604,53 @@ export class Bridge {
 function asBridgeError(err: unknown): never {
   if (err instanceof ApprovalError) throw new BridgeError(err.status, err.message);
   throw err;
+}
+
+/**
+ * Reads a file for `send_file` so that what is uploaded is what was checked. The run's user can change
+ * its own folders at any moment: checking a path and reading it later would let it swap a folder for a
+ * symlink in between and have tara-agent upload a file only tara-agent can read (its own environment,
+ * with the Slack tokens). So the file is opened once (never following a final symlink, never blocking on
+ * a FIFO), the open file is checked (Linux: the path the kernel opened, through /proc/self/fd; elsewhere:
+ * the same file still at a path inside the roots), and the upload reads from that same open file.
+ */
+export async function readChecked(
+  real: string,
+  inside: (p: string) => boolean,
+  shown: string,
+): Promise<Buffer> {
+  let handle: FileHandle;
+  try {
+    handle = await open(real, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'EACCES' || code === 'EPERM')
+      throw new BridgeError(
+        403,
+        `tara-agent cannot read this file: run \`chmod g+r ${shown}\` and send it again`,
+      );
+    if (code === 'ELOOP') throw new BridgeError(403, 'The file changed into a symlink: send the file itself');
+    throw new BridgeError(404, `No such file: ${shown}`);
+  }
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new BridgeError(400, 'Not a file');
+    if (stat.size > MAX_FILE_BYTES) throw new BridgeError(413, 'File is larger than 100 MB');
+    let opened: string | undefined;
+    try {
+      opened = readlinkSync(`/proc/self/fd/${handle.fd}`);
+    } catch {
+      // No /proc (macOS): the same file must still be there, at a path inside the roots.
+      try {
+        const again = realpathSync(real);
+        const now = statSync(again);
+        if (now.dev === stat.dev && now.ino === stat.ino) opened = again;
+      } catch {}
+    }
+    if (!opened || !inside(opened))
+      throw new BridgeError(403, 'Only files inside the project or the temp directory can be sent');
+    return await handle.readFile();
+  } finally {
+    await handle.close();
+  }
 }

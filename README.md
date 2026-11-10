@@ -11,7 +11,7 @@ tara-agent runs on your own server around the clock. It runs scheduled jobs, ans
 **Always on**
 - **Scheduled jobs.** Cron jobs per project, run day and night. A job can run a cheap script first and only wake the agent when there is something to do.
 - **Survives restarts.** Sessions, approvals and schedules are stored locally. Missed jobs catch up after downtime, and no job slot runs twice.
-- **Learns from mistakes.** After a run that had trouble, the agent gets one chance to fix the instructions it followed.
+- **Learns from every run.** After each run, the agent looks back once and fixes the instructions it followed (a wrong selector, a missing step, a trap to avoid). Set `selfImprove: "trouble"` to learn only from runs that went wrong.
 
 **Human in the loop**
 - **Approval buttons in Slack.** The agent asks with Approve / Reject (or your own options). Your tap continues the same session.
@@ -26,7 +26,7 @@ tara-agent runs on your own server around the clock. It runs scheduled jobs, ans
 
 **See everything**
 - **Web dashboard.** What's running, what needs you, failing jobs, the day's schedule, full transcripts of every run, and your repos' uncommitted changes. Works on a phone.
-- **Daily health digest** in each project channel.
+- **Daily health digest** in each project channel, as a `Run health-digest` thread.
 
 ## How it works
 
@@ -35,7 +35,7 @@ tara-agent runs on your own server around the clock. It runs scheduled jobs, ans
 1. tara-agent connects to Slack (Socket Mode, so no public URL is needed).
 2. A message comes in. tara-agent finds the project for that channel and starts the `claude` CLI in headless mode inside that repo, or resumes the thread's session.
 3. Claude's progress streams into the thread as a task list, followed by the answer.
-4. Scheduled jobs use the same path: on their cron time, tara-agent runs the job's script and prompt and posts the result in the project channel. Replying to that post continues the job's session.
+4. Scheduled jobs use the same path: on their cron time, tara-agent posts `Run <job-id>` in the project channel and runs the job's script and prompt in that message's thread. A channel only ever holds these `Run` messages; everything else is in their threads. Replying in the thread continues the job's session.
 5. Everything (sessions, runs, approvals) is stored in a local SQLite file. The dashboard and local API read from it.
 
 Anything that goes out to other people (an email, a post, a reply) waits as a card until you approve it:
@@ -67,14 +67,17 @@ Create `<repo>/.tara/jobs.json`. tara-agent picks up changes within 30 seconds.
 {
   "tz": "Asia/Kolkata",
   "jobs": [
-    {
-      "id": "daily-report",
-      "name": "Daily report",
-      "cron": "45 10 * * *",
-      "prompt": "Check yesterday's late orders and summarise them."
-    }
+    { "id": "daily-report", "name": "Daily report", "cron": "45 10 * * *", "skills": ["order-report"] }
   ]
 }
+```
+
+What the job does goes in its skill, `.claude/skills/order-report/SKILL.md`, under a section for the job:
+
+```markdown
+## Job: `daily-report`
+
+Check yesterday's late orders and summarise them.
 ```
 
 Type `run daily report` in the channel to try it right away.
@@ -104,7 +107,7 @@ No commands to remember: just write.
 | Any message | Starts a session in the project repo; replies in the thread continue it. A new top-level message starts fresh |
 | A reply while it's working | Waits, and is read as soon as the current work finishes (the thread says so). This includes a scheduled job's thread |
 | `stop` (or `cancel`) | Stops whatever is running in the thread, a chat turn or a job. Only the word on its own; "stop the ads" is a normal message |
-| `run <job name>` | Runs a job now, in your message's thread |
+| `run <job name>` | Runs a job now, in your message's thread. A job id or a skill the job uses works too (`run google-analytics`); several matches get buttons |
 | "Which jobs run today?" | Claude answers with its `list_jobs` tool; the health digest posts itself daily |
 
 ## Dashboard

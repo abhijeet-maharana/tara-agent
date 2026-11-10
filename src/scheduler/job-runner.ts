@@ -3,10 +3,11 @@ import type { Bridge, RunContext } from '../bridge/bridge.js';
 import type { HostConfig, ScheduledJob } from '../config/schema.js';
 import { buildAgyArgs } from '../runner/agy.js';
 import { buildClaudeArgs } from '../runner/args.js';
+import { closeRunTabs, openTabs, type Tabs } from '../runner/browser-tabs.js';
 import { buildChildEnv } from '../runner/env.js';
 import type { Runner, RunOutcome } from '../runner/run.js';
 import { jobDataDir, sessionScratch } from '../runner/workspace.js';
-import { type LearnRequest, learnFromRun, troubleReasons } from '../sessions/learn.js';
+import { type LearnRequest, learnFromRun, learnReasons } from '../sessions/learn.js';
 import { type ChatPort, type Logger, threadKey } from '../sessions/manager.js';
 import type { ThreadHold, Threads } from '../sessions/threads.js';
 import { formatDuration, splitMessage, toSlackMrkdwn } from '../slack/format.js';
@@ -22,10 +23,9 @@ import {
   identityPrompt,
   isSilentReply,
   JOB_SYSTEM_PROMPT,
-  parseWakeGate,
   splitHeadline,
 } from './prompt.js';
-import { runScript, type ScriptResult } from './script.js';
+import { openRunThread } from './slack-trigger.js';
 import { expandMcpServers, runSteps, type StepsResult } from './steps.js';
 
 export type JobTrigger =
@@ -67,7 +67,6 @@ export interface JobRunnerDeps {
   threads: Threads;
   bridge?: Bridge;
   env?: NodeJS.ProcessEnv;
-  runScript?: typeof runScript;
   newSessionId?: () => string;
   now?: () => number;
 }
@@ -127,17 +126,16 @@ export async function runJob(
       ? trigger.thread
       : undefined;
   const requestTs = asked?.channel === channel ? asked.ts : cardThread;
-  // A scheduled run started from the bot's own trigger message: that message is the status line.
-  const ownMessage =
-    (trigger.kind === 'schedule' || trigger.kind === 'catch-up') && !trigger.byPerson ? requestTs : undefined;
-  // The thread the run posts in: the requester's message, or (continuing) the job's earlier thread.
-  const inThread = trigger.kind === 'resume' ? trigger.threadTs : requestTs;
-  const postMain = async (text: string) => {
-    if (!ownMessage) return chat.post(channel, inThread, text);
-    await chat.update(channel, ownMessage, text);
-    return ownMessage;
+  // The thread the run posts in: the trigger or requester's message, or (continuing) the job's earlier
+  // thread. A run with none (a queue, Run now) opens its own with a top-level "Run <name>". The top
+  // level of the channel only ever holds those "Run" messages; they are never edited.
+  let inThread = trigger.kind === 'resume' ? trigger.threadTs : requestTs;
+  const thread = async () => {
+    if (!inThread) inThread = await openRunThread(chat, channel, scheduled.runName ?? job.name);
+    return inThread;
   };
-  const reactTo = ownMessage ? undefined : requestTs;
+  const postMain = async (text: string) => chat.post(channel, await thread(), text);
+  const reactTo = requestTs;
   if (reactTo) await chat.react(channel, reactTo, 'eyes').catch(() => {});
 
   // An existing thread may have a chat turn in it: wait for it before taking a slot and locks.
@@ -146,8 +144,14 @@ export async function runJob(
     : undefined;
   const releaseSlot = await deps.slots.acquire();
   const releaseLocks = await deps.locks.acquire(job.locks);
+  // Holding a browser's lock: note its tabs now, to close the ones this run opens or uses.
+  const tabsBefore: { cdpUrl: string; tabs: Tabs }[] = [];
+  for (const b of deps.host.browsers ?? []) {
+    if (!b.closeTabs || !job.locks.includes(b.lock)) continue;
+    const tabs = await openTabs(b.cdpUrl);
+    if (tabs) tabsBefore.push({ cdpUrl: b.cdpUrl, tabs });
+  }
   const startedAt = now();
-  let script: ScriptResult | undefined;
   let lesson: LearnRequest | undefined;
   const record = (status: JobStatus, extra: Partial<RunRecord> = {}) => {
     store.recordRun({
@@ -157,7 +161,6 @@ export async function runJob(
       startedAt,
       endedAt: now(),
       status,
-      scriptOutput: script?.output,
       ...extra,
     });
     log.info(`[${project.config.name}] job ${job.id} ${status} in ${formatDuration(now() - startedAt)}`);
@@ -177,42 +180,16 @@ export async function runJob(
     try {
       env = { ...buildChildEnv(deps.env ?? process.env, project.config.billing), ...scheduled.env };
       env.TARA_JOB_DATA = jobDataDir(project, stateDir, job.id);
+      // The skill runs the job's scripts itself: let one Bash call take as long as the job may.
+      env.BASH_DEFAULT_TIMEOUT_MS = env.BASH_MAX_TIMEOUT_MS = String(timeoutMs);
     } catch (err) {
       await postMain(`❌ ${title} could not start: ${(err as Error).message}`);
       return record('error', { error: (err as Error).message });
     }
 
-    // A queue already decided what to run, and a continued run is past its gate.
-    if (job.preScript && trigger.kind !== 'resume' && trigger.kind !== 'queue') {
-      script = await (deps.runScript ?? runScript)(job.preScript, project.dir, env, timeoutMs, signal);
-      if (signal?.aborted) return record('aborted');
-      if (script.ok && (!script.output.trim() || !parseWakeGate(script.output))) {
-        // Someone asked for this run: say why nothing happened instead of staying silent.
-        if (requestTs) {
-          const reason = script.output.split('\n').find((l) => l.trim() && !l.includes('wakeAgent'));
-          await postMain(
-            `🔇 ${title}: nothing to do right now.${reason ? `\n> ${reason.trim().slice(0, 300)}` : ''}`,
-          );
-        }
-        return record('silent');
-      }
-      if (!job.agent) {
-        // The result line in the channel, the script's output in its thread.
-        const icon = script.ok ? '✅' : '❌';
-        const meta = formatDuration(now() - startedAt);
-        const ts = await postMain(`${icon} ${title} · ${meta}`);
-        if (script.output.trim())
-          await chat.post(channel, inThread ?? ts, `\`\`\`\n${script.output.slice(0, 3_000)}\n\`\`\``);
-        return record(script.ok ? 'ok' : 'failed', {
-          error: script.ok ? undefined : script.output.slice(-500),
-        });
-      }
-    }
-
-    // The job's thread: the requester's message, or a new channel message. The status line (⏳ → ✅
-    // with the headline) is that channel message, or the first reply in the requester's thread.
+    // The status line (⏳ → ✅ with the headline) is the first reply in the run's thread.
     const statusTs = await postMain(`⏳ ${title}`);
-    const rootTs = inThread ?? statusTs;
+    const rootTs = await thread();
     const key = threadKey(channel, rootTs);
     // Holding the thread makes replies wait for this run, and lets "stop" in the thread end it.
     hold ??= await deps.threads.enter(key);
@@ -254,7 +231,6 @@ export async function runJob(
     const harness = session.harness ?? 'claude';
     const resuming = trigger.kind === 'resume' && !handoff;
     store.saveSession(session);
-    // Made only now, when the model runs: gate-skipped runs leave no empty folders behind.
     const folders = {
       scratch: sessionScratch(project, stateDir, job.id, scratchId),
       jobData: env.TARA_JOB_DATA,
@@ -353,7 +329,6 @@ export async function runJob(
                 : trigger.text
             : buildJobPrompt(
                 job,
-                script,
                 folders,
                 trigger.kind === 'queue' ? trigger.items : undefined,
                 stepsDone?.section,
@@ -388,11 +363,17 @@ export async function runJob(
       .finally(() => bridged?.dispose());
     await status.flush();
 
-    /** Sets up a learning turn when this run had trouble; it runs once the job's locks are released. */
+    /** Sets up this run's learning turn (`selfImprove`); it runs once the job's locks are released. */
     const learnIf = (failure: string | undefined, threadTs: string | undefined) => {
-      const reasons = troubleReasons(outcome, toolErrors, failure);
       // Learning turns resume the session with Claude, so agy runs don't get one.
-      if (!project.config.selfImprove || harness !== 'claude' || !reasons.length) return;
+      if (harness !== 'claude') return;
+      const reasons = learnReasons(
+        job.selfImprove ?? project.config.selfImprove,
+        outcome,
+        toolErrors,
+        failure,
+      );
+      if (!reasons) return;
       lesson = {
         project,
         sessionId: outcome.sessionId ?? session.sessionId,
@@ -446,17 +427,11 @@ export async function runJob(
     }
 
     if (isSilentReply(outcome.text)) {
-      await live?.discard();
-      if (inThread) {
-        // The requester's thread stays (and its session, for follow-up questions).
-        await chat.update(channel, statusTs, `🔇 ${title} · nothing to report`);
-      } else {
-        await chat
-          .delete(channel, rootTs)
-          .catch(() => chat.update(channel, rootTs, `🔇 ${title} · nothing to report`));
-        store.deleteSession(key);
-      }
-      learnIf(undefined, inThread);
+      // The thread stays, with the steps the run took and its session, to see what it checked and
+      // to ask about it.
+      await chat.update(channel, statusTs, `🔇 ${title} · ${meta} · nothing to report`);
+      await live?.finish({ summary: `🔇 Nothing to report · ${meta}`, ok: true, answer: '', notes: [] });
+      learnIf(undefined, rootTs);
       return record('silent', { ...usage, output: outcome.text });
     }
 
@@ -483,10 +458,20 @@ export async function runJob(
     log.error(`[${project.config.name}] job ${job.id} crashed: ${(err as Error).stack ?? err}`);
     return record('error', { error: (err as Error).message });
   } finally {
+    for (const { cdpUrl, tabs } of tabsBefore) {
+      const closed = await closeRunTabs(cdpUrl, tabs, (m) => log.warn(`[${project.config.name}] ${m}`));
+      if (closed)
+        log.info(
+          `[${project.config.name}] job ${job.id}: closed ${closed} browser tab${closed === 1 ? '' : 's'} (${cdpUrl})`,
+        );
+    }
     releaseLocks();
-    // Still inside the job slot, so learning turns count towards jobConcurrency.
-    if (lesson) await learnFromRun(deps, lesson);
-    hold?.release();
-    releaseSlot();
+    try {
+      // Still inside the job slot, so learning turns count towards jobConcurrency.
+      if (lesson) await learnFromRun(deps, lesson);
+    } finally {
+      hold?.release();
+      releaseSlot();
+    }
   }
 }

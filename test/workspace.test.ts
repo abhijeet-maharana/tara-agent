@@ -16,7 +16,7 @@ function project(overrides: Partial<Project['config']> = {}): Project {
       allowedTools: [],
       allowedUsers: [],
       billing: 'subscription',
-      selfImprove: true,
+      selfImprove: 'trouble',
       ...overrides,
     },
   };

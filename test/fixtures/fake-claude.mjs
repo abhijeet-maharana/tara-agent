@@ -1,4 +1,5 @@
 // Stands in for the `claude` CLI in tests. Behaviour is picked with FAKE_CLAUDE_MODE.
+import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 
 const mode = process.env.FAKE_CLAUDE_MODE ?? 'ok';
@@ -31,6 +32,17 @@ process.stdin.on('end', () => {
     case 'hang':
       setInterval(() => {}, 1000);
       return;
+    case 'orphan': {
+      // Finishes its turn but leaves a child (like a browser or an MCP server) holding stdout open.
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+        stdio: ['ignore', 'inherit', 'inherit'],
+      });
+      process.stderr.write(`orphan ${child.pid}\n`);
+      process.stdout.write(readFileSync(fixture, 'utf8'));
+      child.unref();
+      process.exit(0);
+      return;
+    }
     case 'crash':
       process.stderr.write('Error: something broke\n');
       process.exitCode = 2;

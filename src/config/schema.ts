@@ -1,3 +1,4 @@
+import { Cron } from 'croner';
 import { z } from 'zod';
 import { GEMINI_LIVE_URL } from '../live/gemini.js';
 
@@ -39,24 +40,35 @@ export const mcpServerSchema = z.object({
 });
 export type McpServer = z.infer<typeof mcpServerSchema>;
 
+/** A key that older jobs files had, refused with where it goes now. */
+const movedToSkill = (
+  key: string,
+  where = 'a job\'s instructions live in its skill, under "## Job: <id>" (steps: "### Step: <name>")',
+) =>
+  z
+    .never({
+      error: `\`${key}\` is no longer read: ${where}. Run \`tara-agent move-prompts <repo>\` to move it`,
+    })
+    .optional();
+
 /**
  * One step of a job: a fresh session of the job's harness and model that runs before the main prompt,
- * with the job's MCP servers but no Slack tools. Its reply goes into the main prompt.
+ * with the job's MCP servers but no Slack tools. Its reply goes into the main prompt. What it does is
+ * the `### Step: <name>` part of the job's section in its skill.
  */
-export const jobStepSchema = z
-  .object({
-    name: z.string().min(1).max(80),
-    prompt: z.string().optional(),
-    /** Read from the repo and put before `prompt` (shared instructions for several steps). */
-    promptFile: z.string().optional(),
-    /** Defaults to the job's `timeoutMinutes`. */
-    timeoutMinutes: z.number().positive().optional(),
-    /** Defaults to the job's `model` (same harness), e.g. a faster model for long browser steps. */
-    model: z.string().min(1).optional(),
-    /** `agy` jobs: rules for this step instead of the job's `agyPermissions`. */
-    agyPermissions: agyPermissionsSchema.optional(),
-  })
-  .refine((s) => s.prompt || s.promptFile, { message: 'a step needs a prompt or a promptFile' });
+export const jobStepSchema = z.object({
+  name: z.string().min(1).max(80),
+  /** The skill holding this step's part. Defaults to the job's first skill. */
+  skill: z.string().min(1).optional(),
+  prompt: movedToSkill('prompt'),
+  promptFile: movedToSkill('promptFile'),
+  /** Defaults to the job's `timeoutMinutes`. */
+  timeoutMinutes: z.number().positive().optional(),
+  /** Defaults to the job's `model` (same harness), e.g. a faster model for long browser steps. */
+  model: z.string().min(1).optional(),
+  /** `agy` jobs: rules for this step instead of the job's `agyPermissions`. */
+  agyPermissions: agyPermissionsSchema.optional(),
+});
 export type JobStep = z.infer<typeof jobStepSchema>;
 
 /** A project's GitHub repo for pull requests (host `github`). */
@@ -135,6 +147,11 @@ export const hostConfigSchema = z.object({
   /** Days after its last use that a session's scratch folder (`TARA_SCRATCH`) is deleted. */
   scratchDays: z.number().min(1).default(3),
   /**
+   * Days of history kept in the state database: runs, slot claims and sessions not used since are
+   * deleted daily (each job's latest run stays). Approval cards are kept.
+   */
+  retentionDays: z.number().int().min(14).default(90),
+  /**
    * Stream replies into Slack threads as Claude writes them, with a live task card (needs the Slack
    * app's "Agents & AI Apps" feature; falls back to an edited status message without it).
    */
@@ -150,6 +167,26 @@ export const hostConfigSchema = z.object({
       models: z.array(z.string().min(1)).min(1),
     })
     .optional(),
+  /**
+   * The shared browsers jobs drive (Chrome with remote debugging), one per Chrome instance, e.g. one
+   * per signed-in identity. After every run of a job that holds a browser's `lock`, the tabs the run
+   * opened or moved to another page in that browser are closed, also when it failed.
+   */
+  browsers: z
+    .array(
+      z.object({
+        /** The job lock that means "this run drives this browser". */
+        lock: z.string().min(1),
+        /** Chrome's DevTools address, as in the Chrome MCP server's `--browserUrl`. */
+        cdpUrl: z.string().url(),
+        /** false: leave tabs as the run left them. */
+        closeTabs: z.boolean().default(true),
+      }),
+    )
+    .refine((b) => new Set(b.map((x) => x.lock)).size === b.length, {
+      message: 'each browser needs its own lock',
+    })
+    .default([{ lock: 'chrome', cdpUrl: 'http://127.0.0.1:9222', closeTabs: true }]),
   /** Minimum gap between edits of the live status message. */
   statusIntervalSeconds: z.number().min(1).default(5),
   /** Max scheduled jobs running at once (separate from chat). */
@@ -284,6 +321,12 @@ export const hostConfigSchema = z.object({
     .optional(),
 });
 
+/** `true`/`false` are kept for configs written before the modes existed. */
+const selfImproveSchema = z
+  .union([z.boolean(), z.enum(['always', 'trouble', 'off'])])
+  .transform((v): SelfImprove => (v === true ? 'always' : v === false ? 'off' : v));
+export type SelfImprove = 'always' | 'trouble' | 'off';
+
 /** `<repo>/.tara/config.json`: committed in the project repo. */
 export const projectConfigSchema = z.object({
   name: z
@@ -348,11 +391,12 @@ export const projectConfigSchema = z.object({
     })
     .optional(),
   /**
-   * After a job run that had trouble (failed, errored, timed out, or several tool errors), resume
-   * its session once and let Claude fix the skill or instruction file it followed, so the same
-   * problem doesn't happen twice. Clean runs cost nothing extra.
+   * Learning turns: resume a finished run's session once and let Claude fix the skill or instruction
+   * file it followed. `always` (default, also `true`): after every run that used a tool; a clean run
+   * gets a short look back, a run with trouble the list of what went wrong. `trouble`: only after a run
+   * that failed, errored, timed out or had several tool errors. `off` (also `false`): never.
    */
-  selfImprove: z.boolean().default(true),
+  selfImprove: selfImproveSchema.default('always'),
   /**
    * Parent folder of the per-session scratch folders (`TARA_SCRATCH`), relative to the repo. Keep it
    * out of git. Defaults to `<stateDir>/scratch/<name>`.
@@ -363,6 +407,32 @@ export const projectConfigSchema = z.object({
 });
 
 const jobIdPattern = /^[a-z0-9][a-z0-9-]*$/;
+
+/** A cron expression croner accepts; checked when the file loads, not when it first fires. */
+const cronString = z.string().refine(
+  (expr) => {
+    try {
+      new Cron(expr, { paused: true }).stop();
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  { message: 'not a valid cron expression' },
+);
+
+/** An IANA timezone the runtime knows. */
+const timeZoneString = z.string().refine(
+  (tz) => {
+    try {
+      new Intl.DateTimeFormat('en', { timeZone: tz });
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  { message: 'not a known timezone' },
+);
 
 /** One scheduled job in `<repo>/.tara/jobs.json`. */
 export const jobSchema = z
@@ -378,18 +448,21 @@ export const jobSchema = z
     tz: z.string().optional(),
     /** Typical run time, for schedule planning tools (overlap checks, calendars). tara doesn't use it. */
     durationMinutes: z.number().positive().optional(),
-    /** What to do. Optional only for script-only jobs (`agent: false`). */
-    prompt: z.string().optional(),
-    /** Skills the job should follow; named in the prompt so Claude reads them first. */
-    skills: z.array(z.string()).default([]),
+    prompt: movedToSkill('prompt'),
     /**
-     * Runs before the model, in the repo root (`.py` with python3, `.sh` with bash, else executed).
-     * Empty stdout or a last line of `{"wakeAgent": false}` = silent run. Otherwise its output (or its
-     * error) is put in front of the prompt.
+     * Skills the job loads first (at least one). The first one holds the job's instructions: its
+     * `## Job: <id>` section, with the scripts to run first (`### Before you start`) and a
+     * `### Step: <name>` part per step.
      */
-    preScript: z.string().optional(),
-    /** false = the script is the job: its stdout is posted as-is and no model runs. */
-    agent: z.boolean().default(true),
+    skills: z.array(z.string()).default([]),
+    preScript: movedToSkill(
+      'preScript',
+      'the job\'s skill runs its scripts (the "### Before you start" part of its "## Job: <id>" section)',
+    ),
+    agent: movedToSkill(
+      'agent',
+      "every job runs the model; a script-only job's skill runs the script and posts what it printed",
+    ),
     /** The CLI the job runs on. `agy` jobs need an agy `model` (`agy models` lists them). */
     harness: z.enum(harnesses).default('claude'),
     model: z.string().min(1).default('sonnet'),
@@ -401,7 +474,7 @@ export const jobSchema = z
     /**
      * When a card of the run is approved, carry on in a fresh session on this harness and model instead
      * of the run's own, e.g. an `agy` job that reports findings and leaves approved fixes to Claude. That
-     * session gets the card, the decision and the job's prompt; later decisions and thread replies stay
+     * session gets the card, the decision and the job's instructions (its skill section); later decisions and thread replies stay
      * on it. A declined card (Skip, Reject, …) runs no model at all.
      */
     handoff: z.object({ harness: z.enum(harnesses), model: z.string().min(1) }).optional(),
@@ -417,20 +490,19 @@ export const jobSchema = z
     timeoutMinutes: z.number().positive().default(30),
     /** Run the most recent missed slot after downtime (see host `catchUpHours`). */
     catchUp: z.boolean().default(true),
-    /**
-     * Post nothing in Slack unless there is something to say, for monitors that run often: no
-     * trigger message, the gate runs first, a gate skip or `[SILENT]` leaves no trace in the channel.
-     */
-    quiet: z.boolean().default(false),
+    /** Overrides the project's `selfImprove` for this job, e.g. `trouble` for a job that runs every few minutes. */
+    selfImprove: selfImproveSchema.optional(),
     /** Slack channel for this job's threads. Defaults to the project channel. */
     channel: z.string().optional(),
-    /** Extra environment for the script and the CLI. `~/` is expanded. */
+    /** Extra environment for the CLI (and the scripts it runs). `~/` is expanded. */
     env: z.record(z.string(), z.string()).default({}),
     allowedTools: z.array(z.string()).optional(),
     enabled: z.boolean().default(true),
   })
-  .refine((j) => j.prompt || !j.agent, { message: 'prompt is required unless agent is false' })
-  .refine((j) => j.preScript || j.agent, { message: 'a job with agent: false needs a preScript' });
+  .refine((j) => j.skills.length > 0, {
+    message: 'a job needs a skill: its instructions are the skill\'s "## Job: <id>" section',
+    path: ['skills'],
+  });
 
 const hhmm = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'HH:MM');
 const days = z
@@ -466,7 +538,7 @@ export const queueSchema = z
     /** Items run only while their window (the item's `window`, or any) is open. */
     windows: z.record(z.string(), queueWindowSchema).optional(),
     /** Instead of windows: one batch per cron slot. */
-    slots: z.string().optional(),
+    slots: cronString.optional(),
     /** With slots: take turns between these kinds (oldest approval first within a kind). */
     alternate: z.array(z.string()).optional(),
     /**
@@ -491,7 +563,7 @@ export const queueSchema = z
      */
     slack: z.boolean().optional(),
     /** Timezone for slots, window defaults and the cap day. Defaults to the jobs file `tz`, then the host. */
-    tz: z.string().optional(),
+    tz: timeZoneString.optional(),
   })
   .refine((q) => !(q.windows && q.slots), { message: 'use windows or slots, not both' })
   .refine((q) => !(q.fills && (q.windows || q.slots)), {
@@ -514,20 +586,48 @@ export type QueueWindow = z.infer<typeof queueWindowSchema>;
 export type QueueConfig = z.infer<typeof queueSchema>;
 
 /** `<repo>/.tara/jobs.json`. */
-export const jobsFileSchema = z.object({
-  /** IANA timezone for every job's `cron` that doesn't set its own `tz`. Defaults to the host timezone. */
-  tz: z.string().optional(),
-  /** Environment shared by every job in this repo. `~/` is expanded. */
-  env: z.record(z.string(), z.string()).default({}),
-  jobs: z.array(jobSchema).superRefine((jobs, ctx) => {
-    const seen = new Set<string>();
-    for (const [i, j] of jobs.entries()) {
-      if (seen.has(j.id))
-        ctx.addIssue({ code: 'custom', path: [i, 'id'], message: `duplicate job id "${j.id}"` });
-      seen.add(j.id);
-    }
-  }),
+/**
+ * Values every job in the file gets unless it sets its own, so a key most jobs share is written once.
+ * A job overrides one by setting it (`"locks": []` for a job that doesn't need the shared lock).
+ */
+export const jobDefaultsSchema = z
+  .object({
+    harness: z.enum(harnesses),
+    model: z.string().min(1),
+    locks: z.array(z.string()),
+    timeoutMinutes: z.number().positive(),
+  })
+  .partial()
+  .strict();
+
+const jobsArraySchema = z.array(jobSchema).superRefine((jobs, ctx) => {
+  const seen = new Set<string>();
+  for (const [i, j] of jobs.entries()) {
+    if (seen.has(j.id))
+      ctx.addIssue({ code: 'custom', path: [i, 'id'], message: `duplicate job id "${j.id}"` });
+    seen.add(j.id);
+  }
 });
+
+export const jobsFileSchema = z
+  .object({
+    /** IANA timezone for every job's `cron` that doesn't set its own `tz`. Defaults to the host timezone. */
+    tz: z.string().optional(),
+    /** Environment shared by every job in this repo. `~/` is expanded. */
+    env: z.record(z.string(), z.string()).default({}),
+    defaults: jobDefaultsSchema.default({}),
+    jobs: z.array(z.record(z.string(), z.unknown())),
+  })
+  .transform((file, ctx) => {
+    // Applied before each job is parsed, so the job's own value (even `[]`) wins and errors point at the job.
+    const jobs = jobsArraySchema.safeParse(file.jobs.map((job) => ({ ...file.defaults, ...job })));
+    if (!jobs.success) {
+      for (const issue of jobs.error.issues) ctx.addIssue({ ...issue, path: ['jobs', ...issue.path] });
+      return z.NEVER;
+    }
+    const { defaults: _applied, ...rest } = file;
+    return { ...rest, jobs: jobs.data };
+  });
 
 export type HostConfig = z.infer<typeof hostConfigSchema>;
 export type JobConfig = z.infer<typeof jobSchema>;
@@ -547,4 +647,6 @@ export interface ScheduledJob {
   project: Project;
   job: JobConfig;
   env: Record<string, string>;
+  /** What its "Run <name>" messages say (`runName`): the job's name unless another job shares it. */
+  runName?: string;
 }

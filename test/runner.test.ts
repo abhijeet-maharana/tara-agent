@@ -247,6 +247,14 @@ describe('runClaude', () => {
     expect(o.status).toBe('timeout');
   });
 
+  it('ends a run whose CLI exited but left a process holding its output, and kills that process', async () => {
+    const started = Date.now();
+    const o = await run('orphan', { exitGraceMs: 300 }).outcome;
+    expect(o.status).toBe('ok');
+    expect(o.text).toBeTruthy();
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
   it('stops when aborted', async () => {
     const controller = new AbortController();
     const { outcome } = run('hang', { signal: controller.signal });

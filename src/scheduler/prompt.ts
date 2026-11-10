@@ -1,18 +1,15 @@
 import type { Harness, JobConfig } from '../config/schema.js';
 import type { Item } from '../store/store.js';
-import type { ScriptResult } from './script.js';
 
-/**
- * The cron conventions below match Hermes Agent's, so jobs and gate scripts written for Hermes run
- * unchanged: the wake gate, the "Script Output" block, `[SILENT]` and `[CRON_FAILURE]`.
- */
+/** `[SILENT]` and `[CRON_FAILURE]` match Hermes Agent's cron conventions. */
 export const JOB_SYSTEM_PROMPT = `You are running a scheduled job unattended, through tara-agent. Nobody is watching live.
 - Do the whole job now. Never wait for input mid-turn.
 - Finish first, ask at the end: do every part that needs no decision, all the way through, and never stop midway for an approval you can do without. Then raise one \`request_approval\` card per thing that needs a person (a decision, a suggestion, a login or a failure you could not fix) and end your turn; each decision continues this run later. Drafts that go out later go through \`propose_item\`.
 - If there is nothing worth reporting, reply with exactly [SILENT] and nothing will be posted.
 - If the job failed, start your reply with a line containing only [CRON_FAILURE], then the evidence.
 - Reply format: a headline of 1–6 lines (shown in the channel), then a line containing only ---, then the full details (posted in the thread). Use Slack mrkdwn and keep it phone-friendly.
-- Temporary files (helper scripts, request bodies, downloads) go in $TARA_SCRATCH, never in the repo; it is deleted automatically later. Data this job needs on its next run goes in $TARA_JOB_DATA. A script that would make every run faster is code: propose it in your reply instead of saving it.`;
+- Temporary files (request bodies, downloads, one-off helpers) go in $TARA_SCRATCH, never in the repo; it is deleted automatically later. Data this job needs on its next run goes in $TARA_JOB_DATA.
+- A script that would make every run faster or more reliable is worth keeping: save it in the \`scripts/\` folder of the job's skill, run it from there, and add it to the skill (what it does, when to run it, how to read its output). Fix a script the skill runs when it is wrong, instead of working around it.`;
 
 /** For a job's `steps`: sessions that run before the main prompt and only feed it. */
 export const STEP_SYSTEM_PROMPT = `You are one step of a scheduled job, running unattended through tara-agent. Nobody is watching live and nobody reads your reply but the job's next session.
@@ -20,13 +17,21 @@ export const STEP_SYSTEM_PROMPT = `You are one step of a scheduled job, running 
 - You have no Slack tools: don't try to post, send files or ask for approval. The job's main session does that with your result.
 - Temporary files go in $TARA_SCRATCH (named below); the main session can read them there.`;
 
-/** The follow-up turn after a job run that had trouble (`selfImprove`); `reasons` say what went wrong. */
+/**
+ * The follow-up turn after a run (`selfImprove`). `reasons` say what went wrong; empty means the run
+ * was clean and only gets a look back for what it had to figure out.
+ */
 export function learnPrompt(reasons: string[]): string {
-  return `This run had trouble: ${reasons.join('; ')}.
+  const opening = reasons.length
+    ? `This run had trouble: ${reasons.join('; ')}.
 
-Before you stop: if a change to the instructions you followed would prevent this next time, make it now with the edit tools. That means the skill (its SKILL.md) or another instruction (.md) file this run used, not code. Keep it small and specific: a corrected selector or URL, a missing step, a known trap and how to get past it. If the skill has a version in its front matter, bump it.
+Before you stop: if a change to the instructions you followed would prevent this next time, make it now with the edit tools.`
+    : `This run is done. Before you stop, look back at it once: did you hit a wrong selector, URL, command or assumption, retry something, find a workaround, take a slow path you would skip next time, or learn a fact about this project the instructions didn't give you?
 
-Do not repeat the task, open the browser or call other services. Do not create new skills or files.
+Only if writing that down would make the next run faster or more reliable, make the change now with the edit tools. Don't rewrite what already worked, and don't add general advice: only what this run actually discovered.`;
+  return `${opening} That means the skill this run used (its SKILL.md, or a script in its folder that the skill runs) or another instruction (.md) file it used. Keep it small and specific: a corrected selector or URL, a missing step, a known trap and how to get past it, a fixed bug in a script. A new script goes in the skill's \`scripts/\` folder, with SKILL.md saying when and how to run it. If the skill has a version in its front matter, bump it.
+
+Do not repeat the task, open the browser or call other services. Do not create new skills.
 
 Reply with exactly NONE if nothing should change. Otherwise reply with one line per file you changed: \`<path>: <what changed>\`.`;
 }
@@ -36,23 +41,6 @@ export const isNoLesson = (text: string | undefined) => !text?.trim() || /^\s*NO
 
 /** First line of every run's system prompt, so Claude knows the name people call it by. */
 export const identityPrompt = (agentName: string) => `Your name is ${agentName}.`;
-
-/** False only when the script's last non-empty line is JSON `{"wakeAgent": false}`. */
-export function parseWakeGate(output: string): boolean {
-  const lines = output.split('\n').filter((l) => l.trim());
-  const last = lines.at(-1);
-  if (!last) return true;
-  try {
-    const gate: unknown = JSON.parse(last.trim());
-    return !(
-      typeof gate === 'object' &&
-      gate !== null &&
-      (gate as { wakeAgent?: unknown }).wakeAgent === false
-    );
-  } catch {
-    return true;
-  }
-}
 
 /** Absolute paths of a run's folders (runner/workspace.ts). */
 export interface RunFolders {
@@ -98,7 +86,7 @@ export function buildHandoffPrompt(
     `This run of the job "${job.name}" ran on ${from} until now. It continues here, in a new session, after a decision on one of its approval cards. You don't have the earlier conversation: the card below and the job's instructions are what you have. Act on the decision only; the rest of the run is already done.`,
     cardSection(card),
     `## The decision\n${decision}`,
-    `## The job's instructions\n${job.prompt ?? ''}`,
+    `## The job's instructions\n${jobInstructions(job)}`,
     foldersNote(folders),
   ].join('\n\n');
 }
@@ -107,10 +95,27 @@ export function buildHandoffPrompt(
 export const decisionWithCard = (card: DecidedCard, decision: string) =>
   `${cardSection(card)}\n\n${decision}`;
 
-/** The user prompt for one run: script data first (as Hermes does), then the job prompt, its skills and folders. */
+/** What the main session is told to do: the job's section in its first skill. */
+export function jobInstructions(job: Pick<JobConfig, 'id' | 'name' | 'skills' | 'steps'>): string {
+  const steps =
+    job.steps.length > 0
+      ? ' Its "### Step" parts were done by the sessions before you (their output is above): do the rest.'
+      : '';
+  return `Run the job "${job.name}" (\`${job.id}\`): do what the "## Job: \`${job.id}\`" section of the \`${job.skills[0]}\` skill says, with the rest of that skill.${steps}`;
+}
+
+/** What one step's session is told to do: its part of the job's section. */
+export function stepInstructions(
+  job: Pick<JobConfig, 'id' | 'name' | 'skills'>,
+  step: Pick<JobConfig['steps'][number], 'name' | 'skill'>,
+): string {
+  const skill = step.skill ?? job.skills[0];
+  return `This is the step "${step.name}" of the job "${job.name}" (\`${job.id}\`). Load the \`${skill}\` skill (the Skill tool, or its SKILL.md). In its "## Job: \`${job.id}\`" section, do only the "### Step: ${step.name}" part (and the "### Every step" part, if there is one); the rest of that section is for the session after the steps.`;
+}
+
+/** The user prompt for one run: approved items and step output, then what to do, its skills and folders. */
 export function buildJobPrompt(
   job: JobConfig,
-  script?: ScriptResult,
   folders?: RunFolders,
   items?: Item[],
   /** The `## Step Output` section from the job's steps. */
@@ -118,17 +123,8 @@ export function buildJobPrompt(
 ): string {
   const parts: string[] = [];
   if (items?.length) parts.push(approvedItemsBlock(items));
-  if (script) {
-    const [heading, intro] = script.ok
-      ? [
-          'Script Output',
-          'The following data was collected by a pre-run script. Use it as context for your analysis.',
-        ]
-      : ['Script Error', 'The data-collection script failed. Report this to the user.'];
-    parts.push(`## ${heading}\n${intro}\n\n\`\`\`\n${script.output}\n\`\`\``);
-  }
   if (stepOutput) parts.push(stepOutput);
-  parts.push(job.prompt ?? '');
+  parts.push(jobInstructions(job));
   if (job.skills.length > 0) {
     parts.push(
       `Skills for this job: ${job.skills.map((s) => `\`${s}\``).join(', ')}. ` +

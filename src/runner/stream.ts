@@ -19,7 +19,15 @@ export interface RateLimit {
 export type StreamEvent =
   | { kind: 'init'; sessionId: string; model: string }
   /** `parent` is set for calls made inside a sub-agent (Task/Agent tool). */
-  | { kind: 'tool'; id: string; name: string; status: string; parent?: string }
+  | {
+      kind: 'tool';
+      id: string;
+      name: string;
+      status: string;
+      parent?: string;
+      /** The file an edit tool writes (`file_path` / `notebook_path` of Write, Edit, MultiEdit, NotebookEdit). */
+      file?: string;
+    }
   | { kind: 'tool_result'; id: string; isError: boolean; parent?: string }
   /** A piece of Claude's text as it is written (needs `--include-partial-messages`). */
   | { kind: 'text'; text: string; parent?: string }
@@ -137,7 +145,16 @@ export function parseStreamLine(line: string): StreamEvent[] {
         .filter((c): c is Json => isObject(c) && c.type === 'tool_use')
         .map((c) => {
           const name = str(c.name) ?? 'tool';
-          return { kind: 'tool', id: str(c.id) ?? '', name, status: describeTool(name, c.input), parent };
+          const input = isObject(c.input) ? c.input : {};
+          const file = str(input.file_path) ?? str(input.notebook_path);
+          return {
+            kind: 'tool',
+            id: str(c.id) ?? '',
+            name,
+            status: describeTool(name, c.input),
+            parent,
+            ...(file ? { file } : {}),
+          };
         });
     }
     case 'user': {

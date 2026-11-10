@@ -10,14 +10,14 @@ import type { Runner, RunOutcome } from '../runner/run.js';
 import { sessionScratch } from '../runner/workspace.js';
 import { foldersNote, identityPrompt } from '../scheduler/prompt.js';
 import type { JobControl, JobInfo } from '../scheduler/scheduler.js';
-import { looksLikeTrigger, parseScheduledRun, SCHEDULE_BY } from '../scheduler/slack-trigger.js';
+import { findRunJob, looksLikeTrigger, parseScheduledRun, SCHEDULE_BY } from '../scheduler/slack-trigger.js';
 import type { ButtonTap } from '../slack/app.js';
 import { formatDuration } from '../slack/format.js';
 import { EditReply, type StreamPort, StreamReply, type TurnReply } from '../slack/reply.js';
 import type { SessionRow, Store } from '../store/store.js';
 import { Semaphore } from '../util/concurrency.js';
 import { matchJob } from './job-match.js';
-import { learnFromRun, troubleReasons } from './learn.js';
+import { learnFromRun, learnReasons } from './learn.js';
 import { Threads } from './threads.js';
 
 /** The chat platform as the session manager sees it. Slack implements it; tests fake it. */
@@ -36,7 +36,13 @@ export interface ChatPort {
     blocks: SlackBlock[],
   ): Promise<string>;
   /** Uploads a local file into a thread. */
-  uploadFile(channel: string, threadTs: string, filePath: string, comment?: string): Promise<void>;
+  /** Uploads bytes already read (see bridge `readChecked`), never a path read later. */
+  uploadFile(
+    channel: string,
+    threadTs: string,
+    file: { name: string; data: Buffer },
+    comment?: string,
+  ): Promise<void>;
   /** Native message streaming, when the platform has it. */
   stream?: StreamPort;
   react(channel: string, ts: string, emoji: string): Promise<void>;
@@ -127,7 +133,10 @@ export class SessionManager {
   async handle(msg: IncomingMessage): Promise<void> {
     const project = this.byChannel.get(msg.channel);
     if (!project) return;
-    if (msg.fromSelf) return this.scheduledRun(project, msg);
+    if (msg.fromSelf) {
+      await this.scheduledRun(project, msg);
+      return;
+    }
     const { allowedUsers } = project.config;
     if (allowedUsers.length > 0 && !allowedUsers.includes(msg.user)) {
       this.log.warn(`[${project.config.name}] ignored message from ${msg.user} (not in allowedUsers)`);
@@ -137,13 +146,19 @@ export class SessionManager {
     if (!text && !msg.attachments?.length) return;
     // A trigger posted as a person (SLACK_USER_TOKEN). It runs only a slot the scheduler posted.
     if (msg.threadTs === msg.ts && looksLikeTrigger(text)) {
-      if (parseScheduledRun(text)) return this.scheduledRun(project, msg);
+      if (parseScheduledRun(text)) {
+        await this.scheduledRun(project, msg);
+        return;
+      }
       // Never hand a trigger to Claude as a chat message: it would improvise the job without its setup.
       this.log.warn(
         `[${project.config.name}] ignored a trigger message that doesn't parse: ${text.slice(0, 120)}`,
       );
       return;
     }
+    // "Run <id>" at the top level: the scheduler's trigger when a slot of that job is waiting for it,
+    // otherwise a person's own request, handled as "run <job name>" below.
+    if (msg.threadTs === msg.ts && parseScheduledRun(text) && (await this.scheduledRun(project, msg))) return;
     const key = threadKey(msg.channel, msg.threadTs);
     const reply = (text: string) => this.deps.chat.post(msg.channel, msg.threadTs, text);
 
@@ -189,12 +204,28 @@ export class SessionManager {
     return true;
   }
 
-  /** The bot's own trigger message for a scheduled slot: the run happens in its thread. */
-  private async scheduledRun(project: Project, msg: IncomingMessage): Promise<void> {
-    const id = parseScheduledRun(msg.text);
-    const job = id ? this.deps.jobs?.list(project.config.name).find((j) => j.id === id) : undefined;
-    if (!job || msg.threadTs !== msg.ts) return;
-    await this.startJob(project, job, SCHEDULE_BY, msg.channel, msg.ts, true);
+  /**
+   * A trigger message for a scheduled slot: the run happens in its thread. False when no slot of that
+   * job is waiting (a person typed "Run <id>", or Slack redelivered an old trigger).
+   */
+  private async scheduledRun(project: Project, msg: IncomingMessage): Promise<boolean> {
+    const said = parseScheduledRun(msg.text);
+    const job =
+      said && this.deps.jobs ? findRunJob(this.deps.jobs.list(project.config.name), said) : undefined;
+    if (!job || msg.threadTs !== msg.ts || !this.deps.jobs) return false;
+    // The bot's own "Run <id>" that opened a thread for a run already going (a queue, Run now): nothing to start.
+    if (!job.enabled && msg.fromSelf) return true;
+    if (!job.enabled) {
+      await this.startJob(project, job, SCHEDULE_BY, msg.channel, msg.ts, true); // says it's paused
+      return true;
+    }
+    const result = this.deps.jobs.trigger(project.config.name, job.id, SCHEDULE_BY, {
+      channel: msg.channel,
+      ts: msg.ts,
+    });
+    if (result === 'running')
+      await this.deps.chat.post(msg.channel, msg.ts, `🔄 *${job.name}* is already running.`);
+    return result !== 'unknown';
   }
 
   /** A tap on one of the "Which job should I run?" buttons. */
@@ -295,10 +326,6 @@ export class SessionManager {
         )
       : new EditReply(chat, msg.channel, msg.threadTs, this.slots.busy, intervalMs);
     await chat.react(msg.channel, msg.ts, 'eyes').catch(() => {});
-    const release = await this.slots.acquire();
-    reply.working();
-    const startedAt = this.now();
-
     let session = store.getSession(key) ?? this.freshSession(project, key);
     store.saveSession(session);
     const permissionPrompts = wantsPermissionPrompts(project.config.permissionMode);
@@ -324,6 +351,11 @@ export class SessionManager {
     ]
       .filter(Boolean)
       .join('\n\n');
+    // The slot is taken only after the setup above, and released in the finally below: a setup error
+    // (SQLite busy, a bridge file that can't be written) must never leak a chat slot.
+    const release = await this.slots.acquire();
+    reply.working();
+    const startedAt = this.now();
     let env: NodeJS.ProcessEnv = {};
     let toolErrors = 0;
     let outcome: RunOutcome;
@@ -437,15 +469,15 @@ export class SessionManager {
       `[${name}] turn ${outcome.status} in ${formatDuration(outcome.durationMs)} (${outcome.toolCalls} tools)`,
     );
 
-    // Learn from a turn that had trouble (selfImprove). Still inside this thread's queue, so the next
-    // message waits for it instead of resuming the same session at the same time.
+    // Learning turn (selfImprove). Still inside this thread's queue, so the next message waits for it
+    // instead of resuming the same session at the same time.
     // Only when the CLI really started the session (setup errors have nothing to learn from).
     // Learning turns resume with Claude, so agy sessions don't get one.
     const reasons =
-      project.config.selfImprove && session.started && session.harness !== 'agy'
-        ? troubleReasons(outcome, toolErrors)
-        : [];
-    if (reasons.length) {
+      session.started && session.harness !== 'agy'
+        ? learnReasons(project.config.selfImprove, outcome, toolErrors)
+        : undefined;
+    if (reasons) {
       const releaseLearn = await this.slots.acquire();
       try {
         await learnFromRun(

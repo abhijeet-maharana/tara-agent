@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseScheduledRun } from '../src/scheduler/slack-trigger.js';
+import { findRunJob, parseScheduledRun, runName } from '../src/scheduler/slack-trigger.js';
 import {
   attachedFiles,
   decodeSlackText,
@@ -54,7 +54,34 @@ describe('toIncoming', () => {
     expect(toIncoming({ ...base, user: 'U1', text }, BOT)?.fromSelf).toBeUndefined();
   });
 
-  it('reads a trigger back the way Slack sends it (emoji as :alarm_clock:)', () => {
+  it('reads "Run <name>" triggers, and our own is marked as ours', () => {
+    expect(parseScheduledRun('Run Weekly GA4 Audit')).toBe('Weekly GA4 Audit');
+    expect(parseScheduledRun('run `sla`')).toBe('sla');
+    expect(parseScheduledRun('Run')).toBeUndefined();
+    expect(parseScheduledRun('Run this\nand that')).toBeUndefined();
+    expect(
+      toIncoming(
+        { ...base, user: BOT, bot_id: 'B9', text: 'Run Weekly Marketplace &amp; Web P&amp;L Pulse' },
+        BOT,
+        'B9',
+      ),
+    ).toMatchObject({ fromSelf: true, text: 'Run Weekly Marketplace & Web P&L Pulse' });
+  });
+
+  it('finds the job a Run message names, by name or id, and names a job by its id only when the name is taken', () => {
+    const jobs = [
+      { id: 'weekly-ga', name: 'Weekly GA4 Audit' },
+      { id: 'pnl', name: 'Weekly Marketplace & Web P&L Pulse' },
+      { id: 'pnl-2', name: 'Weekly  marketplace & Web P&L Pulse ' },
+    ];
+    expect(findRunJob(jobs, 'weekly ga4  audit')?.id).toBe('weekly-ga');
+    expect(findRunJob(jobs, 'weekly-ga')?.id).toBe('weekly-ga');
+    expect(findRunJob(jobs, 'the ga audit')).toBeUndefined();
+    expect(runName(jobs[0] as (typeof jobs)[0], jobs)).toBe('Weekly GA4 Audit');
+    expect(runName(jobs[1] as (typeof jobs)[0], jobs)).toBe('pnl');
+  });
+
+  it('reads an older trigger back the way Slack sends it (emoji as :alarm_clock:)', () => {
     const text = ':alarm_clock: Catch-up: *Application Form Prep* (`application-form-prep`)';
     expect(toIncoming({ ...base, user: BOT, bot_id: 'B9', text }, BOT, 'B9')?.fromSelf).toBe(true);
     expect(parseScheduledRun(text)).toBe('application-form-prep');

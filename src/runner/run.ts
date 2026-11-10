@@ -19,6 +19,8 @@ export interface RunOptions {
    */
   systemPrompt?: string;
   timeoutMs: number;
+  /** How long a process the CLI left behind may hold its pipes after it exits (default 10 s; tests). */
+  exitGraceMs?: number;
   signal?: AbortSignal;
   onEvent?: (event: StreamEvent) => void;
   /** Run as another OS user (host `claude.runAs`). */
@@ -64,6 +66,11 @@ export interface RunOutcome {
 export type Runner = (options: RunOptions) => Promise<RunOutcome>;
 
 const KILL_GRACE_MS = 5_000;
+/**
+ * After the CLI exits, how long what it left in its process group (a browser, an MCP server) may keep
+ * its output pipes open before the group is killed and the pipes closed, so the run can end.
+ */
+const EXIT_GRACE_MS = 10_000;
 const STDERR_TAIL = 4_000;
 const LIMIT_TEXT = /usage limit|rate limit|out of extra usage/i;
 
@@ -144,8 +151,10 @@ export function spawnCli(
       detached: true,
     });
 
+    // The whole group, even once the CLI itself has exited: what it started may still be running.
+    let closed = false;
     const killGroup = (signal: NodeJS.Signals) => {
-      if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+      if (child.pid === undefined || closed) return;
       signalGroup(child.pid, signal, options.runAs);
     };
     const stop = (reason: 'timeout' | 'aborted') => {
@@ -171,8 +180,23 @@ export function spawnCli(
     });
     createInterface({ input: child.stdout }).on('line', onLine);
 
+    // A process the CLI left behind can hold stdout open, and then 'close' never comes: the run would
+    // hang (holding its thread, job slot and locks) even past its timeout. Give it a moment after the
+    // CLI exits, then end the group and close the pipes ourselves.
+    let leftover: NodeJS.Timeout | undefined;
+    child.on('exit', () => {
+      leftover = setTimeout(() => {
+        killGroup('SIGKILL');
+        child.stdout.destroy();
+        child.stderr.destroy();
+      }, options.exitGraceMs ?? EXIT_GRACE_MS);
+      leftover.unref();
+    });
+
     child.on('close', (code) => {
+      closed = true;
       clearTimeout(timer);
+      clearTimeout(leftover);
       options.signal?.removeEventListener('abort', onAbort);
       resolve({ code, stderr, stopReason, spawnError });
     });

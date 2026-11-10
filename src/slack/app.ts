@@ -1,5 +1,3 @@
-import { readFile } from 'node:fs/promises';
-import path from 'node:path';
 import { App, type BlockAction, type ButtonAction, LogLevel } from '@slack/bolt';
 import { parseScheduledRun } from '../scheduler/slack-trigger.js';
 import type { ChatPort, IncomingMessage, Logger } from '../sessions/manager.js';
@@ -185,6 +183,7 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
     async stop(channel, ts) {
       await streamCall('chat.stopStream', { channel, ts });
     },
+    report: (problem) => options.log.warn(problem),
   };
 
   /**
@@ -303,14 +302,12 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
       const res = await app.client.chat.postMessage({ channel, thread_ts: threadTs, text, blocks });
       return res.ts as string;
     },
-    async uploadFile(channel, threadTs, filePath, comment) {
-      // Read up front: a stream that fails to open emits an 'error' nobody listens to and crashes the process.
-      const file = await readFile(filePath);
+    async uploadFile(channel, threadTs, file, comment) {
       await app.client.files.uploadV2({
         channel_id: channel,
         thread_ts: threadTs,
-        file,
-        filename: path.basename(filePath),
+        file: file.data,
+        filename: file.name,
         ...(comment ? { initial_comment: comment } : {}),
       });
     },

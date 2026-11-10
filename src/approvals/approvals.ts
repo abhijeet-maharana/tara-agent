@@ -3,6 +3,7 @@ import { loadQueues } from '../config/load.js';
 import type { Project } from '../config/schema.js';
 import type { Privileged, PrivilegedResult } from '../privileged/privileged.js';
 import type { DecidedCard } from '../scheduler/prompt.js';
+import { openRunThread } from '../scheduler/slack-trigger.js';
 import type { ChatPort, IncomingMessage, Logger, SlackBlock } from '../sessions/manager.js';
 import { splitMessage, toSlackMrkdwn } from '../slack/format.js';
 import type { Item, ItemCheck, ItemField, ItemMedia, Store } from '../store/store.js';
@@ -74,6 +75,11 @@ export interface Decision {
   reply?: string;
   /** Run as soon as the queue is free, ignoring its windows and slots. */
   runNow?: boolean;
+  /**
+   * The card's `updatedAt` as the person saw it. A run can re-propose a pending card with the same key
+   * and new content; if it changed since, the decision is refused instead of approving unseen content.
+   */
+  seen?: number;
 }
 
 export interface ApprovalsDeps {
@@ -104,6 +110,8 @@ export class Approvals {
   ) => Promise<unknown>;
 
   private readonly now: () => number;
+  /** Day threads being opened, so two cards at once share one `Run` message. */
+  private readonly opening = new Map<string, Promise<string>>();
 
   constructor(private readonly deps: ApprovalsDeps) {
     this.now = deps.now ?? Date.now;
@@ -181,8 +189,8 @@ export class Approvals {
 
   /**
    * A card a project server raises outside any run (a login that expired, a send that bounced): posted
-   * in the project's channel and on the Approvals page, and the decision goes to the agent in that
-   * thread like a reply. A pending card with the same `key` is returned instead of a second one.
+   * with its buttons in the day's `Run <kind>` thread and on the Approvals page, and the decision goes
+   * to the agent in that thread like a reply. A pending card with the same `key` is returned instead.
    */
   async ask(
     project: Project,
@@ -197,9 +205,8 @@ export class Approvals {
           .find((i) => i.key === input.key)
       : undefined;
     if (pending) return pending;
-    const channel = project.config.slackChannel;
-    const threadTs = await this.deps.chat.post(channel, undefined, `🟡 ${title}`);
-    const { id } = await this.requestDecision({ project, channel, threadTs }, { ...input, title });
+    const { channel, ts } = await this.dayThread(project, input.kind || 'decision');
+    const { id } = await this.requestDecision({ project, channel, threadTs: ts }, { ...input, title });
     return store.getItem(id) as Item;
   }
 
@@ -331,9 +338,22 @@ export class Approvals {
     const detail: SlackBlock[] = [
       { type: 'section', text: { type: 'mrkdwn', text: text.slice(0, SECTION_MAX) } },
     ];
-    // Its own channel message (not a reply in a run's thread): one line there, the draft in the thread.
-    const ownMessage = !item.threadTs || item.threadTs === item.messageTs;
+    // Its own channel message: only cards posted before channels held only `Run` threads.
+    const ownMessage = !!item.messageTs && item.threadTs === item.messageTs;
     try {
+      if (!item.threadTs) {
+        // No run proposed it: it goes in the day's `Run <queue>` thread, where its outcome, a revise and
+        // the run that sends it follow, like a card a run proposed.
+        const day = await this.dayThread(project, item.queue ?? item.kind);
+        const ts = await this.deps.chat.postBlocks(
+          day.channel,
+          day.ts,
+          item.title,
+          card(text ? `\n${text}` : ''),
+        );
+        this.deps.store.setItemThread(item.id, day.channel, day.ts, ts);
+        return;
+      }
       if (!ownMessage) {
         // Proposed by a run: the whole card goes in that run's thread, which stays the card's thread.
         const blocks = card(text ? `\n${text}` : '');
@@ -405,6 +425,8 @@ export class Approvals {
     let item = store.getItem(id);
     if (!item) throw new ApprovalError(404, 'No such item');
     if (item.status !== 'pending') throw new ApprovalError(409, `Already ${item.status}`);
+    if (d.seen !== undefined && d.seen !== item.updatedAt)
+      throw new ApprovalError(409, 'This card changed since you opened it. Reload and check it again.');
     const project = this.project(item.project);
     const revise = d.option === REVISE;
     if (!revise && !item.options.includes(d.option))
@@ -628,7 +650,9 @@ export class Approvals {
     let threadTs = item.threadTs;
     if (!threadTs) {
       channel = project.config.slackChannel;
-      threadTs = await this.deps.chat.post(channel, undefined, `📝 About *${item.title}*`);
+      // A card no run proposed has no thread: open a "Run <kind>" one, naming the card.
+      threadTs = await openRunThread(this.deps.chat, channel, item.kind);
+      await this.deps.chat.post(channel, threadTs, `📝 *${item.title}*`);
     }
     await this.deps.chat.post(channel, threadTs, `📝 Note from the Approvals page: ${text}`);
     this.onChat({
@@ -705,6 +729,29 @@ export class Approvals {
     return checks;
   }
 
+  /**
+   * The day's `Run <name>` thread in the project's channel (host timezone), opened on first use and
+   * shared by every card of that name that day, so a channel holds one line per queue a day.
+   */
+  private async dayThread(project: Project, name: string): Promise<{ channel: string; ts: string }> {
+    const channel = project.config.slackChannel;
+    const day = new Intl.DateTimeFormat('en-CA', { timeZone: this.deps.timeZone }).format(this.now());
+    const key = `${project.config.name}:${name}:${day}`;
+    const known = this.deps.store.dayThread(key);
+    if (known) return known;
+    let opening = this.opening.get(key);
+    if (!opening) {
+      opening = openRunThread(this.deps.chat, channel, name)
+        .then((ts) => {
+          this.deps.store.saveDayThread(key, channel, ts);
+          return ts;
+        })
+        .finally(() => this.opening.delete(key));
+      this.opening.set(key, opening);
+    }
+    return { channel, ts: await opening };
+  }
+
   /** Puts a decision (or a revise request) into the conversation that asked: the job's run, or a chat. */
   private async continueConversation(
     project: Project,
@@ -721,9 +768,10 @@ export class Approvals {
     let channel = item.channel ?? project.config.slackChannel;
     let threadTs = item.threadTs;
     if (!threadTs) {
-      // Proposed by a project server, not a run: start a thread for it.
+      // Proposed by a project server, not a run: open a "Run <kind>" thread for it, naming the card.
       channel = project.config.slackChannel;
-      threadTs = await this.deps.chat.post(channel, undefined, `✏️ Revise *${item.title}*`);
+      threadTs = await openRunThread(this.deps.chat, channel, item.kind);
+      await this.deps.chat.post(channel, threadTs, `📝 *${item.title}*`);
     }
     await this.onChat?.({ channel, threadTs, ts: item.messageTs ?? threadTs, user, text });
   }

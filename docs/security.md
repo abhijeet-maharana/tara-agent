@@ -14,6 +14,11 @@ tara-agent lets people in Slack, and scheduled prompts, make Claude act on a mac
 | Claude approves its own drafts (forges a decision) | **Split users** (below): decisions on the dashboard need a cookie key Claude can't read and must come from another device; approved items are sealed with a key Claude can't read, and executors in other processes check the seal |
 | Another local process drives the bot | The API binds to `127.0.0.1`; set `TARA_HTTP_TOKEN` to require a bearer token; `/internal/*` needs a per-run token that exists only while that run is alive |
 | A file upload leaks something outside the project | `send_file` resolves symlinks and only accepts files inside the project or the temp directory |
+| A website open in your browser drives the local API (CSRF, DNS rebinding) | Writes whose `Origin` is another host are refused; a server bound to loopback answers only to `localhost`/`127.x`/`[::1]` Host names |
+| A run changes a card after you looked at it | The dashboard sends the card version it showed; a card re-proposed since then is refused ("changed since you opened it") |
+| A card links to a script (`javascript:` media) | Card media must be `http(s)` URLs or `/` paths, on input and when rendered |
+| Model output pings the whole channel | `<!channel>`, `<!here>`, `<!everyone>` and group mentions in replies are posted as plain text |
+| A learning turn edits code | Its tool calls are checked: an edit to a non-`.md` file or a shell/MCP call is listed with a ⚠️ in its Slack note |
 
 ## Run as a dedicated user
 
@@ -83,7 +88,7 @@ The same host `github` projects get `read_ci_job`, so a run can see why a GitHub
 
 Runs have no sudo, yet some failures need root: a file a sync wrote with a tight mode, a project server that needs a restart after a code change. `request_privileged` covers them without giving Claude root:
 
-- **A root-owned helper is the allowlist.** `deploy/tara-priv.mjs` runs only actions listed in `/etc/tara-agent/privileged.json` (root-owned; see `examples/privileged.json`): each a fixed command (absolute path, no shell) with named arguments that must match a pattern in full, never contain `..` or control characters. Install a root-owned copy and allow only that path, for the tara-agent user only (never the run user):
+- **A root-owned helper is the allowlist.** `deploy/tara-priv.mjs` runs only actions listed in `/etc/tara-agent/privileged.json` (root-owned; see `examples/privileged.json`): each a fixed command (absolute path, no shell) with named arguments that must match a pattern in full, never contain `..` or control characters. A path argument is checked again with its symlinks resolved, and the resolved path is what runs, so a link made inside an allowed folder can't point root elsewhere. Action scripts should still not follow links themselves (`chmod -h`, `setfacl -P`, `find -P`): a run can swap a folder for a link between the check and the action. Install a root-owned copy and allow only that path, for the tara-agent user only (never the run user):
   ```sh
   sudo install -o root -g root -m 755 deploy/tara-priv.mjs /usr/local/sbin/tara-priv
   sudo install -o root -g root -m 644 my-privileged.json /etc/tara-agent/privileged.json
@@ -102,7 +107,7 @@ The Code page (`/code`) shows source code, so it is only as private as the dashb
 
 ## Project tabs
 
-`/app/<name>/…` proxies to the project's `dashboardUrl`, so a project app shown as tabs is as private as the dashboard: it needs `http.allowFrom` and `TARA_HTTP_TOKEN` like every page. Only projects with `tabs` are proxied, and only to their configured origin. The app's server never receives `tara_token` or the `tara_admin` unlock cookie. Its pages, though, run on tara-agent's origin, so their scripts can call tara-agent with your browser's cookies just like tara-agent's own pages. Serve only apps you trust as much as tara-agent itself. Actions that only a person may take keep their own check in the app. The app's port can then stay closed to browsers.
+`/app/<name>/…` proxies to the project's `dashboardUrl`, so a project app shown as tabs is as private as the dashboard: it needs `http.allowFrom` and `TARA_HTTP_TOKEN` like every page. Only projects with `tabs` are proxied, and only to their configured origin (a path like `//other.host/` is refused). tara-agent's bearer token and its `x-tara-admin`/`x-tara-run` headers are never forwarded. The app's server never receives `tara_token` or the `tara_admin` unlock cookie. Its pages, though, run on tara-agent's origin, so their scripts can call tara-agent with your browser's cookies just like tara-agent's own pages. Serve only apps you trust as much as tara-agent itself. Actions that only a person may take keep their own check in the app. The app's port can then stay closed to browsers.
 
 ## Reporting a vulnerability
 

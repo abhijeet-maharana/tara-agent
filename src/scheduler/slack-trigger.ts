@@ -10,20 +10,61 @@ export const SCHEDULE_BY = 'schedule';
 
 export type ScheduledKind = 'schedule' | 'catch-up';
 
-/** "⏰ Scheduled: *Find jobs* (`find-jobs`)". The id in backticks is what the bot reads back. */
-export function scheduledRunText(name: string, id: string, kind: ScheduledKind): string {
-  return `⏰ ${kind === 'catch-up' ? 'Catch-up' : 'Scheduled'}: *${name}* (\`${id}\`)`;
+/**
+ * "Run Weekly GA4 Audit": the job's name, the words a person would type, so the channel reads like
+ * someone asking for the job. The run streams into the message's thread. Catch-ups read the same; the
+ * slot knows which.
+ */
+export function scheduledRunText(name: string): string {
+  return `Run ${name}`;
 }
 
-// Slack stores the emoji as its name, so the message comes back as ":alarm_clock: Scheduled: …".
-const TRIGGER = /^(?:⏰|:alarm_clock:) (?:Scheduled|Catch-up): .* \(`([a-z0-9][a-z0-9-]*)`\)$/s;
+/** The name a job's Run message uses: its name, or its id when another job of the project has that name. */
+export function runName(
+  job: { id: string; name: string },
+  jobs: Array<{ id: string; name: string }>,
+): string {
+  const key = nameKey(job.name);
+  return jobs.some((j) => j.id !== job.id && nameKey(j.name) === key) ? job.id : job.name;
+}
 
-/** Starts like a trigger message, whether or not the rest parses. */
+const nameKey = (s: string) => s.trim().replace(/\s+/g, ' ').toLowerCase();
+
+/** The job a Run message names: by its exact name (any case and spacing) or its id. */
+export function findRunJob<J extends { id: string; name: string }>(jobs: J[], said: string): J | undefined {
+  const key = nameKey(said);
+  return jobs.find((j) => j.id === key) ?? jobs.find((j) => nameKey(j.name) === key);
+}
+
+/**
+ * The one kind of message tara starts in a project channel: a top-level "Run <name>". Everything
+ * else (status, the answer, cards, notes) goes in its thread, so the channel is a list of runs.
+ * `name` is a job's name (`runName`), or what runs when it isn't a job (`health-digest`, a card's kind).
+ */
+export function openRunThread(
+  chat: { post(channel: string, threadTs: string | undefined, text: string): Promise<string> },
+  channel: string,
+  name: string,
+): Promise<string> {
+  return chat.post(channel, undefined, scheduledRunText(name));
+}
+
+const RUN = /^run\s+`?([^`\n]{1,150}?)`?$/i;
+// The older form, still read back so a trigger posted before an upgrade runs. Slack stores the emoji
+// as its name, so it comes back as ":alarm_clock: Scheduled: …".
+const LEGACY = /^(?:⏰|:alarm_clock:) (?:Scheduled|Catch-up): .* \(`([a-z0-9][a-z0-9-]*)`\)$/s;
+
+/** Starts like an older trigger message, whether or not the rest parses. */
 export function looksLikeTrigger(text: string): boolean {
   return /^(?:⏰|:alarm_clock:) (?:Scheduled|Catch-up): /.test(text.trim());
 }
 
-/** The job id in a trigger message, or undefined when the text isn't one. */
+/**
+ * What a trigger message names (a job's name or id; `findRunJob` finds the job), or undefined when the
+ * text isn't one. "Run <name>" is also what a person may type: it runs a scheduled slot only when one
+ * is waiting for that job (see the manager).
+ */
 export function parseScheduledRun(text: string): string | undefined {
-  return TRIGGER.exec(text.trim())?.[1];
+  const t = text.trim();
+  return LEGACY.exec(t)?.[1] ?? RUN.exec(t)?.[1]?.trim();
 }

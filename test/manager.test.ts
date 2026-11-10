@@ -2,7 +2,9 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { HostConfig, Project, ProjectConfig } from '../src/config/schema.js';
 import type { RunOptions, RunOutcome } from '../src/runner/run.js';
+import type { StreamEvent } from '../src/runner/stream.js';
 import type { JobControl } from '../src/scheduler/scheduler.js';
+import { learnOverreach } from '../src/sessions/learn.js';
 import { type IncomingMessage, isStopRequest, SessionManager } from '../src/sessions/manager.js';
 import { Threads } from '../src/sessions/threads.js';
 import { Store } from '../src/store/store.js';
@@ -21,7 +23,7 @@ function project(overrides: Partial<ProjectConfig> = {}): Project {
       allowedTools: [],
       allowedUsers: [],
       billing: 'subscription',
-      selfImprove: true,
+      selfImprove: 'trouble',
       ...overrides,
     },
     systemPrompt: 'Project rules.',
@@ -46,8 +48,11 @@ function setup(
     env?: NodeJS.ProcessEnv;
     host?: HostConfig;
     jobs?: JobControl;
+    /** Tool calls the learning turn makes. */
+    learnEvents?: StreamEvent[];
   } = {},
 ) {
+  const learnEvents = [...(opts.learnEvents ?? [])];
   const chat = new FakeChat('bot.');
   const store = new Store(':memory:');
   const calls: RunOptions[] = [];
@@ -65,7 +70,9 @@ function setup(
     run: async (options) => {
       calls.push(options);
       options.onEvent?.({ kind: 'init', sessionId: 'sid-1', model: 'claude-sonnet-5-5' });
-      options.onEvent?.({ kind: 'tool', id: 't1', name: 'Bash', status: 'Bash: npm test' });
+      const learning = options.prompt.includes('Reply with exactly NONE');
+      if (!learning) options.onEvent?.({ kind: 'tool', id: 't1', name: 'Bash', status: 'Bash: npm test' });
+      for (const e of learnEvents.splice(0, learning ? learnEvents.length : 0)) options.onEvent?.(e);
       return outcomes.shift() ?? ok();
     },
   });
@@ -251,6 +258,50 @@ describe('SessionManager', () => {
       );
     });
 
+    it('looks back after every clean turn that used a tool in always mode', async () => {
+      const { chat, calls, manager } = setup({
+        project: project({ selfImprove: 'always' }),
+        outcomes: [ok(), ok({ text: 'NONE' }), ok({ toolCalls: 0 })],
+      });
+      await manager.handle(msg('one'));
+      expect(calls).toHaveLength(2);
+      expect(calls[1]?.prompt).toContain('This run is done. Before you stop, look back');
+      expect(chat.texts().some((t) => t.includes('🔧'))).toBe(false);
+
+      // A reply with no tool calls followed no procedure: nothing to look back at.
+      await manager.handle(msg('two', { ts: '100.2' }));
+      expect(calls).toHaveLength(3);
+
+      const limited = setup({
+        project: project({ selfImprove: 'always' }),
+        outcomes: [ok({ status: 'limit', text: '', rateLimit: { status: 'rejected' } })],
+      });
+      await limited.manager.handle(msg('hi'));
+      expect(limited.calls).toHaveLength(1);
+    });
+
+    it('warns when the learning turn edits more than instruction files', async () => {
+      const { chat, manager } = setup({
+        outcomes: [ok({ status: 'error', text: '', error: 'boom' }), ok({ text: 'SKILL.md: new step' })],
+        learnEvents: [
+          {
+            kind: 'tool',
+            id: 'l1',
+            name: 'Edit',
+            status: 'Edit: SKILL.md',
+            file: '/repo/.claude/skills/x/SKILL.md',
+          },
+          { kind: 'tool', id: 'l2', name: 'Write', status: 'Write: app.ts', file: '/repo/src/app.ts' },
+        ],
+      });
+      await manager.handle(msg('one'));
+      const note = chat.texts().find((t) => t.startsWith('🔧'));
+      expect(note).toContain(
+        '⚠️ It also did more than edit instruction files, please check: edited /repo/src/app.ts',
+      );
+      expect(note).not.toContain('SKILL.md, ');
+    });
+
     it('skips clean turns, usage limits, stops, setup errors and projects that turn it off', async () => {
       const clean = setup({ outcomes: [ok()] });
       await clean.manager.handle(msg('hi'));
@@ -267,7 +318,7 @@ describe('SessionManager', () => {
       expect(stopped.calls).toHaveLength(1);
 
       const off = setup({
-        project: project({ selfImprove: false }),
+        project: project({ selfImprove: 'off' }),
         outcomes: [ok({ status: 'error', text: '', error: 'boom' })],
       });
       await off.manager.handle(msg('hi'));
@@ -296,7 +347,7 @@ describe('SessionManager', () => {
     const chat = new FakeChat('bot.');
     const calls: RunOptions[] = [];
     const manager = new SessionManager({
-      projects: [project({ selfImprove: false })],
+      projects: [project({ selfImprove: 'off' })],
       host,
       store: new Store(':memory:'),
       chat,
@@ -364,7 +415,7 @@ describe('SessionManager', () => {
     const chat = new FakeChat('bot.');
     const calls: RunOptions[] = [];
     const manager = new SessionManager({
-      projects: [project({ selfImprove: false })],
+      projects: [project({ selfImprove: 'off' })],
       host,
       store: new Store(':memory:'),
       chat,
@@ -422,5 +473,114 @@ describe('SessionManager', () => {
     );
     expect(started).toHaveLength(2);
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe('"Run <id>" triggers', () => {
+  function withSlot(pending: boolean) {
+    const started: unknown[][] = [];
+    let slot = pending;
+    const jobs: JobControl = {
+      list: () => [
+        {
+          id: 'find-jobs',
+          name: 'Find jobs',
+          enabled: true,
+          running: false,
+          tz: 'UTC',
+          skills: [],
+          model: 'opus',
+        },
+      ],
+      trigger: (...args) => {
+        started.push(args);
+        if (args[2] !== 'schedule') return 'started';
+        // Like the scheduler: a scheduled start takes the waiting slot once.
+        const had = slot;
+        slot = false;
+        return had ? 'started' : 'unknown';
+      },
+    };
+    return { started, ...setup({ project: project({ allowedUsers: ['U1'] }), jobs }) };
+  }
+
+  it('runs the waiting slot when the scheduler posted it, as the bot or as a person', async () => {
+    const bot = withSlot(true);
+    await bot.manager.handle(msg('Run find-jobs', { user: 'UBOT', fromSelf: true }));
+    expect(bot.started).toEqual([['shop', 'find-jobs', 'schedule', { channel: 'C1', ts: '100.1' }]]);
+
+    const person = withSlot(true);
+    await person.manager.handle(msg('Run find-jobs', { user: 'U1' }));
+    expect(person.started).toEqual([['shop', 'find-jobs', 'schedule', { channel: 'C1', ts: '100.1' }]]);
+    expect(person.calls).toHaveLength(0);
+  });
+
+  it("ignores the bot's own Run message for a paused job (it opened a thread for a run already going)", async () => {
+    const started: unknown[] = [];
+    const jobs: JobControl = {
+      list: () => [
+        {
+          id: 'find-jobs',
+          name: 'Find jobs',
+          enabled: false,
+          running: false,
+          tz: 'UTC',
+          skills: [],
+          model: 'opus',
+        },
+      ],
+      trigger: (...args) => {
+        started.push(args);
+        return 'started';
+      },
+    };
+    const { chat, calls, manager } = setup({ jobs });
+    await manager.handle(msg('Run find-jobs', { user: 'UBOT', fromSelf: true }));
+    expect(started).toHaveLength(0);
+    expect(chat.texts()).toHaveLength(0);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('is a normal run request when a person types it and no slot is waiting', async () => {
+    const { started, calls, manager } = withSlot(false);
+    await manager.handle(msg('Run find-jobs', { user: 'U1' }));
+    expect(started.at(-1)).toEqual(['shop', 'find-jobs', 'U1', { channel: 'C1', ts: '100.1' }]);
+    expect(calls).toHaveLength(0);
+
+    // The bot's own message with no slot waiting (a redelivery) starts nothing.
+    const again = withSlot(false);
+    await again.manager.handle(msg('Run find-jobs', { user: 'UBOT', fromSelf: true }));
+    expect(again.started).toHaveLength(1);
+    expect(again.started[0]?.[2]).toBe('schedule');
+  });
+});
+
+describe('learnOverreach', () => {
+  it('allows reads and .md edits, and names everything else', () => {
+    expect(
+      learnOverreach([
+        { name: 'Read', file: '/r/src/a.ts' },
+        { name: 'Grep' },
+        { name: 'Edit', file: '/r/.claude/skills/x/SKILL.md' },
+        { name: 'Edit', file: '/r/src/a.ts' },
+      ]),
+    ).toEqual(['edited /r/src/a.ts']);
+    expect(learnOverreach([{ name: 'Read', file: '/r/src/a.ts' }])).toEqual([]);
+    expect(learnOverreach([{ name: 'Glob' }, { name: 'Edit', file: '/r/CLAUDE.md' }])).toEqual([]);
+    // A skill's own scripts, and the job scripts skills run, may be fixed too.
+    expect(
+      learnOverreach([
+        { name: 'Write', file: '/r/.agents/skills/x/scripts/fetch.py' },
+        { name: 'Edit', file: '/r/.tara/scripts/gate.sh' },
+      ]),
+    ).toEqual([]);
+    expect(
+      learnOverreach([
+        { name: 'Bash' },
+        { name: 'Bash' },
+        { name: 'mcp__tara__send_file' },
+        { name: 'Write', file: '/r/x.json' },
+      ]),
+    ).toEqual(['used Bash', 'used mcp__tara__send_file', 'edited /r/x.json']);
   });
 });

@@ -1,6 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { formatDuration, splitMessage, toSlackMrkdwn } from '../src/slack/format.js';
+import { defuseBroadcasts, formatDuration, splitMessage, toSlackMrkdwn } from '../src/slack/format.js';
 import { KeyedQueue, Semaphore, Throttle } from '../src/util/concurrency.js';
+
+describe('defuseBroadcasts', () => {
+  it('turns channel-wide mentions into text and keeps person mentions', () => {
+    const out = toSlackMrkdwn('Hey <!channel> and <!here|here>, <!subteam^S123|@devs> — ask <@U42>');
+    expect(out).not.toMatch(/<!/);
+    expect(out).toContain('<@U42>');
+    expect(defuseBroadcasts('<!everyone>')).toBe('@\u200beveryone');
+  });
+});
 
 describe('toSlackMrkdwn', () => {
   it.each([

@@ -53,6 +53,9 @@ describe('StreamReply', () => {
     r.text('ignored live');
     await r.finish(done);
     expect(stream.disabled).toBe(true);
+    expect(stream.problems).toEqual([
+      'Slack streaming is off for this app (feature_not_enabled, in C1 thread 100.1): replies use edited messages until restart',
+    ]);
     expect(chat.texts()).toEqual(['⏳ Working…', 'Hello world']);
     expect(chat.updates.at(-1)?.text).toBe('✅ Done · 3s · 1 step');
   });
@@ -69,6 +72,7 @@ describe('StreamReply', () => {
     expect(stream.calls.filter((c) => c.startsWith('start'))).toHaveLength(2);
     expect(stream.text()).toBe('part one part two');
     expect(stream.calls.at(-1)).toBe('stop s2');
+    expect(stream.problems).toEqual([]); // expected on long turns: not worth a warning
   });
 
   it('posts whatever Slack refuses as plain messages, so no text is lost', async () => {
@@ -81,6 +85,23 @@ describe('StreamReply', () => {
     await r.finish(done);
     expect(stream.text()).toBe('first ');
     expect(chat.texts()).toEqual(['*second*']);
+    expect(stream.problems).toEqual([
+      'Slack refused the live stream in C1 thread 100.1 (msg_too_long, mid-reply): the rest of the reply is posted as plain messages, without its tool steps',
+    ]);
+  });
+
+  it('says why when Slack refuses to start a stream in a thread', async () => {
+    const stream = new FakeStream();
+    stream.failStart = 'invalid_thread_ts';
+    const { chat, reply: r } = reply(stream);
+    r.toolStart('t1', 'Read: a.ts');
+    r.text('Answer');
+    await r.finish(done);
+    expect(stream.disabled).toBe(false);
+    expect(stream.problems).toEqual([
+      'Slack refused the live stream in C1 thread 100.1 (invalid_thread_ts): the rest of the reply is posted as plain messages, without its tool steps',
+    ]);
+    expect(chat.texts().at(-1)).toBe('Answer');
   });
 });
 
@@ -102,7 +123,7 @@ describe('SessionManager with streaming', () => {
             allowedTools: [],
             allowedUsers: [],
             billing: 'subscription',
-            selfImprove: true,
+            selfImprove: 'trouble',
           },
         },
       ],

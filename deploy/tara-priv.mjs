@@ -13,7 +13,8 @@
  * See docs/security.md "Privileged actions". No dependencies: it runs outside the checkout.
  */
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
+import path from 'node:path';
 
 // Only a caller that isn't root (the tests) may point at another allowlist; under sudo it is always this one.
 const CONFIG =
@@ -45,6 +46,21 @@ function loadActions() {
   return actions;
 }
 
+/** `value` with symlinks resolved; for a path that doesn't exist yet, its nearest existing parent's. */
+function resolvePath(value) {
+  let dir = path.resolve(value);
+  const tail = [];
+  for (;;) {
+    try {
+      return path.join(realpathSync(dir), ...tail);
+    } catch (err) {
+      if (err.code !== 'ENOENT' || dir === '/') fail(`Cannot resolve ${value}: ${err.message}`);
+      tail.unshift(path.basename(dir));
+      dir = path.dirname(dir);
+    }
+  }
+}
+
 /** The command line of one action with its arguments filled in; every value is checked first. */
 function plan(actions, id, rawArgs) {
   if (!Object.hasOwn(actions, id)) fail(`No action "${id}". Actions: ${Object.keys(actions).join(', ')}`);
@@ -66,7 +82,15 @@ function plan(actions, id, rawArgs) {
     if (typeof value !== 'string' || !value) fail(`"${id}" needs "${name}"`);
     if (value.length > MAX_ARG || /[\0-\x1f\x7f]/.test(value)) fail(`"${name}" is too long or has control characters`);
     if (/(^|\/)\.\.(\/|$)/.test(value)) fail(`"${name}" must not contain ".."`);
-    if (!new RegExp(`^(?:${pattern})$`).test(value)) fail(`"${name}" does not match ${pattern}`);
+    const re = new RegExp(`^(?:${pattern})$`);
+    if (!re.test(value)) fail(`"${name}" does not match ${pattern}`);
+    // A path is checked again with every symlink resolved, and the resolved path is what runs: a run
+    // can't point root at /etc/passwd through a link it made inside an allowed folder.
+    if (value.startsWith('/')) {
+      const real = resolvePath(value);
+      if (!re.test(real)) fail(`"${name}" resolves to ${real}, which does not match ${pattern}`);
+      args[name] = real;
+    }
   }
   const argv = action.command.map((part) =>
     part.replace(/\{([a-zA-Z0-9_]+)\}/g, (_, name) => (Object.hasOwn(declared, name) ? args[name] : `{${name}}`)),

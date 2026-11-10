@@ -5,7 +5,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Project, QueueConfig } from '../src/config/schema.js';
 import { allowList } from '../src/http/access.js';
-import { approvalsPage, kindLabel } from '../src/http/approvals.js';
+import { approvalsPage, kindLabel, mediaHtml, safeMediaUrl } from '../src/http/approvals.js';
 import { cronText } from '../src/http/cron-text.js';
 import {
   type DashboardContext,
@@ -17,11 +17,12 @@ import {
   jobWeeks,
   lengthOff,
   md,
+  modelUses,
   sessionPage,
   sessionsPage,
 } from '../src/http/dashboard.js';
 import { queuePage } from '../src/http/queue.js';
-import { startHttpServer } from '../src/http/server.js';
+import { crossSite, startHttpServer } from '../src/http/server.js';
 import { firstPrompt, parseTranscript, transcriptPath } from '../src/http/transcript.js';
 import type { Scheduler } from '../src/scheduler/scheduler.js';
 import { type Item, Store, type StoredRun } from '../src/store/store.js';
@@ -132,7 +133,7 @@ describe('dashboard pages', () => {
       allowedTools: [],
       allowedUsers: [],
       billing: 'subscription',
-      selfImprove: true,
+      selfImprove: 'trouble',
       title: 'Shop',
       dashboardUrl: 'https://shop.example/board',
     },
@@ -302,6 +303,47 @@ describe('dashboard pages', () => {
   });
 });
 
+describe('crossSite', () => {
+  const req = (method: string, headers: Record<string, string>) => ({ method, headers }) as never;
+  it('refuses writes from other sites and rebound Host names on a loopback server', () => {
+    expect(crossSite(req('POST', { host: '127.0.0.1:4100' }), '127.0.0.1')).toBeUndefined(); // curl
+    expect(
+      crossSite(req('POST', { host: '127.0.0.1:4100', origin: 'http://127.0.0.1:4100' }), '127.0.0.1'),
+    ).toBeUndefined();
+    expect(
+      crossSite(req('POST', { host: '127.0.0.1:4100', origin: 'https://evil.example' }), '127.0.0.1'),
+    ).toMatch(/cross-site POST/);
+    expect(crossSite(req('POST', { host: 'x:1', origin: 'null' }), '0.0.0.0')).toMatch(/cross-site/);
+    expect(crossSite(req('GET', { host: 'evil.example:4100' }), '127.0.0.1')).toMatch(/unexpected Host/);
+    expect(crossSite(req('GET', { host: 'localhost:4100' }), '127.0.0.1')).toBeUndefined();
+    // Bound to every interface: any Host (a LAN or tailnet name), still no cross-site writes.
+    expect(crossSite(req('GET', { host: 'box.tailnet:4100' }), '0.0.0.0')).toBeUndefined();
+  });
+});
+
+describe('card media', () => {
+  it('links only web and same-site URLs', () => {
+    expect(safeMediaUrl('https://cdn.example/a.png')).toBe(true);
+    expect(safeMediaUrl('/files/a.pdf')).toBe(true);
+    for (const bad of [
+      'javascript:alert(1)',
+      ' JavaScript:alert(1)',
+      'data:text/html,x',
+      '//evil.example/a',
+      '/\\evil',
+    ])
+      expect(safeMediaUrl(bad)).toBe(false);
+    const html = mediaHtml({
+      media: [
+        { type: 'file', url: 'javascript:fetch("/items/x/decide")' },
+        { type: 'image', url: 'https://cdn.example/a.png' },
+      ],
+    } as Item);
+    expect(html).not.toContain('javascript:');
+    expect(html).toContain('https://cdn.example/a.png');
+  });
+});
+
 describe('fallback pass-through', () => {
   it("serves tara's own paths and passes everything else (method, body, headers) to the fallback", async () => {
     const { createServer } = await import('node:http');
@@ -356,6 +398,7 @@ describe('project tabs', () => {
       let body = '';
       req.on('data', (c) => (body += c));
       req.on('end', () => {
+        if (req.headers['x-tara-admin']) throw new Error('admin header leaked to the app');
         seen.push({
           url: req.url,
           prefix: req.headers['x-tara-prefix'] as string | undefined,
@@ -378,7 +421,7 @@ describe('project tabs', () => {
         allowedTools: [],
         allowedUsers: [],
         billing: 'subscription',
-        selfImprove: true,
+        selfImprove: 'trouble',
         ...extra,
       },
     });
@@ -435,6 +478,10 @@ describe('project tabs', () => {
     });
     await fetch(`${base}/app/shop`);
     expect(seen.at(-1)?.url).toBe('/');
+
+    // A path that would resolve to another host stays on the app's own origin.
+    await fetch(`${base}/app/shop//evil.example/x`, { headers: { 'x-tara-admin': 'key' } });
+    expect(seen.at(-1)?.url).toBe('//evil.example/x');
 
     // Unknown projects and projects without tabs aren't proxied.
     expect((await fetch(`${base}/app/blog/x`)).status).toBe(404);
@@ -553,6 +600,79 @@ describe('home page', () => {
     expect(live).toContain('● running');
     expect(live).toContain('id="live" data-session="s"');
     expect(live).not.toContain('data-refresh="1"'); // the live card polls instead
+  });
+});
+
+describe('models section', () => {
+  const projects = [
+    { dir: '/r/shop', config: { name: 'shop', title: 'Shop', chatModel: 'sonnet', selfImprove: 'always' } },
+    { dir: '/r/blog', config: { name: 'blog', chatModel: 'sonnet', selfImprove: 'off' } },
+  ] as unknown as Project[];
+  const job = (name: string, extra: Partial<JobView> = {}) =>
+    ({
+      id: name,
+      name,
+      enabled: true,
+      running: false,
+      tz: 'UTC',
+      skills: [],
+      model: 'sonnet',
+      ...extra,
+    }) as JobView;
+  const jobs = [
+    job('SLA', { stepModels: ['haiku'] }),
+    job('Audit', { harness: 'agy', model: 'gemini-3-pro', handoff: { harness: 'claude', model: 'opus' } }),
+    job('GA4'),
+  ];
+
+  it('lists each purpose with its model, most-used first', () => {
+    const uses = modelUses(projects, jobs, {
+      live: { model: 'gemini-3.8-live', askModel: 'haiku' },
+      voice: ['gemini-a', 'gemini-b'],
+    });
+    expect(uses).toEqual([
+      { purpose: 'Chat', model: 'sonnet', used: 'Shop, blog' },
+      { purpose: 'Jobs', model: 'sonnet', used: '2 jobs: SLA, GA4' },
+      { purpose: 'Jobs', model: 'agy · gemini-3-pro', used: '1 job: Audit' },
+      { purpose: 'Job steps', model: 'haiku', used: '1 job: SLA' },
+      { purpose: 'After approval', model: 'opus', used: '1 job: Audit' },
+      {
+        purpose: 'Learning',
+        model: 'same as the run',
+        used: 'a turn after a chat or job run, in its session',
+      },
+      {
+        purpose: 'Command (voice)',
+        model: 'gemini-3.8-live',
+        used: 'talking to the agent from the dashboard',
+      },
+      { purpose: 'Command questions', model: 'haiku', used: 'read-only questions about a project' },
+      {
+        purpose: 'Voice notes',
+        model: 'gemini-a → gemini-b',
+        used: "speech-to-text when Slack didn't transcribe, tried in order",
+      },
+    ]);
+  });
+
+  it('shows on the home page with the effort', () => {
+    const page = homePage(
+      { projects, timeZone: 'UTC', agentName: 'Jarvis' },
+      {
+        jobs: [],
+        latest: [],
+        quietRuns: 0,
+        pending: [],
+        uptimeSeconds: 1,
+        now: 0,
+        models: modelUses(projects, jobs),
+        effort: 'high',
+      },
+    );
+    expect(page).toContain('<h2>Models</h2><span>effort high</span>');
+    expect(page).toContain('<span class="when">Job steps</span>');
+    expect(page).toContain('<code>agy · gemini-3-pro</code>');
+    expect(page).not.toContain('Command (voice)');
   });
 });
 

@@ -17,7 +17,7 @@ import { ApprovalError, type Approvals, type ProposeInput } from '../approvals/a
 import { type Bridge, BridgeError } from '../bridge/bridge.js';
 import { CodeError, type CodeRepo, MIN_QUERY, type RepoReader } from '../code/repo.js';
 import { loadQueues } from '../config/load.js';
-import type { Project, QueueConfig } from '../config/schema.js';
+import type { HostConfig, Project, QueueConfig } from '../config/schema.js';
 import type { Activity } from '../live/activity.js';
 import type { Attention } from '../live/attention.js';
 import type { Scheduler } from '../scheduler/scheduler.js';
@@ -25,7 +25,16 @@ import { type IncomingMessage as ChatMessage, type Logger, threadKey } from '../
 import { ITEM_STATUSES, type ItemStatus, type Store } from '../store/store.js';
 import { addDays, dayKey, midnight } from '../util/time.js';
 import { allowList } from './access.js';
-import { type ApprovalsTab, approvalsPage, ITEMS_LIMIT, isNotice, unlockPage } from './approvals.js';
+import {
+  type ApprovalsTab,
+  approvalsPage,
+  ITEMS_LIMIT,
+  isNotice,
+  safeMediaUrl,
+  unlockPage,
+} from './approvals.js';
+import { probeBrowser, projectNeeds, SiteScanner } from './browser-usage.js';
+import { browsersPage } from './browsers.js';
 import {
   codeDiffPage,
   codeFilePage,
@@ -40,11 +49,13 @@ import {
   type DashboardContext,
   errorPage,
   type HomeUsage,
+  type HostModels,
   homePage,
   type JobView,
   jobState,
   jobsPage,
   jobWeeks,
+  modelUses,
   runPage,
   type StaleRepo,
   sessionPage,
@@ -113,6 +124,8 @@ export interface HttpOptions {
   tls?: { port: number; cert: string; key: string };
   /** Command (voice): takes each browser connection to `/command/ws` (unlocked browsers only). */
   live?: { connect: (ws: WebSocket) => void };
+  /** The shared Chromes (host `browsers`): the Browsers page shows them and what each project needs. */
+  browsers?: HostConfig['browsers'];
   /** Enables the HTML pages (sessions, transcripts, jobs) for browsers. */
   dashboard?: {
     projects: Project[];
@@ -121,6 +134,8 @@ export interface HttpOptions {
     slackUrl?: () => string | undefined;
     /** This machine's host name (see DashboardContext.hostName). */
     hostName?: string;
+    /** Host-level models for the home page's Models section. */
+    models?: HostModels;
   };
 }
 
@@ -144,6 +159,8 @@ const originHost = (origin: string) => {
 /** Runs per job shown on the dashboard (recent-runs strip and history). */
 const RECENT_RUNS = 10;
 const DAY_MS = 86_400_000;
+/** The Browsers page looks at this many days of transcripts. */
+const BROWSER_DAYS = 30;
 /** Jobs that start this often or more are left out of the home page's "Coming up" list. */
 const FREQUENT_MS = 30 * 60_000;
 /** Most start times `GET /jobs?upcoming=` returns per job. */
@@ -231,6 +248,7 @@ const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : unde
 
 /** Approval items carry drafts (emails, posts), so they may be bigger than other requests. */
 const ITEM_BODY_LIMIT = 200_000;
+const PERMISSION_BODY_LIMIT = 5_000_000;
 /** Enough for a job application form: the note, every question and the resume. */
 const MAX_FIELDS = 40;
 
@@ -275,13 +293,42 @@ export function itemInput(body: Record<string, unknown>): ProposeInput {
       .map((c: Record<string, unknown>) => ({ text: String(c?.text ?? ''), blocking: c?.blocking === true })),
     media: arr(body.media)
       .slice(0, 20)
-      .map((m: Record<string, unknown>) => ({
-        type: m?.type === 'video' || m?.type === 'file' ? (m.type as 'video' | 'file') : ('image' as const),
-        url: need(m?.url, 'media[].url'),
-        caption: str(m?.caption),
-        poster: str(m?.poster),
-      })),
+      .map((m: Record<string, unknown>) => {
+        const url = need(m?.url, 'media[].url');
+        const poster = str(m?.poster);
+        if (!safeMediaUrl(url) || (poster && !safeMediaUrl(poster)))
+          throw new HttpError(400, 'media[].url and poster must be http(s) URLs or paths starting with /');
+        return {
+          type: m?.type === 'video' || m?.type === 'file' ? (m.type as 'video' | 'file') : ('image' as const),
+          url,
+          caption: str(m?.caption),
+          poster,
+        };
+      }),
   };
+}
+
+const LOOPBACK_HOST = /^(localhost|127(?:\.\d{1,3}){3}|\[::1\])(:\d+)?$/i;
+
+/**
+ * Why a request looks like it came from another website, else undefined. A page on any site can make
+ * the browser POST to 127.0.0.1 (no token is needed by default), and a DNS-rebinding page can even
+ * read the answers. So: a write whose Origin is another host is refused, and a server bound to
+ * loopback only answers to loopback Host names. Scripts (curl, the MCP server) send no Origin.
+ */
+export function crossSite(req: IncomingMessage, bind: string): string | undefined {
+  const host = req.headers.host ?? '';
+  if (LOOPBACK_HOST.test(bind.includes(':') ? `[${bind}]` : bind) && !LOOPBACK_HOST.test(host))
+    return `unexpected Host "${host.slice(0, 100)}"`;
+  const method = req.method ?? 'GET';
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return undefined;
+  const origin = req.headers.origin;
+  if (origin === undefined) return undefined;
+  let from: string | undefined;
+  try {
+    from = new URL(origin).host;
+  } catch {}
+  return from === host ? undefined : `cross-site ${method} from ${origin.slice(0, 100)}`;
 }
 
 export async function startHttpServer(options: HttpOptions): Promise<Server> {
@@ -683,11 +730,17 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
           : [];
         const option = str(body.option);
         if (!option) throw new HttpError(400, '"option" is required');
+        const seen = body.seen && typeof body.seen === 'object' ? (body.seen as Record<string, unknown>) : {};
         const decided: string[] = [];
         const failed: Array<{ id: string; error: string }> = [];
         for (const id of ids) {
           try {
-            await approvals.decide(id, { option, by: owner(id) ?? by, via: 'dashboard' });
+            await approvals.decide(id, {
+              option,
+              by: owner(id) ?? by,
+              via: 'dashboard',
+              seen: typeof seen[id] === 'number' ? seen[id] : undefined,
+            });
             decided.push(id);
           } catch (err) {
             failed.push({ id, error: (err as Error).message });
@@ -711,6 +764,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
             fields,
             reply: str(body.reply),
             runNow: body.runNow === true,
+            seen: typeof body.seen === 'number' ? body.seen : undefined,
           }),
         };
       }
@@ -883,7 +937,8 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       return v;
     };
     if (req.method === 'POST' && parts[1] === 'approval' && parts.length === 2) {
-      const body = await readJson(req);
+      // Long details are split into several Slack messages, so they may be long here too.
+      const body = await readJson(req, ITEM_BODY_LIMIT);
       const options = Array.isArray(body.options)
         ? body.options.filter((o) => typeof o === 'string')
         : undefined;
@@ -914,7 +969,8 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       return bridge.sendFile(token, { path: required(body.path, 'path'), comment });
     }
     if (req.method === 'POST' && parts[1] === 'permission' && parts.length === 2) {
-      const body = await readJson(req);
+      // The input of a Write or Edit holds the whole file: a small cap would silently deny every large write.
+      const body = await readJson(req, PERMISSION_BODY_LIMIT);
       const input =
         typeof body.input === 'object' && body.input !== null ? (body.input as Record<string, unknown>) : {};
       return bridge.askPermission(token, { tool_name: required(body.tool_name, 'tool_name'), input });
@@ -998,6 +1054,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         .filter((j) => jobState(j) === 'failing').length,
       code: Boolean(options.code),
       live: Boolean(options.live),
+      browsers: Boolean(options.browsers),
     };
   };
 
@@ -1075,8 +1132,11 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
           const gap = (starts[1] ?? Infinity) - (starts[0] ?? 0);
           if (gap <= FREQUENT_MS) every.set(`${p}:${id}`, gap);
         }
+      const views = jobViews();
       return homePage(ctx, {
-        jobs: jobViews().map((j) => ({
+        models: modelUses(ctx.projects, views, options.dashboard?.models),
+        effort: options.dashboard?.models?.effort,
+        jobs: views.map((j) => ({
           ...j,
           everyMs: every.get(`${j.project}:${j.id}`),
           liveSessionId: j.running ? liveJobSession(j.project, j.id) : undefined,
@@ -1206,6 +1266,37 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     return undefined;
   };
 
+  /** The Browsers page (reads transcripts and asks each Chrome, so it is async); undefined for other paths. */
+  const sites = new SiteScanner({ readAs: options.readAs, days: BROWSER_DAYS, now });
+  const browsersPageFor = async (
+    req: IncomingMessage,
+    ctx: DashboardContext,
+  ): Promise<string | undefined> => {
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    if (url.pathname.replace(/\/$/, '') !== '/browsers' || !options.browsers) return undefined;
+    const at = now();
+    const scan = sites.scan(ctx.projects.map((p) => p.dir));
+    // The first scan reads every recent transcript: show what is read so far rather than wait long.
+    await Promise.race([scan, new Promise((r) => setTimeout(r, 4_000).unref())]);
+    const jobOf = options.store.sessionJobs(at - BROWSER_DAYS * DAY_MS);
+    const jobNames = new Map<string, string>();
+    for (const p of options.projects)
+      for (const j of options.scheduler.list(p)) jobNames.set(`${p}:${j.id}`, j.name);
+    return browsersPage(ctx, {
+      browsers: await Promise.all(options.browsers.map(probeBrowser)),
+      needs: projectNeeds(
+        ctx.projects,
+        (p) => sites.sessions(p.dir),
+        (sid) => jobOf.get(sid),
+        (p) => options.scheduler.list(p),
+      ),
+      jobNames,
+      scanning: sites.scanning,
+      days: BROWSER_DAYS,
+      now: at,
+    });
+  };
+
   /** The Code pages (they read git, so they are async); undefined for other paths. */
   const codePage = async (req: IncomingMessage, ctx: DashboardContext): Promise<string | undefined> => {
     const url = new URL(req.url ?? '/', 'http://localhost');
@@ -1254,19 +1345,44 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
   };
 
   const fallback = options.fallback ? new URL(options.fallback) : undefined;
-  /** Streams a request to another service (the fallback, or a project's app) and its answer back. */
+  /**
+   * Streams a request to another service (the fallback, or a project's app) and its answer back. `path`
+   * is resolved against `base`'s origin only: a path like `//evil.com/x` or an absolute URL would
+   * otherwise point the proxy at another host, serving its pages on the dashboard's origin.
+   */
   const passThrough = (
     req: IncomingMessage,
     res: ServerResponse,
-    target = new URL(req.url ?? '/', fallback),
+    base: URL,
+    path: string,
     extraHeaders: Record<string, string> = {},
   ) => {
+    let target: URL | undefined;
+    try {
+      if (path.startsWith('/')) target = new URL(base.origin + path);
+    } catch {}
+    if (!target || target.origin !== base.origin) {
+      res.writeHead(400, { 'content-type': 'text/plain' });
+      res.end('Bad path');
+      return;
+    }
+    // tara-agent's own keys never leave it: its bearer token, admin and run headers, and its cookies.
+    const headers: Record<string, string | string[] | undefined> = { ...req.headers };
+    delete headers['x-tara-admin'];
+    delete headers['x-tara-run'];
+    if (options.token && headers.authorization === `Bearer ${options.token}`) delete headers.authorization;
+    const cookies = (req.headers.cookie ?? '')
+      .split(/;\s*/)
+      .filter((c) => c && !c.startsWith(`${TOKEN_COOKIE}=`) && !c.startsWith(`${ADMIN_COOKIE}=`))
+      .join('; ');
+    if (cookies) headers.cookie = cookies;
+    else delete headers.cookie;
     const upstream = httpRequest(
       target,
       {
         method: req.method,
         headers: {
-          ...req.headers,
+          ...headers,
           host: target.host,
           'x-forwarded-for': req.socket.remoteAddress ?? '',
           'x-forwarded-host': req.headers.host ?? '',
@@ -1305,9 +1421,16 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       res.end('Forbidden: not on the allowed networks');
       return;
     }
+    const refused = crossSite(req, options.bind);
+    if (refused) {
+      options.log.warn(`refused ${req.method} ${req.url}: ${refused}`);
+      res.writeHead(403, { 'content-type': 'text/plain' });
+      res.end(`Forbidden: ${refused}`);
+      return;
+    }
     const url = new URL(req.url ?? '/', 'http://localhost');
     if (fallback && !OWN_PATH.test(url.pathname)) {
-      passThrough(req, res);
+      passThrough(req, res, fallback, req.url ?? '/');
       return;
     }
     const internalPath = url.pathname.startsWith('/internal/');
@@ -1333,13 +1456,10 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         return;
       }
       if (tab[1] === 'app') {
-        const target = new URL((rest || '/') + url.search, tabProject.config.dashboardUrl);
-        // The app gets its own cookies, never tara-agent's keys.
-        const cookies = (req.headers.cookie ?? '')
-          .split(/;\s*/)
-          .filter((c) => c && !c.startsWith(`${TOKEN_COOKIE}=`) && !c.startsWith(`${ADMIN_COOKIE}=`))
-          .join('; ');
-        passThrough(req, res, target, { 'x-tara-prefix': `/app/${name}`, cookie: cookies });
+        // The app gets its own cookies, never tara-agent's keys (passThrough strips them).
+        passThrough(req, res, new URL(tabProject.config.dashboardUrl as string), (rest || '/') + url.search, {
+          'x-tara-prefix': `/app/${name}`,
+        });
         return;
       }
       if (!rest || rest === '/') {
@@ -1409,7 +1529,9 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       try {
         const home = new URL(req.url ?? '/', 'http://localhost').pathname === '/';
         const html =
-          (await codePage(req, ctx)) ?? page(req, ctx, home ? { staleRepos: await staleRepos(now()) } : {});
+          (await codePage(req, ctx)) ??
+          (await browsersPageFor(req, ctx)) ??
+          page(req, ctx, home ? { staleRepos: await staleRepos(now()) } : {});
         if (html) return sendHtml(res, 200, html);
       } catch (err) {
         if (err instanceof CodeError || err instanceof HttpError)
@@ -1455,7 +1577,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     const url = new URL(req.url ?? '/', 'http://localhost');
     if (!sockets || !options.live || !['/command/ws', '/live/ws'].includes(url.pathname))
       return refuse(404, 'Not Found');
-    if (!allowed(req.socket.remoteAddress)) return refuse(403, 'Forbidden');
+    if (!allowed(req.socket.remoteAddress) || crossSite(req, options.bind)) return refuse(403, 'Forbidden');
     if (req.headers.origin && originHost(req.headers.origin) !== req.headers.host)
       return refuse(403, 'Forbidden');
     if (!authorized(req)) return refuse(401, 'Unauthorized');

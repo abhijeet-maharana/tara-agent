@@ -1,6 +1,6 @@
 import type { ChatPort } from '../sessions/manager.js';
 import { Throttle } from '../util/concurrency.js';
-import { splitMessage, toSlackMrkdwn } from './format.js';
+import { defuseBroadcasts, splitMessage, toSlackMrkdwn } from './format.js';
 
 export type TaskStatus = 'in_progress' | 'complete' | 'error';
 
@@ -17,6 +17,8 @@ export interface StreamPort {
   start(channel: string, threadTs: string, recipientUserId: string): Promise<string>;
   append(channel: string, ts: string, chunks: StreamChunk[]): Promise<void>;
   stop(channel: string, ts: string): Promise<void>;
+  /** Told when Slack refuses a stream and the reply falls back, with Slack's error code (for the log). */
+  report?(problem: string): void;
 }
 
 /** A Slack API error, with Slack's error code (e.g. `message_not_in_streaming_state`). */
@@ -106,8 +108,6 @@ export class EditReply implements TurnReply {
  */
 export class StreamReply implements TurnReply {
   private ts: string | undefined;
-  /** Every stream message this reply opened (a sealed stream is continued in a new one). */
-  private readonly opened: string[] = [];
   private title: string;
   private readonly tasks = new Map<string, { title: string; status: TaskStatus }>();
   private pendingTasks = new Set<string>();
@@ -204,14 +204,6 @@ export class StreamReply implements TurnReply {
     }
   }
 
-  /** Removes everything this reply showed (a job that ended up having nothing to report). */
-  async discard(): Promise<void> {
-    if (this.timer) clearTimeout(this.timer);
-    await this.chain;
-    if (this.ts) await this.port.stop(this.channel, this.ts).catch(() => {});
-    for (const ts of this.opened) await this.chat.delete(this.channel, ts).catch(() => {});
-  }
-
   private setTitle(title: string): void {
     if (this.fallback || this.title === title) return;
     this.title = title;
@@ -239,7 +231,7 @@ export class StreamReply implements TurnReply {
       const task = this.tasks.get(id);
       if (task) chunks.push({ type: 'task_update', id, title: task.title, status: task.status });
     }
-    if (this.buffer) chunks.push({ type: 'markdown_text', text: this.buffer });
+    if (this.buffer) chunks.push({ type: 'markdown_text', text: defuseBroadcasts(this.buffer) });
     this.pendingTitle = false;
     this.pendingTasks = new Set();
     return chunks;
@@ -256,16 +248,17 @@ export class StreamReply implements TurnReply {
       return;
     }
     try {
-      if (!this.ts) {
-        this.ts = await this.port.start(this.channel, this.threadTs, this.user);
-        this.opened.push(this.ts);
-      }
+      if (!this.ts) this.ts = await this.port.start(this.channel, this.threadTs, this.user);
       await this.port.append(this.channel, this.ts, chunks);
       this.streamed += text;
     } catch (err) {
       const code = err instanceof StreamError ? err.code : (err as Error).message;
+      const where = `${this.channel} thread ${this.threadTs}`;
       if (!this.ts && UNSUPPORTED.test(code)) {
         // This app can't stream at all: switch this turn (and later ones) to edited messages.
+        this.port.report?.(
+          `Slack streaming is off for this app (${code}, in ${where}): replies use edited messages until restart`,
+        );
         this.port.disabled = true;
         this.fallback = new EditReply(this.chat, this.channel, this.threadTs, false, this.intervalMs);
         for (const task of this.tasks.values()) this.fallback.toolStart('', task.title);
@@ -275,7 +268,6 @@ export class StreamReply implements TurnReply {
         // Slack seals long streams after a few minutes: continue in a fresh card with the full state.
         try {
           this.ts = await this.port.start(this.channel, this.threadTs, this.user);
-          this.opened.push(this.ts);
           const state: StreamChunk[] = [
             { type: 'plan_update', title: this.title.slice(0, 256) },
             ...[...this.tasks].map(([id, t]) => ({
@@ -284,14 +276,20 @@ export class StreamReply implements TurnReply {
               title: t.title,
               status: t.status,
             })),
-            ...(text ? [{ type: 'markdown_text' as const, text }] : []),
+            ...(text ? [{ type: 'markdown_text' as const, text: defuseBroadcasts(text) }] : []),
           ];
           await this.port.append(this.channel, this.ts, state);
           this.streamed += text;
           return;
-        } catch {
+        } catch (again) {
           // fall through: stop streaming and post the rest as messages
+          const next = again instanceof StreamError ? again.code : (again as Error).message;
+          this.port.report?.(`Slack sealed the stream in ${where} and refused a new one (${next})`);
         }
+      } else {
+        this.port.report?.(
+          `Slack refused the live stream in ${where} (${code}${this.ts ? ', mid-reply' : ''}): the rest of the reply is posted as plain messages, without its tool steps`,
+        );
       }
       this.broken = true;
       this.leftover += text;

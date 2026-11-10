@@ -1,5 +1,5 @@
 import type { Bridge, RunContext } from '../bridge/bridge.js';
-import type { HostConfig, Project } from '../config/schema.js';
+import type { HostConfig, Project, SelfImprove } from '../config/schema.js';
 import { buildClaudeArgs } from '../runner/args.js';
 import type { Runner, RunOutcome } from '../runner/run.js';
 import { isNoLesson, learnPrompt } from '../scheduler/prompt.js';
@@ -8,8 +8,8 @@ import type { Store } from '../store/store.js';
 import type { ChatPort, Logger } from './manager.js';
 
 /**
- * Learning turns (`selfImprove`): after a job run or chat turn that had trouble, resume its session
- * once and let Claude fix the skill or instruction file behind it. The turn repeats the run's exact
+ * Learning turns (`selfImprove`): after a job run or chat turn (every one that used a tool, or only
+ * those with trouble), resume its session once and let Claude fix the skill or instruction file behind it. The turn repeats the run's exact
  * system prompt, tools and model, so the prompt cache still applies.
  */
 
@@ -32,6 +32,46 @@ export function troubleReasons(outcome: RunOutcome, toolErrors: number, failure?
   return reasons;
 }
 
+/**
+ * Whether a finished run gets a learning turn: undefined for none, the trouble reasons for a run that
+ * had trouble, or an empty list for a clean run in `always` mode (a short look back). A clean run that
+ * used no tool followed no procedure, so there is nothing to write down.
+ */
+export function learnReasons(
+  mode: SelfImprove,
+  outcome: RunOutcome,
+  toolErrors: number,
+  failure?: string,
+): string[] | undefined {
+  if (mode === 'off') return undefined;
+  const reasons = troubleReasons(outcome, toolErrors, failure);
+  if (reasons.length) return reasons;
+  if (mode === 'always' && outcome.status === 'ok' && outcome.toolCalls > 0) return [];
+  return undefined;
+}
+
+/** Tools that only read: everything else a learning turn does is checked against its rules. */
+const READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep', 'LS', 'TodoWrite']);
+const INSTRUCTION_FILE = /\.md$/i;
+/** A skill's own files (its scripts too) and the job scripts skills run: a learning turn may fix them. */
+const SKILL_FILE = /\/\.(?:claude|agents)\/skills\/|\/\.tara\/scripts\//;
+
+/**
+ * What a learning turn did beyond its rules ("instruction .md files and the skill's own scripts, with
+ * the edit tools"): edits of other files, and other tools that may write (a shell, MCP tools). Empty
+ * when it kept to them.
+ */
+export function learnOverreach(calls: Array<{ name: string; file?: string }>): string[] {
+  const out = new Set<string>();
+  for (const c of calls) {
+    if (READ_ONLY_TOOLS.has(c.name)) continue;
+    if (c.file) {
+      if (!INSTRUCTION_FILE.test(c.file) && !SKILL_FILE.test(c.file)) out.add(`edited ${c.file}`);
+    } else out.add(`used ${c.name}`);
+  }
+  return [...out];
+}
+
 export interface LearnDeps {
   host: HostConfig;
   store: Store;
@@ -52,9 +92,10 @@ export interface LearnRequest {
   bridge?: RunContext;
   allowedTools: string[];
   env: NodeJS.ProcessEnv;
+  /** What went wrong; empty for a clean run (`selfImprove: "always"`). */
   reasons: string[];
   channel: string;
-  /** Thread to report a change in; undefined posts in the channel (the job's message was deleted). */
+  /** Thread to report a change in; undefined: no Slack note (the run's thread was removed). */
   threadTs?: string;
   threadKey?: string;
   jobId?: string;
@@ -67,8 +108,11 @@ export async function learnFromRun(deps: LearnDeps, req: LearnRequest): Promise<
   const now = deps.now ?? Date.now;
   const name = req.project.config.name;
   const startedAt = now();
-  const bridged = req.bridge && deps.bridge?.open(req.bridge);
+  let bridged: ReturnType<Bridge['open']> | undefined;
   try {
+    // Inside the try: callers rely on this never rejecting to release their job or chat slot.
+    bridged = req.bridge && deps.bridge?.open(req.bridge);
+    const calls: Array<{ name: string; file?: string }> = [];
     const outcome = await deps.run({
       bin: deps.host.claude.bin,
       args: buildClaudeArgs({
@@ -86,7 +130,12 @@ export async function learnFromRun(deps: LearnDeps, req: LearnRequest): Promise<
       systemPrompt: req.appendSystemPrompt,
       prompt: learnPrompt(req.reasons),
       timeoutMs: LEARN_TIMEOUT_MS,
+      onEvent: (event) => {
+        if (event.kind === 'tool') calls.push({ name: event.name, file: event.file });
+      },
     });
+    // The rules are in the prompt only, so what the turn really did is checked and shown to people.
+    const overreach = learnOverreach(calls);
     const changed = outcome.status === 'ok' && !isNoLesson(outcome.text);
     deps.store.recordRun({
       kind: 'learn',
@@ -108,13 +157,18 @@ export async function learnFromRun(deps: LearnDeps, req: LearnRequest): Promise<
       output: outcome.text,
     });
     deps.log.info(
-      `[${name}] ${req.jobId ? `job ${req.jobId}` : 'chat'} learning turn: ${outcome.status}${changed ? ', changed instructions' : ', nothing to change'}`,
+      `[${name}] ${req.jobId ? `job ${req.jobId}` : 'chat'} learning turn: ${outcome.status}${changed ? ', changed instructions' : ', nothing to change'}${overreach.length ? `; beyond its rules: ${overreach.join(', ')}` : ''}`,
     );
-    if (changed) {
+    const warning = overreach.length
+      ? `\n⚠️ It also did more than edit instruction files, please check: ${overreach.slice(0, 10).join(', ')}`
+      : '';
+    // Only in the run's thread: a channel holds only "Run" threads. Without one (a silent run's thread
+    // was removed) the change is in the log and the daily health digest.
+    if ((changed || warning) && req.threadTs) {
       await deps.chat.post(
         req.channel,
         req.threadTs,
-        `🔧 ${req.label} learned from this run (${req.reasons.join('; ')}):\n${toSlackMrkdwn(outcome.text.trim().slice(0, 1_500))}`,
+        `🔧 ${req.label} learned from this run${req.reasons.length ? ` (${req.reasons.join('; ')})` : ''}:\n${toSlackMrkdwn(outcome.text.trim().slice(0, 1_500))}${warning}`,
       );
     }
   } catch (err) {

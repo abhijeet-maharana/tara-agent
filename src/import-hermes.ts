@@ -24,7 +24,11 @@ export interface ImportOptions {
   env: Record<string, string>;
 }
 
-type ImportedJob = JobsFile['jobs'][number];
+/** A tara job with Hermes' `prompt` and script, before `planPromptMove` puts them in the job's skill. */
+type ImportedJob = Omit<JobsFile['jobs'][number], 'prompt' | 'preScript' | 'agent'> & {
+  prompt: string;
+  preScript?: string;
+};
 
 function slug(name: string): string {
   return (
@@ -48,8 +52,14 @@ function usesBrowser(toolsets: string[] | null | undefined): boolean {
   return !toolsets || toolsets.some((t) => /chrome|browser/.test(t));
 }
 
-/** Converts Hermes `jobs.json` / `jobs.definitions.json` content into a tara-agent jobs file. */
-export function convertHermesJobs(source: unknown, options: ImportOptions): JobsFile {
+/**
+ * Converts Hermes `jobs.json` / `jobs.definitions.json` content into a tara-agent jobs file. The jobs
+ * still carry Hermes' `prompt`: `planPromptMove` then moves it into each job's skill.
+ */
+export function convertHermesJobs(
+  source: unknown,
+  options: ImportOptions,
+): { env: Record<string, string>; jobs: ImportedJob[] } {
   const list = (Array.isArray(source) ? source : (source as { jobs?: unknown })?.jobs) as
     | HermesJob[]
     | undefined;
@@ -73,14 +83,12 @@ export function convertHermesJobs(source: unknown, options: ImportOptions): Jobs
       prompt: h.prompt ?? '',
       skills: skills.filter(Boolean),
       ...(h.script ? { preScript: path.posix.join(options.scriptsDir, h.script) } : {}),
-      agent: true,
       harness: 'claude',
       steps: [],
       model: model(h.model, options.defaultModel),
       locks: browser ? ['chrome'] : [],
       timeoutMinutes: browser ? 40 : 30,
       catchUp: true,
-      quiet: false,
       env: {},
       enabled: h.enabled !== false,
     };

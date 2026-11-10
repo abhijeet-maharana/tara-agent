@@ -1,54 +1,38 @@
-import { chmodSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { jobSchema } from '../src/config/schema.js';
 import { convertHermesJobs } from '../src/import-hermes.js';
-import {
-  buildJobPrompt,
-  cronFailure,
-  isSilentReply,
-  parseWakeGate,
-  splitHeadline,
-} from '../src/scheduler/prompt.js';
-import { runScript } from '../src/scheduler/script.js';
+import { buildJobPrompt, cronFailure, isSilentReply, splitHeadline } from '../src/scheduler/prompt.js';
 
 const job = (o: object = {}) =>
-  jobSchema.parse({ id: 'j', name: 'J', cron: '* * * * *', prompt: 'Do it.', ...o });
-
-describe('parseWakeGate', () => {
-  it.each([
-    ['', true],
-    ['some report', true],
-    ['data\n{"wakeAgent": true}', true],
-    ['data\n{"wakeAgent": false}\n\n', false],
-    ['{"wakeAgent": false} trailing', true],
-    ['{"other": 1}', true],
-  ])('%j → %s', (output, wake) => {
-    expect(parseWakeGate(output)).toBe(wake);
-  });
-});
+  jobSchema.parse({ id: 'j', name: 'J', cron: '* * * * *', skills: ['do-it'], ...o });
 
 describe('buildJobPrompt', () => {
-  it('puts script output first, then the prompt and skills', () => {
-    const prompt = buildJobPrompt(job({ skills: ['sla-report'] }), {
-      ok: true,
-      output: 'STATUS: OK',
-      exitCode: 0,
-      timedOut: false,
-    });
-    expect(prompt).toMatch(/^## Script Output\nThe following data was collected/);
-    expect(prompt).toContain('```\nSTATUS: OK\n```\n\nDo it.');
-    expect(prompt).toContain('Skills for this job: `sla-report`');
+  it("is the job's section in its first skill, then the skills to load", () => {
+    expect(buildJobPrompt(job({ skills: ['sla-report', 'humanizer'] }))).toBe(
+      'Run the job "J" (`j`): do what the "## Job: `j`" section of the `sla-report` skill says, with the rest of that skill.\n\n' +
+        'Skills for this job: `sla-report`, `humanizer`. Load each one before you start (the Skill tool, or its SKILL.md) and follow it.',
+    );
   });
 
-  it('reports a failed script as Script Error', () => {
-    const prompt = buildJobPrompt(job(), { ok: false, output: 'boom', exitCode: 1, timedOut: false });
-    expect(prompt).toMatch(/^## Script Error\nThe data-collection script failed/);
+  it('needs a skill, and refuses the keys that moved into it', () => {
+    const base = { id: 'x', name: 'X', cron: '* * * * *' };
+    expect(jobSchema.safeParse(base).success).toBe(false);
+    const script = jobSchema.safeParse({ ...base, skills: ['s'], preScript: 'a.sh' });
+    expect(script.error?.issues[0]?.message).toMatch(
+      /`preScript` is no longer read: the job's skill runs its scripts/,
+    );
+    const agent = jobSchema.safeParse({ ...base, skills: ['s'], agent: false });
+    expect(agent.error?.issues[0]?.message).toMatch(/`agent` is no longer read/);
+    const old = jobSchema.safeParse({ ...base, skills: ['s'], prompt: 'Do it.' });
+    expect(old.error?.issues[0]?.message).toMatch(/`prompt` is no longer read.*move-prompts/);
+    const step = jobSchema.safeParse({ ...base, skills: ['s'], steps: [{ name: 'A', promptFile: 'a.md' }] });
+    expect(step.error?.issues[0]?.message).toMatch(/`promptFile` is no longer read/);
   });
 
-  it('is just the prompt without a script', () => {
-    expect(buildJobPrompt(job())).toBe('Do it.');
+  it('tells a job with steps that they are done', () => {
+    expect(buildJobPrompt(job({ steps: [{ name: 'A' }] }))).toContain(
+      'Its "### Step" parts were done by the sessions before you (their output is above): do the rest.',
+    );
   });
 });
 
@@ -88,47 +72,6 @@ describe('splitHeadline', () => {
     const { headline, details } = splitHeadline(`Summary line\n\n${'detail '.repeat(200)}`);
     expect(headline).toBe('Summary line');
     expect(details.startsWith('detail')).toBe(true);
-  });
-});
-
-describe('runScript', () => {
-  const dir = mkdtempSync(path.join(tmpdir(), 'tara-script-'));
-  const write = (name: string, body: string) => {
-    writeFileSync(path.join(dir, name), body);
-    chmodSync(path.join(dir, name), 0o755);
-    return name;
-  };
-
-  it('runs .sh relative to the repo with the given env', async () => {
-    const r = await runScript(
-      write('ok.sh', 'echo "root=$PWD v=$MY_VAR"'),
-      dir,
-      { ...process.env, MY_VAR: 'x' },
-      5_000,
-    );
-    expect(r).toMatchObject({ ok: true, exitCode: 0 });
-    expect(r.output).toBe(`root=${realpathSync(dir)} v=x`);
-  });
-
-  it('runs .py with python3', async () => {
-    const r = await runScript(write('ok.py', 'print("from python")'), dir, process.env, 5_000);
-    expect(r.output).toBe('from python');
-  });
-
-  it('reports failures with stderr and the exit code', async () => {
-    const r = await runScript(
-      write('bad.sh', 'echo partial; echo oops >&2; exit 3'),
-      dir,
-      process.env,
-      5_000,
-    );
-    expect(r.ok).toBe(false);
-    expect(r.output).toBe('partial\noops\n(exit code 3)');
-  });
-
-  it('kills a script that runs too long', async () => {
-    const r = await runScript(write('slow.sh', 'sleep 30'), dir, process.env, 300);
-    expect(r).toMatchObject({ ok: false, timedOut: true });
   });
 });
 
@@ -184,7 +127,7 @@ describe('convertHermesJobs', () => {
     });
     expect(out.jobs[1]).toMatchObject({ model: 'sonnet', locks: [], enabled: false });
     expect(out.jobs[2]?.locks).toEqual(['chrome']);
-    for (const j of out.jobs) expect(() => jobSchema.parse(j)).not.toThrow();
+    expect(out.jobs[0]?.prompt).toBe('Download labels');
   });
 
   it('rejects input without a jobs list', () => {

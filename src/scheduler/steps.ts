@@ -1,12 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
 import type { Harness, HostConfig, JobConfig, McpServer, Project } from '../config/schema.js';
 import { buildAgyArgs } from '../runner/agy.js';
 import { buildClaudeArgs } from '../runner/args.js';
 import type { Runner } from '../runner/run.js';
 import type { TokenUsage } from '../runner/stream.js';
-import { foldersNote, identityPrompt, type RunFolders, STEP_SYSTEM_PROMPT } from './prompt.js';
+import {
+  foldersNote,
+  identityPrompt,
+  type RunFolders,
+  STEP_SYSTEM_PROMPT,
+  stepInstructions,
+} from './prompt.js';
 
 /** `${VAR}` in a job's MCP server config, replaced from the run's environment (unknown names stay). */
 export function expandMcpServers(
@@ -66,14 +70,7 @@ export async function runSteps(input: StepsInput): Promise<StepsResult> {
     if (input.signal.aborted) break;
     input.onStep?.(i + 1, step.name);
     const timeoutMs = (step.timeoutMinutes ?? job.timeoutMinutes) * 60_000;
-    let prompt: string;
-    try {
-      const shared = step.promptFile ? readFileSync(path.join(project.dir, step.promptFile), 'utf8') : '';
-      prompt = [shared, step.prompt ?? '', foldersNote(input.folders)].filter((p) => p.trim()).join('\n\n');
-    } catch (err) {
-      parts.push(`### ${step.name} (not run)\nCould not read its prompt file: ${(err as Error).message}`);
-      continue;
-    }
+    const prompt = `${stepInstructions(job, step)}\n\n${foldersNote(input.folders)}`;
     const agy =
       harness === 'agy'
         ? buildAgyArgs({

@@ -22,10 +22,21 @@ function convertLine(line: string): string {
   );
 }
 
+/**
+ * Turns broadcast mentions (`<!channel>`, `<!here>`, `<!everyone>`, `<!subteam^…>`) into plain text.
+ * Model output can carry them from a page or email it read, and one would ping the whole channel.
+ * Person mentions (`<@U…>`) stay: replies address the project owner.
+ */
+export function defuseBroadcasts(text: string): string {
+  return text
+    .replace(/<!(channel|here|everyone)(?:\|[^>]*)?>/gi, '@\u200b$1')
+    .replace(/<!subteam\^[A-Z0-9]+(?:\|@?([^>]*))?>/gi, (_, name) => `@\u200b${name || 'group'}`);
+}
+
 /** Converts Claude's GitHub-flavoured markdown to Slack mrkdwn. Code blocks pass through untouched. */
 export function toSlackMrkdwn(markdown: string): string {
   let inFence = false;
-  return markdown
+  return defuseBroadcasts(markdown)
     .split('\n')
     .map((line) => {
       if (FENCE.test(line)) {

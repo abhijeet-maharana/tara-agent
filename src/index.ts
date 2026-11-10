@@ -1,6 +1,6 @@
 #!/usr/bin/env -S node --disable-warning=ExperimentalWarning
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
@@ -8,7 +8,15 @@ import type { WebSocket } from 'ws';
 import { Approvals } from './approvals/approvals.js';
 import { Bridge } from './bridge/bridge.js';
 import { codeReaders } from './code/repo.js';
-import { DEFAULT_HOST_CONFIG, expandHome, loadHostConfig, loadJobs, loadProjects } from './config/load.js';
+import {
+  DEFAULT_HOST_CONFIG,
+  expandHome,
+  JOBS_FILE,
+  loadHostConfig,
+  loadJobs,
+  loadProjects,
+} from './config/load.js';
+import { applyPromptMove, planPromptMove, type RawJobsFile } from './config/move-prompts.js';
 import { CiJobs } from './github/actions.js';
 import { PullRequests } from './github/pull-requests.js';
 import { jobState } from './http/dashboard.js';
@@ -27,7 +35,7 @@ import { type Runner, runClaude } from './runner/run.js';
 import { sweepScratch } from './runner/workspace.js';
 import { QueueWorker } from './scheduler/queues.js';
 import { Scheduler } from './scheduler/scheduler.js';
-import { runScript } from './scheduler/script.js';
+import { openRunThread } from './scheduler/slack-trigger.js';
 import { type Logger, SessionManager } from './sessions/manager.js';
 import { Threads } from './sessions/threads.js';
 import { createSlackGateway } from './slack/app.js';
@@ -44,7 +52,9 @@ const USAGE = `Usage:
   tara-agent validate [--config <file>]      check host, project and job config, then exit
   tara-agent import-hermes --from <hermes jobs json> --out <repo>/.tara/jobs.json
       [--scripts-dir .agents/hermes/cron/scripts] [--default-model haiku] [--tz UTC]
-      [--env KEY=VALUE ...] [--force]`;
+      [--env KEY=VALUE ...] [--force]
+  tara-agent move-prompts <repo> [--write]   move job and step prompts into the jobs' skills
+      (prints the plan; --write writes the skills and .tara/jobs.json)`;
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -109,8 +119,30 @@ function importHermes(args: string[]): void {
     tz: values.tz as string,
     env,
   });
-  writeFileSync(out, `${JSON.stringify(result, null, 2)}\n`);
-  log.info(`Wrote ${result.jobs.length} jobs to ${out}`);
+  // <repo>/.tara/jobs.json: each Hermes prompt goes into its job's skill in that repo.
+  const move = planPromptMove(path.dirname(path.dirname(out)), result);
+  applyPromptMove(move, out);
+  log.info(`Wrote ${result.jobs.length} jobs to ${out}; their prompts went into their skills:`);
+  for (const line of move.moved) log.info(`  ${line}`);
+}
+
+function movePrompts(args: string[]): void {
+  const { values, positionals } = parseArgs({
+    args,
+    allowPositionals: true,
+    options: { write: { type: 'boolean', default: false } },
+  });
+  if (positionals.length !== 1) throw new Error(USAGE);
+  const repo = path.resolve(expandHome(positionals[0] as string));
+  const jobsPath = path.join(repo, JOBS_FILE);
+  const move = planPromptMove(repo, JSON.parse(readFileSync(jobsPath, 'utf8')) as RawJobsFile);
+  if (move.moved.length === 0) return void log.info('Nothing to move: no job or step has a prompt.');
+  for (const line of move.moved) log.info(line);
+  if (!values.write)
+    return void log.info(`\n${move.moved.length} jobs to move. Run again with --write to do it.`);
+  applyPromptMove(move, jobsPath);
+  log.info(`\nMoved ${move.moved.length} jobs. Check the skills' new "## Job: <id>" sections.`);
+  for (const f of move.unusedPromptFiles) log.info(`No longer read: ${f} (its text is in the skill now)`);
 }
 
 async function serve(configFlag: string | undefined) {
@@ -216,7 +248,6 @@ async function serve(configFlag: string | undefined) {
     store,
     chat: slack.chat,
     run,
-    runScript: runAs ? (s, cwd, env, ms, signal) => runScript(s, cwd, env, ms, signal, runAs) : undefined,
     bridge,
     threads,
     log,
@@ -246,12 +277,16 @@ async function serve(configFlag: string | undefined) {
     timeZone: host.timezone,
     onFinished: (item) => approvals.finished(item),
   });
-  /** A new thread in the project's channel, as if its owner had asked there; returns its link. */
-  const startThread = async (name: string | undefined, title: string, prompt: string) => {
+  /**
+   * A new "Run <what>" thread in the project's channel, as if its owner had asked there; returns its
+   * link. The title is the thread's first reply.
+   */
+  const startThread = async (name: string | undefined, what: string, title: string, prompt: string) => {
     const project = projects.find((p) => p.config.name === name);
     if (!project) throw new Error(`No project "${name}" to ask in`);
     const channel = project.config.slackChannel;
-    const ts = await slack.chat.post(channel, undefined, title);
+    const ts = await openRunThread(slack.chat, channel, what);
+    await slack.chat.post(channel, ts, title);
     const user = project.config.owner ?? project.config.allowedUsers[0] ?? 'dashboard';
     void (manager as SessionManager).handle({ channel, threadTs: ts, ts, user, text: prompt });
     return { url: threadUrl(channel, ts), thread: { channel, ts } };
@@ -357,7 +392,8 @@ async function serve(configFlag: string | undefined) {
       },
       activity,
       alerts: alerts || undefined,
-      dispatch: (name, task) => startThread(name, `🎙️ ${task.split('\n')[0]?.slice(0, 120)}`, task),
+      dispatch: (name, task) =>
+        startThread(name, 'voice-task', `🎙️ ${task.split('\n')[0]?.slice(0, 120)}`, task),
       jobs,
       runJob: (project, id) => scheduler.trigger(project, id, 'command'),
       setJobEnabled: (project, id, enabled) => scheduler.setEnabled(project, id, enabled),
@@ -411,16 +447,22 @@ async function serve(configFlag: string | undefined) {
           ? {
               readers,
               // A new thread in the project's channel, as if its owner had asked there.
-              ask: (repo, title, prompt) => startThread(repo.askIn, title, prompt),
+              ask: (repo, title, prompt) => startThread(repo.askIn, 'code-question', title, prompt),
             }
           : undefined,
         projects: projects.map((p) => p.config.name),
+        browsers: host.browsers,
         dashboard: {
           projects,
           timeZone: host.timezone,
           agentName: host.agentName,
           slackUrl: slack.workspaceUrl,
           hostName: hostname(),
+          models: {
+            effort: host.claude.effort,
+            live: host.live && { model: host.live.model, askModel: host.live.askModel },
+            voice: host.voice?.models,
+          },
         },
         log,
       })
@@ -436,6 +478,21 @@ async function serve(configFlag: string | undefined) {
   };
   sweep();
   setInterval(sweep, 3_600_000).unref();
+
+  // Run history and slot claims older than `retentionDays`, once at start and then daily.
+  const prune = () => {
+    try {
+      const { runs, claims, sessions } = store.prune(Date.now() - host.retentionDays * 86_400_000);
+      if (runs || claims || sessions)
+        log.info(
+          `Deleted ${runs} runs, ${claims} slot claims and ${sessions} sessions older than ${host.retentionDays} days`,
+        );
+    } catch (err) {
+      log.error(`Pruning the state database failed: ${(err as Error).message}`);
+    }
+  };
+  prune();
+  setInterval(prune, 86_400_000).unref();
 
   let stopping = false;
   const shutdown = async (signal: string) => {
@@ -472,6 +529,7 @@ async function serve(configFlag: string | undefined) {
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
   if (command === 'import-hermes') return importHermes(rest);
+  if (command === 'move-prompts') return movePrompts(rest);
   if (command === '--help' || command === 'help') return void log.info(USAGE);
   const args = command === 'validate' ? rest : process.argv.slice(2);
   const { values } = parseArgs({ args, options: { config: { type: 'string', short: 'c' } } });

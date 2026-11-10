@@ -3,6 +3,9 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
@@ -15,7 +18,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { describe, expect, it } from 'vitest';
 import { Approvals } from '../src/approvals/approvals.js';
-import { Bridge, type RunContext, wantsPermissionPrompts } from '../src/bridge/bridge.js';
+import { Bridge, type RunContext, readChecked, wantsPermissionPrompts } from '../src/bridge/bridge.js';
 import type { Project, ProjectConfig } from '../src/config/schema.js';
 import { startHttpServer } from '../src/http/server.js';
 import { buildClaudeArgs } from '../src/runner/args.js';
@@ -39,7 +42,7 @@ function project(overrides: Partial<ProjectConfig> = {}): Project {
       allowedTools: [],
       allowedUsers: [],
       billing: 'subscription',
-      selfImprove: true,
+      selfImprove: 'trouble',
       ...overrides,
     },
   };
@@ -274,8 +277,12 @@ describe('send_file', () => {
     expect(await bridge.sendFile(token, { path: '.scratch/shot.png', comment: 'here' })).toEqual({
       name: 'shot.png',
     });
-    expect(chat.uploads[0]).toMatchObject({ thread: '100.1', comment: 'here' });
-    expect(chat.uploads[0]?.file.endsWith(path.join('.scratch', 'shot.png'))).toBe(true);
+    expect(chat.uploads[0]).toMatchObject({
+      thread: '100.1',
+      comment: 'here',
+      file: 'shot.png',
+      data: 'png',
+    });
 
     await expect(bridge.sendFile(token, { path: 'missing.txt' })).rejects.toMatchObject({ status: 404 });
     await expect(bridge.sendFile(token, { path: '.scratch' })).rejects.toMatchObject({ status: 400 });
@@ -284,6 +291,29 @@ describe('send_file', () => {
     if (!outside.startsWith(tmpdir())) {
       await expect(bridge.sendFile(token, { path: 'link.txt' })).rejects.toMatchObject({ status: 403 });
     }
+  });
+
+  it('uploads what it checked: a folder swapped for a symlink after the check sends nothing', async () => {
+    const root = realpathSync(mkdtempSync(path.join(tmpdir(), 'tara-send-')));
+    const dir = path.join(root, 'shots');
+    mkdirSync(dir);
+    writeFileSync(path.join(dir, 'a.png'), 'png');
+    const elsewhere = realpathSync(mkdtempSync(path.join(tmpdir(), 'tara-secret-')));
+    writeFileSync(path.join(elsewhere, 'a.png'), 'secret');
+    const inside = (p: string) => p.startsWith(root + path.sep);
+    const real = path.join(dir, 'a.png');
+    expect((await readChecked(real, inside, 'shots/a.png')).toString()).toBe('png');
+
+    // The run swaps the folder for a link to a place only tara-agent can read, after the path check.
+    renameSync(dir, `${dir}.old`);
+    symlinkSync(elsewhere, dir);
+    await expect(readChecked(real, inside, 'shots/a.png')).rejects.toMatchObject({ status: 403 });
+
+    // A file swapped for a symlink is refused too.
+    rmSync(dir);
+    mkdirSync(dir);
+    symlinkSync(path.join(elsewhere, 'a.png'), real);
+    await expect(readChecked(real, inside, 'shots/a.png')).rejects.toMatchObject({ status: 403 });
   });
 
   it('refuses a file it cannot read instead of failing in the upload', async () => {

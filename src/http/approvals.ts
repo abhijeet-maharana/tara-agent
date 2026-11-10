@@ -104,7 +104,7 @@ const decide = async (c, option, runNow) => {
   if (option === 'Revise' && !reply) { c.classList.add('open'); c.querySelector('[data-reply]').focus(); return toast('Say what to change, then press Revise again'); }
   c.querySelectorAll('button').forEach((b) => (b.disabled = true));
   try {
-    await post('/items/' + c.dataset.item + '/decide', { option, fields: editedFields(c), reply, runNow: Boolean(runNow) });
+    await post('/items/' + c.dataset.item + '/decide', { option, fields: editedFields(c), reply, runNow: Boolean(runNow), seen: Number(c.dataset.version) });
     toast(option === 'Revise' ? 'Sent back to Jarvis for a new version' : option + ': ' + c.dataset.title);
     c.remove();
     document.querySelectorAll('[data-group]').forEach((g) => { if (!g.querySelector('[data-item]')) g.remove(); });
@@ -150,7 +150,8 @@ document.addEventListener('click', async (e) => {
     const seen = b.dataset.notice !== undefined;
     if (!seen && !(await ask('Approve ' + ids.length + (ids.length === 1 ? ' item?' : ' items?'), 'Each runs at its queue\\'s time, as it is now. Unsaved edits on these cards are not included.', 'Approve ' + ids.length))) return;
     try {
-      const r = await post('/items/bulk', { ids, option: b.dataset.bulk });
+      const seen = Object.fromEntries(ids.map((id) => [id, Number(document.getElementById('item-' + id)?.dataset.version)]).filter(([, v]) => v));
+      const r = await post('/items/bulk', { ids, option: b.dataset.bulk, seen });
       toast(r.decided.length + (seen ? ' marked ' + b.dataset.bulk.toLowerCase() : ' approved') + (r.failed.length ? ', ' + r.failed.length + ' not: ' + r.failed[0].error : ''), r.failed.length ? { error: true } : {});
       reload();
     } catch (err) { toast(err.message, { error: true }); }
@@ -215,12 +216,16 @@ function fieldHtml(f: Item['fields'][number], editable: boolean): string {
   return `<label class="field">${esc(f.label)}${count}${input}</label>`;
 }
 
+/** Web and same-site links only: a `javascript:` or `data:` URL on a card would run on the dashboard. */
+export const safeMediaUrl = (url: string) => /^(https?:\/\/|\/(?![/\\]))/i.test(url.trim());
+
 export function mediaHtml(item: Item): string {
-  if (!item.media.length) return '';
-  return `<div class="media">${item.media
+  const media = item.media.filter((m) => safeMediaUrl(m.url));
+  if (!media.length) return '';
+  return `<div class="media">${media
     .map((m) =>
       m.type === 'video'
-        ? `<video src="${esc(m.url)}"${m.poster ? ` poster="${esc(m.poster)}"` : ''} controls playsinline preload="none" title="${esc(m.caption ?? '')}"></video>`
+        ? `<video src="${esc(m.url)}"${m.poster && safeMediaUrl(m.poster) ? ` poster="${esc(m.poster)}"` : ''} controls playsinline preload="none" title="${esc(m.caption ?? '')}"></video>`
         : m.type === 'file'
           ? `<a class="chip" href="${esc(m.url)}" target="_blank" rel="noopener noreferrer">📄 ${esc(m.caption ?? 'Open file')} ↗</a>`
           : `<a href="${esc(m.url)}" target="_blank" rel="noopener noreferrer"><img src="${esc(m.url)}" alt="${esc(m.caption ?? '')}" loading="lazy"></a>`,
@@ -275,7 +280,7 @@ function waitingCard(
         `<button type="button" class="btn quiet" data-open-note>${item.mode === 'queue' ? 'Revise or note…' : 'Note…'}</button>`,
       ].join('')
     : '';
-  return `<article class="card item${blocking ? ' bad' : ''}${open ? ' open' : ''}" id="item-${esc(item.id)}" data-item="${esc(item.id)}" data-title="${esc(item.title)}"${
+  return `<article class="card item${blocking ? ' bad' : ''}${open ? ' open' : ''}" id="item-${esc(item.id)}" data-item="${esc(item.id)}" data-version="${item.updatedAt}" data-title="${esc(item.title)}"${
     blocking ? '' : ' data-clean'
   }>
 <div class="card-head"><div class="grow"><button type="button" class="fold-btn" data-fold aria-expanded="${open}"><span class="title">${esc(item.title)}</span></button>

@@ -134,8 +134,13 @@ export class QueueWorker {
     for (const project of this.deps.projects) {
       const days = project.config.approvals?.expireDays ?? 7;
       this.deps.store.expireItems(now - days * DAY_MS, project.config.name);
+      // One broken queue (a bad slot or timezone) must not hold up the others or the next projects.
       for (const [name, queue] of Object.entries(this.queues(project)))
-        this.consider(project, name, queue, now);
+        try {
+          this.consider(project, name, queue, now);
+        } catch (err) {
+          this.deps.log.error(`[${project.config.name}] queue ${name}: ${(err as Error).message}`);
+        }
     }
   }
 

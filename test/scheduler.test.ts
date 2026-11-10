@@ -3,21 +3,25 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import type { Project } from '../src/config/schema.js';
+import type { HostConfig, Project, SelfImprove } from '../src/config/schema.js';
 import { startHttpServer } from '../src/http/server.js';
 import type { RunOptions, RunOutcome } from '../src/runner/run.js';
 import { buildDigest } from '../src/scheduler/health.js';
 import { streamRecipient } from '../src/scheduler/job-runner.js';
 import { Scheduler } from '../src/scheduler/scheduler.js';
-import type { ScriptResult } from '../src/scheduler/script.js';
-import { parseScheduledRun, SCHEDULE_BY } from '../src/scheduler/slack-trigger.js';
+import { findRunJob, parseScheduledRun, SCHEDULE_BY } from '../src/scheduler/slack-trigger.js';
 import { Threads } from '../src/sessions/threads.js';
 import { type Item, Store, type StoredRun } from '../src/store/store.js';
-import { FakeChat, FakeStream, testHost } from './fakes.js';
+import { FakeChat, FakeStream, fakeChrome, testHost } from './fakes.js';
 
 const host = testHost({ concurrency: 2, catchUpHours: 6, claude: { bin: 'claude', chatTimeoutMinutes: 20 } });
 
-function makeProject(jobs: object[], env: object = {}, owner?: string, selfImprove = false): Project {
+function makeProject(
+  jobs: object[],
+  env: object = {},
+  owner?: string,
+  selfImprove: SelfImprove = 'off',
+): Project {
   const dir = mkdtempSync(path.join(tmpdir(), 'tara-sched-'));
   mkdirSync(path.join(dir, '.tara'));
   writeFileSync(path.join(dir, '.tara', 'jobs.json'), JSON.stringify({ env, jobs }));
@@ -53,18 +57,25 @@ function setup(opts: {
   jobs: object[];
   env?: object;
   replies?: string[];
-  script?: ScriptResult;
   now?: () => number;
   store?: Store;
   stream?: FakeStream;
   owner?: string;
-  selfImprove?: boolean;
+  selfImprove?: SelfImprove;
   /** Tool calls that fail in the first run. */
   toolErrors?: number;
+  /** How the first run ends, e.g. `aborted` for a run a person stopped. */
+  firstStatus?: RunOutcome['status'];
   /** The session id the CLI reports (agy picks its own conversation id). */
   initSessionId?: string;
   chatSetup?: (chat: FakeChat) => void;
   pickupTimeoutMs?: number;
+  /** The shared browser's DevTools address: tabs are closed after runs that hold its lock. */
+  browserUrl?: string;
+  /** Several browsers, each with its own lock (instead of `browserUrl`). */
+  browsers?: HostConfig['browsers'];
+  /** Called inside each model run, e.g. to open a browser tab. */
+  during?: () => Promise<void>;
 }) {
   const chat = new FakeChat('ts');
   chat.stream = opts.stream;
@@ -72,12 +83,15 @@ function setup(opts: {
   const store = opts.store ?? new Store(':memory:', opts.now);
   const calls: RunOptions[] = [];
   const callTimes: number[] = [];
-  const scripts: { script: string; env: NodeJS.ProcessEnv }[] = [];
   const replies = [...(opts.replies ?? [])];
   const project = makeProject(opts.jobs, opts.env, opts.owner, opts.selfImprove);
   const scheduler = new Scheduler({
     projects: [project],
-    host,
+    host: opts.browsers
+      ? { ...host, browsers: opts.browsers }
+      : opts.browserUrl
+        ? { ...host, browsers: [{ cdpUrl: opts.browserUrl, lock: 'chrome', closeTabs: true }] }
+        : host,
     store,
     chat,
     log: { info() {}, warn() {}, error() {} },
@@ -85,16 +99,15 @@ function setup(opts: {
     now: opts.now,
     newSessionId: () => 'sid',
     pickupTimeoutMs: opts.pickupTimeoutMs,
-    runScript: async (script, _cwd, env) => {
-      scripts.push({ script, env });
-      return opts.script ?? { ok: true, output: 'STATUS: OK', exitCode: 0, timedOut: false };
-    },
     run: async (o) => {
       calls.push(o);
+      await opts.during?.();
       callTimes.push(Date.now());
       o.onEvent?.({ kind: 'init', sessionId: opts.initSessionId ?? 'sid', model: 'claude-haiku-5-5' });
-      o.onEvent?.({ kind: 'tool', id: 't1', name: 'Bash', status: 'Bash: curl' });
-      o.onEvent?.({ kind: 'tool_result', id: 't1', isError: false });
+      if (!o.prompt.includes('Reply with exactly NONE')) {
+        o.onEvent?.({ kind: 'tool', id: 't1', name: 'Bash', status: 'Bash: curl' });
+        o.onEvent?.({ kind: 'tool_result', id: 't1', isError: false });
+      }
       if (calls.length === 1) {
         for (let i = 0; i < (opts.toolErrors ?? 0); i++) {
           o.onEvent?.({ kind: 'tool', id: `e${i}`, name: 'Bash', status: 'Bash: click' });
@@ -104,18 +117,20 @@ function setup(opts: {
       const reply = replies.shift() ?? 'Headline\n---\nDetails here';
       o.onEvent?.({ kind: 'text_start' });
       o.onEvent?.({ kind: 'text', text: reply });
+      if (calls.length === 1 && opts.firstStatus) return { ...ok(''), status: opts.firstStatus };
       return ok(reply);
     },
   });
-  return { chat, store, calls, callTimes, scripts, scheduler, project };
+  return { chat, store, calls, callTimes, scheduler, project };
 }
 
 /** What the bot does when its own trigger messages arrive from Slack: start each job in its thread. */
 async function pickUp(scheduler: Scheduler, chat: FakeChat): Promise<void> {
   await new Promise((r) => setImmediate(r));
   for (const post of chat.posts) {
-    const id = post.thread === '' ? parseScheduledRun(post.text) : undefined;
-    if (id) scheduler.trigger('shop', id, SCHEDULE_BY, { channel: 'C1', ts: post.ts });
+    const said = post.thread === '' ? parseScheduledRun(post.text) : undefined;
+    const job = said ? findRunJob(scheduler.list('shop'), said) : undefined;
+    if (job) scheduler.trigger('shop', job.id, SCHEDULE_BY, { channel: 'C1', ts: post.ts });
   }
   await scheduler.idle();
 }
@@ -125,7 +140,7 @@ const baseJob = {
   name: 'SLA Report',
   cron: '0 * * * *',
   tz: 'UTC',
-  prompt: 'Run the report.',
+  skills: ['sla-report'],
   model: 'haiku',
 };
 
@@ -147,9 +162,9 @@ describe('Scheduler', () => {
     expect(chat.reactions).toContain('+eyes@card.1');
   });
 
-  it('runs a job on demand: script context, job prompt, headline in channel, details in thread', async () => {
-    const { chat, calls, scripts, scheduler, store } = setup({
-      jobs: [{ ...baseJob, preScript: 'gate.sh', skills: ['sla-report'] }],
+  it('runs a job on demand: its skill section, a Run message, status and details in its thread', async () => {
+    const { chat, calls, scheduler, store } = setup({
+      jobs: [{ ...baseJob, timeoutMinutes: 20 }],
       env: { ROOT: '~/repo' },
     });
     scheduler.start();
@@ -157,11 +172,15 @@ describe('Scheduler', () => {
     expect(scheduler.trigger('shop', 'sla', 'U1')).toBe('running');
     await scheduler.idle();
 
-    expect(scripts[0]?.script).toBe('gate.sh');
-    expect(scripts[0]?.env.ROOT).toMatch(/\/repo$/);
-    expect(scripts[0]?.env.SLACK_BOT_TOKEN).toBeUndefined();
     const call = calls[0] as RunOptions;
-    expect(call.prompt).toMatch(/^## Script Output[\s\S]*Run the report\.[\s\S]*`sla-report`/);
+    expect(call.prompt).toMatch(
+      /^Run the job "SLA Report" \(`sla`\): do what the "## Job: `sla`" section of the `sla-report` skill says[\s\S]*Skills for this job: `sla-report`/,
+    );
+    // The job's env (no Slack token), and Bash may take as long as the job: the skill runs its scripts.
+    expect(call.env.ROOT).toMatch(/\/repo$/);
+    expect(call.env.SLACK_BOT_TOKEN).toBeUndefined();
+    expect(call.env.BASH_MAX_TIMEOUT_MS).toBe(String(20 * 60_000));
+    expect(call.env.BASH_DEFAULT_TIMEOUT_MS).toBe(String(20 * 60_000));
     expect(call.args).toEqual(expect.arrayContaining(['--model', 'haiku', '--session-id', 'sid']));
     // No host effort set: the model's default applies.
     expect(call.args).not.toContain('--effort');
@@ -172,14 +191,14 @@ describe('Scheduler', () => {
     expect(call.env.TARA_JOB_DATA).toBe('/tmp/job-data/shop/sla');
     expect(call.prompt).toContain('- Scratch folder (`$TARA_SCRATCH`): /tmp/scratch/shop/sla-sid.');
     expect(call.prompt).toContain('- Job data folder (`$TARA_JOB_DATA`): /tmp/job-data/shop/sla.');
-    expect(scripts[0]?.env.TARA_JOB_DATA).toBe('/tmp/job-data/shop/sla');
-    expect(scripts[0]?.env.TARA_SCRATCH).toBeUndefined();
 
-    expect(chat.log[0]).toBe('post top ts1: ⏳ *SLA Report* (run by <@U1>)');
+    // The channel gets only "Run SLA Report"; the status line and the details are replies in its thread.
+    expect(chat.log[0]).toBe('post top ts1: Run SLA Report');
+    expect(chat.log[1]).toBe('post ts1 ts2: ⏳ *SLA Report* (run by <@U1>)');
     expect(chat.log.at(-2)).toBe(
-      'update ts1: ✅ *SLA Report* (run by <@U1>) · 2s · 2 steps · claude-haiku-5-5\nHeadline',
+      'update ts2: ✅ *SLA Report* (run by <@U1>) · 2s · 2 steps · claude-haiku-5-5\nHeadline',
     );
-    expect(chat.log.at(-1)).toBe('post ts1 ts2: Details here');
+    expect(chat.log.at(-1)).toBe('post ts1 ts3: Details here');
     // Replies in the job thread resume the job's session.
     expect(store.getSession('C1:ts1')).toMatchObject({ sessionId: 'sid', model: 'haiku', started: true });
     expect(scheduler.list('shop')[0]).toMatchObject({ id: 'sla', lastStatus: 'ok', running: false });
@@ -260,7 +279,9 @@ describe('Scheduler', () => {
     expect(fix.prompt).toContain('ran on agy');
     expect(fix.prompt).toContain('### Footer\nWhatsApp button covers the footer.');
     expect(fix.prompt).toContain('## The decision\nUSER DECISION on "Footer": Fix it');
-    expect(fix.prompt).toContain("## The job's instructions\nRun the report.");
+    expect(fix.prompt).toContain(
+      '## The job\'s instructions\nRun the job "SLA Report" (`sla`): do what the "## Job: `sla`" section of the `sla-report` skill says',
+    );
     expect(store.getSession('C1:ts1')).toMatchObject({
       harness: 'claude',
       model: 'claude-opus-5-5',
@@ -284,27 +305,26 @@ describe('Scheduler', () => {
   });
 
   it('runs steps in their own sessions before the main prompt, with the job MCP servers', async () => {
-    const { calls, scheduler, project } = setup({
+    const { calls, scheduler } = setup({
       jobs: [
         {
           ...baseJob,
           // biome-ignore lint/suspicious/noTemplateCurlyInString: a literal ${VAR} placeholder, expanded by tara-agent
           mcpServers: { browser: { command: 'npx', args: ['mcp', '--workspace=${TARA_SCRATCH}/shots'] } },
-          steps: [
-            { name: 'Home', promptFile: 'shared.md', prompt: 'Test the home page.' },
-            { name: 'Cart', prompt: 'Test the cart.', timeoutMinutes: 5, model: 'sonnet' },
-          ],
+          steps: [{ name: 'Home' }, { name: 'Cart', skill: 'cart-test', timeoutMinutes: 5, model: 'sonnet' }],
         },
       ],
       replies: ['home: 1 finding', 'cart: fine', 'Headline\n---\nAll steps done'],
     });
-    writeFileSync(path.join(project.dir, 'shared.md'), 'Shared rules.');
     scheduler.start();
     scheduler.trigger('shop', 'sla', 'U1');
     await scheduler.idle();
     expect(calls).toHaveLength(3);
     const [home, cart, main] = calls as [RunOptions, RunOptions, RunOptions];
-    expect(home.prompt).toMatch(/^Shared rules\.\n\nTest the home page\.\n\nYour folders:/);
+    expect(home.prompt).toMatch(
+      /^This is the step "Home" of the job "SLA Report" \(`sla`\)\. Load the `sla-report` skill[\s\S]*do only the "### Step: Home" part[\s\S]*\n\nYour folders:/,
+    );
+    expect(cart.prompt).toContain('Load the `cart-test` skill');
     expect(home.systemPrompt).toContain('one step of a scheduled job');
     expect(home.mcpServers).toEqual({
       browser: { command: 'npx', args: ['mcp', '--workspace=/tmp/scratch/shop/sla-sid/shots'], env: {} },
@@ -313,32 +333,20 @@ describe('Scheduler', () => {
     expect(home.args).toEqual(expect.arrayContaining(['--model', 'haiku']));
     expect(cart.args).toEqual(expect.arrayContaining(['--model', 'sonnet']));
     expect(main.prompt).toMatch(
-      /## Step Output[\s\S]*### Home\nhome: 1 finding[\s\S]*### Cart\ncart: fine[\s\S]*Run the report\./,
+      /## Step Output[\s\S]*### Home\nhome: 1 finding[\s\S]*### Cart\ncart: fine[\s\S]*Its "### Step" parts were done by the sessions before you/,
     );
     expect(main.mcpServers).toEqual(home.mcpServers);
     await scheduler.stop();
   });
 
-  it('stays silent when the script gate says so (no model, no post)', async () => {
-    const { chat, calls, scheduler } = setup({
-      jobs: [{ ...baseJob, preScript: 'gate.py' }],
-      script: { ok: true, output: 'checked\n{"wakeAgent": false}', exitCode: 0, timedOut: false },
-    });
-    scheduler.start();
-    scheduler.trigger('shop', 'sla', 'U1');
-    await scheduler.idle();
-    expect(calls).toHaveLength(0);
-    expect(chat.log).toEqual([]);
-    await scheduler.stop();
-  });
-
-  it('deletes the thread when the model replies [SILENT]', async () => {
+  it('keeps its own Run thread and session when the model replies [SILENT]', async () => {
     const { chat, scheduler, store } = setup({ jobs: [baseJob], replies: ['[SILENT]'] });
     scheduler.start();
     scheduler.trigger('shop', 'sla', 'U1');
     await scheduler.idle();
-    expect(chat.log.at(-1)).toBe('delete ts1');
-    expect(store.getSession('C1:ts1')).toBeUndefined();
+    expect(chat.deleted).toEqual([]);
+    expect(chat.log.some((l) => l.startsWith('update ts2: 🔇 *SLA Report*') && l.endsWith('· nothing to report'))).toBe(true);
+    expect(store.getSession('C1:ts1')).toBeDefined();
     await scheduler.stop();
   });
 
@@ -348,7 +356,7 @@ describe('Scheduler', () => {
     scheduler.trigger('shop', 'sla', 'U1');
     await scheduler.idle();
     expect(
-      chat.log.some((l) => l.startsWith('update ts1: ❌ *SLA Report*') && l.endsWith('Portal login expired')),
+      chat.log.some((l) => l.startsWith('update ts2: ❌ *SLA Report*') && l.endsWith('Portal login expired')),
     ).toBe(true);
     expect(scheduler.list('shop')[0]?.lastStatus).toBe('failed');
     await scheduler.stop();
@@ -358,7 +366,7 @@ describe('Scheduler', () => {
     it('resumes a failed run once to fix its skill, reports the change, and keeps it out of job history', async () => {
       const { chat, calls, scheduler, store } = setup({
         jobs: [baseJob],
-        selfImprove: true,
+        selfImprove: 'trouble',
         replies: ['[CRON_FAILURE]\nSave button not found', '.claude/skills/sla/SKILL.md: new Save selector'],
       });
       scheduler.start();
@@ -375,7 +383,7 @@ describe('Scheduler', () => {
       expect(learn.prompt).toContain('it reported a failure: Save button not found');
       expect(learn.prompt).toContain('Reply with exactly NONE');
       expect(chat.log.at(-1)).toBe(
-        'post ts1 ts3: 🔧 *SLA Report* learned from this run (it reported a failure: Save button not found):\n.claude/skills/sla/SKILL.md: new Save selector',
+        'post ts1 ts4: 🔧 *SLA Report* learned from this run (it reported a failure: Save button not found):\n.claude/skills/sla/SKILL.md: new Save selector',
       );
       expect(store.jobRuns('shop', 'sla', 10).map((r) => r.status)).toEqual(['failed']);
       expect(store.runsSince(0).map((r) => r.kind)).toEqual(['job', 'learn']);
@@ -383,8 +391,37 @@ describe('Scheduler', () => {
       await scheduler.stop();
     });
 
-    it('costs nothing extra for a clean run, and posts nothing when there is nothing to change', async () => {
-      const clean = setup({ jobs: [baseJob], selfImprove: true });
+    it('looks back after a clean run in always mode, and reports a change without reasons', async () => {
+      const { chat, calls, scheduler, store } = setup({
+        jobs: [baseJob],
+        selfImprove: 'always',
+        replies: ['Headline\n---\nDetails', '.claude/skills/sla/SKILL.md: export button moved to the menu'],
+      });
+      scheduler.start();
+      scheduler.trigger('shop', 'sla', 'U1');
+      await scheduler.idle();
+      expect(calls).toHaveLength(2);
+      expect(calls[1]?.prompt).toContain('This run is done. Before you stop, look back');
+      expect(calls[1]?.prompt).toContain('Reply with exactly NONE');
+      expect(chat.log.at(-1)).toMatch(/🔧 \*SLA Report\* learned from this run:\n\.claude/);
+      expect(store.jobRuns('shop', 'sla', 10).map((r) => r.status)).toEqual(['ok']);
+      await scheduler.stop();
+    });
+
+    it('lets a job override the project mode', async () => {
+      const { calls, scheduler } = setup({
+        jobs: [{ ...baseJob, selfImprove: 'trouble' }],
+        selfImprove: 'always',
+      });
+      scheduler.start();
+      scheduler.trigger('shop', 'sla', 'U1');
+      await scheduler.idle();
+      expect(calls).toHaveLength(1);
+      await scheduler.stop();
+    });
+
+    it('costs nothing extra for a clean run in trouble mode, and posts nothing when there is nothing to change', async () => {
+      const clean = setup({ jobs: [baseJob], selfImprove: 'trouble' });
       clean.scheduler.start();
       clean.scheduler.trigger('shop', 'sla', 'U1');
       await clean.scheduler.idle();
@@ -393,7 +430,7 @@ describe('Scheduler', () => {
 
       const none = setup({
         jobs: [baseJob],
-        selfImprove: true,
+        selfImprove: 'trouble',
         replies: ['[CRON_FAILURE]\nPortal down', 'NONE'],
       });
       none.scheduler.start();
@@ -404,10 +441,10 @@ describe('Scheduler', () => {
       await none.scheduler.stop();
     });
 
-    it('learns from tool errors in a silent run and reports in the channel, since its thread is gone', async () => {
+    it('learns from tool errors in a silent run, with the note in its kept thread', async () => {
       const { chat, calls, scheduler } = setup({
         jobs: [baseJob],
-        selfImprove: true,
+        selfImprove: 'trouble',
         toolErrors: 2,
         replies: ['[SILENT]', 'SKILL.md: dismiss the cookie banner first'],
       });
@@ -415,7 +452,9 @@ describe('Scheduler', () => {
       scheduler.trigger('shop', 'sla', 'U1');
       await scheduler.idle();
       expect(calls[1]?.prompt).toContain('2 tool calls returned errors');
-      expect(chat.log.at(-1)).toMatch(/^post top ts\d: 🔧 \*SLA Report\* learned from this run/);
+      expect(calls).toHaveLength(2);
+      // A silent run keeps its thread, so the lesson's note goes there.
+      expect(chat.log.some((l) => l.startsWith('post ts1') && l.includes('🔧'))).toBe(true);
       await scheduler.stop();
     });
 
@@ -427,20 +466,6 @@ describe('Scheduler', () => {
       expect(calls).toHaveLength(1);
       await scheduler.stop();
     });
-  });
-
-  it("posts a script-only job's result in the channel and its output in the thread", async () => {
-    const { chat, calls, scheduler } = setup({
-      jobs: [{ id: 'backup', name: 'Backup', cron: '0 2 * * *', preScript: 'b.sh', agent: false }],
-      script: { ok: false, output: 'upload failed\n(exit code 1)', exitCode: 1, timedOut: false },
-    });
-    scheduler.start();
-    scheduler.trigger('shop', 'backup', 'U1');
-    await scheduler.idle();
-    expect(calls).toHaveLength(0);
-    expect(chat.log[0]).toMatch(/^post top ts1: ❌ \*Backup\* \(run by <@U1>\) · \d+s$/);
-    expect(chat.posts.find((p) => p.thread === 'ts1')?.text).toMatch(/^```\nupload failed/);
-    await scheduler.stop();
   });
 
   it('catches up a missed slot once, but never for a job first seen after that slot', async () => {
@@ -461,9 +486,9 @@ describe('Scheduler', () => {
     second.scheduler.start();
     await pickUp(second.scheduler, second.chat);
     expect(second.calls).toHaveLength(1);
-    expect(second.chat.log[0]).toBe('post top ts1: ⏰ Catch-up: *SLA Report* (`sla`)');
+    expect(second.chat.log[0]).toBe('post top ts1: Run SLA Report');
     // The trigger message is the run's status line; the run itself is in its thread.
-    expect(second.chat.log[1]).toBe('update ts1: ⏳ *SLA Report* (catch-up)');
+    expect(second.chat.log[1]).toBe('post ts1 ts2: ⏳ *SLA Report* (catch-up)');
     await second.scheduler.stop();
 
     // A restart in the same hour doesn't run it again: the slot is claimed.
@@ -551,7 +576,9 @@ describe('Scheduler', () => {
     writeFileSync(path.join(project.dir, '.tara', 'jobs.json'), '{"jobs":[{"id":"Bad Id"}]}');
     // biome-ignore lint/suspicious/noExplicitAny: reaching into the private poller for a deterministic test
     (scheduler as any).checkFiles();
-    expect(chat.log[0]).toMatch(/jobs\.json` was not reloaded/);
+    await new Promise((r) => setImmediate(r));
+    expect(chat.log[0]).toBe('post top ts1: Run jobs-reload');
+    expect(chat.log[1]).toMatch(/^post ts1 ts2: ⚠️ `\.tara\/jobs\.json` was not reloaded/);
     expect(scheduler.list('shop').map((j) => j.id)).toEqual(['sla']);
     await scheduler.stop();
   });
@@ -621,7 +648,10 @@ describe('HTTP API', () => {
     const { call, close, scheduler, chat } = await api();
     await call('/jobs/shop/sla/run', { method: 'POST', body: '{"by":"job-board"}' });
     await scheduler.idle();
-    expect(chat.log[0]).toBe('post top ts1: ⏳ *SLA Report* (run by job-board)');
+    expect(chat.log.slice(0, 2)).toEqual([
+      'post top ts1: Run SLA Report',
+      'post ts1 ts2: ⏳ *SLA Report* (run by job-board)',
+    ]);
     await close();
   });
 
@@ -794,9 +824,11 @@ describe('job streaming', () => {
       title: '✅ Done · 2s · 2 steps · claude-haiku-5-5',
       tasks: { 'Bash: curl': 'complete' },
     });
-    // Headline still updates the channel message; details are not posted a second time.
-    expect(chat.log.some((l) => l.startsWith('update ts1: ✅ *SLA Report* (run by <@U1>)'))).toBe(true);
-    expect(chat.posts.filter((p) => p.thread === 'ts1')).toHaveLength(0);
+    // The headline updates the status line; the details are not posted a second time.
+    expect(chat.log.some((l) => l.startsWith('update ts2: ✅ *SLA Report* (run by <@U1>)'))).toBe(true);
+    expect(chat.posts.filter((p) => p.thread === 'ts1').map((p) => p.text)).toEqual([
+      '⏳ *SLA Report* (run by <@U1>)',
+    ]);
     await scheduler.stop();
   });
 
@@ -817,16 +849,21 @@ describe('job streaming', () => {
     expect(quiet.calls).toEqual([]);
     expect(plain.chat.texts()).toContain('Details here');
     await plain.scheduler.stop();
-    expect(chat.posts.filter((p) => p.thread === 'ts1')).toHaveLength(0);
+    expect(chat.posts.filter((p) => p.thread === 'ts1').map((p) => p.text)).toEqual([
+      '⏳ *SLA Report* (run by Shop Dashboard)',
+    ]);
   });
 
-  it('removes the streamed thread too when the job had nothing to report', async () => {
+  it('keeps the streamed steps when the job had nothing to report', async () => {
     const stream = new FakeStream();
     const { chat, scheduler } = setup({ jobs: [baseJob], stream, replies: ['[SILENT]'] });
     scheduler.start();
     scheduler.trigger('shop', 'sla', 'U1');
     await scheduler.idle();
-    expect(chat.deleted).toEqual(['s1', 'ts1']);
+    // The stream (its steps) is finished, not removed, so the thread shows what the run checked.
+    expect(chat.deleted).toEqual([]);
+    expect(stream.appended.flat()).toContainEqual({ type: 'plan_update', title: expect.stringMatching(/^🔇 Nothing to report/) });
+    expect(stream.calls.at(-1)).toMatch(/^stop s1/);
     await scheduler.stop();
   });
 });
@@ -844,25 +881,6 @@ describe('a job run asked for in chat', () => {
     expect(chat.reactions).toEqual(expect.arrayContaining(['+eyes@500.1', '+white_check_mark@500.1']));
     // Replies in the requester's thread continue the job's session.
     expect(store.getSession('C1:500.1')).toMatchObject({ model: 'haiku', started: true });
-    await scheduler.stop();
-  });
-
-  it('says why when the pre-check finds nothing to do', async () => {
-    const { chat, scheduler } = setup({
-      jobs: [{ ...baseJob, preScript: 'gate.py' }],
-      script: {
-        ok: true,
-        output: 'Skipping: 1 post in the queue\n{"wakeAgent": false}',
-        exitCode: 0,
-        timedOut: false,
-      },
-    });
-    scheduler.start();
-    scheduler.trigger('shop', 'sla', 'U1', { channel: 'C1', ts: '500.1' });
-    await scheduler.idle();
-    expect(chat.texts()).toEqual([
-      '🔇 *SLA Report* (run by <@U1>): nothing to do right now.\n> Skipping: 1 post in the queue',
-    ]);
     await scheduler.stop();
   });
 });
@@ -884,16 +902,106 @@ function missedSlot(
   return { ...run, setNow: (t: string) => (now = Date.parse(t)), jobs };
 }
 
+describe('the shared browser', () => {
+  it('closes the tabs a job holding its lock opened, also when the run fails', async () => {
+    const chrome = await fakeChrome({ a: 'chrome://new-tab-page/' });
+    try {
+      for (const firstStatus of [undefined, 'error'] as const) {
+        const { scheduler } = setup({
+          jobs: [{ ...baseJob, locks: ['chrome'] }],
+          browserUrl: chrome.url,
+          firstStatus,
+          during: async () => {
+            await fetch(`${chrome.url}/json/new?https://seller.example/`, { method: 'PUT' });
+          },
+        });
+        scheduler.start();
+        scheduler.trigger('shop', 'sla', 'U1');
+        await scheduler.idle();
+        expect(chrome.pages()).toEqual(['a chrome://new-tab-page/']);
+        await scheduler.stop();
+      }
+    } finally {
+      chrome.server.close();
+    }
+  });
+
+  it('leaves the browser alone for a job without its lock', async () => {
+    const chrome = await fakeChrome({ a: 'chrome://new-tab-page/' });
+    try {
+      const { scheduler } = setup({
+        jobs: [baseJob],
+        browserUrl: chrome.url,
+        during: async () => {
+          await fetch(`${chrome.url}/json/new?https://own-browser.example/`, { method: 'PUT' });
+        },
+      });
+      scheduler.start();
+      scheduler.trigger('shop', 'sla', 'U1');
+      await scheduler.idle();
+      expect(chrome.pages()).toHaveLength(2);
+      expect(chrome.calls.some((c) => c.startsWith('GET /json/list'))).toBe(false);
+      await scheduler.stop();
+    } finally {
+      chrome.server.close();
+    }
+  });
+
+  it('with several browsers, tidies only the one whose lock the job holds', async () => {
+    const work = await fakeChrome({ a: 'chrome://new-tab-page/' });
+    const other = await fakeChrome({ b: 'chrome://new-tab-page/' });
+    try {
+      const { scheduler } = setup({
+        jobs: [{ ...baseJob, locks: ['chrome-work'] }],
+        browsers: [
+          { lock: 'chrome', cdpUrl: other.url, closeTabs: true },
+          { lock: 'chrome-work', cdpUrl: work.url, closeTabs: true },
+        ],
+        during: async () => {
+          await fetch(`${work.url}/json/new?https://jobs.example/`, { method: 'PUT' });
+          await fetch(`${other.url}/json/new?https://shop.example/`, { method: 'PUT' });
+        },
+      });
+      scheduler.start();
+      scheduler.trigger('shop', 'sla', 'U1');
+      await scheduler.idle();
+      expect(work.pages()).toEqual(['a chrome://new-tab-page/']);
+      expect(other.pages()).toHaveLength(2);
+      expect(other.calls.some((c) => c.startsWith('GET /json/list'))).toBe(false);
+      await scheduler.stop();
+    } finally {
+      work.server.close();
+      other.server.close();
+    }
+  });
+});
+
+describe('the channel holds only Run threads', () => {
+  it('posts the health digest in a "Run health-digest" thread', async () => {
+    const { chat, scheduler } = setup({ jobs: [baseJob] });
+    scheduler.start();
+    scheduler.trigger('shop', 'sla', 'U1');
+    await scheduler.idle();
+    const before = chat.posts.length;
+    await scheduler.postDigests();
+    const digest = chat.posts.slice(before);
+    expect(digest[0]).toMatchObject({ thread: '', text: 'Run health-digest' });
+    expect(digest.slice(1).every((p) => p.thread === digest[0]?.ts)).toBe(true);
+    expect(digest.length).toBeGreaterThan(1);
+    await scheduler.stop();
+  });
+});
+
 describe('scheduled runs through Slack', () => {
   it('posts a trigger message and runs only once the bot picks it up, in its thread', async () => {
     const { chat, calls, scheduler, store } = missedSlot();
     await new Promise((r) => setImmediate(r));
     expect(calls).toHaveLength(0);
-    expect(chat.log).toEqual(['post top ts1: ⏰ Catch-up: *SLA Report* (`sla`)']);
+    expect(chat.log).toEqual(['post top ts1: Run SLA Report']);
     await pickUp(scheduler, chat);
     expect(calls).toHaveLength(1);
     expect(chat.updates.at(-1)?.text).toMatch(/^✅ \*SLA Report\* \(catch-up\) · .*\nHeadline$/);
-    expect(chat.log.at(-1)).toBe('post ts1 ts2: Details here');
+    expect(chat.log.at(-1)).toBe('post ts1 ts3: Details here');
     expect(chat.posts.filter((p) => p.thread === '')).toHaveLength(1); // nothing else top-level
     expect(store.getSession('C1:ts1')).toBeDefined();
     await scheduler.stop();
@@ -910,7 +1018,7 @@ describe('scheduled runs through Slack', () => {
       },
     });
     await new Promise((r) => setImmediate(r));
-    expect(asUser).toEqual(['⏰ Catch-up: *SLA Report* (`sla`)']);
+    expect(asUser).toEqual(['Run SLA Report']);
     expect(chat.posts).toHaveLength(0);
     scheduler.trigger('shop', 'sla', SCHEDULE_BY, { channel: 'C1', ts: 'u1' });
     await scheduler.idle();
@@ -931,9 +1039,9 @@ describe('scheduled runs through Slack', () => {
       },
     });
     await pickUp(scheduler, chat);
-    expect(chat.log[0]).toBe('post top ts1: ⏰ Catch-up: *SLA Report* (`sla`)');
+    expect(chat.log[0]).toBe('post top ts1: Run SLA Report');
     expect(calls).toHaveLength(1);
-    expect(chat.log[1]).toBe('update ts1: ⏳ *SLA Report* (catch-up)'); // the bot's own message again
+    expect(chat.log[1]).toBe('post ts1 ts2: ⏳ *SLA Report* (catch-up)'); // in the bot's own message's thread
     await scheduler.stop();
   });
 
@@ -942,9 +1050,21 @@ describe('scheduled runs through Slack', () => {
     await new Promise((r) => setTimeout(r, 60));
     await scheduler.idle();
     expect(calls).toHaveLength(1);
-    expect(chat.log[1]).toBe('update ts1: ⏳ *SLA Report* (catch-up)');
+    expect(chat.log[1]).toBe('post ts1 ts2: ⏳ *SLA Report* (catch-up)');
     // A late event for it starts nothing.
     expect(scheduler.trigger('shop', 'sla', SCHEDULE_BY, { channel: 'C1', ts: 'ts1' })).toBe('unknown');
+    await scheduler.stop();
+  });
+
+  it('never starts a job paused between its trigger post and pickup', async () => {
+    const { calls, scheduler, store } = missedSlot({ pickupTimeoutMs: 20 });
+    expect(scheduler.setEnabled('shop', 'sla', false)).toBe('ok');
+    await new Promise((r) => setTimeout(r, 60));
+    await scheduler.idle();
+    expect(calls).toHaveLength(0);
+    // The slot is closed as skipped, so it isn't caught up later either.
+    expect([...store.claimedSlots('shop:sla', 0, Date.now() * 2)]).toHaveLength(1);
+    expect(store.claimSlot('shop:sla', Date.parse('2026-10-25T12:00:00Z'))).toBe(false);
     await scheduler.stop();
   });
 
@@ -954,17 +1074,6 @@ describe('scheduled runs through Slack', () => {
     await new Promise((r) => setTimeout(r, 60));
     await scheduler.idle();
     expect(calls).toHaveLength(1);
-    await scheduler.stop();
-  });
-
-  it('runs a quiet job straight away and says nothing when the gate skips it', async () => {
-    const { chat, calls, scheduler } = missedSlot(
-      { script: { ok: true, output: '{"wakeAgent": false}', exitCode: 0, timedOut: false } },
-      { preScript: 'watch.py', quiet: true },
-    );
-    await scheduler.idle();
-    expect(calls).toHaveLength(0);
-    expect(chat.log).toEqual([]);
     await scheduler.stop();
   });
 
@@ -981,21 +1090,8 @@ describe('scheduled runs through Slack', () => {
     const { chat, scheduler, store } = missedSlot({ replies: ['[SILENT]'] });
     await pickUp(scheduler, chat);
     expect(chat.deleted).toEqual([]);
-    expect(chat.log.at(-1)).toBe('update ts1: 🔇 *SLA Report* (catch-up) · nothing to report');
+    expect(chat.log.some((l) => l.startsWith('update ts2: 🔇 *SLA Report* (catch-up) ·') && l.endsWith('· nothing to report'))).toBe(true);
     expect(store.getSession('C1:ts1')).toBeDefined();
-    await scheduler.stop();
-  });
-
-  it('says why when the script gate skips the run', async () => {
-    const { chat, calls, scheduler } = missedSlot(
-      { script: { ok: true, output: 'No new listings\n{"wakeAgent": false}', exitCode: 0, timedOut: false } },
-      { preScript: 'gate.py' },
-    );
-    await pickUp(scheduler, chat);
-    expect(calls).toHaveLength(0);
-    expect(chat.log.at(-1)).toBe(
-      'update ts1: 🔇 *SLA Report* (catch-up): nothing to do right now.\n> No new listings',
-    );
     await scheduler.stop();
   });
 
@@ -1030,13 +1126,36 @@ describe('runs cut short by a restart', () => {
     second.scheduler.start();
     await pickUp(second.scheduler, second.chat);
     expect(second.calls).toHaveLength(1);
-    expect(second.chat.log[0]).toBe('post top ts1: ⏰ Catch-up: *SLA Report* (`sla`)');
+    expect(second.chat.log[0]).toBe('post top ts1: Run SLA Report');
     await second.scheduler.stop();
 
     const third = setup({ jobs: [job], store, now: () => now });
     third.scheduler.start();
     await pickUp(third.scheduler, third.chat);
     expect(third.calls).toHaveLength(0); // done now: not again
+    await third.scheduler.stop();
+  });
+
+  it('never re-runs a slot a person stopped', async () => {
+    let now = Date.parse('2026-10-25T09:00:00Z');
+    const store = new Store(':memory:', () => now);
+    const job = { ...baseJob, cron: '0 * * * *' };
+    const first = setup({ jobs: [job], store, now: () => now });
+    first.scheduler.start();
+    await first.scheduler.stop();
+
+    // The 10:00 slot is caught up and stopped in its thread (the scheduler itself keeps running).
+    now = Date.parse('2026-10-25T10:02:00Z');
+    const second = setup({ jobs: [job], store, now: () => now, firstStatus: 'aborted' });
+    second.scheduler.start();
+    await pickUp(second.scheduler, second.chat);
+    expect(second.calls).toHaveLength(1);
+    await second.scheduler.stop();
+
+    const third = setup({ jobs: [job], store, now: () => now });
+    third.scheduler.start();
+    await pickUp(third.scheduler, third.chat);
+    expect(third.calls).toHaveLength(0);
     await third.scheduler.stop();
   });
 

@@ -74,7 +74,7 @@ function makeProject(extra: object = {}): Project {
   writeFileSync(
     path.join(dir, '.tara', 'jobs.json'),
     JSON.stringify({
-      jobs: [{ id: 'sender', name: 'Sender', cron: '0 0 1 1 *', prompt: 'Send.', locks: ['chrome'] }],
+      jobs: [{ id: 'sender', name: 'Sender', cron: '0 0 1 1 *', skills: ['sender'], locks: ['chrome'] }],
     }),
   );
   return {
@@ -87,7 +87,7 @@ function makeProject(extra: object = {}): Project {
       allowedTools: [],
       allowedUsers: [],
       billing: 'subscription',
-      selfImprove: false,
+      selfImprove: 'off',
       owner: 'U1',
       ...extra,
     },
@@ -170,6 +170,30 @@ describe('proposing and deciding', () => {
     await expect(
       approvals.decide(first.id, { option: 'Reject', by: 'U2', via: 'slack' }),
     ).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('refuses a decision on a card that changed since the person saw it', async () => {
+    let t = 1_000;
+    const { project, approvals } = setup({ now: () => t });
+    const shown = await approvals.propose(project, {
+      kind: 'note',
+      key: 'k1',
+      title: 'Harmless',
+      queue: 'linkedin',
+    });
+    t = 2_000;
+    // The run re-proposes the same key with other content while the page is open.
+    await approvals.propose(project, { kind: 'note', key: 'k1', title: 'Harmful', queue: 'linkedin' });
+    await expect(
+      approvals.decide(shown.id, { option: 'Approve', by: 'U1', via: 'dashboard', seen: shown.updatedAt }),
+    ).rejects.toMatchObject({ status: 409 });
+    const current = await approvals.decide(shown.id, {
+      option: 'Approve',
+      by: 'U1',
+      via: 'dashboard',
+      seen: 2_000,
+    });
+    expect(current).toMatchObject({ status: 'approved', title: 'Harmful' });
   });
 
   it('refuses unknown queues and windows, and adds the project checks', async () => {
@@ -294,6 +318,9 @@ describe('auto-approved cards', () => {
     expect(item.reply).toBe('Auto-approved: every answer is from the profile');
     expect(verifySeal(item, KEY)).toBe(true);
     expect(asked).toEqual([{ kind: 'application', key: 'application:1', fields: { note: 'Hi Acme' } }]);
+    // No run proposed it: it goes in the day's "Run <queue>" thread.
+    expect(chat.posts[0]).toMatchObject({ thread: '', text: 'Run replies' });
+    expect(chat.blockPosts[0]?.thread).toBe(chat.posts[0]?.ts);
     expect(JSON.stringify(chat.blockPosts[0]?.blocks)).toContain(
       'Auto-approved: every answer is from the profile',
     );
@@ -338,7 +365,7 @@ describe('auto-approved cards', () => {
 });
 
 describe('cards of a slack queue', () => {
-  it('posts a one-line card in the channel with the draft in its thread, edits both on refresh, and closes it on a decision or a withdrawal', async () => {
+  it("posts cards no run proposed in the day's Run <queue> thread, edits them there, and closes them on a decision or a withdrawal", async () => {
     const { project, store, chat, approvals } = setup();
     const reply = (value: string) => ({ key: 'reply', label: 'Reply', type: 'textarea' as const, value });
     const card = await approvals.propose(project, {
@@ -350,27 +377,26 @@ describe('cards of a slack queue', () => {
       options: ['Approve', 'Skip'],
       fields: [reply('Locks need a timeout.'), { key: 'link', label: 'Link', type: 'text', value: '' }],
     });
-    expect(chat.blockPosts).toHaveLength(2);
-    const [posted, detail] = chat.blockPosts;
-    expect(posted?.thread).toBe('');
-    expect(card).toMatchObject({ channel: 'C1', messageTs: posted?.ts, threadTs: posted?.ts });
-    // The channel message is the title and status only.
-    expect(JSON.stringify(posted?.blocks[0])).toContain('*📝 Reply to @ann*"');
-    expect(JSON.stringify(posted?.blocks[1])).toContain(
-      'Waiting on the Approvals page (Approve · Skip · Revise)',
-    );
-    // The draft is the first reply in its thread.
-    expect(detail?.thread).toBe(posted?.ts);
-    expect(store.getItem(card.id)?.detailTs).toBe(detail?.ts);
-    const section = JSON.stringify(detail?.blocks[0]);
+    // One top-level "Run replies" for the day; the whole card is a reply in its thread.
+    expect(chat.posts).toEqual([expect.objectContaining({ thread: '', text: 'Run replies' })]);
+    const day = chat.posts[0]?.ts;
+    expect(chat.blockPosts).toHaveLength(1);
+    const posted = chat.blockPosts[0];
+    expect(posted?.thread).toBe(day);
+    expect(card).toMatchObject({ channel: 'C1', threadTs: day, messageTs: posted?.ts });
+    const section = JSON.stringify(posted?.blocks[0]);
+    expect(section).toContain('*📝 Reply to @ann*');
     expect(section).toContain('Ann posted *2h* ago');
     expect(section).toContain('> Locks need a timeout.');
     expect(section).not.toContain('*Link*'); // empty fields stay out
+    expect(JSON.stringify(posted?.blocks[1])).toContain(
+      'Waiting on the Approvals page (Approve · Skip · Revise)',
+    );
     // No buttons: decisions stay on the Approvals page.
     expect(chat.blockPosts.some((p) => p.blocks.some((b) => b.type === 'actions'))).toBe(false);
 
-    // A refresh (same key) edits the same message and keeps where the card lives.
-    const again = await approvals.propose(project, {
+    // A refresh (same key) edits the same reply.
+    await approvals.propose(project, {
       kind: 'x-reply',
       key: 'r1',
       title: 'Reply to @ann',
@@ -378,23 +404,46 @@ describe('cards of a slack queue', () => {
       options: ['Approve', 'Skip'],
       fields: [reply('Set lock_timeout first.')],
     });
-    expect(chat.blockPosts).toHaveLength(2);
-    expect(again).toMatchObject({ id: card.id, channel: 'C1', threadTs: posted?.ts });
-    expect(chat.updates.at(-1)?.ts).toBe(detail?.ts);
+    expect(chat.blockPosts).toHaveLength(1);
+    expect(chat.updates.at(-1)?.ts).toBe(posted?.ts);
     expect(JSON.stringify(chat.updates.at(-1)?.blocks)).toContain('Set lock_timeout first.');
 
     await approvals.decide(card.id, { option: 'Approve', by: 'U1', via: 'dashboard' });
     expect(chat.updates.at(-1)?.text).toBe('Reply to @ann: Approve');
 
+    // Another card that day: same thread, no second Run message.
     const other = await approvals.propose(project, {
       kind: 'x-reply',
       key: 'r2',
       title: 'Reply to @bob',
       queue: 'replies',
     });
+    expect(chat.posts).toHaveLength(1);
+    expect(other.threadTs).toBe(day);
     approvals.withdraw(other.id, 'post too old');
     expect(chat.updates.at(-1)?.text).toBe('Reply to @bob: ➖ Withdrawn: post too old');
     expect(store.getItem(other.id)?.status).toBe('cancelled');
+  });
+
+  it('keeps updating a card that got its own channel message before channels held only Run threads', async () => {
+    const { project, store, chat, approvals } = setup();
+    const card = await approvals.propose(project, {
+      kind: 'x-reply',
+      key: 'r1',
+      title: 'Reply',
+      queue: 'replies',
+    });
+    store.setItemSlack(card.id, 'C1', 'old.1'); // as it was posted then
+    const before = chat.posts.length;
+    await approvals.propose(project, {
+      kind: 'x-reply',
+      key: 'r1',
+      title: 'Reply',
+      body: 'new',
+      queue: 'replies',
+    });
+    expect(chat.posts).toHaveLength(before);
+    expect(chat.updates.some((u) => u.ts === 'old.1')).toBe(true);
   });
 
   it('puts a card from a run in that run thread, and every outcome in the card thread', async () => {
@@ -450,7 +499,10 @@ describe('cards of a slack queue', () => {
     approvals.report(card.id, 'waiting', 'Comment posted; the note goes out next send day');
     approvals.report(card.id, 'done', 'Note sent');
     await new Promise((r) => setImmediate(r));
-    expect(chat.posts.map((p) => [p.thread, p.text])).toEqual([
+    // Its progress and result go in the card's thread: the day's "Run linkedin" thread.
+    expect(chat.posts[0]).toMatchObject({ thread: '', text: 'Run linkedin' });
+    expect(card.threadTs).toBe(chat.posts[0]?.ts);
+    expect(chat.posts.slice(1).map((p) => [p.thread, p.text])).toEqual([
       [card.threadTs, '⏳ Comment posted; the note goes out next send day'],
       [card.threadTs, '✅ Done: Note sent'],
     ]);
@@ -683,7 +735,7 @@ describe('queue worker', () => {
 });
 
 describe('decisions over HTTP', () => {
-  it('lets a project server ask outside any run: one card per key, the decision goes to Jarvis', async () => {
+  it("lets a project server ask outside any run: in the day's Run thread, one card per key, the decision goes to Jarvis there", async () => {
     const { project, store, chat, approvals, chats } = setup();
     const server = await startHttpServer({
       bind: '127.0.0.1',
@@ -714,10 +766,15 @@ describe('decisions over HTTP', () => {
       key: 'login:portal',
       options: ['Done', 'Dismiss'],
     });
-    expect(chat.posts[0]).toMatchObject({ thread: '', text: '🟡 Log in to the portal again' });
+    // In the day's "Run decision" thread, with its buttons.
+    expect(chat.posts).toEqual([expect.objectContaining({ thread: '', text: 'Run decision' })]);
     expect(chat.blockPosts[0]?.thread).toBe(chat.posts[0]?.ts);
+    expect(chat.blockPosts[0]?.blocks.some((b) => b.type === 'actions')).toBe(true);
     expect((await ask(body)).item.id).toBe(item.id);
+    // Another question the same day shares the thread: still one Run message.
+    await ask({ ...body, key: 'login:other', title: 'Log in to the other portal' });
     expect(chat.posts).toHaveLength(1);
+    expect(chat.blockPosts[1]?.thread).toBe(chat.posts[0]?.ts);
     expect((await ask({ project: 'shop' })).error).toMatch(/title/);
 
     await approvals.decide(item.id, { option: 'Done', by: 'U1', via: 'slack' });
@@ -1099,7 +1156,7 @@ describe('queue executors', () => {
     const project = makeProject();
     writeFileSync(
       path.join(project.dir, '.tara', 'jobs.json'),
-      JSON.stringify({ jobs: [{ id: 'sender', name: 'Sender', prompt: 'Send.', enabled: false }] }),
+      JSON.stringify({ jobs: [{ id: 'sender', name: 'Sender', skills: ['sender'], enabled: false }] }),
     );
     const store = new Store(':memory:');
     const scheduler = new Scheduler({

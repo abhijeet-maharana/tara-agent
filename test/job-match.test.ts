@@ -5,14 +5,14 @@ import { SessionManager } from '../src/sessions/manager.js';
 import { Store } from '../src/store/store.js';
 import { FakeChat, testHost } from './fakes.js';
 
-const job = (id: string, name: string, enabled = true): JobInfo => ({
+const job = (id: string, name: string, enabled = true, skills: string[] = []): JobInfo => ({
   id,
   name,
   enabled,
   running: false,
   cron: '0 * * * *',
   tz: 'UTC',
-  skills: [],
+  skills,
   model: 'haiku',
 });
 const jobs = [
@@ -32,7 +32,43 @@ describe('matchJob', () => {
     ['run marketplace-pickup-sla-check', 'marketplace-pickup-sla-check'],
     ['run weekly p&l pulse', 'weekly-marketplace-and-web-p-and-l-pulse'],
   ])('%j → %s', (text, id) => {
-    expect(matchJob(text, jobs)).toEqual({ job: expect.objectContaining({ id }) });
+    expect(matchJob(text, jobs)).toEqual({
+      job: expect.objectContaining({ id }),
+    });
+  });
+
+  describe('by skill name', () => {
+    const withSkills = [
+      ...jobs,
+      job('weekly-google-analytics-4-ga4-audit', 'Weekly Google Analytics 4 (GA4) Audit', true, [
+        'google-analytics',
+      ]),
+      job('morning-scouts', 'Morning Scouts', true, ['job-board-scout', 'humanizer']),
+      job('x-reply-drafter', 'X Reply Drafter', true, ['x-reply-drafter', 'humanizer']),
+      job('competitor-intel-daily', 'Competitor Intel Daily', true, ['competitor-intel']),
+      job('competitor-intel', 'Competitor Intel Weekly'),
+    ];
+    const ids = (text: string) => {
+      const m = matchJob(text, withSkills);
+      return m && ('job' in m ? m.job.id : m.choices.map((j) => j.id));
+    };
+
+    it.each([
+      ['Run google-analytics', 'weekly-google-analytics-4-ga4-audit'],
+      ['run `job-board-scout`', 'morning-scouts'],
+      ['run board scout', 'morning-scouts'],
+      ['run x-reply-drafter', 'x-reply-drafter'],
+    ])('%j → %s', (text, id) => {
+      expect(ids(text)).toBe(id);
+    });
+
+    it('offers every job using a shared skill', () => {
+      expect(ids('run humanizer')).toEqual(['morning-scouts', 'x-reply-drafter']);
+    });
+
+    it("prefers a job's own id over another job's skill", () => {
+      expect(ids('run competitor-intel')).toBe('competitor-intel');
+    });
   });
 
   it('offers choices when several jobs fit', () => {
@@ -71,7 +107,7 @@ describe('"run <job name>" in chat', () => {
             allowedTools: [],
             allowedUsers: [],
             billing: 'subscription',
-            selfImprove: true,
+            selfImprove: 'trouble',
           },
         },
       ],
@@ -82,11 +118,19 @@ describe('"run <job name>" in chat', () => {
       log: { info() {}, warn() {}, error() {} },
       run: async (o) => {
         runs.push(o);
-        return { status: 'ok', text: 'hi', durationMs: 1, toolCalls: 0, permissionDenials: [] };
+        return {
+          status: 'ok',
+          text: 'hi',
+          durationMs: 1,
+          toolCalls: 0,
+          permissionDenials: [],
+        };
       },
       jobs: {
         list: () => [...jobs, job('paused-job', 'Paused Job', false)],
+        // Like the scheduler: a "schedule" start only runs a slot that is waiting, and none is.
         trigger: (...args: unknown[]) => {
+          if (args[2] === 'schedule') return 'unknown';
           triggered.push(args);
           return 'started';
         },

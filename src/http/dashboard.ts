@@ -29,6 +29,8 @@ export interface DashboardContext {
   code?: boolean;
   /** Command (talking to the agent) is on. */
   live?: boolean;
+  /** The Browsers page is on. */
+  browsers?: boolean;
 }
 
 /** A job with its project and latest runs (newest first), as the home and jobs pages show it. */
@@ -121,6 +123,24 @@ export interface HomeData {
   staleRepos?: StaleRepo[];
   uptimeSeconds: number;
   now: number;
+  /** Which model does what (Models section); see modelUses. */
+  models?: ModelUse[];
+  /** Host `claude.effort`, shown next to the models. */
+  effort?: string;
+}
+
+/** Host-level model settings the dashboard shows: Command (`live`) and voice notes (`voice`). */
+export interface HostModels {
+  effort?: string;
+  live?: { model: string; askModel: string };
+  voice?: string[];
+}
+
+/** One line of the Models section: what a model is used for, and by what. */
+export interface ModelUse {
+  purpose: string;
+  model: string;
+  used: string;
 }
 
 export const esc = (s: unknown) =>
@@ -588,7 +608,16 @@ export const jobViewTabs = (view: JobsView, project?: string) => {
   return `<div class="toolbar"><div class="chips views">${tab('list', '/jobs', 'List')}${tab('ondemand', '/jobs', 'On demand')}${tab('timeline', '/schedule', 'Timeline')}</div></div>`;
 };
 
-export type Page = 'Home' | 'Command' | 'Approvals' | 'Queue' | 'Jobs' | 'Sessions' | 'Code' | '';
+export type Page =
+  | 'Home'
+  | 'Command'
+  | 'Approvals'
+  | 'Queue'
+  | 'Jobs'
+  | 'Sessions'
+  | 'Code'
+  | 'Browsers'
+  | '';
 
 /** Projects whose app pages show here as tabs (`tabs` plus `dashboardUrl`). */
 export const tabbed = (projects: Project[]) =>
@@ -629,6 +658,7 @@ export function layout(
       ['/jobs', 'Jobs', '⏱️', failing, 'failing jobs'],
       ['/sessions', 'Sessions', '💬', 0, ''],
       ...(ctx.code ? ([['/code', 'Code', '📝', 0, '']] as const) : []),
+      ...(ctx.browsers ? ([['/browsers', 'Browsers', '🌐', 0, '']] as const) : []),
     ] as const
   )
     .map(
@@ -690,6 +720,88 @@ const USAGE_WINDOW: Record<string, string> = {
   seven_day: '7-day window',
   seven_day_opus: '7-day Opus window',
 };
+
+const nameList = (names: string[], max = 4) =>
+  names.length > max ? `${names.slice(0, max).join(', ')} +${names.length - max} more` : names.join(', ');
+const onHarness = (harness: string | undefined, model: string) =>
+  harness === 'agy' ? `agy · ${model}` : model;
+
+/** Which model does what: chat per project, jobs (and their steps and handoffs) per model, Command, voice notes. */
+export function modelUses(projects: Project[], jobs: JobInfo[], host: HostModels = {}): ModelUse[] {
+  const out: ModelUse[] = [];
+  const grouped = (purpose: string, pairs: Array<[model: string, name: string]>, kind?: string) => {
+    const by = new Map<string, string[]>();
+    for (const [model, name] of pairs) by.set(model, [...(by.get(model) ?? []), name]);
+    for (const [model, names] of [...by].sort((a, b) => b[1].length - a[1].length))
+      out.push({
+        purpose,
+        model,
+        used: `${kind ? `${plural(names.length, kind)}: ` : ''}${nameList(names)}`,
+      });
+  };
+  grouped(
+    'Chat',
+    projects.map((p) => [p.config.chatModel, p.config.title ?? p.config.name]),
+  );
+  grouped(
+    'Jobs',
+    jobs.map((j) => [onHarness(j.harness, j.model), j.name]),
+    'job',
+  );
+  grouped(
+    'Job steps',
+    jobs.flatMap((j) => (j.stepModels ?? []).map((m): [string, string] => [onHarness(j.harness, m), j.name])),
+    'job',
+  );
+  grouped(
+    'After approval',
+    jobs.flatMap(
+      (j): Array<[string, string]> =>
+        j.handoff ? [[onHarness(j.handoff.harness, j.handoff.model), j.name]] : [],
+    ),
+    'job',
+  );
+  if (projects.some((p) => p.config.selfImprove !== 'off'))
+    out.push({
+      purpose: 'Learning',
+      model: 'same as the run',
+      used: 'a turn after a chat or job run, in its session',
+    });
+  if (host.live) {
+    out.push({
+      purpose: 'Command (voice)',
+      model: host.live.model,
+      used: 'talking to the agent from the dashboard',
+    });
+    out.push({
+      purpose: 'Command questions',
+      model: host.live.askModel,
+      used: 'read-only questions about a project',
+    });
+  }
+  if (host.voice?.length)
+    out.push({
+      purpose: 'Voice notes',
+      model: host.voice.join(' → '),
+      used: "speech-to-text when Slack didn't transcribe, tried in order",
+    });
+  return out;
+}
+
+function modelsSection(models: ModelUse[], effort?: string): string {
+  if (!models.length) return '';
+  const rows = models
+    .map(
+      (m) =>
+        `<li><span class="when">${esc(m.purpose)}</span><span class="what"><span class="line" title="${esc(m.used)}">${esc(
+          m.used,
+        )}</span></span><code>${esc(m.model)}</code></li>`,
+    )
+    .join('');
+  return section('Models', `<ul class="timeline models">${rows}</ul>`, {
+    sub: effort ? `effort ${effort}` : "each model's default effort",
+  });
+}
 
 export function homePage(ctx: DashboardContext, data: HomeData): string {
   const { jobs, now } = data;
@@ -858,7 +970,8 @@ ${section(
 )}
 ${first ? section('Start with these', `<div class="todo">${first}</div>`, { more: '<a class="more" href="/approvals">All approvals →</a>' }) : ''}
 ${section('Just ran', ran, { more: '<a class="more" href="/jobs">All jobs →</a>' })}
-${section('Coming up', coming, { more: '<a class="more" href="/schedule">Timeline →</a>' })}`,
+${section('Coming up', coming, { more: '<a class="more" href="/schedule">Timeline →</a>' })}
+${modelsSection(data.models ?? [], data.effort)}`,
     { refresh: true },
   );
 }
@@ -985,8 +1098,9 @@ ${usage || length ? `<div class="meta">${usage}${length}</div>` : ''}
 ${state === 'failing' && j.lastError ? `<div class="meta error">Last error: ${esc(j.lastError)}</div>` : ''}
 <details><summary>Details and run history</summary><dl class="facts">
 <dt>Skills</dt><dd>${j.skills.length ? esc(j.skills.join(', ')) : '—'}</dd>
-<dt>Runs first</dt><dd>${j.preScript ? `<code>${esc(j.preScript)}</code>` : 'Nothing: the model starts straight away'}</dd>
-<dt>Model</dt><dd>${j.harness === 'agy' ? 'agy (Antigravity CLI) · ' : ''}${esc(j.model)}</dd>
+<dt>Model</dt><dd>${j.harness === 'agy' ? 'agy (Antigravity CLI) · ' : ''}${esc(j.model)}${
+      j.stepModels?.length ? ` · steps: ${esc(j.stepModels.join(', '))}` : ''
+    }${j.handoff ? ` · after approval: ${esc(onHarness(j.handoff.harness, j.handoff.model))}` : ''}</dd>
 <dt>Length</dt><dd>${j.durationMinutes ? `${j.durationMinutes} min planned` : 'not planned'}${week?.typicalMinutes ? ` · ~${week.typicalMinutes} min in the last 7 days` : ''} <button type="button" class="btn quiet" data-length="${esc(j.project)}/${esc(j.id)}" data-name="${esc(j.name)}" data-minutes="${j.durationMinutes ?? week?.typicalMinutes ?? ''}" title="The planned length the Timeline uses for overlaps and free time">Change</button></dd>
 <dt>Schedule</dt><dd>${
       j.cron

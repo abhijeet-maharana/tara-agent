@@ -3,7 +3,14 @@ import path from 'node:path';
 import { Cron } from 'croner';
 import type { Bridge } from '../bridge/bridge.js';
 import { JOBS_FILE, loadJobs } from '../config/load.js';
-import type { AgyPermissions, Harness, HostConfig, Project, ScheduledJob } from '../config/schema.js';
+import type {
+  AgyPermissions,
+  Harness,
+  HostConfig,
+  JobConfig,
+  Project,
+  ScheduledJob,
+} from '../config/schema.js';
 import type { Runner } from '../runner/run.js';
 import type { ChatPort, Logger } from '../sessions/manager.js';
 import { Threads } from '../sessions/threads.js';
@@ -13,8 +20,13 @@ import { Locks, Semaphore } from '../util/concurrency.js';
 import { buildDigest, type MissedJob } from './health.js';
 import { type JobStatus, type JobTrigger, runJob } from './job-runner.js';
 import type { DecidedCard } from './prompt.js';
-import type { runScript } from './script.js';
-import { SCHEDULE_BY, type ScheduledKind, scheduledRunText } from './slack-trigger.js';
+import {
+  openRunThread,
+  runName,
+  SCHEDULE_BY,
+  type ScheduledKind,
+  scheduledRunText,
+} from './slack-trigger.js';
 
 export interface JobInfo {
   id: string;
@@ -28,10 +40,14 @@ export interface JobInfo {
   model: string;
   /** The CLI the job runs on (unset: claude). */
   harness?: Harness;
-  /** Script run before the model, relative to the repo root. */
-  preScript?: string;
+  /** Models its steps run on where they differ from `model` (same harness). */
+  stepModels?: string[];
+  /** The harness and model an approved card continues on, when not the job's own. */
+  handoff?: { harness: Harness; model: string };
   /** Typical run time from the jobs file. */
   durationMinutes?: number;
+  /** Named locks it holds while running (e.g. a browser's). */
+  locks?: string[];
   nextRun?: Date;
   lastStatus?: string;
   lastRunAt?: Date;
@@ -63,7 +79,6 @@ export interface SchedulerDeps {
   run: Runner;
   log: Logger;
   env?: NodeJS.ProcessEnv;
-  runScript?: typeof runScript;
   bridge?: Bridge;
   /** Shared with the chat sessions, so replies in a job's thread wait for it and "stop" reaches it. */
   threads?: Threads;
@@ -153,8 +168,12 @@ export class Scheduler implements JobControl {
           skills: job.skills,
           model: job.model,
           harness: job.harness,
-          preScript: job.preScript,
+          stepModels: [
+            ...new Set(job.steps.flatMap((s) => (s.model && s.model !== job.model ? [s.model] : []))),
+          ],
+          handoff: job.handoff,
           durationMinutes: job.durationMinutes,
+          locks: job.locks,
           nextRun: cron?.nextRun() ?? undefined,
           lastStatus: last?.status,
           lastRunAt: last ? new Date(last.startedAt) : undefined,
@@ -193,13 +212,14 @@ export class Scheduler implements JobControl {
     });
   }
 
-  /** Posts each project's digest in its channel: headline as a new message, details in its thread. */
+  /** Posts each project's digest in a "Run health-digest" thread: the headline, then the details. */
   async postDigests(): Promise<void> {
     for (const project of this.deps.projects) {
       const digest = this.digest(project.config.name);
       if (!digest) continue;
       try {
-        const ts = await this.deps.chat.post(project.config.slackChannel, undefined, digest.headline);
+        const ts = await openRunThread(this.deps.chat, project.config.slackChannel, 'health-digest');
+        await this.deps.chat.post(project.config.slackChannel, ts, digest.headline);
         for (const chunk of splitMessage(digest.details))
           await this.deps.chat.post(project.config.slackChannel, ts, chunk);
       } catch (err) {
@@ -299,6 +319,12 @@ export class Scheduler implements JobControl {
       const pending = this.pending.get(key);
       this.pending.delete(key);
       if (!entry || !pending) return 'unknown';
+      // Paused (Pause, or the project's emergency stop) between the trigger post and its pickup: the
+      // slot is skipped, never started by the pickup watchdog after all.
+      if (!entry.scheduled.job.enabled) {
+        this.deps.store.finishSlot(key, pending.slot, 'skipped');
+        return 'unknown';
+      }
       if (this.running.has(key)) {
         this.deps.store.finishSlot(key, pending.slot, 'skipped');
         return 'running';
@@ -327,11 +353,13 @@ export class Scheduler implements JobControl {
     } catch (err) {
       const message = (err as Error).message;
       this.deps.log.error(`[${name}] jobs not reloaded: ${message}`);
-      void this.deps.chat
-        .post(
-          project.config.slackChannel,
-          undefined,
-          `⚠️ \`${JOBS_FILE}\` was not reloaded:\n\`\`\`\n${message.slice(0, 2_500)}\n\`\`\``,
+      void openRunThread(this.deps.chat, project.config.slackChannel, 'jobs-reload')
+        .then((ts) =>
+          this.deps.chat.post(
+            project.config.slackChannel,
+            ts,
+            `⚠️ \`${JOBS_FILE}\` was not reloaded:\n\`\`\`\n${message.slice(0, 2_500)}\n\`\`\``,
+          ),
         )
         .catch(() => {});
       return;
@@ -392,14 +420,9 @@ export class Scheduler implements JobControl {
       return;
     }
     if (!this.deps.store.claimSlot(key, slot, this.startedAt)) return;
-    if (job.quiet) {
-      // Runs straight away, posting only when there is something to say.
-      this.launch(scheduled, { kind }, (status) => this.deps.store.finishSlot(key, slot, status));
-      return;
-    }
     const { chat } = this.deps;
     const channel = project.config.slackChannel;
-    const text = scheduledRunText(job.name, job.id, kind);
+    const text = scheduledRunText(runName(job, this.jobsOf(project.config.name)));
     const asBot = () => {
       // Set before posting: Slack can deliver the message event before the post call returns.
       this.pending.set(key, { slot, kind, byPerson: false });
@@ -474,14 +497,25 @@ export class Scheduler implements JobControl {
     return this.launch(entry.scheduled, trigger);
   }
 
+  /** The jobs of one project, as loaded. */
+  private jobsOf(project: string): JobConfig[] {
+    return [...this.entries.values()]
+      .filter((e) => e.scheduled.project.config.name === project)
+      .map((e) => e.scheduled.job);
+  }
+
   private launch(
     scheduled: ScheduledJob,
     trigger: JobTrigger,
-    done?: (status: JobStatus) => void,
+    done?: (status: JobStatus | 'stopped') => void,
   ): Promise<JobStatus> {
     const key = jobKey(scheduled.project.config.name, scheduled.job.id);
     this.running.add(key);
     let result: JobStatus = 'error';
+    const named = {
+      ...scheduled,
+      runName: runName(scheduled.job, this.jobsOf(scheduled.project.config.name)),
+    };
     const task = runJob(
       {
         host: this.deps.host,
@@ -493,18 +527,19 @@ export class Scheduler implements JobControl {
         locks: this.locks,
         threads: this.threads,
         env: this.deps.env,
-        runScript: this.deps.runScript,
         bridge: this.deps.bridge,
         newSessionId: this.deps.newSessionId,
         now: this.deps.now,
       },
-      scheduled,
+      named,
       trigger,
       this.controller.signal,
     )
       .then((status) => {
         result = status;
-        done?.(status);
+        // Only a shutdown's `aborted` leaves the slot open to be claimed again after the restart; a run a
+        // person stopped ("stop" in its thread, Stop on the dashboard) stays stopped.
+        done?.(status === 'aborted' && !this.controller.signal.aborted ? 'stopped' : status);
       })
       .catch((err: Error) => this.deps.log.error(`[${key}] ${err.message}`))
       .finally(() => {
