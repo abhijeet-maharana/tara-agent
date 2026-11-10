@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { App, type BlockAction, type ButtonAction, LogLevel } from '@slack/bolt';
+import { parseScheduledRun } from '../scheduler/slack-trigger.js';
 import type { ChatPort, IncomingMessage, Logger } from '../sessions/manager.js';
 import { StreamError, type StreamPort } from './reply.js';
 import { transcribeAudio, type VoiceOptions } from './voice.js';
@@ -19,6 +20,8 @@ export interface ButtonTap {
 export interface SlackOptions {
   botToken: string;
   appToken: string;
+  /** A person's token (xoxp-…): scheduled-run triggers are posted as them. */
+  userToken?: string;
   log: Logger;
   onMessage: (msg: IncomingMessage) => Promise<void>;
   onButton?: (tap: ButtonTap) => Promise<void>;
@@ -98,8 +101,24 @@ export function vttToText(vtt: string): string {
  * Turns a message event into an IncomingMessage, or null when it should be ignored: edits, deletes,
  * joins, our own posts and pure bot posts (no `user`). Messages a person posts through an app with a
  * user token carry a `bot_id` but still have their `user`, so they count as that person.
+ * The exception: our own scheduled-run trigger messages, which start the job they name.
  */
-export function toIncoming(message: SlackMessageEvent, botUserId?: string): IncomingMessage | null {
+export function toIncoming(
+  message: SlackMessageEvent,
+  botUserId?: string,
+  botId?: string,
+): IncomingMessage | null {
+  // A person posting through this app with a user token also carries its bot_id, but has their own user.
+  const own =
+    (botUserId !== undefined && message.user === botUserId) ||
+    (botId !== undefined && !message.user && message.bot_id === botId);
+  if (own) {
+    const text = decodeSlackText(message.text ?? '');
+    if (message.thread_ts || !parseScheduledRun(text)) return null;
+    if (message.subtype !== undefined && message.subtype !== 'bot_message') return null;
+    const user = botUserId ?? message.user ?? 'bot';
+    return { channel: message.channel, threadTs: message.ts, ts: message.ts, user, text, fromSelf: true };
+  }
   if (message.subtype !== undefined && message.subtype !== 'file_share') return null;
   if (!message.user || message.user === botUserId) return null;
   const text = decodeSlackText(message.text ?? '')
@@ -127,10 +146,13 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
     token: options.botToken,
     appToken: options.appToken,
     socketMode: true,
+    // Our own messages reach `toIncoming`, which drops all but the scheduled-run triggers.
+    ignoreSelf: false,
     logLevel: LogLevel.WARN,
   });
 
   let botUserId: string | undefined;
+  let botId: string | undefined;
   let teamId: string | undefined;
   let workspaceUrl: string | undefined;
 
@@ -196,7 +218,7 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
 
   app.message(async ({ message }) => {
     const event = message as SlackMessageEvent;
-    const incoming = toIncoming(event, botUserId);
+    const incoming = toIncoming(event, botUserId, botId);
     if (!incoming) return;
     // Don't block Bolt's listener on a whole Claude turn.
     void (async () => {
@@ -263,6 +285,14 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
       });
       return res.ts as string;
     },
+    ...(options.userToken
+      ? {
+          async postAsUser(channel: string, text: string) {
+            const res = await app.client.chat.postMessage({ token: options.userToken, channel, text });
+            return res.ts as string;
+          },
+        }
+      : {}),
     async delete(channel, ts) {
       await app.client.chat.delete({ channel, ts });
     },
@@ -298,6 +328,7 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
     async start() {
       const auth = await app.client.auth.test();
       botUserId = auth.user_id;
+      botId = auth.bot_id;
       teamId = auth.team_id;
       workspaceUrl = auth.url;
       await app.start();

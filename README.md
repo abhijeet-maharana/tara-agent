@@ -53,7 +53,7 @@ Anything that goes out to other people (an email, a post, a reply) waits as a ca
    npm ci && npm run build
    ```
 3. **Host config:** copy [`examples/config.yaml`](examples/config.yaml) to `~/.config/tara-agent/config.yaml` and list your project paths.
-4. **Secrets:** put `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` in `~/.config/tara-agent/env` (see [`.env.example`](.env.example)).
+4. **Secrets:** put `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` in `~/.config/tara-agent/env` (see [`.env.example`](.env.example)). Optional: `SLACK_USER_TOKEN` (a person's `xoxp-…` token with `chat:write`) posts each scheduled run's `⏰` trigger message as that person instead of the bot.
 5. **Each project:** add `<repo>/.tara/config.json` with at least a `name` and a `slackChannel` (see [`examples/project`](examples/project/.tara)).
 6. **Run:** `node dist/index.js`.
 

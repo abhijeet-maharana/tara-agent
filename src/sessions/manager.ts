@@ -10,6 +10,7 @@ import type { Runner, RunOutcome } from '../runner/run.js';
 import { sessionScratch } from '../runner/workspace.js';
 import { foldersNote, identityPrompt } from '../scheduler/prompt.js';
 import type { JobControl, JobInfo } from '../scheduler/scheduler.js';
+import { looksLikeTrigger, parseScheduledRun, SCHEDULE_BY } from '../scheduler/slack-trigger.js';
 import type { ButtonTap } from '../slack/app.js';
 import { formatDuration } from '../slack/format.js';
 import { EditReply, type StreamPort, StreamReply, type TurnReply } from '../slack/reply.js';
@@ -23,6 +24,8 @@ import { Threads } from './threads.js';
 export interface ChatPort {
   /** Posts into a thread (or top-level when `threadTs` is undefined) and returns the new message's ts. */
   post(channel: string, threadTs: string | undefined, text: string): Promise<string>;
+  /** Posts top-level as a person (a user token), for scheduled-run triggers. Unset: `post` as the bot. */
+  postAsUser?(channel: string, text: string): Promise<string>;
   delete(channel: string, ts: string): Promise<void>;
   update(channel: string, ts: string, text: string, blocks?: SlackBlock[]): Promise<void>;
   /** Posts a Block Kit message (text is the notification/fallback text), top-level without `threadTs`. */
@@ -52,6 +55,8 @@ export interface IncomingMessage {
   text: string;
   /** Files posted with the message (photos, PDFs), saved to the session's scratch folder for Claude. */
   attachments?: Attachment[];
+  /** Posted by the bot itself: only its scheduled-run trigger messages get this far. */
+  fromSelf?: boolean;
 }
 
 export interface Attachment {
@@ -122,6 +127,7 @@ export class SessionManager {
   async handle(msg: IncomingMessage): Promise<void> {
     const project = this.byChannel.get(msg.channel);
     if (!project) return;
+    if (msg.fromSelf) return this.scheduledRun(project, msg);
     const { allowedUsers } = project.config;
     if (allowedUsers.length > 0 && !allowedUsers.includes(msg.user)) {
       this.log.warn(`[${project.config.name}] ignored message from ${msg.user} (not in allowedUsers)`);
@@ -129,6 +135,15 @@ export class SessionManager {
     }
     const text = msg.text.trim();
     if (!text && !msg.attachments?.length) return;
+    // A trigger posted as a person (SLACK_USER_TOKEN). It runs only a slot the scheduler posted.
+    if (msg.threadTs === msg.ts && looksLikeTrigger(text)) {
+      if (parseScheduledRun(text)) return this.scheduledRun(project, msg);
+      // Never hand a trigger to Claude as a chat message: it would improvise the job without its setup.
+      this.log.warn(
+        `[${project.config.name}] ignored a trigger message that doesn't parse: ${text.slice(0, 120)}`,
+      );
+      return;
+    }
     const key = threadKey(msg.channel, msg.threadTs);
     const reply = (text: string) => this.deps.chat.post(msg.channel, msg.threadTs, text);
 
@@ -172,6 +187,14 @@ export class SessionManager {
       },
     ]);
     return true;
+  }
+
+  /** The bot's own trigger message for a scheduled slot: the run happens in its thread. */
+  private async scheduledRun(project: Project, msg: IncomingMessage): Promise<void> {
+    const id = parseScheduledRun(msg.text);
+    const job = id ? this.deps.jobs?.list(project.config.name).find((j) => j.id === id) : undefined;
+    if (!job || msg.threadTs !== msg.ts) return;
+    await this.startJob(project, job, SCHEDULE_BY, msg.channel, msg.ts, true);
   }
 
   /** A tap on one of the "Which job should I run?" buttons. */

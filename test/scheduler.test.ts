@@ -10,6 +10,7 @@ import { buildDigest } from '../src/scheduler/health.js';
 import { streamRecipient } from '../src/scheduler/job-runner.js';
 import { Scheduler } from '../src/scheduler/scheduler.js';
 import type { ScriptResult } from '../src/scheduler/script.js';
+import { parseScheduledRun, SCHEDULE_BY } from '../src/scheduler/slack-trigger.js';
 import { Threads } from '../src/sessions/threads.js';
 import { type Item, Store, type StoredRun } from '../src/store/store.js';
 import { FakeChat, FakeStream, testHost } from './fakes.js';
@@ -62,9 +63,12 @@ function setup(opts: {
   toolErrors?: number;
   /** The session id the CLI reports (agy picks its own conversation id). */
   initSessionId?: string;
+  chatSetup?: (chat: FakeChat) => void;
+  pickupTimeoutMs?: number;
 }) {
   const chat = new FakeChat('ts');
   chat.stream = opts.stream;
+  opts.chatSetup?.(chat);
   const store = opts.store ?? new Store(':memory:', opts.now);
   const calls: RunOptions[] = [];
   const callTimes: number[] = [];
@@ -80,6 +84,7 @@ function setup(opts: {
     env: { PATH: '/bin', SLACK_BOT_TOKEN: 'secret' },
     now: opts.now,
     newSessionId: () => 'sid',
+    pickupTimeoutMs: opts.pickupTimeoutMs,
     runScript: async (script, _cwd, env) => {
       scripts.push({ script, env });
       return opts.script ?? { ok: true, output: 'STATUS: OK', exitCode: 0, timedOut: false };
@@ -103,6 +108,16 @@ function setup(opts: {
     },
   });
   return { chat, store, calls, callTimes, scripts, scheduler, project };
+}
+
+/** What the bot does when its own trigger messages arrive from Slack: start each job in its thread. */
+async function pickUp(scheduler: Scheduler, chat: FakeChat): Promise<void> {
+  await new Promise((r) => setImmediate(r));
+  for (const post of chat.posts) {
+    const id = post.thread === '' ? parseScheduledRun(post.text) : undefined;
+    if (id) scheduler.trigger('shop', id, SCHEDULE_BY, { channel: 'C1', ts: post.ts });
+  }
+  await scheduler.idle();
 }
 
 const baseJob = {
@@ -444,16 +459,19 @@ describe('Scheduler', () => {
     now = Date.parse('2026-10-25T12:30:00Z');
     const second = setup({ jobs: [job], store, now: () => now });
     second.scheduler.start();
-    await second.scheduler.idle();
+    await pickUp(second.scheduler, second.chat);
     expect(second.calls).toHaveLength(1);
-    expect(second.chat.log[0]).toBe('post top ts1: ⏳ *SLA Report* (catch-up)');
+    expect(second.chat.log[0]).toBe('post top ts1: ⏰ Catch-up: *SLA Report* (`sla`)');
+    // The trigger message is the run's status line; the run itself is in its thread.
+    expect(second.chat.log[1]).toBe('update ts1: ⏳ *SLA Report* (catch-up)');
     await second.scheduler.stop();
 
     // A restart in the same hour doesn't run it again: the slot is claimed.
     const third = setup({ jobs: [job], store, now: () => now });
     third.scheduler.start();
-    await third.scheduler.idle();
+    await pickUp(third.scheduler, third.chat);
     expect(third.calls).toHaveLength(0);
+    expect(third.chat.posts).toHaveLength(0);
     await third.scheduler.stop();
   });
 
@@ -473,10 +491,12 @@ describe('Scheduler', () => {
   });
 
   it('fires on the real clock and claims each slot once', async () => {
-    const { calls, callTimes, scheduler, store } = setup({ jobs: [{ ...baseJob, cron: '*/2 * * * * *' }] });
+    const { calls, callTimes, chat, scheduler, store } = setup({
+      jobs: [{ ...baseJob, cron: '*/2 * * * * *' }],
+    });
     scheduler.start();
     await new Promise((r) => setTimeout(r, 2_600));
-    await scheduler.idle();
+    await pickUp(scheduler, chat);
     expect(calls.length).toBeGreaterThanOrEqual(1);
     const slot = Math.floor((callTimes[0] as number) / 2_000) * 2_000;
     expect(store.claimSlot('shop:sla', slot)).toBe(false);
@@ -847,6 +867,152 @@ describe('a job run asked for in chat', () => {
   });
 });
 
+/** A job whose 12:00 slot was missed while tara was down: started at 12:30, its trigger is posted. */
+function missedSlot(
+  opts: Omit<Parameters<typeof setup>[0], 'jobs' | 'store' | 'now'> = {},
+  job: object = {},
+) {
+  let now = Date.parse('2026-10-25T10:20:00Z');
+  const store = new Store(':memory:', () => now);
+  const jobs = [{ ...baseJob, ...job }];
+  const first = setup({ jobs, store, now: () => now });
+  first.scheduler.start(); // first seen 10:20
+  void first.scheduler.stop();
+  now = Date.parse('2026-10-25T12:30:00Z');
+  const run = setup({ ...opts, jobs, store, now: () => now });
+  run.scheduler.start();
+  return { ...run, setNow: (t: string) => (now = Date.parse(t)), jobs };
+}
+
+describe('scheduled runs through Slack', () => {
+  it('posts a trigger message and runs only once the bot picks it up, in its thread', async () => {
+    const { chat, calls, scheduler, store } = missedSlot();
+    await new Promise((r) => setImmediate(r));
+    expect(calls).toHaveLength(0);
+    expect(chat.log).toEqual(['post top ts1: ⏰ Catch-up: *SLA Report* (`sla`)']);
+    await pickUp(scheduler, chat);
+    expect(calls).toHaveLength(1);
+    expect(chat.updates.at(-1)?.text).toMatch(/^✅ \*SLA Report\* \(catch-up\) · .*\nHeadline$/);
+    expect(chat.log.at(-1)).toBe('post ts1 ts2: Details here');
+    expect(chat.posts.filter((p) => p.thread === '')).toHaveLength(1); // nothing else top-level
+    expect(store.getSession('C1:ts1')).toBeDefined();
+    await scheduler.stop();
+  });
+
+  it('posts the trigger as a person when a user token is set', async () => {
+    const asUser: string[] = [];
+    const { chat, scheduler, calls } = missedSlot({
+      chatSetup: (c) => {
+        c.postAsUser = async (_channel, text) => {
+          asUser.push(text);
+          return 'u1';
+        };
+      },
+    });
+    await new Promise((r) => setImmediate(r));
+    expect(asUser).toEqual(['⏰ Catch-up: *SLA Report* (`sla`)']);
+    expect(chat.posts).toHaveLength(0);
+    scheduler.trigger('shop', 'sla', SCHEDULE_BY, { channel: 'C1', ts: 'u1' });
+    await scheduler.idle();
+    expect(calls).toHaveLength(1);
+    // The bot can't edit a person's message: the status is the first reply in its thread.
+    expect(chat.log[0]).toBe('post u1 ts1: ⏳ *SLA Report* (catch-up)');
+    expect(chat.updates.every((u) => u.ts !== 'u1')).toBe(true);
+    expect(chat.reactions.length).toBeGreaterThan(0);
+    await scheduler.stop();
+  });
+
+  it('posts the trigger as the bot when the person is not in the channel', async () => {
+    const { chat, scheduler, calls } = missedSlot({
+      chatSetup: (c) => {
+        c.postAsUser = async () => {
+          throw new Error('not_in_channel');
+        };
+      },
+    });
+    await pickUp(scheduler, chat);
+    expect(chat.log[0]).toBe('post top ts1: ⏰ Catch-up: *SLA Report* (`sla`)');
+    expect(calls).toHaveLength(1);
+    expect(chat.log[1]).toBe('update ts1: ⏳ *SLA Report* (catch-up)'); // the bot's own message again
+    await scheduler.stop();
+  });
+
+  it("starts a trigger itself when Slack never delivers it, in the trigger's thread", async () => {
+    const { chat, calls, scheduler } = missedSlot({ pickupTimeoutMs: 20 });
+    await new Promise((r) => setTimeout(r, 60));
+    await scheduler.idle();
+    expect(calls).toHaveLength(1);
+    expect(chat.log[1]).toBe('update ts1: ⏳ *SLA Report* (catch-up)');
+    // A late event for it starts nothing.
+    expect(scheduler.trigger('shop', 'sla', SCHEDULE_BY, { channel: 'C1', ts: 'ts1' })).toBe('unknown');
+    await scheduler.stop();
+  });
+
+  it('leaves a trigger the bot picked up to the bot', async () => {
+    const { chat, calls, scheduler } = missedSlot({ pickupTimeoutMs: 30 });
+    await pickUp(scheduler, chat);
+    await new Promise((r) => setTimeout(r, 60));
+    await scheduler.idle();
+    expect(calls).toHaveLength(1);
+    await scheduler.stop();
+  });
+
+  it('runs a quiet job straight away and says nothing when the gate skips it', async () => {
+    const { chat, calls, scheduler } = missedSlot(
+      { script: { ok: true, output: '{"wakeAgent": false}', exitCode: 0, timedOut: false } },
+      { preScript: 'watch.py', quiet: true },
+    );
+    await scheduler.idle();
+    expect(calls).toHaveLength(0);
+    expect(chat.log).toEqual([]);
+    await scheduler.stop();
+  });
+
+  it('starts a slot once, even when Slack delivers the trigger twice', async () => {
+    const { chat, calls, scheduler } = missedSlot();
+    await pickUp(scheduler, chat);
+    expect(scheduler.trigger('shop', 'sla', SCHEDULE_BY, { channel: 'C1', ts: 'ts1' })).toBe('unknown');
+    await scheduler.idle();
+    expect(calls).toHaveLength(1);
+    await scheduler.stop();
+  });
+
+  it('keeps the thread and its session when the run finds nothing ([SILENT])', async () => {
+    const { chat, scheduler, store } = missedSlot({ replies: ['[SILENT]'] });
+    await pickUp(scheduler, chat);
+    expect(chat.deleted).toEqual([]);
+    expect(chat.log.at(-1)).toBe('update ts1: 🔇 *SLA Report* (catch-up) · nothing to report');
+    expect(store.getSession('C1:ts1')).toBeDefined();
+    await scheduler.stop();
+  });
+
+  it('says why when the script gate skips the run', async () => {
+    const { chat, calls, scheduler } = missedSlot(
+      { script: { ok: true, output: 'No new listings\n{"wakeAgent": false}', exitCode: 0, timedOut: false } },
+      { preScript: 'gate.py' },
+    );
+    await pickUp(scheduler, chat);
+    expect(calls).toHaveLength(0);
+    expect(chat.log.at(-1)).toBe(
+      'update ts1: 🔇 *SLA Report* (catch-up): nothing to do right now.\n> No new listings',
+    );
+    await scheduler.stop();
+  });
+
+  it('posts the trigger again on the next start when the bot never picked it up', async () => {
+    const { chat, scheduler, store, setNow, jobs } = missedSlot();
+    await new Promise((r) => setImmediate(r));
+    expect(chat.posts).toHaveLength(1);
+    await scheduler.stop(); // the message event never arrived
+    setNow('2026-10-25T12:35:00Z');
+    const again = setup({ jobs, store, now: () => Date.parse('2026-10-25T12:35:00Z') });
+    again.scheduler.start();
+    await pickUp(again.scheduler, again.chat);
+    expect(again.calls).toHaveLength(1);
+    await again.scheduler.stop();
+  });
+});
+
 describe('runs cut short by a restart', () => {
   it('re-runs a slot that a shutdown aborted, once, on the next start', async () => {
     let now = Date.parse('2026-10-25T09:00:00Z');
@@ -862,14 +1028,14 @@ describe('runs cut short by a restart', () => {
     now = Date.parse('2026-10-25T10:02:00Z');
     const second = setup({ jobs: [job], store, now: () => now });
     second.scheduler.start();
-    await second.scheduler.idle();
+    await pickUp(second.scheduler, second.chat);
     expect(second.calls).toHaveLength(1);
-    expect(second.chat.log[0]).toBe('post top ts1: ⏳ *SLA Report* (catch-up)');
+    expect(second.chat.log[0]).toBe('post top ts1: ⏰ Catch-up: *SLA Report* (`sla`)');
     await second.scheduler.stop();
 
     const third = setup({ jobs: [job], store, now: () => now });
     third.scheduler.start();
-    await third.scheduler.idle();
+    await pickUp(third.scheduler, third.chat);
     expect(third.calls).toHaveLength(0); // done now: not again
     await third.scheduler.stop();
   });

@@ -417,6 +417,11 @@ export const jobSchema = z
     timeoutMinutes: z.number().positive().default(30),
     /** Run the most recent missed slot after downtime (see host `catchUpHours`). */
     catchUp: z.boolean().default(true),
+    /**
+     * Post nothing in Slack unless there is something to say, for monitors that run often: no
+     * trigger message, the gate runs first, a gate skip or `[SILENT]` leaves no trace in the channel.
+     */
+    quiet: z.boolean().default(false),
     /** Slack channel for this job's threads. Defaults to the project channel. */
     channel: z.string().optional(),
     /** Extra environment for the script and the CLI. `~/` is expanded. */

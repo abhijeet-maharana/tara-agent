@@ -46,13 +46,17 @@ tara-agent is one Node process per host. It never calls the Anthropic API: every
 
 ## A scheduled job
 
-1. croner fires; the scheduler works out the slot time and **claims** it in SQLite. A claimed slot never runs again, even after a restart.
-2. The job waits for a job slot (`jobConcurrency`) and its named locks (for example `chrome`).
-3. The pre-script runs from the repo root. Empty output or `{"wakeAgent": false}` ends the run silently. Otherwise its output goes in front of the prompt.
-4. The run posts a channel message with its current step, and streams its steps and text live into that message's thread (addressed to whoever started it in Slack, else the project `owner`). Replies `[SILENT]` → the message and thread are deleted; `[CRON_FAILURE]` → marked failed; otherwise headline in the channel and the full reply in the thread.
-5. The job thread is saved as a session, so replying to it continues the job's conversation.
+Scheduled runs go through Slack: the scheduler only posts a message, and the bot runs the job it names.
 
-On start, each enabled job runs its most recent missed slot once if it is younger than `catchUpHours` and after the job was first seen on this host.
+1. croner fires; the scheduler works out the slot time and **claims** it in SQLite. A claimed slot never runs again, even after a restart.
+2. It posts a trigger message in the project channel: `` ⏰ Scheduled: *Find jobs* (`find-jobs`) `` (`src/scheduler/slack-trigger.ts`). With `SLACK_USER_TOKEN` set it is posted as that person, otherwise as the bot.
+3. The bot receives its own message from Slack (`ignoreSelf: false`; `toIncoming` lets through only its top-level trigger messages, as `fromSelf`) and starts that job in the message's thread. The scheduler takes the slot once, so a redelivered event starts nothing. A trigger not picked up within 2 minutes (a dropped event) is started by the scheduler itself in the same thread; one lost to a restart leaves the slot `running`, and the next start catches it up. A trigger-looking message that doesn't parse is dropped, never sent to Claude. `quiet` jobs skip all this and run directly, posting only when there is something to say.
+4. The job waits for a job slot (`jobConcurrency`) and its named locks (for example `chrome`).
+5. The pre-script runs from the repo root. Empty output or `{"wakeAgent": false}` ends the run, and the trigger message says why ("🔇 nothing to do right now" + the script's first line). Otherwise its output goes in front of the prompt.
+6. The trigger message becomes the status line, and the run streams its steps and text live into its thread (addressed to the project `owner`). Replies `[SILENT]` → "🔇 nothing to report", the thread and session stay; `[CRON_FAILURE]` → marked failed; otherwise the headline on the trigger message and the full reply in the thread.
+7. The job thread is saved as a session, so replying to it continues the job's conversation ("why didn't you check X?").
+
+On start, each enabled job posts its most recent missed slot once if it is younger than `catchUpHours` and after the job was first seen on this host (`⏰ Catch-up: …`). Runs started with `run <job name>`, a card decision or a queue don't go through a trigger message.
 
 ## An approval
 

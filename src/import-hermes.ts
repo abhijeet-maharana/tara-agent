@@ -80,6 +80,7 @@ export function convertHermesJobs(source: unknown, options: ImportOptions): Jobs
       locks: browser ? ['chrome'] : [],
       timeoutMinutes: browser ? 40 : 30,
       catchUp: true,
+      quiet: false,
       env: {},
       enabled: h.enabled !== false,
     };

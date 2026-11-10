@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { parseScheduledRun } from '../src/scheduler/slack-trigger.js';
 import {
   attachedFiles,
   decodeSlackText,
@@ -36,6 +37,34 @@ describe('toIncoming', () => {
 
   it('accepts file shares', () => {
     expect(toIncoming({ ...base, subtype: 'file_share', user: 'U1', text: 'see file' }, BOT)).not.toBeNull();
+  });
+
+  it('accepts our own scheduled-run trigger message, marked as ours', () => {
+    const text = '⏰ Scheduled: *Find jobs* (`find-jobs`)';
+    expect(toIncoming({ ...base, user: BOT, bot_id: 'B9', text }, BOT)).toEqual({
+      channel: 'C1',
+      threadTs: '100.1',
+      ts: '100.1',
+      user: BOT,
+      text,
+      fromSelf: true,
+    });
+    // Our own trigger inside a thread, or a person typing the same text, is not one.
+    expect(toIncoming({ ...base, thread_ts: '99.1', user: BOT, text }, BOT)).toBeNull();
+    expect(toIncoming({ ...base, user: 'U1', text }, BOT)?.fromSelf).toBeUndefined();
+  });
+
+  it('reads a trigger back the way Slack sends it (emoji as :alarm_clock:)', () => {
+    const text = ':alarm_clock: Catch-up: *Application Form Prep* (`application-form-prep`)';
+    expect(toIncoming({ ...base, user: BOT, bot_id: 'B9', text }, BOT, 'B9')?.fromSelf).toBe(true);
+    expect(parseScheduledRun(text)).toBe('application-form-prep');
+    expect(parseScheduledRun(':alarm_clock: Scheduled: *X* (`x`) and more')).toBeUndefined();
+  });
+
+  it('treats a person posting through our app (our bot_id, their user) as that person', () => {
+    const msg = toIncoming({ ...base, user: 'U1', bot_id: 'B9', text: 'hello' }, BOT, 'B9');
+    expect(msg).toMatchObject({ user: 'U1', text: 'hello' });
+    expect(msg?.fromSelf).toBeUndefined();
   });
 
   it.each([

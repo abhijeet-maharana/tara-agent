@@ -144,6 +144,7 @@ async function serve(configFlag: string | undefined) {
   const slack = createSlackGateway({
     botToken: requireEnv('SLACK_BOT_TOKEN'),
     appToken: requireEnv('SLACK_APP_TOKEN'),
+    userToken: process.env.SLACK_USER_TOKEN || undefined,
     log,
     onMessage: (msg) => manager?.handle(msg) ?? Promise.resolve(),
     onButton: (tap) =>

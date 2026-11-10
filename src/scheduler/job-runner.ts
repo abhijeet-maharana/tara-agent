@@ -29,8 +29,12 @@ import { runScript, type ScriptResult } from './script.js';
 import { expandMcpServers, runSteps, type StepsResult } from './steps.js';
 
 export type JobTrigger =
-  | { kind: 'schedule' }
-  | { kind: 'catch-up' }
+  /**
+   * `thread`: the trigger message in Slack. Posted by the bot, it becomes the run's status line;
+   * posted as a person (`byPerson`, which the bot can't edit), the status is its first reply.
+   */
+  | { kind: 'schedule'; thread?: { channel: string; ts: string }; byPerson?: boolean }
+  | { kind: 'catch-up'; thread?: { channel: string; ts: string }; byPerson?: boolean }
   /** `thread`: the chat message that asked for the run; the run then happens in its thread. */
   | { kind: 'manual'; by: string; thread?: { channel: string; ts: string } }
   /** A decision on the run's approval card: the same session continues in its thread. */
@@ -118,12 +122,23 @@ export async function runJob(
     )
       ? trigger.items[0]?.threadTs
       : undefined;
-  const requestTs =
-    trigger.kind === 'manual' && trigger.thread?.channel === channel ? trigger.thread.ts : cardThread;
+  const asked =
+    trigger.kind === 'manual' || trigger.kind === 'schedule' || trigger.kind === 'catch-up'
+      ? trigger.thread
+      : undefined;
+  const requestTs = asked?.channel === channel ? asked.ts : cardThread;
+  // A scheduled run started from the bot's own trigger message: that message is the status line.
+  const ownMessage =
+    (trigger.kind === 'schedule' || trigger.kind === 'catch-up') && !trigger.byPerson ? requestTs : undefined;
   // The thread the run posts in: the requester's message, or (continuing) the job's earlier thread.
   const inThread = trigger.kind === 'resume' ? trigger.threadTs : requestTs;
-  const postMain = (text: string) => chat.post(channel, inThread, text);
-  if (requestTs) await chat.react(channel, requestTs, 'eyes').catch(() => {});
+  const postMain = async (text: string) => {
+    if (!ownMessage) return chat.post(channel, inThread, text);
+    await chat.update(channel, ownMessage, text);
+    return ownMessage;
+  };
+  const reactTo = ownMessage ? undefined : requestTs;
+  if (reactTo) await chat.react(channel, reactTo, 'eyes').catch(() => {});
 
   // An existing thread may have a chat turn in it: wait for it before taking a slot and locks.
   let hold: ThreadHold | undefined = inThread
@@ -146,11 +161,11 @@ export async function runJob(
       ...extra,
     });
     log.info(`[${project.config.name}] job ${job.id} ${status} in ${formatDuration(now() - startedAt)}`);
-    if (requestTs) {
+    if (reactTo) {
       void chat
-        .unreact(channel, requestTs, 'eyes')
+        .unreact(channel, reactTo, 'eyes')
         .catch(() => {})
-        .then(() => chat.react(channel, requestTs, REACTIONS[status]))
+        .then(() => chat.react(channel, reactTo, REACTIONS[status]))
         .catch(() => {});
     }
     return status;

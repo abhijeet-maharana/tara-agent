@@ -109,6 +109,7 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `locks` | `[]` | Named locks held during the run, e.g. `["chrome"]` so jobs don't share a browser |
 | `timeoutMinutes` | `30` | Time limit for the script and for Claude, each |
 | `catchUp` | `true` | Run the latest missed slot after downtime |
+| `quiet` | `false` | For monitors that run often: no `⏰` trigger message, the gate runs first, and a gate skip or `[SILENT]` leaves nothing in the channel. Something to say is posted as a new channel message |
 | `channel` | project channel | Where the job posts |
 | `env` | `{}` | Extra environment for the script and Claude (`~/` expanded), merged over the file-level `env` |
 | `durationMinutes` | none | Typical run time: the Jobs Timeline plans with it (change it on the job's card in Jobs → List) |
@@ -116,12 +117,13 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 
 ### How a run goes
 
-1. **Pre-script** (if any) runs first. Empty output, or a last line of `{"wakeAgent": false}`, ends the run quietly. Otherwise its output is added to the prompt under `## Script Output`.
-2. **Claude** runs the prompt.
-3. **The reply** goes to Slack: the part before a `---` line as a new channel message, the rest in its thread.
-   - A reply of `[SILENT]` posts nothing.
+1. **Trigger message.** At cron time a `` ⏰ Scheduled: *<name>* (`<id>`) `` message is posted in the project channel, as the `SLACK_USER_TOKEN` person if set (else, or when that person isn't in the channel, as the bot). The bot picks it up and runs the job in its thread; if Slack doesn't deliver it within 2 minutes, the scheduler starts it there itself. `quiet` jobs skip this step.
+2. **Pre-script** (if any) runs. Empty output, or a last line of `{"wakeAgent": false}`, ends the run; the trigger message says why ("🔇 nothing to do right now" + the script's first line). Otherwise its output is added to the prompt under `## Script Output`.
+3. **Claude** runs the prompt, streaming into the thread.
+4. **The reply**: the part before a `---` line is the headline on the trigger message (or the thread's first reply, when a person posted it), the rest goes in its thread.
+   - A reply of `[SILENT]` shows "🔇 nothing to report"; the thread and session stay, so you can ask why.
    - A first line of `[CRON_FAILURE]` marks the run failed.
-4. **Replying** in the job's thread continues its session, so a job can ask a question and act on your answer.
+5. **Replying** in the job's thread continues its session, so a job can ask a question and act on your answer.
 
 Other rules:
 

@@ -386,4 +386,41 @@ describe('SessionManager', () => {
     await reply;
     expect(calls).toHaveLength(1);
   });
+
+  it("starts a scheduled job from the bot's own trigger message, whoever allowedUsers names", async () => {
+    const started: unknown[] = [];
+    const jobs: JobControl = {
+      list: () => [
+        {
+          id: 'find-jobs',
+          name: 'Find jobs',
+          enabled: true,
+          running: false,
+          tz: 'UTC',
+          skills: [],
+          model: 'opus',
+        },
+      ],
+      trigger: (...args) => {
+        started.push(args);
+        return 'started';
+      },
+    };
+    const { calls, manager } = setup({ project: project({ allowedUsers: ['U1'] }), jobs });
+    const text = '⏰ Scheduled: *Find jobs* (`find-jobs`)';
+    await manager.handle(msg(text, { user: 'UBOT', fromSelf: true }));
+    expect(started).toEqual([['shop', 'find-jobs', 'schedule', { channel: 'C1', ts: '100.1' }]]);
+    // From someone not in allowedUsers: ignored.
+    await manager.handle(msg(text, { user: 'U2', ts: '200.1', threadTs: '200.1' }));
+    expect(started).toHaveLength(1);
+    // Posted as an allowed person (SLACK_USER_TOKEN): the same scheduled start.
+    await manager.handle(msg(text, { user: 'U1', ts: '300.1', threadTs: '300.1' }));
+    expect(started.at(-1)).toEqual(['shop', 'find-jobs', 'schedule', { channel: 'C1', ts: '300.1' }]);
+    // Something that looks like a trigger but doesn't parse never reaches Claude as a chat message.
+    await manager.handle(
+      msg(':alarm_clock: Scheduled: *Find jobs* (find-jobs)', { ts: '400.1', threadTs: '400.1' }),
+    );
+    expect(started).toHaveLength(2);
+    expect(calls).toHaveLength(0);
+  });
 });

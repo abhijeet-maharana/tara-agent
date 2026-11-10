@@ -12,6 +12,7 @@ export class FakeChat implements ChatPort {
   deleted: string[] = [];
   log: string[] = [];
   stream?: StreamPort;
+  postAsUser?: (channel: string, text: string) => Promise<string>;
   private n = 0;
 
   /** `prefix` shapes the fake message ts: "bot." → bot.1, bot.2 … */

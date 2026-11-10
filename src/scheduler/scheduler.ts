@@ -14,6 +14,7 @@ import { buildDigest, type MissedJob } from './health.js';
 import { type JobStatus, type JobTrigger, runJob } from './job-runner.js';
 import type { DecidedCard } from './prompt.js';
 import type { runScript } from './script.js';
+import { SCHEDULE_BY, type ScheduledKind, scheduledRunText } from './slack-trigger.js';
 
 export interface JobInfo {
   id: string;
@@ -40,7 +41,10 @@ export interface JobInfo {
 /** What chat ("run <job name>") and the `list_jobs` / `run_job` tools need from the scheduler. */
 export interface JobControl {
   list(project: string): JobInfo[];
-  /** Runs a job now; with `thread`, inside that chat message's thread. */
+  /**
+   * Runs a job now; with `thread`, inside that chat message's thread. `by` = SCHEDULE_BY: the bot
+   * saw its own trigger message, and the run is that scheduled slot (once; 'unknown' otherwise).
+   */
   trigger(
     project: string,
     id: string,
@@ -67,6 +71,8 @@ export interface SchedulerDeps {
   now?: () => number;
   /** How often job files are checked for changes. */
   reloadIntervalMs?: number;
+  /** How long a posted trigger may wait for the bot before the scheduler starts it itself. */
+  pickupTimeoutMs?: number;
 }
 
 interface Entry {
@@ -82,6 +88,10 @@ const jobKey = (project: string, id: string) => `${project}:${id}`;
 export class Scheduler implements JobControl {
   private readonly entries = new Map<string, Entry>();
   private readonly running = new Set<string>();
+  /** Slots whose trigger message is posted in Slack, waiting for the bot to pick it up. */
+  private readonly pending = new Map<string, { slot: number; kind: ScheduledKind; byPerson: boolean }>();
+  /** Watchdogs of posted triggers, cleared on stop. */
+  private readonly pickups = new Set<NodeJS.Timeout>();
   private readonly fileStamps = new Map<string, number>();
   private readonly slots: Semaphore;
   private readonly locks = new Locks();
@@ -118,6 +128,8 @@ export class Scheduler implements JobControl {
     this.healthCron?.stop();
     for (const entry of this.entries.values()) this.stopEntry(entry);
     this.entries.clear();
+    for (const timer of this.pickups) clearTimeout(timer);
+    this.pickups.clear();
     this.controller.abort();
     await Promise.allSettled([...this.inflight]);
   }
@@ -280,9 +292,24 @@ export class Scheduler implements JobControl {
     by: string,
     thread?: { channel: string; ts: string },
   ): 'started' | 'unknown' | 'running' {
-    const entry = this.entries.get(jobKey(project, id));
+    const key = jobKey(project, id);
+    const entry = this.entries.get(key);
+    if (by === SCHEDULE_BY) {
+      // Taken once: a redelivered Slack event (or an old trigger message) starts nothing.
+      const pending = this.pending.get(key);
+      this.pending.delete(key);
+      if (!entry || !pending) return 'unknown';
+      if (this.running.has(key)) {
+        this.deps.store.finishSlot(key, pending.slot, 'skipped');
+        return 'running';
+      }
+      this.launch(entry.scheduled, { kind: pending.kind, thread, byPerson: pending.byPerson }, (status) =>
+        this.deps.store.finishSlot(key, pending.slot, status),
+      );
+      return 'started';
+    }
     if (!entry) return 'unknown';
-    if (this.running.has(jobKey(project, id))) return 'running';
+    if (this.running.has(key)) return 'running';
     this.launch(entry.scheduled, { kind: 'manual', by, thread });
     return 'started';
   }
@@ -327,7 +354,7 @@ export class Scheduler implements JobControl {
       const firstSeen = this.deps.store.firstSeen(key);
       entry.cron = new Cron(job.cron, { timezone, catch: true }, () => {
         const slot = this.slotAtOrBefore(clock, this.now() + 1_000);
-        if (slot !== undefined) this.fire(scheduled, slot, { kind: 'schedule' });
+        if (slot !== undefined) this.fire(scheduled, slot, 'schedule');
       });
       if (opts.catchUp) this.catchUp(scheduled, clock, firstSeen);
     }
@@ -344,22 +371,79 @@ export class Scheduler implements JobControl {
     const slot = this.slotAtOrBefore(clock, this.now());
     // Only slots after the job was first seen here: a newly added job must not fire for its past.
     if (slot === undefined || slot < firstSeen || this.now() - slot > windowMs) return;
-    this.fire(scheduled, slot, { kind: 'catch-up' });
+    this.fire(scheduled, slot, 'catch-up');
   }
 
   private slotAtOrBefore(clock: Cron, at: number): number | undefined {
     return clock.previousRuns(1, new Date(at))[0]?.getTime();
   }
 
-  /** Runs a scheduled slot once: skipped when the job is still running or the slot was already claimed. */
-  private fire(scheduled: ScheduledJob, slot: number, trigger: JobTrigger): void {
-    const key = jobKey(scheduled.project.config.name, scheduled.job.id);
+  /**
+   * A scheduled slot, once: claims it and posts its trigger message in the project channel. The bot
+   * picks that message up and starts the run in its thread (see `trigger`). Skipped when the job is
+   * still running or the slot was already claimed. A slot whose message never comes back stays
+   * claimed as `running`, so the next start catches it up.
+   */
+  private fire(scheduled: ScheduledJob, slot: number, kind: ScheduledKind): void {
+    const { project, job } = scheduled;
+    const key = jobKey(project.config.name, job.id);
     if (this.running.has(key)) {
       this.deps.log.warn(`[${key}] still running; skipped slot ${new Date(slot).toISOString()}`);
       return;
     }
     if (!this.deps.store.claimSlot(key, slot, this.startedAt)) return;
-    this.launch(scheduled, trigger, (status) => this.deps.store.finishSlot(key, slot, status));
+    if (job.quiet) {
+      // Runs straight away, posting only when there is something to say.
+      this.launch(scheduled, { kind }, (status) => this.deps.store.finishSlot(key, slot, status));
+      return;
+    }
+    const { chat } = this.deps;
+    const channel = project.config.slackChannel;
+    const text = scheduledRunText(job.name, job.id, kind);
+    const asBot = () => {
+      // Set before posting: Slack can deliver the message event before the post call returns.
+      this.pending.set(key, { slot, kind, byPerson: false });
+      return chat.post(channel, undefined, text);
+    };
+    const asPerson = chat.postAsUser?.bind(chat);
+    const post = asPerson
+      ? (() => {
+          this.pending.set(key, { slot, kind, byPerson: true });
+          return asPerson(channel, text).catch((err: Error) => {
+            // e.g. not_in_channel: that person isn't in the channel. The bot posts it instead.
+            this.deps.log.warn(
+              `[${key}] trigger not posted as the user (${err.message}); posting as the bot`,
+            );
+            return asBot();
+          });
+        })()
+      : asBot();
+    post.then(
+      (ts) => this.watchPickup(key, slot, { channel, ts }),
+      (err: Error) => {
+        this.deps.log.error(`[${key}] trigger message not posted: ${err.message}`);
+        this.pending.delete(key);
+        // Aborted slots are claimed again on the next start.
+        this.deps.store.finishSlot(key, slot, 'aborted');
+      },
+    );
+  }
+
+  /**
+   * Slack can drop a message event (a socket reconnect, an outage). A trigger the bot hasn't picked
+   * up in time is started by the scheduler itself, in the same thread, as if the bot had.
+   */
+  private watchPickup(key: string, slot: number, thread: { channel: string; ts: string }): void {
+    const timer = setTimeout(() => {
+      this.pickups.delete(timer);
+      if (this.pending.get(key)?.slot !== slot) return; // picked up already
+      const at = key.lastIndexOf(':'); // ids have no ':'
+      const [project, id] = [key.slice(0, at), key.slice(at + 1)];
+      this.deps.log.warn(`[${key}] trigger not picked up from Slack in time; starting it here`);
+      this.trigger(project, id, SCHEDULE_BY, thread);
+    }, this.deps.pickupTimeoutMs ?? 120_000);
+    timer.unref();
+    this.pickups.add(timer);
   }
 
   /**
