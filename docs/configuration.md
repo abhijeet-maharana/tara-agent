@@ -93,7 +93,8 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 
 | Key | Default | Meaning |
 |---|---|---|
-| `id`, `name`, `cron` | required | Slug, display name, cron expression (5 or 6 fields) |
+| `id`, `name` | required | Slug, display name |
+| `cron` | none | Cron expression (5 or 6 fields). Leave it out for a job a queue runs (its `executor`) or an **on-demand** job, listed on the Jobs page's **On demand** tab and started only with **Run now** there, `POST /jobs/<project>/<id>/run`, or by asking in chat (`run_job`) |
 | `tz` | file-level `tz`, else host `timezone` | Timezone of `cron` |
 | `prompt` | required unless `agent: false` | What Claude should do |
 | `skills` | `[]` | Skills Claude should read first |
@@ -110,7 +111,7 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `catchUp` | `true` | Run the latest missed slot after downtime |
 | `channel` | project channel | Where the job posts |
 | `env` | `{}` | Extra environment for the script and Claude (`~/` expanded), merged over the file-level `env` |
-| `durationMinutes` | none | Typical run time, shown on the Schedule page |
+| `durationMinutes` | none | Typical run time: the Jobs Timeline plans with it (change it on the job's card in Jobs → List) |
 | `enabled` | `true` | `false` keeps the job listed but never scheduled |
 
 ### How a run goes
@@ -125,7 +126,7 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 Other rules:
 
 - **Every slot runs at most once**, even across restarts. A job added while tara-agent was down doesn't run for past slots.
-- **Watching live:** scheduled runs show their current step in the channel message. A run you start with `run <job name>` streams in your message's thread; runs started from the API or dashboard stream to the project `owner`.
+- **Watching live:** every run streams its steps and text into its Slack thread (the channel message keeps the current step and, at the end, the headline). A run you start with `run <job name>` streams in your message's thread; scheduled, queue and dashboard/API runs stream in the job message's thread, addressed to the project `owner` (Slack's streaming needs a recipient; without `owner` they post only the status line and the details at the end). A script-only job (`agent: false`) posts its result line in the channel and the script's output in the thread.
 - These conventions match Hermes Agent's, so Hermes jobs run unchanged. To import them:
   ```sh
   tara-agent import-hermes --from ~/.hermes/cron/jobs.json --out <repo>/.tara/jobs.json \
@@ -246,7 +247,7 @@ An item that is never reported ends as failed and is not retried, so nothing goe
 
 - The first option (default **Approve**) queues the item. A negative option (Reject, Skip…) closes it as rejected; any other closes it as done.
 - **Revise** keeps the card pending and asks the agent for a new version.
-- `slack: true` on a queue also posts each card in the project channel (decisions stay on the dashboard).
+- `slack: true` on a queue also posts each card in Slack (decisions stay on the dashboard): a card a run proposed goes in that run's thread; any other card is one line in the project channel (title and status) with the full draft as the first reply in its thread. A refresh edits both.
 - `approvals.validateUrl` gets POST `{kind, key, fields}` and returns `{checks: [{text, blocking}]}`; blocking checks stop approval.
 - `approvals.hookUrl` gets POST `{event: "decided" | "finished", item}`, signed with HMAC-SHA256 of the body using `APPROVAL_SEAL_KEY` in the `x-tara-signature` header. Best effort only.
 
@@ -258,7 +259,7 @@ Open the HTTP address in a browser. Every page also answers JSON to tools.
 - **Approvals** (`/approvals`): cards waiting for a person, and decisions from the last 30 days. Deciding needs the browser unlocked once on `/unlock` with `TARA_ADMIN_TOKEN`, from a device other than the server.
 - **Queue** (`/queue`): approved drafts waiting to run, in run order with the next slot or window. Each queue with `"reorder": true` has its own section (per kind with `alternate`), shown even when empty, with how many cards wait for approval. Drag a row (mouse or touch) or use **Top** / **↑** / **↓** / **Bottom** to choose what goes out first; **Cancel** drops one. Reordering needs the unlocked browser. Other queues are listed read-only under **Other queues**.
 - **Jobs** (`/jobs`): every job, failing first, with schedule, recent results, **Run now**, **Pause** / **Resume**, and run history.
-- **Schedule** (`/schedule`): a day's timeline with each job's usual length, overlaps and free windows.
+- **Jobs → Timeline** (`/schedule`): a day's timeline with each job's planned length, queue slots, overlaps and free windows.
 - **Sessions** (`/sessions`, `/sessions/<id>`): every thread and job run, with full transcripts and tool calls.
 - **Runs** (`/runs/<id>`): one run's status, reply and script output.
 - **Code** (`/code`): uncommitted changes, diffs, file browser and search. See [code-view.md](code-view.md).

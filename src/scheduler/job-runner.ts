@@ -74,12 +74,12 @@ const SLACK_USER = /^[UW][A-Z0-9]+$/;
 const sum = (a?: number, b?: number) => (a === undefined && !b ? a : (a ?? 0) + (b ?? 0));
 
 /**
- * Who a run streams live to. Scheduled runs don't stream (nobody is waiting); a run someone started
- * streams to them, or to the project owner when it came from the API or a dashboard.
+ * Who a run's live thread is addressed to (Slack's streaming API needs a recipient). Every run streams
+ * its steps into its thread: to whoever started or continued it in Slack, else the project owner.
  */
 export function streamRecipient(trigger: JobTrigger, owner: string | undefined): string | undefined {
-  if (trigger.kind !== 'manual') return undefined;
-  return SLACK_USER.test(trigger.by) ? trigger.by : owner;
+  const by = trigger.kind === 'manual' || trigger.kind === 'resume' ? trigger.by : undefined;
+  return by && SLACK_USER.test(by) ? by : owner;
 }
 
 function triggerLabel(trigger: JobTrigger): string {
@@ -182,9 +182,12 @@ export async function runJob(
         return record('silent');
       }
       if (!job.agent) {
+        // The result line in the channel, the script's output in its thread.
         const icon = script.ok ? '✅' : '❌';
         const meta = formatDuration(now() - startedAt);
-        await postMain(`${icon} ${title} · ${meta}\n\`\`\`\n${script.output.slice(0, 3_000)}\n\`\`\``);
+        const ts = await postMain(`${icon} ${title} · ${meta}`);
+        if (script.output.trim())
+          await chat.post(channel, inThread ?? ts, `\`\`\`\n${script.output.slice(0, 3_000)}\n\`\`\``);
         return record(script.ok ? 'ok' : 'failed', {
           error: script.ok ? undefined : script.output.slice(-500),
         });
@@ -275,7 +278,7 @@ export async function runJob(
       }
     }
 
-    // Jobs get approval buttons and file uploads, never permission prompts: nobody is watching live.
+    // Jobs get approval buttons and file uploads, never permission prompts: nobody is there to answer.
     const bridgeContext: RunContext = {
       project,
       channel,

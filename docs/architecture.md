@@ -49,7 +49,7 @@ tara-agent is one Node process per host. It never calls the Anthropic API: every
 1. croner fires; the scheduler works out the slot time and **claims** it in SQLite. A claimed slot never runs again, even after a restart.
 2. The job waits for a job slot (`jobConcurrency`) and its named locks (for example `chrome`).
 3. The pre-script runs from the repo root. Empty output or `{"wakeAgent": false}` ends the run silently. Otherwise its output goes in front of the prompt.
-4. The run posts a channel message and streams status into it. Replies `[SILENT]` → the message is deleted; `[CRON_FAILURE]` → marked failed; otherwise headline in the channel and details in the thread.
+4. The run posts a channel message with its current step, and streams its steps and text live into that message's thread (addressed to whoever started it in Slack, else the project `owner`). Replies `[SILENT]` → the message and thread are deleted; `[CRON_FAILURE]` → marked failed; otherwise headline in the channel and the full reply in the thread.
 5. The job thread is saved as a session, so replying to it continues the job's conversation.
 
 On start, each enabled job runs its most recent missed slot once if it is younger than `catchUpHours` and after the job was first seen on this host.

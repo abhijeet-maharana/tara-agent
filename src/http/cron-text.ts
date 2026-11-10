@@ -43,6 +43,15 @@ export function sameZone(a: string, b: string): boolean {
 export function cronText(cron: string, tz?: string, hostTz?: string): string {
   const parts = cron.trim().split(/\s+/);
   const [min = '', hour = '', dom = '', month = '', dow = ''] = parts;
+  // Every few minutes or hours, every day: "Every 10 min", "Hourly", "Every 2 hours at :15".
+  if (parts.length === 5 && dom === '*' && month === '*' && dow === '*') {
+    const step = /^\*\/(\d+)$/.exec(min);
+    if (step && hour === '*') return `Every ${step[1]} min`;
+    if (/^\d+$/.test(min) && hour === '*')
+      return min === '0' ? 'Hourly' : `Hourly at :${min.padStart(2, '0')}`;
+    const hours = /^\*\/(\d+)$/.exec(hour);
+    if (/^\d+$/.test(min) && hours) return `Every ${hours[1]} hours at :${min.padStart(2, '0')}`;
+  }
   if (parts.length !== 5 || !/^\d+$/.test(min) || !/^\d+(,\d+)*$/.test(hour) || month !== '*') return cron;
   const times = hour
     .split(',')

@@ -298,14 +298,20 @@ export class Approvals {
   }
 
   /**
-   * A `slack` queue's card as its own message in the project's channel (a refresh edits the same
-   * message), so each card has a thread: the decision shows on the message, and a Revise and the run
-   * that executes the card reply in it. Decisions stay on the Approvals page: the message has no
-   * buttons. A Slack failure never loses the card: it still waits on the Approvals page.
+   * A `slack` queue's card. Proposed by a run, the whole card goes in that run's thread. Otherwise it
+   * gets its own channel message, kept to one line (title and status) so the channel stays scannable,
+   * with the full draft as the first reply in its thread; a refresh edits both. The decision shows on
+   * the message, and a Revise and the run that executes the card reply in its thread. Decisions stay
+   * on the Approvals page: the message has no buttons. A Slack failure never loses the card: it still
+   * waits on the Approvals page.
    */
   private async postCard(project: Project, item: Item): Promise<void> {
     const channel = item.channel ?? project.config.slackChannel;
     if (!channel) return;
+    const status =
+      item.status === 'approved' && item.decidedBy === 'auto'
+        ? `✅ ${item.reply ?? 'Auto-approved'}. Goes out with the ${item.queue} queue; what happens next shows in this thread.`
+        : `Waiting on the Approvals page (${item.options.join(' · ')} · Revise). What happens next shows in this thread.`;
     const shown = (v: string | string[]) => (Array.isArray(v) ? v.join('\n') : v).trim();
     const fields = item.fields
       .filter((f) => shown(f.value))
@@ -318,39 +324,40 @@ export class Approvals {
       });
     const checks = item.checks.map((c) => `${c.blocking ? '⛔' : '⚠️'} ${c.text}`);
     const text = [toSlackMrkdwn(item.body ?? ''), ...fields, ...checks].filter(Boolean).join('\n\n');
-    const blocks: SlackBlock[] = [
-      {
-        type: 'section',
-        text: { type: 'mrkdwn', text: `*📝 ${item.title}*\n${text}`.slice(0, SECTION_MAX) },
-      },
-      {
-        type: 'context',
-        elements: [
-          {
-            type: 'mrkdwn',
-            text:
-              item.status === 'approved' && item.decidedBy === 'auto'
-                ? `✅ ${item.reply ?? 'Auto-approved'}. Goes out with the ${item.queue} queue; what happens next shows in this thread.`
-                : `Waiting on the Approvals page (${item.options.join(' · ')} · Revise). What happens next shows in this thread.`,
-          },
-        ],
-      },
+    const card = (body: string): SlackBlock[] => [
+      { type: 'section', text: { type: 'mrkdwn', text: `*📝 ${item.title}*${body}`.slice(0, SECTION_MAX) } },
+      { type: 'context', elements: [{ type: 'mrkdwn', text: status }] },
     ];
+    const detail: SlackBlock[] = [
+      { type: 'section', text: { type: 'mrkdwn', text: text.slice(0, SECTION_MAX) } },
+    ];
+    // Its own channel message (not a reply in a run's thread): one line there, the draft in the thread.
+    const ownMessage = !item.threadTs || item.threadTs === item.messageTs;
     try {
-      if (item.messageTs) await this.deps.chat.update(channel, item.messageTs, item.title, blocks);
-      else if (item.threadTs) {
-        // Proposed by a run: the card goes in that run's thread, which stays the card's thread.
-        this.deps.store.setItemMessage(
-          item.id,
-          await this.deps.chat.postBlocks(channel, item.threadTs, item.title, blocks),
-        );
-      } else {
-        this.deps.store.setItemSlack(
-          item.id,
-          channel,
-          await this.deps.chat.postBlocks(channel, undefined, item.title, blocks),
-        );
+      if (!ownMessage) {
+        // Proposed by a run: the whole card goes in that run's thread, which stays the card's thread.
+        const blocks = card(text ? `\n${text}` : '');
+        if (item.messageTs) await this.deps.chat.update(channel, item.messageTs, item.title, blocks);
+        else
+          this.deps.store.setItemMessage(
+            item.id,
+            await this.deps.chat.postBlocks(channel, item.threadTs, item.title, blocks),
+          );
+        return;
       }
+      let ts = item.messageTs;
+      if (ts) await this.deps.chat.update(channel, ts, item.title, card(''));
+      else {
+        ts = await this.deps.chat.postBlocks(channel, undefined, item.title, card(''));
+        this.deps.store.setItemSlack(item.id, channel, ts);
+      }
+      if (!text) return;
+      if (item.detailTs) await this.deps.chat.update(channel, item.detailTs, item.title, detail);
+      else
+        this.deps.store.setItemDetail(
+          item.id,
+          await this.deps.chat.postBlocks(channel, ts, item.title, detail),
+        );
     } catch (err) {
       this.deps.log.warn(
         `[${item.project}] could not post card ${item.id} to Slack: ${(err as Error).message}`,
@@ -603,6 +610,35 @@ export class Approvals {
     this.closeMessage(cancelled, `➖ Withdrawn${reason ? `: ${reason}` : ''}`);
     this.notify(cancelled, 'decided');
     return store.getItem(id) as Item;
+  }
+
+  /**
+   * A note or question about a waiting card, from the Approvals page, without deciding it. It shows in
+   * the card's Slack thread as the owner's reply and goes to Jarvis there, who answers in the thread;
+   * the card keeps waiting. (A note typed before picking an option still goes with that decision.)
+   */
+  async note(id: string, text: string, by: string): Promise<Item> {
+    const item = this.deps.store.getItem(id);
+    if (!item) throw new ApprovalError(404, 'No such item');
+    if (item.status !== 'pending') throw new ApprovalError(409, `Already ${item.status}`);
+    if (!this.onChat) throw new ApprovalError(503, 'Chat is not running, so the note has nowhere to go');
+    const project = this.project(item.project);
+    const user = /^[UW][A-Z0-9]+$/.test(by) ? by : (project.config.owner ?? by);
+    let channel = item.channel ?? project.config.slackChannel;
+    let threadTs = item.threadTs;
+    if (!threadTs) {
+      channel = project.config.slackChannel;
+      threadTs = await this.deps.chat.post(channel, undefined, `📝 About *${item.title}*`);
+    }
+    await this.deps.chat.post(channel, threadTs, `📝 Note from the Approvals page: ${text}`);
+    this.onChat({
+      channel,
+      threadTs,
+      ts: threadTs,
+      user,
+      text: `About the waiting card "${item.title}" (item ${id}), sent from the Approvals page without a decision. The card is still waiting: answer in this thread, and change or withdraw the card only if the note asks for that.\n\n${text}`,
+    }).catch((err) => this.deps.log.error(`[${item.project}] note on item ${id}: ${(err as Error).message}`));
+    return item;
   }
 
   /**

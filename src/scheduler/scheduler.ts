@@ -332,9 +332,9 @@ export class Scheduler implements JobControl {
       if (opts.catchUp) this.catchUp(scheduled, clock, firstSeen);
     }
     const scheduled = jobs.filter((j) => j.job.enabled && j.job.cron).length;
-    const fromQueues = jobs.filter((j) => !j.job.cron).length;
+    const unscheduled = jobs.filter((j) => !j.job.cron).length;
     this.deps.log.info(
-      `[${name}] ${scheduled}/${jobs.length} jobs scheduled${fromQueues ? ` (${fromQueues} run from queues)` : ''}`,
+      `[${name}] ${scheduled}/${jobs.length} jobs scheduled${unscheduled ? ` (${unscheduled} run from queues or on demand)` : ''}`,
     );
   }
 

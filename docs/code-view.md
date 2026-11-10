@@ -6,8 +6,8 @@ See what changed in your repos from a phone: each repo's uncommitted changes, th
 
 | Page | Shows |
 |---|---|
-| `/code` | One row per repo: branch, how many files changed (+/− lines), last commit |
-| `/code/<repo>` | The changed files: **M** modified, **A** added, **D** deleted, **N** new and not added to git, **!** conflict; staged changes are marked in the tooltip |
+| `/code` | One row per repo: branch, how many files changed (+/− lines), last commit (amber when there are changes and it is over 3 days old; Home lists those repos too) |
+| `/code/<repo>` | The changed files: **M** modified, **A** added, **D** deleted, **N** new and not added to git, **!** conflict; staged changes are marked in the tooltip. Grouped by folder (first two folders), closed when there are more than 30 changes |
 | `/code/<repo>/diff?path=` | The change against the last commit (staged and unstaged together), line numbers, wrapped for a phone. A new file shows as all added lines. First 2,000 lines |
 | `/code/<repo>/files?path=` | A folder: subfolders, files, and which of them changed |
 | `/code/<repo>/file?path=` | A file with line numbers (up to 512 KB; binary files are named, not shown); `#L12` jumps to line 12 |
@@ -15,7 +15,7 @@ See what changed in your repos from a phone: each repo's uncommitted changes, th
 
 The same paths answer JSON (`Accept: application/json`) for tools. `GET /code` returns every repo's status.
 
-**Ask.** A diff or file page has a box to ask about it. It posts the question as a new thread in the project's Slack channel and starts a conversation there, as if the project `owner` had asked; Claude also gets the diff. Asking needs the browser unlocked on `/unlock` (the approvals key), like deciding approvals.
+**Ask.** A diff or file page has a box to ask about it, and a repo's page one to ask about all its changes (Claude gets the list of changed files and reads the diffs itself, read-only). It posts the question as a new thread in the project's Slack channel and starts a conversation there, as if the project `owner` had asked; Claude also gets the diff. Asking needs the browser unlocked on `/unlock` (the approvals key), like deciding approvals.
 
 ## Configuration
 

@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, readSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { describeTool } from '../runner/stream.js';
@@ -112,6 +112,48 @@ export function parseTranscript(jsonl: string): TranscriptEntry[] {
  * transcripts readable by their owner only, so with `claude.runAs` a file tara-agent can't open is
  * read as that user (the sudoers rule that starts runs allows it).
  */
+/** Bytes read from the start of a transcript to find its first prompt. */
+const HEAD_BYTES = 64 * 1024;
+
+/**
+ * A session's first prompt, from the first 64 KB of its transcript, for lists. Claude writes
+ * transcripts readable by the run user only, so it is read as `readAs` (sudo head) when tara-agent
+ * can't open the file itself.
+ */
+export function firstPromptOf(
+  cwd: string,
+  sessionId: string,
+  configDir?: string,
+  readAs?: string,
+): string | undefined {
+  if (!/^[0-9a-f-]{36}$/i.test(sessionId)) return undefined;
+  const file = transcriptPath(cwd, sessionId, configDir);
+  let head: string;
+  try {
+    const fd = openSync(file, 'r');
+    try {
+      const buf = Buffer.alloc(HEAD_BYTES);
+      head = buf.subarray(0, readSync(fd, buf, 0, HEAD_BYTES, 0)).toString('utf8');
+    } finally {
+      closeSync(fd);
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EACCES' || !readAs) return undefined;
+    try {
+      head = execFileSync(
+        'sudo',
+        ['-n', '-u', readAs, '/usr/bin/head', '-c', String(HEAD_BYTES), '--', file],
+        {
+          encoding: 'utf8',
+        },
+      );
+    } catch {
+      return undefined;
+    }
+  }
+  return firstPrompt(parseTranscript(head.slice(0, head.lastIndexOf('\n'))));
+}
+
 export function readTranscript(
   cwd: string,
   sessionId: string,

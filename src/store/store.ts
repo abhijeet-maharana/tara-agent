@@ -56,6 +56,8 @@ export interface SessionOverview extends SessionRow {
   updatedAt: number;
   turns: number;
   lastRun?: StoredRun;
+  /** The job whose thread this is, when any run in it belongs to a job (a reply in a job's thread too). */
+  jobId?: string;
 }
 
 const OUTPUT_CAP = 20_000;
@@ -197,6 +199,11 @@ const MIGRATIONS = [
   `ALTER TABLE sessions ADD COLUMN harness TEXT NOT NULL DEFAULT 'claude';`,
   // A job's scratch folder outlives a change of session id (agy's own id, a handoff).
   `ALTER TABLE sessions ADD COLUMN scratch_id TEXT;`,
+  // The Sessions list looks up each thread's runs, and a session page its latest run.
+  `CREATE INDEX runs_thread ON runs (thread_key, started_at);
+   CREATE INDEX runs_session ON runs (session_id, started_at);`,
+  // A draft card with its own channel message keeps its full text in the first reply of its thread.
+  `ALTER TABLE items ADD COLUMN detail_ts TEXT;`,
 ];
 
 export const ITEM_STATUSES = [
@@ -262,6 +269,8 @@ export interface Item {
   threadTs?: string;
   /** The Slack card, for resume items. */
   messageTs?: string;
+  /** A draft card's full text, the first reply in the thread of its own channel message. */
+  detailTs?: string;
   queue?: string;
   /** Window key in the queue's config, e.g. `EU`. */
   window?: string;
@@ -329,6 +338,7 @@ function toItem(r: Record<string, unknown>): Item {
     channel: opt(r.channel),
     threadTs: opt(r.thread_ts),
     messageTs: opt(r.message_ts),
+    detailTs: opt(r.detail_ts),
     queue: opt(r.queue),
     window: opt(r.window),
     runAfter: opt(r.run_after),
@@ -485,7 +495,8 @@ export class Store {
       .prepare(
         `SELECT s.thread_key, s.project, s.session_id, s.model, s.started, s.harness, s.created_at, s.updated_at,
            (SELECT COUNT(*) FROM runs x WHERE x.thread_key = s.thread_key) AS turns,
-           (SELECT id FROM runs x WHERE x.thread_key = s.thread_key ORDER BY x.started_at DESC LIMIT 1) AS last_run_id
+           (SELECT id FROM runs x WHERE x.thread_key = s.thread_key AND x.kind != 'learn' ORDER BY x.started_at DESC LIMIT 1) AS last_run_id,
+           (SELECT job_id FROM runs x WHERE x.thread_key = s.thread_key AND x.job_id IS NOT NULL ORDER BY x.started_at LIMIT 1) AS job_id
          FROM sessions s ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
          ORDER BY COALESCE((SELECT MAX(x.started_at) FROM runs x WHERE x.thread_key = s.thread_key), s.updated_at) DESC
          LIMIT ?`,
@@ -502,6 +513,7 @@ export class Store {
       updatedAt: r.updated_at as number,
       turns: r.turns as number,
       lastRun: r.last_run_id ? this.getRun(r.last_run_id as number) : undefined,
+      jobId: (r.job_id as string | null) ?? undefined,
     }));
   }
 
@@ -734,6 +746,10 @@ export class Store {
 
   setItemMessage(id: string, messageTs: string): void {
     this.db.prepare('UPDATE items SET message_ts = ? WHERE id = ?').run(messageTs, id);
+  }
+
+  setItemDetail(id: string, detailTs: string): void {
+    this.db.prepare('UPDATE items SET detail_ts = ? WHERE id = ?').run(detailTs, id);
   }
 
   /** A card posted as its own Slack message: that message is also the thread its run replies in. */

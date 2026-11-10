@@ -338,7 +338,7 @@ describe('auto-approved cards', () => {
 });
 
 describe('cards of a slack queue', () => {
-  it('posts the card in the channel, edits it on refresh, and closes it on a decision or a withdrawal', async () => {
+  it('posts a one-line card in the channel with the draft in its thread, edits both on refresh, and closes it on a decision or a withdrawal', async () => {
     const { project, store, chat, approvals } = setup();
     const reply = (value: string) => ({ key: 'reply', label: 'Reply', type: 'textarea' as const, value });
     const card = await approvals.propose(project, {
@@ -350,19 +350,24 @@ describe('cards of a slack queue', () => {
       options: ['Approve', 'Skip'],
       fields: [reply('Locks need a timeout.'), { key: 'link', label: 'Link', type: 'text', value: '' }],
     });
-    expect(chat.blockPosts).toHaveLength(1);
-    const posted = chat.blockPosts[0];
+    expect(chat.blockPosts).toHaveLength(2);
+    const [posted, detail] = chat.blockPosts;
     expect(posted?.thread).toBe('');
     expect(card).toMatchObject({ channel: 'C1', messageTs: posted?.ts, threadTs: posted?.ts });
-    const section = JSON.stringify(posted?.blocks[0]);
+    // The channel message is the title and status only.
+    expect(JSON.stringify(posted?.blocks[0])).toContain('*📝 Reply to @ann*"');
+    expect(JSON.stringify(posted?.blocks[1])).toContain(
+      'Waiting on the Approvals page (Approve · Skip · Revise)',
+    );
+    // The draft is the first reply in its thread.
+    expect(detail?.thread).toBe(posted?.ts);
+    expect(store.getItem(card.id)?.detailTs).toBe(detail?.ts);
+    const section = JSON.stringify(detail?.blocks[0]);
     expect(section).toContain('Ann posted *2h* ago');
     expect(section).toContain('> Locks need a timeout.');
     expect(section).not.toContain('*Link*'); // empty fields stay out
     // No buttons: decisions stay on the Approvals page.
-    expect(posted?.blocks.some((b) => b.type === 'actions')).toBe(false);
-    expect(JSON.stringify(posted?.blocks[1])).toContain(
-      'Waiting on the Approvals page (Approve · Skip · Revise)',
-    );
+    expect(chat.blockPosts.some((p) => p.blocks.some((b) => b.type === 'actions'))).toBe(false);
 
     // A refresh (same key) edits the same message and keeps where the card lives.
     const again = await approvals.propose(project, {
@@ -373,8 +378,9 @@ describe('cards of a slack queue', () => {
       options: ['Approve', 'Skip'],
       fields: [reply('Set lock_timeout first.')],
     });
-    expect(chat.blockPosts).toHaveLength(1);
+    expect(chat.blockPosts).toHaveLength(2);
     expect(again).toMatchObject({ id: card.id, channel: 'C1', threadTs: posted?.ts });
+    expect(chat.updates.at(-1)?.ts).toBe(detail?.ts);
     expect(JSON.stringify(chat.updates.at(-1)?.blocks)).toContain('Set lock_timeout first.');
 
     await approvals.decide(card.id, { option: 'Approve', by: 'U1', via: 'dashboard' });
@@ -720,6 +726,59 @@ describe('decisions over HTTP', () => {
     server.close();
   });
 
+  it('takes a note on a waiting card without deciding it: shown in its thread, sent to Jarvis there', async () => {
+    const { project, store, chat, approvals, chats } = setup();
+    const server = await startHttpServer({
+      bind: '127.0.0.1',
+      port: 0,
+      scheduler: { list: () => [] } as unknown as Scheduler,
+      store,
+      approvals,
+      projects: ['shop'],
+      log: silent,
+      adminToken: 'key',
+      decisionsFromLocal: true,
+      dashboard: { projects: [project], timeZone: 'UTC', agentName: 'Jarvis' },
+    });
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const item = await approvals.ask(project, {
+      title: 'Log in to the portal',
+      details: 'Expired.',
+      options: ['Done', 'Dismiss'],
+    });
+    const send = (text: string, cookie = 'tara_admin=key') =>
+      fetch(`${base}/items/${item.id}/note`, {
+        method: 'POST',
+        headers: { cookie },
+        body: JSON.stringify({ text }),
+      });
+
+    expect((await send('Which portal?', '')).status).toBe(403);
+    expect((await send('  ')).status).toBe(400);
+    expect((await send('Which portal?')).status).toBe(200);
+    const thread = chat.posts[0]?.ts;
+    expect(chat.posts.at(-1)).toMatchObject({
+      thread,
+      text: '📝 Note from the Approvals page: Which portal?',
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(chats.at(-1)).toMatchObject({ channel: 'C1', threadTs: thread, user: 'U1' });
+    expect(chats.at(-1)?.text).toContain('sent from the Approvals page without a decision');
+    expect(chats.at(-1)?.text).toContain('Which portal?');
+    expect(store.getItem(item.id)?.status).toBe('pending');
+
+    // The card shows the note box with Send, and Note… opens it.
+    const page = await fetch(`${base}/approvals`, {
+      headers: { accept: 'text/html', cookie: 'tara_admin=key' },
+    }).then((r) => r.text());
+    expect(page).toContain('data-open-note>Note…</button>');
+    expect(page).toContain('data-note title=');
+
+    await approvals.decide(item.id, { option: 'Done', by: 'U1', via: 'slack' });
+    expect((await send('Too late')).status).toBe(409);
+    server.close();
+  });
+
   it("lists a project's queues with the next slot times and the kind that went last", async () => {
     const { project, store, approvals } = setup({ now: () => Date.parse('2026-10-26T18:00:00Z') });
     const server = await startHttpServer({
@@ -813,7 +872,7 @@ describe('decisions over HTTP', () => {
     );
     expect(page).toContain('Jane &lt;CTO&gt;');
     expect(page).toContain(
-      '<video src="http://board/reel.mp4" poster="http://board/cover.jpg" controls playsinline preload="metadata"',
+      '<video src="http://board/reel.mp4" poster="http://board/cover.jpg" controls playsinline preload="none"',
     );
     expect(page).toContain('data-decide="Approve"');
     expect(page).not.toContain('can look but not decide');
@@ -967,8 +1026,8 @@ describe('reordering a queue', () => {
     expect(page).toContain('<h2>Linkedin</h2>');
     expect(page).toContain('<h2>Content</h2>'); // reorderable: shown while empty
     // Not reorderable: read-only, under "Other queues".
-    expect(page.indexOf('<details class="others">')).toBeLessThan(page.indexOf('<h2>Email</h2>'));
-    expect(page.indexOf('<h2>Linkedin</h2>')).toBeLessThan(page.indexOf('<details class="others">'));
+    expect(page.indexOf('<details class="others"')).toBeLessThan(page.indexOf('<h2>Email</h2>'));
+    expect(page.indexOf('<h2>Linkedin</h2>')).toBeLessThan(page.indexOf('<details class="others"'));
     expect(page.indexOf('Second')).toBeLessThan(page.indexOf('First'));
     expect(page).toContain(`data-qitem="${ids[1]}"`);
     expect(page).toContain(

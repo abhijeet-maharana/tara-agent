@@ -24,6 +24,9 @@ const CSS = `<style>
 .diff .del{background:rgba(244,63,94,.12)}.diff .del code{color:#fecdd3}
 .diff .hunk{background:var(--accent-dim);color:var(--accent)}.diff .hunk code{color:var(--accent)}
 .ask{display:grid;gap:8px;margin-top:18px}.ask textarea{min-height:70px}
+.fgroup{margin:0 0 6px}.fgroup>summary{display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--card-bg);cursor:pointer;list-style:none}
+.fgroup>summary::-webkit-details-marker{display:none}.fgroup>summary::before{content:'▸';color:var(--text-dim)}.fgroup[open]>summary::before{content:'▾'}
+.fgroup>summary .grow{flex:1;min-width:0}.fgroup>.todo{margin:6px 0 10px 14px}
 .repo-grid{display:grid;gap:8px}
 .search{display:flex;gap:8px;margin:0 0 18px}.search .input{flex:1;min-width:0}
 .src>div{scroll-margin-top:90px}.src>div:target{background:var(--amber-dim)}
@@ -115,6 +118,29 @@ const totals = (s: RepoStatus) => ({
   removed: s.changes.reduce((n, c) => n + c.removed, 0),
 });
 
+/** A repo's changes have waited this long since its last commit: flagged in amber. */
+export const STALE_MS = 3 * 86_400_000;
+/** More changed files than this: the folders start closed. */
+const OPEN_UP_TO = 30;
+
+/** Uncommitted changes and a last commit older than STALE_MS. */
+export const staleWork = (s: RepoStatus, now: number) =>
+  s.changes.length > 0 && s.head !== undefined && now - s.head.at > STALE_MS;
+
+/** "uncommitted · last commit 9d ago", amber when the work is old. */
+const lastCommit = (s: RepoStatus, now: number) =>
+  s.head
+    ? staleWork(s, now)
+      ? `<span class="tag warn">uncommitted · last commit ${esc(relative(s.head.at, now))}</span>`
+      : `<span>last commit ${esc(relative(s.head.at, now))}</span>`
+    : '';
+
+/** The folder a change is listed under: its first two folders (`board/web`), or the top level. */
+const folderOf = (file: string) => {
+  const parts = file.split('/');
+  return parts.length >= 3 ? `${parts[0]}/${parts[1]}` : parts.length === 2 ? (parts[0] as string) : '';
+};
+
 export function codeHomePage(
   ctx: DashboardContext,
   repos: Array<{ repo: CodeRepo; status: RepoStatus }>,
@@ -124,15 +150,12 @@ export function codeHomePage(
     .map(({ repo, status }) => {
       const n = status.changes.length;
       const tone = status.error ? 'bad' : n ? 'warn' : 'ok';
-      const head = status.head;
       return `<a class="row" href="${repoUrl(repo)}"><span class="dot ${tone}"></span><span class="grow"><span class="title">${esc(repo.title)}</span>
 <span class="meta">${status.branch ? `<span class="tag dim">${esc(status.branch)}</span>` : ''}${
         status.error
           ? `<span class="error">${esc(status.error)}</span>`
           : `<span>${n ? `<b>${n}</b> changed file${n === 1 ? '' : 's'}` : 'no uncommitted changes'}</span>`
-      }${head ? `<span>last commit ${esc(relative(head.at, now))}</span>` : ''}</span></span>${
-        n ? counts(totals(status)) : ''
-      }</a>`;
+      }${lastCommit(status, now)}</span></span>${n ? counts(totals(status)) : ''}</a>`;
     })
     .join('');
   return layout(
@@ -148,24 +171,49 @@ export function codeHomePage(
   );
 }
 
-export function codeRepoPage(ctx: DashboardContext, repo: CodeRepo, status: RepoStatus, now: number): string {
+export function codeRepoPage(
+  ctx: DashboardContext,
+  repo: CodeRepo,
+  status: RepoStatus,
+  now: number,
+  canAsk = false,
+): string {
   const head = status.head;
   const sub = [
     status.branch && `on <b>${esc(status.branch)}</b>`,
     head && `last commit “${esc(head.subject)}” ${esc(relative(head.at, now))}`,
+    staleWork(status, now) && '<span class="tag warn">uncommitted for a while</span>',
   ]
     .filter(Boolean)
     .join(' · ');
-  const list = status.changes
-    .map(
-      (c) =>
-        `<a class="row" href="${repoUrl(repo, 'diff', c.path)}">${stateBadge(c)}<span class="grow">${pathHtml(c.path)}</span>${counts(c)}</a>`,
-    )
-    .join('');
+  const row = (c: Change) =>
+    `<a class="row" href="${repoUrl(repo, 'diff', c.path)}">${stateBadge(c)}<span class="grow">${pathHtml(c.path)}</span>${counts(c)}</a>`;
+  // By folder: each folder's files and lines, open when there are only a few changes.
+  const folders = new Map<string, Change[]>();
+  for (const c of status.changes)
+    folders.set(folderOf(c.path), [...(folders.get(folderOf(c.path)) ?? []), c]);
+  const open = status.changes.length <= OPEN_UP_TO;
+  const list =
+    folders.size > 1
+      ? [...folders.entries()]
+          .sort(([a], [b]) => (a === '' ? -1 : b === '' ? 1 : a.localeCompare(b)))
+          .map(
+            ([folder, changes]) =>
+              `<details class="fgroup"${open ? ' open' : ''}><summary><span class="grow"><span class="path">${esc(folder ? `${folder}/` : 'Top level')}</span> <span class="dim">· ${changes.length} ${
+                changes.length === 1 ? 'file' : 'files'
+              }</span></span>${counts({
+                added: changes.reduce((n, c) => n + c.added, 0),
+                removed: changes.reduce((n, c) => n + c.removed, 0),
+              })}</summary><div class="todo">${changes.map(row).join('')}</div></details>`,
+          )
+          .join('')
+      : status.changes.map(row).join('');
   const body = status.error
     ? `<div class="alert">${esc(status.error)}</div>`
     : list
-      ? `<div class="todo">${list}</div>`
+      ? folders.size > 1
+        ? list
+        : `<div class="todo">${list}</div>`
       : '<div class="clear">No uncommitted changes.</div>';
   const n = status.changes.length;
   return layout(
@@ -179,8 +227,8 @@ export function codeRepoPage(ctx: DashboardContext, repo: CodeRepo, status: Repo
         sub: n ? `${n} file${n === 1 ? '' : 's'}` : undefined,
         more: `<a class="more" href="${repoUrl(repo, 'files', '')}">Browse files →</a>`,
       },
-    )}`,
-    { refresh: true },
+    )}${n ? askBox(repo, '', canAsk, 'these changes', 'Summarise what changed. Anything risky or unfinished?') : ''}`,
+    { refresh: !n, script: SCRIPT },
   );
 }
 
@@ -214,12 +262,18 @@ function diffHtml(text: string): string {
   return `<div class="diff">${rows.join('')}</div>`;
 }
 
-function askBox(repo: CodeRepo, file: string, canAsk: boolean, about: string): string {
+function askBox(
+  repo: CodeRepo,
+  file: string,
+  canAsk: boolean,
+  about: string,
+  placeholder = 'What does this change do? Is it safe to commit?',
+): string {
   if (!repo.askIn) return '';
   if (!canAsk)
     return `<p class="dim" style="margin-top:18px;font-size:13px"><a href="/unlock">Unlock this browser</a> to ask ${esc(about)}.</p>`;
   return `<form class="ask card" data-ask="${repoUrl(repo, 'ask')}" data-path="${esc(file)}">
-<label class="field">Ask about ${esc(about)}<textarea class="input" name="question" required placeholder="What does this change do? Is it safe to commit?"></textarea></label>
+<label class="field">Ask about ${esc(about)}<textarea class="input" name="question" required placeholder="${esc(placeholder)}"></textarea></label>
 <div class="actions"><button type="submit" class="btn">Ask in Slack</button><span class="dim" style="font-size:12.5px">Starts a thread in the project's channel.</span></div></form>`;
 }
 

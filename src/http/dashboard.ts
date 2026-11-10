@@ -1,11 +1,10 @@
-import { closeSync, openSync, readSync } from 'node:fs';
 import type { Project } from '../config/schema.js';
 import type { JobInfo } from '../scheduler/scheduler.js';
 import { formatDuration } from '../slack/format.js';
 import type { Item, SessionOverview, StoredRun } from '../store/store.js';
 import { cronText } from './cron-text.js';
 import { SWITCHER_CSS, TOKENS } from './look.js';
-import { firstPrompt, parseTranscript, type TranscriptEntry, transcriptPath } from './transcript.js';
+import { firstPrompt, type TranscriptEntry } from './transcript.js';
 
 /**
  * Server-rendered pages for people (the same paths answer JSON for tools): a home page with what
@@ -40,6 +39,62 @@ export interface JobView extends JobInfo {
   everyMs?: number;
   /** Home page: the session a running job is working in, for a link to its live transcript. */
   liveSessionId?: string;
+  /** Jobs page: the last 7 days of runs. */
+  week?: JobWeek;
+  /** Jobs page: the queues (`.tara/queues.json`) this job is the executor of. */
+  queues?: string[];
+}
+
+/** A job's last 7 days: how many runs, their cost at API prices, and how long a run that worked takes. */
+export interface JobWeek {
+  runs: number;
+  costUsd: number;
+  /**
+   * 75th percentile of the scheduled runs where the model ran (the first run in each thread, not a
+   * continuation after a card), in whole minutes; set from 3 such runs.
+   */
+  typicalMinutes?: number;
+}
+
+/** Runs of the last 7 days per `project:jobId`. */
+export function jobWeeks(runs: StoredRun[]): Map<string, JobWeek> {
+  const by = new Map<string, StoredRun[]>();
+  for (const r of runs)
+    if (r.kind === 'job' && r.jobId)
+      by.set(`${r.project}:${r.jobId}`, [...(by.get(`${r.project}:${r.jobId}`) ?? []), r]);
+  const out = new Map<string, JobWeek>();
+  for (const [key, list] of by) {
+    // The scheduled run only: a card decision continues the job in the same thread as a later, short
+    // run, which the schedule doesn't plan for. So each thread counts once, by its first run.
+    const firsts = new Map<string, StoredRun>();
+    for (const r of [...list].sort((a, b) => a.startedAt - b.startedAt))
+      if (r.status !== 'silent') {
+        const thread = r.threadKey ?? `run:${r.id}`;
+        if (!firsts.has(thread)) firsts.set(thread, r);
+      }
+    const worked = [...firsts.values()].map((r) => (r.endedAt - r.startedAt) / 60_000).sort((a, b) => a - b);
+    out.set(key, {
+      runs: list.length,
+      costUsd: list.reduce((t, r) => t + (r.costUsd ?? 0), 0),
+      typicalMinutes:
+        worked.length >= 3
+          ? Math.max(1, Math.ceil(worked[Math.floor((worked.length - 1) * 0.75)] as number))
+          : undefined,
+    });
+  }
+  return out;
+}
+
+/** The planned length is far off what runs take: worth a "Use N min" button. */
+export const lengthOff = (planned: number | undefined, typical: number | undefined) =>
+  planned !== undefined && typical !== undefined && Math.abs(planned - typical) >= Math.max(5, planned * 0.5);
+
+/** A repo whose uncommitted changes have waited since an old last commit. */
+export interface StaleRepo {
+  name: string;
+  title: string;
+  files: number;
+  lastCommit: number;
 }
 
 /** How much of Claude's usage window is used, from the CLI's last report or the latest run. */
@@ -62,6 +117,8 @@ export interface HomeData {
   /** Waiting approval cards. */
   pending: Item[];
   usage?: HomeUsage;
+  /** Repos with uncommitted changes and an old last commit (Code page). */
+  staleRepos?: StaleRepo[];
   uptimeSeconds: number;
   now: number;
 }
@@ -278,21 +335,6 @@ function threadLink(ctx: DashboardContext, threadKey: string): string {
 }
 
 /** The first prompt of a session, read from the start of its transcript only (they can be large). */
-function promptPreview(cwd: string, sessionId: string): string | undefined {
-  let fd: number | undefined;
-  try {
-    fd = openSync(transcriptPath(cwd, sessionId), 'r');
-    const buf = Buffer.alloc(64 * 1024);
-    const n = readSync(fd, buf, 0, buf.length, 0);
-    const text = buf.subarray(0, n).toString('utf8');
-    return firstPrompt(parseTranscript(text.slice(0, text.lastIndexOf('\n'))));
-  } catch {
-    return undefined;
-  } finally {
-    if (fd !== undefined) closeSync(fd);
-  }
-}
-
 const CSS = `${TOKENS}
 *{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 var(--font)}
 a{color:var(--accent)}:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
@@ -338,9 +380,18 @@ a.row:hover{border-color:var(--border-light);background:var(--card-hover)}.row .
 .timeline .when{color:var(--text-heading);font-variant-numeric:tabular-nums}
 .timeline li.free{color:var(--text-dim);font-size:13px}.timeline li.free .when{color:var(--text-dim)}
 .timeline li.clash .when{color:var(--amber)}
+.sessions .day{margin:14px 0 2px;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--text-dim)}.sessions .day:first-child{margin-top:0}
+.sessions .row .line{display:block;color:var(--text-dim);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .timeline .what{min-width:0}.timeline .line{display:block;color:var(--text-dim);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .nowbar a{color:var(--text-heading)}.nowbar a:hover{color:var(--accent)}
-.card:target{outline:2px solid var(--accent);outline-offset:2px}.card[id]{scroll-margin-top:72px}
+.card:target{outline:2px solid var(--accent);outline-offset:2px}
+.fold-btn{all:unset;cursor:pointer;display:flex;gap:8px;align-items:baseline;min-width:0}
+.fold-btn::before{content:'▸';color:var(--text-dim);flex:none;transition:transform .15s}.open>* .fold-btn::before,.open .fold-btn::before{transform:rotate(90deg)}
+.fold-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+.live .steps{list-style:none;margin:10px 0 0;padding:0;font-size:13px;display:grid;gap:3px;max-height:360px;overflow:auto}
+.live .steps li{display:flex;gap:10px;overflow-wrap:anywhere}.live .steps li.sub{padding-left:22px}.live .steps li.error{color:var(--red)}.live .steps li.running{color:var(--accent)}
+.live .steps .at{flex:none;min-width:58px;color:var(--text-dim);font-variant-numeric:tabular-nums}
+.live .live-text{margin:10px 0 0;white-space:pre-wrap;font-size:13px;color:var(--text-dim);max-height:180px;overflow:auto}.card[id]{scroll-margin-top:72px}
 .card{background:var(--card-bg);border:1px solid var(--border);border-left:3px solid var(--rc,var(--border-light));border-radius:var(--radius);padding:13px 15px;margin-bottom:10px}
 .card.bad{--rc:var(--red)}.card.warn{--rc:var(--amber)}.card.ok{--rc:var(--green)}.card.accent{--rc:var(--accent)}
 .card-head{display:flex;gap:12px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap}.card-head .grow{flex:1;min-width:0}
@@ -352,6 +403,7 @@ a.row:hover{border-color:var(--border-light);background:var(--card-hover)}.row .
 .strip{display:inline-flex;gap:2px;vertical-align:middle}.strip i{width:9px;height:12px;border-radius:2px;background:var(--border-light)}
 .strip i.ok{background:var(--green)}.strip i.bad{background:var(--red)}
 details{margin-top:8px;font-size:13.5px}summary{cursor:pointer;color:var(--text-dim)}summary:hover{color:var(--text)}
+.views .chip{font-weight:600}.queue-jobs{margin-top:22px}.queue-jobs>summary{cursor:pointer;color:var(--text-dim);font-size:14px;margin-bottom:12px}
 .facts{display:grid;grid-template-columns:110px 1fr;gap:4px 12px;margin:10px 0;font-size:13px}.facts dt{color:var(--text-dim)}.facts dd{margin:0;overflow-wrap:anywhere}
 .runs{list-style:none;margin:0;padding:0;display:grid;gap:2px}
 .runs a{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:6px;color:var(--text);text-decoration:none;font-size:13px}.runs a:hover{background:var(--card-hover)}
@@ -383,7 +435,10 @@ details{margin-top:8px;font-size:13.5px}summary{cursor:pointer;color:var(--text-
 .brand{padding:12px 16px}.menu-btn{display:flex}.sidebar nav,.sidebar .switcher,.sidebar .side-foot{display:none}
 .sidebar.open nav,.sidebar.open .switcher{display:flex}.sidebar.open .side-foot{display:block}
 .main{padding:18px 16px 80px}.main.framed{padding:0}.app-frame{height:calc(100dvh - var(--bar,53px))}.page-head h1{font-size:21px}.timeline li{grid-template-columns:1fr auto}.timeline .when{grid-column:1/-1}
-.input{min-width:0;width:100%}.row{flex-wrap:wrap}.fields{grid-template-columns:1fr}}
+.input{min-width:0;width:100%}.row{flex-wrap:wrap}.fields{grid-template-columns:1fr}
+.jobs-filters .chips{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;margin:0 -16px;padding:0 16px;max-width:calc(100% + 32px)}.jobs-filters .chips::-webkit-scrollbar{display:none}
+.jobs-filters .chips>*{flex:none}.jobs-filters .toolbar{flex-direction:column;align-items:stretch}
+[data-card] .card-head>.actions{width:100%}[data-card] .card-head>.actions .btn{flex:1;justify-content:center;min-height:40px}}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 `;
 
@@ -456,7 +511,8 @@ if (document.body.dataset.refresh) setInterval(() => {
 /** Filters on the jobs page: project, state and search, kept in the URL so a refresh keeps them. */
 const JOBS_SCRIPT = `
 const params = new URLSearchParams(location.search);
-const filter = { project: params.get('project') || '', state: params.get('state') || '', q: params.get('q') || '' };
+const view = params.get('view') || '';
+const filter = { project: params.get('project') || '', state: params.get('state') || '', q: params.get('q') || '', sort: params.get('sort') || '' };
 const cards = [...document.querySelectorAll('[data-card]')];
 const search = document.getElementById('q');
 search.value = filter.q;
@@ -467,28 +523,72 @@ const apply = () => {
     c.hidden = !ok;
     if (ok) shown++;
   }
+  // Most usage: every job in one ranked list. Otherwise the server's order (state, then next run),
+  // with on-demand jobs and the jobs a queue runs back in their own groups.
+  const main = document.querySelector('[data-cards]');
+  const usage = filter.sort === 'usage';
+  cards.sort((a, b) => usage ? Number(b.dataset.usage) - Number(a.dataset.usage) : Number(a.dataset.order) - Number(b.dataset.order));
+  for (const c of cards) ((!usage && document.querySelector('[data-cards="' + c.dataset.group + '"]')) || main).append(c);
+  for (const group of document.querySelectorAll('[data-group-box]')) {
+    const visible = !usage && [...group.querySelectorAll('[data-card]')].some((c) => !c.hidden);
+    group.hidden = !visible;
+    if (visible && group.tagName === 'DETAILS' && (filter.q || filter.state)) group.open = true;
+  }
   document.querySelectorAll('.chip[data-filter]').forEach((b) => { const on = filter[b.dataset.filter] === b.dataset.value; b.classList.toggle('on', on); b.setAttribute('aria-pressed', on); });
   document.getElementById('none').hidden = shown > 0;
   const p = new URLSearchParams(Object.entries(filter).filter(([, v]) => v));
+  if (view) p.set('view', view);
+  document.querySelectorAll('a[data-view]').forEach((a) => {
+    const u = new URL(a.href);
+    if (filter.project) u.searchParams.set('project', filter.project); else u.searchParams.delete('project');
+    a.href = u.pathname + u.search;
+  });
   history.replaceState(null, '', location.pathname + (p.size ? '?' + p : '') + location.hash);
 };
 document.querySelectorAll('.chip[data-filter]').forEach((b) => b.addEventListener('click', () => { filter[b.dataset.filter] = b.dataset.value; apply(); }));
 search.addEventListener('input', () => { filter.q = search.value.trim(); apply(); });
 apply();
+document.addEventListener('click', async (e) => {
+  const c = e.target.closest('button[data-length]');
+  if (c) {
+    const value = prompt('Planned length of "' + c.dataset.name + '" in minutes', c.dataset.minutes);
+    if (value === null) return;
+    const minutes = Number(value);
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 600) return toast('Enter whole minutes, 1 to 600', { error: true });
+    try { await post('/jobs/' + c.dataset.length + '/duration', { minutes }); toast(c.dataset.name + ': ' + minutes + ' min'); reload(); }
+    catch (err) { toast(err.message, { error: true }); }
+    return;
+  }
+  const b = e.target.closest('button[data-duration]');
+  if (!b) return;
+  b.disabled = true;
+  try { await post('/jobs/' + b.dataset.duration + '/duration', { minutes: Number(b.dataset.minutes) }); toast('Planned length set to ' + b.dataset.minutes + ' min'); reload(); }
+  catch (err) { toast(err.message, { error: true }); b.disabled = false; }
+});
 const target = location.hash && document.getElementById(location.hash.slice(1));
-if (target) { target.hidden = false; target.querySelector('details')?.setAttribute('open', ''); target.scrollIntoView({ block: 'center' }); }
+// Links to /jobs#job-… come from every page; an on-demand job's card is on the On demand tab.
+if (location.hash.startsWith('#job-') && !target && !view) location.replace('/jobs?view=on-demand' + location.hash);
+if (target) { target.hidden = false; target.closest('details.queue-jobs')?.setAttribute('open', ''); target.querySelector('details')?.setAttribute('open', ''); target.scrollIntoView({ block: 'center' }); }
 `;
 
-export type Page =
-  | 'Home'
-  | 'Command'
-  | 'Approvals'
-  | 'Queue'
-  | 'Jobs'
-  | 'Schedule'
-  | 'Sessions'
-  | 'Code'
-  | '';
+export type JobsView = 'list' | 'ondemand' | 'timeline';
+
+/**
+ * The Jobs page's three views: List (`/jobs`, scheduled and queue jobs), On demand
+ * (`/jobs?view=on-demand`, jobs started only by hand) and Timeline (`/schedule`, a day of runs).
+ * The project carries over; the jobs pages keep the links current as their filter changes.
+ */
+export const jobViewTabs = (view: JobsView, project?: string) => {
+  const tab = (v: JobsView, path: string, label: string) => {
+    const q = new URLSearchParams(path === '/jobs' && v === 'ondemand' ? { view: 'on-demand' } : {});
+    if (project) q.set('project', project);
+    const href = `${path}${q.size ? `?${q}` : ''}`;
+    return `<a class="chip${view === v ? ' on' : ''}" href="${esc(href)}" data-view="${v}"${view === v ? ' aria-current="page"' : ''}>${label}</a>`;
+  };
+  return `<div class="toolbar"><div class="chips views">${tab('list', '/jobs', 'List')}${tab('ondemand', '/jobs', 'On demand')}${tab('timeline', '/schedule', 'Timeline')}</div></div>`;
+};
+
+export type Page = 'Home' | 'Command' | 'Approvals' | 'Queue' | 'Jobs' | 'Sessions' | 'Code' | '';
 
 /** Projects whose app pages show here as tabs (`tabs` plus `dashboardUrl`). */
 export const tabbed = (projects: Project[]) =>
@@ -527,7 +627,6 @@ export function layout(
       ['/approvals', 'Approvals', '✅', waiting, 'waiting for a decision'],
       ['/queue', 'Queue', '📤', 0, ''],
       ['/jobs', 'Jobs', '⏱️', failing, 'failing jobs'],
-      ['/schedule', 'Schedule', '📅', 0, ''],
       ['/sessions', 'Sessions', '💬', 0, ''],
       ...(ctx.code ? ([['/code', 'Code', '📝', 0, '']] as const) : []),
     ] as const
@@ -593,7 +692,11 @@ const USAGE_WINDOW: Record<string, string> = {
 };
 
 export function homePage(ctx: DashboardContext, data: HomeData): string {
-  const { jobs, now, pending } = data;
+  const { jobs, now } = data;
+  // Notices only tell: one line for them, kept out of the counts and the cards to start with.
+  const pending = data.pending.filter((i) => i.kind !== 'notice');
+  const notices = data.pending.length - pending.length;
+  const runWaits = (i: Item) => i.mode === 'resume' && Boolean(i.jobId);
   const tz = ctx.timeZone;
   const failing = jobs.filter((j) => jobState(j) === 'failing');
   const paused = jobs.filter((j) => !j.enabled);
@@ -660,6 +763,19 @@ export function homePage(ctx: DashboardContext, data: HomeData): string {
 
   const attention = [
     ...approvalRows,
+    ...(data.staleRepos ?? []).map(
+      (r) =>
+        `<a class="row" href="/code/${encodeURIComponent(r.name)}"><span class="dot warn"></span><span class="grow"><span class="title">${esc(r.title)}: ${r.files} ${
+          r.files === 1 ? 'file' : 'files'
+        } uncommitted</span><span class="meta"><span>last commit ${esc(relative(r.lastCommit, now))}</span></span></span><span class="dim">Code →</span></a>`,
+    ),
+    ...(notices
+      ? [
+          `<a class="row" href="/approvals#fyi"><span class="dot dim"></span><span class="grow"><span class="title">${notices} ${
+            notices === 1 ? 'notice' : 'notices'
+          } to glance at</span><span class="meta"><span>for your information, nothing to decide</span></span></span><span class="dim">See →</span></a>`,
+        ]
+      : []),
     ...failing.map(
       (
         j,
@@ -679,18 +795,16 @@ export function homePage(ctx: DashboardContext, data: HomeData): string {
     ),
   ].join('');
 
-  // The cards to start with: those a paused run is waiting on, then the oldest.
+  // The cards to start with: those a paused job run is waiting on, then the oldest.
   const first = [...pending]
-    .sort(
-      (a, b) => (a.mode === 'resume' ? 0 : 1) - (b.mode === 'resume' ? 0 : 1) || a.createdAt - b.createdAt,
-    )
+    .sort((a, b) => Number(runWaits(b)) - Number(runWaits(a)) || a.createdAt - b.createdAt)
     .slice(0, 3)
     .map(
       (i) =>
         `<a class="row" href="/approvals?project=${esc(i.project)}#item-${esc(i.id)}"><span class="dot warn"></span><span class="grow"><span class="title">${esc(
           i.title,
         )}</span><span class="meta">${projectTag(ctx, i.project)}<span>${esc(plural(1, i.kind))}</span>${
-          i.mode === 'resume' ? '<span class="tag warn">a run is waiting</span>' : ''
+          runWaits(i) ? '<span class="tag warn">a run is waiting</span>' : ''
         }<span>${esc(relative(i.createdAt, now))}</span></span></span></a>`,
     )
     .join('');
@@ -744,15 +858,27 @@ ${section(
 )}
 ${first ? section('Start with these', `<div class="todo">${first}</div>`, { more: '<a class="more" href="/approvals">All approvals →</a>' }) : ''}
 ${section('Just ran', ran, { more: '<a class="more" href="/jobs">All jobs →</a>' })}
-${section('Coming up', coming, { more: '<a class="more" href="/schedule">Schedule →</a>' })}`,
+${section('Coming up', coming, { more: '<a class="more" href="/schedule">Timeline →</a>' })}`,
     { refresh: true },
   );
 }
 
 const STATE_ORDER: Record<JobState, number> = { failing: 0, running: 1, ok: 2, new: 2, paused: 3 };
 
-export function jobsPage(ctx: DashboardContext, jobs: JobView[], now = Date.now()): string {
+/** Where a job sits on the jobs page: on a schedule, started by hand, or run by its queue. */
+const group = (j: JobView): 'scheduled' | 'ondemand' | 'queued' =>
+  j.cron ? 'scheduled' : j.queues?.length ? 'queued' : 'ondemand';
+
+export function jobsPage(
+  ctx: DashboardContext,
+  allJobs: JobView[],
+  now = Date.now(),
+  view: 'list' | 'ondemand' = 'list',
+): string {
   const tz = ctx.timeZone;
+  const onDemandView = view === 'ondemand';
+  // List: scheduled and queue jobs. On demand: jobs that run only when started.
+  const jobs = allJobs.filter((j) => (group(j) === 'ondemand') === onDemandView);
   const sorted = [...jobs].sort(
     (a, b) =>
       STATE_ORDER[jobState(a)] - STATE_ORDER[jobState(b)] ||
@@ -762,17 +888,20 @@ export function jobsPage(ctx: DashboardContext, jobs: JobView[], now = Date.now(
   const chip = (key: string, value: string, label: string, n: number) =>
     `<button type="button" class="chip" data-filter="${key}" data-value="${esc(value)}" aria-pressed="false">${esc(label)}<small>${n}</small></button>`;
   const projectChips =
-    ctx.projects.length > 1
+    new Set(jobs.map((j) => j.project)).size > 1
       ? [
           chip('project', '', 'All', jobs.length),
-          ...ctx.projects.map((p) =>
-            chip(
-              'project',
-              p.config.name,
-              p.config.title ?? p.config.name,
-              count((j) => j.project === p.config.name),
+          // Projects with no jobs get no chip.
+          ...ctx.projects
+            .filter((p) => jobs.some((j) => j.project === p.config.name))
+            .map((p) =>
+              chip(
+                'project',
+                p.config.name,
+                p.config.title ?? p.config.name,
+                count((j) => j.project === p.config.name),
+              ),
             ),
-          ),
         ].join('')
       : '';
   const stateChips = [
@@ -786,57 +915,124 @@ export function jobsPage(ctx: DashboardContext, jobs: JobView[], now = Date.now(
       ),
     ),
   ].join('');
+  const sortChips = `<span class="dim">Sort</span>${chip('sort', '', 'Next run', jobs.length).replace(/<small>.*<\/small>/, '')}${chip(
+    'sort',
+    'usage',
+    'Most usage',
+    jobs.length,
+  ).replace(/<small>.*<\/small>/, '')}`;
+  // Usage: the share of all job runs' cost this week (cost is at API prices; a subscription pays none of it).
+  const total = allJobs.reduce((t, j) => t + (j.week?.costUsd ?? 0), 0);
+  const top3 = [...allJobs]
+    .sort((a, b) => (b.week?.costUsd ?? 0) - (a.week?.costUsd ?? 0))
+    .slice(0, 3)
+    .reduce((t, j) => t + (j.week?.costUsd ?? 0), 0);
+  const order = new Map(sorted.map((j, i) => [j, i]));
 
-  const cards = sorted
-    .map((j) => {
-      const state = jobState(j);
-      const streak = failureStreak(j.recent);
-      const next =
-        j.enabled && j.nextRun
-          ? `<span>Next <b>${esc(when(j.nextRun, tz))}</b> (${esc(relative(j.nextRun, now))})</span>`
-          : '';
-      const history = j.recent.length
-        ? `<ul class="runs">${j.recent
-            .map(
-              (r) =>
-                `<li><a href="${runHref(r)}"><span class="dot ${runTone(r.status)}"></span>${esc(when(r.startedAt, tz))}<span class="dim">· ${esc(
-                  RUN_LABEL[r.status] ?? r.status,
-                )} · ${formatDuration(r.endedAt - r.startedAt)}</span></a></li>`,
-            )
-            .join('')}</ul>`
-        : '<div class="empty">No runs yet.</div>';
-      return `<article class="card ${STATE[state].card}" id="${anchor(j)}" data-card data-project="${esc(j.project)}" data-state="${state}" data-q="${esc(
-        `${j.name} ${j.id} ${j.skills.join(' ')}`.toLowerCase(),
-      )}">
+  const card = (j: JobView) => {
+    const state = jobState(j);
+    const week = j.week;
+    const share = total && week?.costUsd ? week.costUsd / total : 0;
+    const usage = week?.runs
+      ? `<span title="Last 7 days. Cost at API prices; on a subscription it counts against the usage limit instead.">${
+          share >= 0.005 ? `≈${Math.round(share * 100)}% of job usage · ` : ''
+        }${week.runs} ${week.runs === 1 ? 'run' : 'runs'}${week.costUsd >= 0.5 ? ` · $${Math.round(week.costUsd)} this week` : ''}</span>`
+      : '';
+    const off = lengthOff(j.durationMinutes, week?.typicalMinutes);
+    const length = off
+      ? `<span class="tag warn">takes ~${week?.typicalMinutes} min (planned ${j.durationMinutes})</span><button type="button" class="btn quiet" data-duration="${esc(j.project)}/${esc(j.id)}" data-minutes="${week?.typicalMinutes}" title="Set the planned length the Timeline uses">Use ${week?.typicalMinutes} min</button>`
+      : '';
+    const streak = failureStreak(j.recent);
+    const next =
+      j.enabled && j.nextRun
+        ? `<span>Next <b>${esc(when(j.nextRun, tz))}</b> (${esc(relative(j.nextRun, now))})</span>`
+        : '';
+    const history = j.recent.length
+      ? `<ul class="runs">${j.recent
+          .map(
+            (r) =>
+              `<li><a href="${runHref(r)}"><span class="dot ${runTone(r.status)}"></span>${esc(when(r.startedAt, tz))}<span class="dim">· ${esc(
+                RUN_LABEL[r.status] ?? r.status,
+              )} · ${formatDuration(r.endedAt - r.startedAt)}</span></a></li>`,
+          )
+          .join('')}</ul>`
+      : '<div class="empty">No runs yet.</div>';
+    return `<article class="card ${STATE[state].card}" id="${anchor(j)}" data-card data-order="${order.get(j)}" data-group="${group(j)}" data-usage="${(week?.costUsd ?? 0).toFixed(2)}" data-project="${esc(j.project)}" data-state="${state}" data-q="${esc(
+      `${j.name} ${j.id} ${j.skills.join(' ')}`.toLowerCase(),
+    )}">
 <div class="card-head"><div class="grow"><div class="title">${esc(j.name)}</div>
-<div class="meta"><span class="tag ${STATE[state].tone}">${STATE[state].label}</span>${projectTag(ctx, j.project)}<span>${esc(
-        j.cron ? cronText(j.cron, j.tz, tz) : 'Runs when its queue has approved items',
-      )}</span></div></div>
-<div class="actions">${actionButton(j, 'run', 'Run now', 'ghost')}${
-        j.enabled ? actionButton(j, 'pause', 'Pause', 'quiet') : actionButton(j, 'resume', 'Resume', 'green')
-      }</div></div>
+<div class="meta"><span class="tag ${STATE[state].tone}">${STATE[state].label}</span>${projectTag(ctx, j.project)}${
+      onDemandView
+        ? '' // the tab already says it
+        : `<span>${esc(j.cron ? cronText(j.cron, j.tz, tz) : 'Runs when its queue has approved items')}</span>`
+    }</div></div>
+<div class="actions">${
+      // An on-demand job has no schedule to pause: Run now is its one action (Resume if a person disabled it).
+      onDemandView
+        ? j.enabled
+          ? actionButton(j, 'run', 'Run now')
+          : actionButton(j, 'resume', 'Resume', 'green')
+        : `${actionButton(j, 'run', 'Run now', 'ghost')}${
+            j.enabled
+              ? actionButton(j, 'pause', 'Pause', 'quiet')
+              : actionButton(j, 'resume', 'Resume', 'green')
+          }`
+    }</div></div>
 <div class="meta">${next}<span>Last run ${esc(relative(j.lastRunAt, now))}</span>${runStrip(j.recent, tz)}${
-        streak > 1 ? `<span class="tag bad">${streak} failures in a row</span>` : ''
-      }</div>
+      streak > 1 ? `<span class="tag bad">${streak} failures in a row</span>` : ''
+    }</div>
+${usage || length ? `<div class="meta">${usage}${length}</div>` : ''}
 ${state === 'failing' && j.lastError ? `<div class="meta error">Last error: ${esc(j.lastError)}</div>` : ''}
 <details><summary>Details and run history</summary><dl class="facts">
 <dt>Skills</dt><dd>${j.skills.length ? esc(j.skills.join(', ')) : '—'}</dd>
 <dt>Runs first</dt><dd>${j.preScript ? `<code>${esc(j.preScript)}</code>` : 'Nothing: the model starts straight away'}</dd>
 <dt>Model</dt><dd>${j.harness === 'agy' ? 'agy (Antigravity CLI) · ' : ''}${esc(j.model)}</dd>
-${j.durationMinutes ? `<dt>Usual length</dt><dd>${j.durationMinutes} min</dd>` : ''}
-<dt>Schedule</dt><dd>${j.cron ? `<code>${esc(j.cron)}</code> ${esc(j.tz)}` : 'none (a queue executor)'}</dd>
+<dt>Length</dt><dd>${j.durationMinutes ? `${j.durationMinutes} min planned` : 'not planned'}${week?.typicalMinutes ? ` · ~${week.typicalMinutes} min in the last 7 days` : ''} <button type="button" class="btn quiet" data-length="${esc(j.project)}/${esc(j.id)}" data-name="${esc(j.name)}" data-minutes="${j.durationMinutes ?? week?.typicalMinutes ?? ''}" title="The planned length the Timeline uses for overlaps and free time">Change</button></dd>
+<dt>Schedule</dt><dd>${
+      j.cron
+        ? `<code>${esc(j.cron)}</code> ${esc(j.tz)}`
+        : j.queues?.length
+          ? `none (executor of the ${esc(j.queues.join(', '))} ${j.queues.length === 1 ? 'queue' : 'queues'})`
+          : 'none (on demand: Run now, or ask in chat)'
+    }</dd>
 <dt>Job id</dt><dd><code>${esc(j.id)}</code></dd></dl>${history}</details></article>`;
-    })
-    .join('');
+  };
+  // Jobs a queue runs when it has approved items are folded at the bottom of List.
+  const main = sorted.filter((j) => group(j) !== 'queued');
+  const queued = sorted.filter((j) => group(j) === 'queued');
+  const jobsThatRun = (n: number) => `${n} ${n === 1 ? 'job that runs' : 'jobs that run'}`;
+  const cards = `<div data-cards>${main.map(card).join('')}</div>${
+    queued.length
+      ? `<details class="queue-jobs" data-group-box><summary>Run by a queue · ${jobsThatRun(queued.length)} when ${queued.length === 1 ? 'its' : 'their'} queue has approved items</summary><div data-cards="queued">${queued.map(card).join('')}</div></details>`
+      : ''
+  }`;
 
   return layout(
     ctx,
     'Jobs',
     'Jobs',
-    `${pageHead('Jobs', `Every scheduled job${ctx.projects.length > 1 ? `, across ${ctx.projects.length} projects` : ''}. Times in ${esc(tz)}.`)}
+    `${pageHead(
+      'Jobs',
+      onDemandView
+        ? `Jobs that never run on a schedule: start one with Run now, or ask for it in Slack. It posts in the project's channel. Times in ${esc(tz)}.`
+        : `Every scheduled job${ctx.projects.length > 1 ? `, across ${ctx.projects.length} projects` : ''}. Times in ${esc(tz)}.${
+            total >= 1
+              ? ` Last 7 days: ≈$${Math.round(total)} of usage at API prices; the top 3 jobs used ${Math.round((top3 / total) * 100)}%.`
+              : ''
+          }`,
+    )}
+${jobViewTabs(view)}
+<div class="jobs-filters">
 ${projectChips ? `<div class="toolbar"><div class="chips">${projectChips}</div></div>` : ''}
-<div class="toolbar"><div class="chips">${stateChips}</div><input id="q" class="input" type="search" placeholder="Search jobs" aria-label="Search jobs"></div>
-${cards}<div id="none" class="empty" hidden>${jobs.length ? 'No jobs match.' : 'No scheduled jobs.'}</div>`,
+<div class="toolbar">${onDemandView ? '' : `<div class="chips">${stateChips}</div><div class="chips">${sortChips}</div>`}<input id="q" class="input" type="search" placeholder="Search jobs" aria-label="Search jobs"></div>
+</div>
+${cards}<div id="none" class="empty" hidden>${
+      jobs.length
+        ? 'No jobs match.'
+        : onDemandView
+          ? 'No on-demand jobs. A job with no <code>cron</code> that no queue runs shows here.'
+          : 'No scheduled jobs.'
+    }</div>`,
     { refresh: true, script: JOBS_SCRIPT },
   );
 }
@@ -877,6 +1073,13 @@ export function sessionsPage(
   sessions: SessionOverview[],
   jobNames: Map<string, string>,
   filter: { project?: string; kind?: string },
+  opts: {
+    /** A session's first message (chats), read from its transcript. */
+    preview?: (project: string, sessionId: string) => string | undefined;
+    /** Slack threads with a run working in them now. */
+    runningThreads?: Set<string>;
+    now?: number;
+  } = {},
 ): string {
   const chips = (key: 'project' | 'kind', values: [string, string][]) =>
     values
@@ -887,22 +1090,62 @@ export function sessionsPage(
         return `<a class="chip${on ? ' on' : ''}" href="/sessions${params.size ? `?${params}` : ''}"${on ? ' aria-current="true"' : ''}>${esc(label)}</a>`;
       })
       .join('');
-  const dirs = new Map(ctx.projects.map((p) => [p.config.name, p.dir]));
+  const tz = ctx.timeZone;
+  const now = opts.now ?? Date.now();
+  // A session belongs to a job when its runs do (a learning turn after it carries the job's id too).
+  // A job prompt starts with its pre-run check's output: a session with no recorded run (stopped by
+  // a restart) is still recognisable as a job's.
+  const jobPrompt = (s: SessionOverview) =>
+    opts.preview?.(s.project, s.sessionId)?.startsWith('## Script ') ?? false;
+  const kindOf = (s: SessionOverview) => (s.jobId || s.lastRun?.jobId || jobPrompt(s) ? 'job' : 'chat');
+  const dayOf = (ms: number) => new Date(ms).toLocaleDateString('en-CA', { timeZone: tz });
+  const today = dayOf(now);
+  const yesterday = dayOf(now - 86_400_000);
+  const dayLabel = (key: string, ms: number) =>
+    key === today
+      ? 'Today'
+      : key === yesterday
+        ? 'Yesterday'
+        : new Date(ms).toLocaleDateString('en-GB', {
+            timeZone: tz,
+            weekday: 'short',
+            day: 'numeric',
+            month: 'short',
+          });
+  let lastDay = '';
   const rows = sessions
-    .filter((s) => !filter.kind || (s.lastRun?.kind ?? 'chat') === filter.kind)
+    .filter((s) => !filter.kind || kindOf(s) === filter.kind)
     .map((s) => {
       const run = s.lastRun;
-      const kind = run?.kind ?? 'chat';
-      const jobName = run?.jobId ? (jobNames.get(`${s.project}:${run.jobId}`) ?? run.jobId) : undefined;
+      const kind = kindOf(s);
+      const at = run?.startedAt ?? s.updatedAt;
+      const jobId = s.jobId ?? run?.jobId;
+      const jobName = jobId ? (jobNames.get(`${s.project}:${jobId}`) ?? jobId) : undefined;
+      // A chat's title is its message's first line (tara-agent adds context below it).
+      const message = opts
+        .preview?.(s.project, s.sessionId)
+        ?.split('\n')
+        .find((l) => l.trim());
       const title =
         kind === 'job'
-          ? jobName
-          : (promptPreview(dirs.get(s.project) ?? '', s.sessionId) ?? '(no message yet)');
-      return `<a class="row" href="/sessions/${esc(s.sessionId)}"><span class="dot ${run ? runTone(run.status) : 'dim'}"></span><span class="grow">
-<span class="title">${kind === 'job' ? '⏱ ' : '💬 '}${esc((title ?? '').slice(0, 160))}</span>
-<span class="meta">${projectTag(ctx, s.project)}${runTag(run?.status)}
-<span>${s.turns} ${s.turns === 1 ? 'turn' : 'turns'}</span><span>${esc(when(run?.startedAt ?? s.updatedAt, ctx.timeZone))}</span>
-${run ? `<span>${formatDuration(run.endedAt - run.startedAt)}</span>` : ''}</span></span></a>`;
+          ? (jobName ?? 'A job run with no record (stopped before it finished?)')
+          : (message ?? '(no message yet)');
+      // What happened: a job run's first line, or "replied in Slack" when the last turn was a reply.
+      const line =
+        kind === 'job' && run ? (run.jobId ? headline(run) : 'Last: a reply in its Slack thread') : '';
+      const running = opts.runningThreads?.has(s.threadKey);
+      const key = dayOf(at);
+      const heading = key !== lastDay ? `<h3 class="day" data-day>${esc(dayLabel(key, at))}</h3>` : '';
+      lastDay = key;
+      return `${heading}<a class="row" href="/sessions/${esc(s.sessionId)}" data-q="${esc(
+        `${title ?? ''} ${line} ${jobId ?? ''} ${projectTitle(ctx, s.project)}`.toLowerCase(),
+      )}"><span class="dot ${running ? '' : run ? runTone(run.status) : 'dim'}"></span><span class="grow">
+<span class="title">${kind === 'job' ? '⏱ ' : '💬 '}${esc((title ?? '').slice(0, 160))}</span>${
+        line ? `<span class="line">${esc(line)}</span>` : ''
+      }
+<span class="meta">${projectTag(ctx, s.project)}${running ? '<span class="tag">● running</span>' : runTag(run?.status)}
+<span>${s.turns} ${s.turns === 1 ? 'turn' : 'turns'}</span><span>${esc(clock(at, tz))}</span>
+${run && !running ? `<span>${formatDuration(run.endedAt - run.startedAt)}</span>` : ''}</span></span></a>`;
     })
     .join('');
   const filtered = Boolean(filter.project || filter.kind);
@@ -922,10 +1165,29 @@ ${run ? `<span>${formatDuration(run.endedAt - run.startedAt)}</span>` : ''}</spa
       ['', 'Chats and jobs'],
       ['chat', 'Chats'],
       ['job', 'Jobs'],
-    ])}</div></div>
-<div class="todo">${rows || `<div class="empty">${filtered ? 'No sessions match.' : 'No sessions yet.'}</div>`}</div>`,
+    ])}</div><input id="sq" class="input" type="search" placeholder="Search sessions" aria-label="Search sessions"></div>
+<div class="todo sessions">${rows || `<div class="empty">${filtered ? 'No sessions match.' : 'No sessions yet.'}</div>`}</div><div id="none" class="empty" hidden>No sessions match.</div>`,
+    { script: SESSIONS_SCRIPT },
   );
 }
+
+/** The Sessions search: filters the rows as you type and hides day headings left empty. */
+const SESSIONS_SCRIPT = `
+const sq = document.getElementById('sq');
+sq?.addEventListener('input', () => {
+  const q = sq.value.trim().toLowerCase();
+  let shown = 0, day = null, dayShown = 0;
+  const close = () => { if (day) day.hidden = dayShown === 0; };
+  for (const el of document.querySelectorAll('.sessions > *')) {
+    if (el.matches('[data-day]')) { close(); day = el; dayShown = 0; continue; }
+    const ok = !q || (el.dataset.q || '').includes(q);
+    el.hidden = !ok;
+    if (ok) { shown++; dayShown++; }
+  }
+  close();
+  document.getElementById('none').hidden = shown > 0;
+});
+`;
 
 function entryHtml(e: TranscriptEntry, timeZone: string): string {
   const time = e.time ? ` · ${esc(when(e.time, timeZone))}` : '';
@@ -957,8 +1219,10 @@ export function sessionPage(
     jobName?: string;
     /** The session's latest run: its error, and its reply when there is no transcript. */
     run?: StoredRun;
-    /** A run is working in this session now: the page shows so and refreshes itself. */
+    /** A run is working in this session now: the page shows its steps as they happen. */
     running?: boolean;
+    /** This browser may stop the run (unlocked, from another device). */
+    canStop?: boolean;
   } = {},
 ): string {
   const { run, running } = opts;
@@ -985,9 +1249,70 @@ export function sessionPage(
     ? entries.map((e) => entryHtml(e, ctx.timeZone)).join('')
     : run?.output
       ? `<div class="empty">No transcript for this session on this machine (old, or run on another CLI). The run's reply:</div><div class="msg">${md(run.output)}</div>`
-      : `<div class="empty">${running ? 'Starting… this page refreshes every minute.' : 'No transcript for this session on this machine.'}</div>`;
-  return layout(ctx, title, 'Sessions', `${pageHead(title)}${head}${error}${body}`, { refresh: running });
+      : `<div class="empty">${running ? 'The transcript shows here when the run ends.' : 'No transcript for this session on this machine.'}</div>`;
+  // While it runs: its steps and the end of what it is writing, polled; the page reloads when it ends.
+  const live = running
+    ? `<section class="card accent live" id="live" data-session="${esc(sessionId)}" aria-live="polite"><div class="card-head"><div class="grow"><div class="title">● Working <span class="dim" id="live-clock"></span></div><div class="meta" id="live-meta">Connecting…</div></div>${
+        opts.canStop
+          ? '<div class="actions"><button type="button" class="btn danger" id="live-stop">Stop</button></div>'
+          : '<div class="actions"><a class="btn quiet" href="/unlock" title="Unlock this browser to stop runs from here">Unlock to stop</a></div>'
+      }</div><ol class="steps" id="live-steps"></ol><pre class="live-text" id="live-text" hidden></pre></section>`
+    : '';
+  return layout(ctx, title, 'Sessions', `${pageHead(title)}${head}${error}${live}${body}`, {
+    script: running ? LIVE_SCRIPT : undefined,
+  });
 }
+
+/** The running session's live card: polls `/sessions/<id>/live`, Stop posts `/sessions/<id>/stop`. */
+const LIVE_SCRIPT = `
+(() => {
+  const box = document.getElementById('live');
+  if (!box) return;
+  const url = '/sessions/' + encodeURIComponent(box.dataset.session);
+  const $ = (id) => document.getElementById(id);
+  const fmt = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return Math.floor(s / 60) + 'm ' + String(s % 60).padStart(2, '0') + 's'; };
+  let started = 0, misses = 0;
+  setInterval(() => { if (started) $('live-clock').textContent = fmt(Date.now() - started); }, 1000);
+  async function poll() {
+    try {
+      const r = await fetch(url + '/live');
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error);
+      if (!j.running) return location.reload();
+      misses = 0;
+      const t = j.task;
+      started = t.startedAt;
+      $('live-meta').textContent = t.stepCount + (t.stepCount === 1 ? ' step' : ' steps') + (t.stepCount > t.steps.length ? ' · the latest ' + t.steps.length + ' shown' : '');
+      const list = $('live-steps');
+      const atEnd = list.scrollTop + list.clientHeight >= list.scrollHeight - 8;
+      list.replaceChildren(...t.steps.map((s) => {
+        const li = document.createElement('li');
+        li.className = s.state + (s.depth ? ' sub' : '');
+        const at = document.createElement('span');
+        at.className = 'at';
+        at.textContent = fmt(s.at - t.startedAt);
+        li.append(at, (s.state === 'error' ? '✗ ' : s.state === 'running' ? '… ' : '') + s.text);
+        return li;
+      }));
+      if (atEnd) list.scrollTop = list.scrollHeight;
+      $('live-text').hidden = !t.text;
+      $('live-text').textContent = t.text;
+    } catch {
+      $('live-meta').textContent = 'Lost touch with the run; retrying…';
+      if (++misses > 20) return;
+    }
+    setTimeout(poll, document.hidden ? 10000 : 2500);
+  }
+  poll();
+  const stop = $('live-stop');
+  stop?.addEventListener('click', async () => {
+    if (!(await ask('Stop this run?', 'The work so far stays, and its Slack thread says it stopped.', 'Stop', true))) return;
+    stop.disabled = true;
+    try { await post(url + '/stop'); toast('Stopping…'); }
+    catch (err) { toast(err.message, { error: true }); stop.disabled = false; }
+  });
+})();
+`;
 
 /** 404 and 500 pages, inside the normal layout so the way back is always there. */
 /**

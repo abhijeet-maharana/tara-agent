@@ -300,8 +300,8 @@ export const projectConfigSchema = z.object({
   /** Extra system prompt appended to every session, relative to the repo root. */
   systemPromptFile: z.string().optional(),
   /**
-   * Slack user who owns this project: jobs started from the local API or a dashboard stream their
-   * thread live to this person (jobs started from Slack stream to whoever asked).
+   * Slack user who owns this project: scheduled, queue, API and dashboard job runs address their live
+   * thread stream to this person (jobs started from Slack stream to whoever asked).
    */
   owner: z
     .string()

@@ -25,7 +25,7 @@ import { type IncomingMessage as ChatMessage, type Logger, threadKey } from '../
 import { ITEM_STATUSES, type ItemStatus, type Store } from '../store/store.js';
 import { addDays, dayKey, midnight } from '../util/time.js';
 import { allowList } from './access.js';
-import { type ApprovalsTab, approvalsPage, unlockPage } from './approvals.js';
+import { type ApprovalsTab, approvalsPage, ITEMS_LIMIT, isNotice, unlockPage } from './approvals.js';
 import {
   codeDiffPage,
   codeFilePage,
@@ -33,6 +33,7 @@ import {
   codeRepoPage,
   codeSearchPage,
   codeTreePage,
+  staleWork,
 } from './code.js';
 import { commandPage } from './command-page.js';
 import {
@@ -43,7 +44,9 @@ import {
   type JobView,
   jobState,
   jobsPage,
+  jobWeeks,
   runPage,
+  type StaleRepo,
   sessionPage,
   sessionsPage,
   tabbed,
@@ -51,7 +54,7 @@ import {
 } from './dashboard.js';
 import { queuePage } from './queue.js';
 import { isDayKey, MAX_RUNS_PER_DAY, type PlanJob, planDay, schedulePage } from './schedule.js';
-import { readTranscript } from './transcript.js';
+import { firstPromptOf, readTranscript } from './transcript.js';
 
 export interface HttpOptions {
   bind: string;
@@ -98,8 +101,11 @@ export interface HttpOptions {
   };
   /** What needs the owner (`GET /attention`). */
   attention?: () => Promise<Attention>;
-  /** Live Claude runs: links to a running job's transcript, and the usage figure on the home page. */
-  activity?: Pick<Activity, 'tasks' | 'usage'>;
+  /**
+   * Live Claude runs: a running session's steps (and Stop) on its page, links to a running job's
+   * transcript, and the usage figure on the home page.
+   */
+  activity?: Pick<Activity, 'tasks' | 'usage' | 'stop'>;
   /**
    * A second, HTTPS listener on the same address (browsers only allow the microphone over HTTPS).
    * The certificate is re-read when its file changes.
@@ -314,11 +320,90 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     return undefined;
   };
 
+  /** First messages of sessions, for the Sessions list: a session's first prompt never changes. */
+  const previews = new Map<string, string>();
+  const preview = (project: string, sessionId: string) => {
+    const known = previews.get(sessionId);
+    if (known !== undefined) return known;
+    const dir = options.dashboard?.projects.find((p) => p.config.name === project)?.dir;
+    const found = dir ? firstPromptOf(dir, sessionId, undefined, options.readAs) : undefined;
+    if (found !== undefined) {
+      if (previews.size >= 5000) previews.clear(); // transcripts are kept 14 days: far fewer sessions
+      previews.set(sessionId, found);
+    }
+    return found;
+  };
+
+  /** The queues each job is the executor of, so the jobs page can tell queue jobs from on-demand ones. */
+  const queueExecutors = (name: string): Map<string, string[]> => {
+    const byJob = new Map<string, string[]>();
+    const project = options.dashboard?.projects.find((x) => x.config.name === name);
+    if (!project) return byJob;
+    let configs: Record<string, QueueConfig>;
+    try {
+      configs = (options.queueConfig ?? loadQueues)(project);
+    } catch {
+      return byJob;
+    }
+    for (const [queue, q] of Object.entries(configs))
+      if ('job' in q.executor) byJob.set(q.executor.job, [...(byJob.get(q.executor.job) ?? []), queue]);
+    return byJob;
+  };
+
+  /**
+   * A project's queue slots in [start, end) as planned runs of the queue's job: a queue with `slots`
+   * runs its executor job at each one when something is approved (its own items or those of a queue
+   * that `fills` it). Queues with windows, or run elsewhere, have no fixed times to draw.
+   */
+  const queueSlots = (name: string, start: number, end: number): PlanJob[] => {
+    const project = options.dashboard?.projects.find((x) => x.config.name === name);
+    if (!project) return [];
+    let configs: Record<string, QueueConfig>;
+    try {
+      configs = (options.queueConfig ?? loadQueues)(project);
+    } catch {
+      return [];
+    }
+    const info = new Map(options.scheduler.list(name).map((j) => [j.id, j]));
+    const approved = options.store.items({ project: name, statuses: ['approved'], limit: 1000 });
+    return Object.entries(configs).flatMap(([queue, q]): PlanJob[] => {
+      if (!q.slots || q.fills || !('job' in q.executor)) return [];
+      const id = q.executor.job;
+      const clock = new Cron(q.slots, { timezone: q.tz ?? timeZone, paused: true });
+      const starts: number[] = [];
+      for (
+        let next = clock.nextRun(new Date(start - 1));
+        next && next.getTime() < end;
+        next = clock.nextRun(next)
+      ) {
+        starts.push(next.getTime());
+        if (starts.length > MAX_RUNS_PER_DAY) break;
+      }
+      const waiting = approved.filter(
+        (i) => i.queue === queue || configs[i.queue ?? '']?.fills === queue,
+      ).length;
+      return starts.length
+        ? [
+            {
+              project: name,
+              id,
+              name: info.get(id)?.name ?? id,
+              durationMinutes: info.get(id)?.durationMinutes,
+              starts,
+              queue,
+              waiting,
+            },
+          ]
+        : [];
+    });
+  };
+
   /** One calendar day of every (or one) project's planned runs, matched with the runs that happened. */
   const dayPlan = (day: string, project?: string) => {
     const start = midnight(day, timeZone);
     const end = midnight(addDays(day, 1), timeZone);
-    const jobs: PlanJob[] = (project ? [project] : options.projects).flatMap((p) => {
+    const names = project ? [project] : options.projects;
+    const jobs: PlanJob[] = names.flatMap((p) => {
       const info = new Map(options.scheduler.list(p).map((j) => [j.id, j]));
       return options.scheduler.plannedRuns(p, start, end, MAX_RUNS_PER_DAY).map(({ id, starts }) => ({
         project: p,
@@ -329,11 +414,30 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       }));
     });
     return planDay(
-      jobs,
+      [...jobs, ...names.flatMap((p) => queueSlots(p, start, end))],
       options.store.runsSince(start - 3_600_000).filter((r) => r.kind === 'job'),
       start,
       end,
     );
+  };
+
+  /** The session a running job works in (from its live task's thread), for a link to its transcript. */
+  const liveJobSession = (project: string, jobId: string) => {
+    const task = options.activity
+      ?.tasks()
+      .find((t) => t.status === 'running' && t.kind === 'job' && t.project === project && t.jobId === jobId);
+    return task?.thread
+      ? options.store.getSession(threadKey(task.thread.channel, task.thread.ts))?.sessionId
+      : undefined;
+  };
+
+  /** The task working in a session's thread now, else the latest finished one there (newest first). */
+  const liveTask = (sessionId: string) => {
+    const key = options.store.sessionsOverview({ sessionId, limit: 1 })[0]?.threadKey;
+    if (!key) return undefined;
+    return options.activity
+      ?.tasks()
+      .find((t) => t.thread && threadKey(t.thread.channel, t.thread.ts) === key);
   };
 
   const approvals = options.approvals;
@@ -461,6 +565,18 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         const entries = transcript(id);
         if (!entries) throw new HttpError(404, 'No transcript for this session on this host');
         return { sessionId: id, entries };
+      }
+      if (method === 'GET' && parts.length === 3 && parts[2] === 'live') {
+        const task = liveTask(id);
+        return { running: task?.status === 'running', task: task ?? null };
+      }
+      // The session page's Stop: ends the run as "stop" in its Slack thread would.
+      if (method === 'POST' && parts.length === 3 && parts[2] === 'stop') {
+        human(req);
+        const task = liveTask(id);
+        if (task?.status !== 'running' || !options.activity?.stop(task.id))
+          throw new HttpError(409, 'Nothing is running in this session');
+        return { ok: true };
       }
       if (method === 'POST' && parts.length === 3 && parts[2] === 'message') {
         const given = req.headers['x-tara-admin'];
@@ -598,6 +714,17 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
           }),
         };
       }
+      // A note about a waiting card without deciding it: to Jarvis in the card's Slack thread.
+      if (method === 'POST' && parts.length === 3 && parts[2] === 'note') {
+        const by = human(req);
+        const id = parts[1] as string;
+        const text = str((await readJson(req)).text)
+          ?.trim()
+          .slice(0, 4_000);
+        if (!text) throw new HttpError(400, '"text" is required');
+        await approvals.note(id, text, owner(id) ?? by);
+        return { ok: true };
+      }
       if (method === 'POST' && parts.length === 3 && parts[2] === 'withdraw') {
         const body = await readJson(req);
         return { item: approvals.withdraw(parts[1] as string, str(body.reason)) };
@@ -696,6 +823,21 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         // The diff goes to Claude only: the thread shows the question.
         const diff = change ? (await reader.diff(target)).text.split('\n').slice(0, 400).join('\n') : '';
         const where = target ? `\`${target}\` in ${reader.repo.title}` : reader.repo.title;
+        // About the whole repo: the list of what changed (Claude reads the diffs itself, read-only).
+        if (!target) {
+          const all = (await reader.status()).changes;
+          const lines = all
+            .slice(0, 300)
+            .map((c) => `${c.state.padEnd(9)} ${c.path} (+${c.added} −${c.removed})`)
+            .join('\n');
+          return ask(
+            reader.repo,
+            `📄 ${reader.repo.title}: ${question}`,
+            `${question}\n\nAbout the uncommitted changes in the repo ${reader.repo.dir} (${all.length} files${
+              all.length > 300 ? ', the first 300 listed' : ''
+            }; run \`git diff\` there to read them). Only read and answer: don't commit, stage or change files.\n\`\`\`\n${lines}\n\`\`\``,
+          );
+        }
         return ask(
           reader.repo,
           `📄 ${where}: ${question}`,
@@ -846,8 +988,10 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       agentName: dash.agentName,
       slackUrl: dash.slackUrl?.(),
       hostName: dash.hostName,
+      // Notices only tell: they aren't waiting for a decision.
       waiting: options.approvals
-        ? options.store.items({ statuses: ['pending'], limit: 500 }).length
+        ? options.store.items({ statuses: ['pending'], limit: ITEMS_LIMIT }).filter((i) => !isNotice(i))
+            .length
         : undefined,
       failing: options.projects
         .flatMap((p) => options.scheduler.list(p))
@@ -867,7 +1011,23 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     }
   };
 
-  const page = (req: IncomingMessage, ctx: DashboardContext): string | undefined => {
+  /** Repos whose uncommitted changes have waited a while (the Code page's readers, cached), for Home. */
+  const staleRepos = async (at: number): Promise<StaleRepo[]> => {
+    const readers = options.code?.readers ?? [];
+    const statuses = await Promise.all(readers.map((r) => r.status().catch(() => undefined)));
+    return readers.flatMap((r, i) => {
+      const s = statuses[i];
+      return s && staleWork(s, at) && s.head
+        ? [{ name: r.repo.name, title: r.repo.title, files: s.changes.length, lastCommit: s.head.at }]
+        : [];
+    });
+  };
+
+  const page = (
+    req: IncomingMessage,
+    ctx: DashboardContext,
+    extra: { staleRepos?: StaleRepo[] } = {},
+  ): string | undefined => {
     const url = new URL(req.url ?? '/', 'http://localhost');
     const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
     const names = ctx.projects.map((p) => p.config.name);
@@ -882,19 +1042,29 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       parts.length === 0 && (url.searchParams.has('project') || url.searchParams.has('kind'));
     if ((parts[0] === 'sessions' && parts.length === 1) || oldSessionsLink) {
       const project = url.searchParams.get('project') ?? undefined;
-      return sessionsPage(ctx, options.store.sessionsOverview({ project, limit: 200 }), jobNames(), {
-        project,
-        kind: url.searchParams.get('kind') ?? undefined,
-      });
+      const runningThreads = new Set(
+        (options.activity?.tasks() ?? [])
+          .filter((t) => t.status === 'running' && t.thread)
+          .map((t) => threadKey(t.thread?.channel ?? '', t.thread?.ts ?? '')),
+      );
+      return sessionsPage(
+        ctx,
+        options.store.sessionsOverview({ project, limit: 200 }),
+        jobNames(),
+        { project, kind: url.searchParams.get('kind') ?? undefined },
+        { preview, runningThreads, now: now() },
+      );
     }
     const jobViews = (): JobView[] =>
-      names.flatMap((project) =>
-        options.scheduler.list(project).map((job) => ({
+      names.flatMap((project) => {
+        const runBy = queueExecutors(project);
+        return options.scheduler.list(project).map((job) => ({
           ...job,
           project,
           recent: options.store.jobRuns(project, job.id, RECENT_RUNS),
-        })),
-      );
+          queues: runBy.get(job.id),
+        }));
+      });
     if (parts.length === 0) {
       const at = now();
       const runs = options.store.recentJobRuns(400);
@@ -905,21 +1075,11 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
           const gap = (starts[1] ?? Infinity) - (starts[0] ?? 0);
           if (gap <= FREQUENT_MS) every.set(`${p}:${id}`, gap);
         }
-      const tasks = options.activity?.tasks() ?? [];
-      // A running job's transcript, from the session its thread holds right now.
-      const liveSession = (project: string, jobId: string) => {
-        const task = tasks.find(
-          (t) => t.status === 'running' && t.kind === 'job' && t.project === project && t.jobId === jobId,
-        );
-        return task?.thread
-          ? options.store.getSession(threadKey(task.thread.channel, task.thread.ts))?.sessionId
-          : undefined;
-      };
       return homePage(ctx, {
         jobs: jobViews().map((j) => ({
           ...j,
           everyMs: every.get(`${j.project}:${j.id}`),
-          liveSessionId: j.running ? liveSession(j.project, j.id) : undefined,
+          liveSessionId: j.running ? liveJobSession(j.project, j.id) : undefined,
         })),
         // Each job's latest run that did something, so a job that ran three times doesn't fill the list.
         latest: runs
@@ -927,8 +1087,9 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
           .filter((r, i, all) => all.findIndex((x) => x.project === r.project && x.jobId === r.jobId) === i)
           .slice(0, 8),
         quietRuns: runs.filter((r) => r.status === 'silent' && r.startedAt >= at - DAY_MS).length,
-        pending: options.approvals ? options.store.items({ statuses: ['pending'], limit: 500 }) : [],
+        pending: options.approvals ? options.store.items({ statuses: ['pending'], limit: ITEMS_LIMIT }) : [],
         usage: usageNow(at),
+        staleRepos: extra.staleRepos,
         uptimeSeconds: Math.floor((at - started) / 1000),
         now: at,
       });
@@ -956,6 +1117,13 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
           approved: options.store.items({ project, statuses: ['approved'], limit: 1000 }),
           running: options.store.items({ project, statuses: ['running'], limit: 100 }),
           pending: options.store.items({ project, statuses: ['pending'], limit: 500 }),
+          // What went out lately, for each queue's "last out".
+          finished: options.store.items({
+            project,
+            statuses: ['done', 'failed'],
+            since: at - 14 * DAY_MS,
+            limit: ITEMS_LIMIT,
+          }),
           queues,
           canDecide: canDecide(req),
           now: at,
@@ -967,13 +1135,14 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       };
       const since = (t: ApprovalsTab) => (t === 'done' ? at - DONE_DAYS * 86_400_000 : undefined);
       const list = (t: ApprovalsTab) =>
-        options.store.items({ project, statuses: STATUSES[t], since: since(t), limit: 500 });
+        options.store.items({ project, statuses: STATUSES[t], since: since(t), limit: ITEMS_LIMIT });
       return approvalsPage(ctx, {
         tab,
         project,
         kind: url.searchParams.get('kind') ?? undefined,
         items: list(tab),
-        counts: { waiting: list('waiting').length, done: list('done').length },
+        counts: { waiting: list('waiting').filter((i) => !isNotice(i)).length, done: list('done').length },
+        jobNames: jobNames(),
         queues,
         canDecide: canDecide(req),
         now: at,
@@ -986,7 +1155,19 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       const day = url.searchParams.get('day');
       const project = projectParam();
       const chosen = isDayKey(day) ? day : today;
-      return schedulePage(ctx, dayPlan(chosen, project), { day: chosen, today, project, now: at });
+      // Running jobs, each with the session to watch it in.
+      const running = new Map<string, string | undefined>();
+      for (const p of names)
+        for (const j of options.scheduler.list(p))
+          if (j.running) running.set(`${p}:${j.id}`, liveJobSession(p, j.id));
+      return schedulePage(ctx, dayPlan(chosen, project), {
+        day: chosen,
+        today,
+        project,
+        now: at,
+        running,
+        projectsWithJobs: names.filter((p) => options.scheduler.list(p).length > 0),
+      });
     }
     if (parts[0] === 'sessions' && parts.length === 2) {
       const id = parts[1] as string;
@@ -998,20 +1179,24 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       // Sessions whose thread was cleared are still on disk: look in every project.
       const entries = transcript(id, dir);
       const jobName = run?.jobId ? jobNames().get(`${run.project}:${run.jobId}`) : undefined;
-      const running = Boolean(
-        session &&
-          options.activity
-            ?.tasks()
-            .some(
-              (t) =>
-                t.status === 'running' &&
-                t.thread &&
-                threadKey(t.thread.channel, t.thread.ts) === session.threadKey,
-            ),
-      );
-      return sessionPage(ctx, session, id, entries, { jobName, run, running });
+      const running = liveTask(id)?.status === 'running';
+      return sessionPage(ctx, session, id, entries, {
+        jobName,
+        run,
+        running,
+        canStop: running && canDecide(req),
+      });
     }
-    if (parts[0] === 'jobs' && parts.length === 1) return jobsPage(ctx, jobViews(), now());
+    if (parts[0] === 'jobs' && parts.length === 1) {
+      const at = now();
+      const weeks = jobWeeks(options.store.runsSince(at - 7 * DAY_MS));
+      return jobsPage(
+        ctx,
+        jobViews().map((j) => ({ ...j, week: weeks.get(`${j.project}:${j.id}`) })),
+        at,
+        url.searchParams.get('view') === 'on-demand' ? 'ondemand' : 'list',
+      );
+    }
     if (parts[0] === 'runs' && parts.length === 2) {
       const run = options.store.getRun(Number(parts[1]));
       if (!run) return errorPage(ctx, 404);
@@ -1046,7 +1231,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         [{ repo: reader.repo, result: await reader.search(query) }],
         reader.repo,
       );
-    if (parts.length === 2) return codeRepoPage(ctx, reader.repo, await reader.status(), at);
+    if (parts.length === 2) return codeRepoPage(ctx, reader.repo, await reader.status(), at, canDecide(req));
     const changes = parts.length === 3 ? (await reader.status()).changes : [];
     if (parts[2] === 'diff') {
       const diff = await reader.diff(file);
@@ -1222,7 +1407,9 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       );
     if (wantsHtml && ctx) {
       try {
-        const html = (await codePage(req, ctx)) ?? page(req, ctx);
+        const home = new URL(req.url ?? '/', 'http://localhost').pathname === '/';
+        const html =
+          (await codePage(req, ctx)) ?? page(req, ctx, home ? { staleRepos: await staleRepos(now()) } : {});
         if (html) return sendHtml(res, 200, html);
       } catch (err) {
         if (err instanceof CodeError || err instanceof HttpError)

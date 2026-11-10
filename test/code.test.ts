@@ -13,8 +13,11 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import type { Change, CodeRepo, RepoStatus } from '../src/code/repo.js';
 import { cleanPath, parseGrep, parseNumstat, parseStatus, RepoReader, snippet } from '../src/code/repo.js';
 import type { Project } from '../src/config/schema.js';
+import { codeHomePage, codeRepoPage, staleWork } from '../src/http/code.js';
+import type { DashboardContext } from '../src/http/dashboard.js';
 import { startHttpServer } from '../src/http/server.js';
 import type { Scheduler } from '../src/scheduler/scheduler.js';
 import { Store } from '../src/store/store.js';
@@ -239,5 +242,41 @@ describe('Code pages and API', () => {
     expect(await ok.json()).toEqual({ url: 'https://acme.slack.com/archives/C1/p1' });
     expect(asked[0]).toBe('📄 `src/app.ts` in Shop: Safe to commit?');
     expect(asked[1]).toContain('+const c = 4;');
+  });
+});
+
+describe('Code pages: folders, old work and asking about a repo', () => {
+  const NOW = Date.parse('2026-11-10T05:00:00Z');
+  const ctx = { projects: [], timeZone: 'UTC', agentName: 'Jarvis' } as unknown as DashboardContext;
+  const repo = { name: 'jobs', title: 'Job Search', dir: '/r/jobs', askIn: 'jobs' } as unknown as CodeRepo;
+  const change = (path: string, added = 1): Change =>
+    ({ path, state: 'modified', added, removed: 0 }) as Change;
+  const many = Array.from({ length: 31 }, (_, i) => change(`.agents/memory/m${i}.md`, 2));
+  const status: RepoStatus = {
+    branch: 'main',
+    head: { sha: 'abc', subject: 'Add posts', at: NOW - 9 * 86_400_000 },
+    changes: [change('README.md'), ...many, change('board/web/src/App.tsx', 5)],
+  };
+
+  it('groups changes by folder, closed when there are many', () => {
+    const page = codeRepoPage(ctx, repo, status, NOW, true);
+    expect(page).toContain(
+      '<details class="fgroup"><summary><span class="grow"><span class="path">.agents/memory/</span> <span class="dim">· 31 files</span>',
+    );
+    expect(page).toContain('<span class="path">Top level</span>');
+    expect(page.indexOf('Top level')).toBeLessThan(page.indexOf('.agents/memory/</span>'));
+    expect(page).toContain('<span class="path">board/web/</span>');
+    expect(page).toContain('uncommitted for a while');
+    expect(page).toContain('Ask about these changes');
+    const few = codeRepoPage(ctx, repo, { ...status, changes: [change('a/b/c.ts'), change('d/e.ts')] }, NOW);
+    expect(few).toContain('<details class="fgroup" open>');
+  });
+
+  it('flags old uncommitted work on the overview', () => {
+    expect(staleWork(status, NOW)).toBe(true);
+    expect(staleWork({ ...status, changes: [] }, NOW)).toBe(false);
+    expect(staleWork({ ...status, head: { sha: 'a', subject: 's', at: NOW - 3_600_000 } }, NOW)).toBe(false);
+    const page = codeHomePage(ctx, [{ repo, status }], NOW);
+    expect(page).toContain('<span class="tag warn">uncommitted · last commit 9d ago</span>');
   });
 });

@@ -414,7 +414,7 @@ describe('Scheduler', () => {
     });
   });
 
-  it('posts script output as-is for script-only jobs', async () => {
+  it("posts a script-only job's result in the channel and its output in the thread", async () => {
     const { chat, calls, scheduler } = setup({
       jobs: [{ id: 'backup', name: 'Backup', cron: '0 2 * * *', preScript: 'b.sh', agent: false }],
       script: { ok: false, output: 'upload failed\n(exit code 1)', exitCode: 1, timedOut: false },
@@ -423,7 +423,8 @@ describe('Scheduler', () => {
     scheduler.trigger('shop', 'backup', 'U1');
     await scheduler.idle();
     expect(calls).toHaveLength(0);
-    expect(chat.log[0]).toMatch(/^post top ts1: ❌ \*Backup\* \(run by <@U1>\) · \d+s\n```\nupload failed/);
+    expect(chat.log[0]).toMatch(/^post top ts1: ❌ \*Backup\* \(run by <@U1>\) · \d+s$/);
+    expect(chat.posts.find((p) => p.thread === 'ts1')?.text).toMatch(/^```\nupload failed/);
     await scheduler.stop();
   });
 
@@ -747,11 +748,16 @@ describe('job threads', () => {
 });
 
 describe('job streaming', () => {
-  it('streams only runs someone started, to that person or the project owner', () => {
-    expect(streamRecipient({ kind: 'schedule' }, 'UOWNER')).toBeUndefined();
-    expect(streamRecipient({ kind: 'catch-up' }, 'UOWNER')).toBeUndefined();
+  it('streams every run: to whoever started or continued it in Slack, else the project owner', () => {
+    expect(streamRecipient({ kind: 'schedule' }, 'UOWNER')).toBe('UOWNER');
+    expect(streamRecipient({ kind: 'catch-up' }, 'UOWNER')).toBe('UOWNER');
+    expect(streamRecipient({ kind: 'queue', queue: 'content', items: [] }, 'UOWNER')).toBe('UOWNER');
     expect(streamRecipient({ kind: 'manual', by: 'U123ABC' }, 'UOWNER')).toBe('U123ABC');
+    expect(streamRecipient({ kind: 'resume', by: 'U123ABC', threadTs: 't', text: 'go' }, 'UOWNER')).toBe(
+      'U123ABC',
+    );
     expect(streamRecipient({ kind: 'manual', by: 'Shop Dashboard' }, 'UOWNER')).toBe('UOWNER');
+    expect(streamRecipient({ kind: 'schedule' }, undefined)).toBeUndefined();
     expect(streamRecipient({ kind: 'manual', by: 'api' }, undefined)).toBeUndefined();
   });
 
@@ -774,7 +780,7 @@ describe('job streaming', () => {
     await scheduler.stop();
   });
 
-  it('streams board/API runs to the owner, and keeps scheduled runs as before', async () => {
+  it('streams board/API runs to the owner, and posts details without an owner', async () => {
     const stream = new FakeStream();
     const { chat, scheduler } = setup({ jobs: [baseJob], stream, owner: 'UOWNER' });
     scheduler.start();

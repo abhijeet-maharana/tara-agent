@@ -1,8 +1,8 @@
 import type { QueueConfig } from '../config/schema.js';
 import { nextRun } from '../scheduler/queues.js';
 import type { Item } from '../store/store.js';
-import { goesOut, kindLabel } from './approvals.js';
-import { type DashboardContext, esc, layout, pageHead, projectTag, relative, when } from './dashboard.js';
+import { goesOut, kindLabel, mediaHtml } from './approvals.js';
+import { type DashboardContext, esc, layout, md, pageHead, projectTag, relative, when } from './dashboard.js';
 
 /**
  * The Queue page: approved drafts waiting to run, one section per queue (per kind in a queue that
@@ -18,6 +18,8 @@ export interface QueueData {
   running: Item[];
   /** Items waiting for approval, counted per queue. */
   pending: Item[];
+  /** Items that ran lately (done or failed), for each queue's "last out". */
+  finished?: Item[];
   /** Queue config per project. */
   queues: (project: string) => Record<string, QueueConfig>;
   /** This browser holds the decision cookie. */
@@ -32,6 +34,7 @@ const moveTo = async (id, to) => {
 document.addEventListener('click', async (e) => {
   const b = e.target.closest('button');
   if (!b) return;
+  if (b.dataset.fold !== undefined) { const r = b.closest('.row'); b.setAttribute('aria-expanded', r.classList.toggle('open')); return; }
   if (b.dataset.move) { b.disabled = true; return moveTo(b.dataset.move, b.dataset.to); }
   if (b.dataset.cancel) {
     if (!(await ask('Cancel "' + b.dataset.title + '"?', 'It will not run. Jarvis can propose it again.', 'Cancel it', true))) return;
@@ -78,10 +81,41 @@ const CSS = `<style>
 .sub-kind{font-size:13px;color:var(--text-dim);margin:12px 0 6px}
 .others{margin-top:28px}.others>summary{cursor:pointer;color:var(--text-dim);font-size:14px;margin-bottom:12px}
 .result{font-size:13px;color:var(--text-dim);margin-top:4px;overflow-wrap:anywhere}
+.qlist .row.open{align-items:flex-start}.qlist .row:not(.open) .fold{display:none}
+.fold{margin-top:8px;font-size:14px;overflow-wrap:anywhere}.fold .media{display:flex;gap:8px;overflow-x:auto;margin-top:8px}
+.fold .media img{height:160px;border-radius:8px;border:1px solid var(--border)}.fold .media video{height:min(56vh,460px);aspect-ratio:9/16;background:#000;border-radius:8px}
+.qfield{margin-top:8px}.qfield b{display:block;font-size:12px;color:var(--text-dim);font-weight:600}.qfield div{white-space:pre-wrap}
 .lock{color:var(--amber);background:var(--amber-dim);border-radius:var(--radius);padding:11px 14px;margin-bottom:14px}
 </style>`;
 
 const queueTitle = (name: string) => (name.charAt(0).toUpperCase() + name.slice(1)).replace(/-/g, ' ');
+/** Approved this long ago and still in line: the row says so in amber, and "Other queues" opens. */
+const STALE_MS = 3 * 86_400_000;
+
+/** The queue's next `count` slot times (a queue with `slots`). */
+function slotTimes(cfg: QueueConfig, hostTz: string, now: number, count: number): number[] {
+  const out: number[] = [];
+  let t = now;
+  while (out.length < count) {
+    const next = nextRun({ runNow: false }, cfg, hostTz, t);
+    if (next === undefined) break;
+    out.push(next);
+    t = next + 60_000;
+  }
+  return out;
+}
+
+/** A row's draft as approved, shown when the row is opened: text, media and field values. */
+function draftHtml(item: Item): string {
+  const fields = item.fields
+    .map(
+      (f) =>
+        `<div class="qfield"><b>${esc(f.label)}</b><div>${esc(Array.isArray(f.value) ? f.value.join('\n') : f.value)}</div></div>`,
+    )
+    .join('');
+  const html = `${item.body ? md(item.body) : ''}${mediaHtml(item)}${fields}`;
+  return html ? `<div class="fold">${html}</div>` : '';
+}
 
 /**
  * How the queue runs, for the section head: "next slot Tue 14:40 · 2 per run · 3 a day" (`filled`:
@@ -92,10 +126,14 @@ function howItRuns(
   cfg: QueueConfig | undefined,
   filled: QueueConfig | undefined,
   now: number,
+  /** Items in the filled queue, which go first. */
+  ahead = 0,
 ): string {
   if (!cfg) return 'not in .tara/queues.json';
   const parts: string[] = [];
   if ('external' in cfg.executor) parts.push('run by the project');
+  else if (cfg.fills && ahead)
+    parts.push(`fills empty ${cfg.fills} slots · waits while ${cfg.fills} has ${ahead}`);
   else {
     const at = nextRun({ runNow: false }, filled ?? cfg, ctx.timeZone, now);
     const what = cfg.fills
@@ -129,7 +167,14 @@ function row(
   ctx: DashboardContext,
   item: Item,
   data: QueueData,
-  opts: { pos?: number; count?: number; kinds: boolean; reorder?: boolean },
+  opts: {
+    pos?: number;
+    count?: number;
+    kinds: boolean;
+    reorder?: boolean;
+    /** When it goes out, worked out from the queue's slots (or what it waits for). */
+    eta?: string;
+  },
 ): string {
   const running = item.status === 'running';
   const movable = !running && opts.reorder && data.canDecide && (opts.count ?? 0) > 1;
@@ -137,20 +182,32 @@ function row(
   const last = opts.pos === (opts.count ?? 0) - 1;
   // Only the head of the line (the first batch), or an item with its own timing, has a "goes out".
   const batch = data.queues(item.project)[item.queue ?? '']?.batch ?? 1;
-  const timing = (opts.pos ?? 0) < batch || item.window || item.runNow || (item.runAfter ?? 0) > data.now;
+  const own = Boolean(item.window || item.runNow || (item.runAfter ?? 0) > data.now);
+  const timing = own || (opts.pos ?? 0) < batch;
+  const draft = draftHtml(item);
+  const stale = !running && data.now - (item.decidedAt ?? data.now) > STALE_MS;
+  const approvedAt = `approved ${esc(relative(item.decidedAt, data.now))}`;
   return `<div class="row"${running ? '' : ` data-qitem="${esc(item.id)}"`}>${
     movable ? '<span class="handle" data-handle title="Drag to reorder" aria-hidden="true">⋮⋮</span>' : ''
-  }${running ? '<span class="dot"></span>' : `<span class="pos">${(opts.pos ?? 0) + 1}</span>`}<span class="grow"><span class="title">${esc(item.title)}</span>
+  }${running ? '<span class="dot"></span>' : `<span class="pos">${(opts.pos ?? 0) + 1}</span>`}<span class="grow">${
+    draft
+      ? `<button type="button" class="fold-btn" data-fold aria-expanded="false"><span class="title">${esc(item.title)}</span></button>`
+      : `<span class="title">${esc(item.title)}</span>`
+  }
 <span class="meta">${opts.kinds ? `<span class="tag">${esc(kindLabel(item.kind))}</span>` : ''}${
     running
       ? '<span class="tag">running now</span>'
-      : timing
-        ? goesOut(ctx, item, data.queues, data.now, false)
-        : ''
-  }${item.runNow && !running ? '<span class="tag">run now</span>' : ''}<span>approved ${esc(relative(item.decidedAt, data.now))}</span></span>${
+      : !own && opts.eta
+        ? opts.eta
+        : timing
+          ? goesOut(ctx, item, data.queues, data.now, false)
+          : ''
+  }${item.runNow && !running ? '<span class="tag">run now</span>' : ''}${
+    stale ? `<span class="tag warn">${approvedAt}</span>` : `<span>${approvedAt}</span>`
+  }</span>${
     // Why an executor put it back ("daily cap reached").
     !running && item.result ? `<div class="result">Waiting: ${esc(item.result.slice(0, 300))}</div>` : ''
-  }</span>${
+  }${draft}</span>${
     !running && data.canDecide
       ? `<span class="actions">${movable ? moveButtons(item.id, first, last) : ''}<button type="button" class="btn quiet" data-cancel="${esc(item.id)}" data-title="${esc(item.title)}">Cancel</button></span>`
       : ''
@@ -191,10 +248,41 @@ export function queuePage(ctx: DashboardContext, data: QueueData): string {
     const running = mine(data.running);
     const pending = mine(data.pending).length;
     const kinds = new Set([...approved, ...running].map((i) => i.kind)).size > 1;
-    const list = (items: Item[]) =>
-      `<div class="qlist">${items.map((i, n) => row(ctx, i, data, { pos: n, count: items.length, kinds, reorder })).join('')}</div>`;
     // A queue that alternates kinds takes turns by kind: each kind is its own line.
     const alternate = cfg?.alternate ?? [];
+    // A queue that fills another's empty slots waits for that queue's items; otherwise each row gets
+    // the slot it will take (slots and batch, ignoring caps: "~" after the first batch).
+    const filled = cfg?.fills ? data.queues(project)[cfg.fills] : undefined;
+    const inFilled = (list: Item[]) =>
+      list.filter((i) => i.project === project && i.queue === cfg?.fills).length;
+    const ahead = cfg?.fills ? inFilled(data.approved) + inFilled(data.running) : 0;
+    const slotCfg = filled ?? cfg;
+    const batch = Math.max(1, cfg?.batch ?? 1);
+    const times =
+      !ahead && slotCfg?.slots && !alternate.length && !('external' in (cfg?.executor ?? {}))
+        ? slotTimes(slotCfg, ctx.timeZone, data.now, Math.ceil(approved.length / batch))
+        : [];
+    const eta = (n: number): string | undefined => {
+      if (ahead)
+        return `<span>after ${esc(cfg?.fills ?? '')}'s ${ahead} ${ahead === 1 ? 'item' : 'items'}</span>`;
+      const at = times[Math.floor(n / batch)];
+      return at === undefined
+        ? undefined
+        : `<span>${n < batch ? 'goes out' : '~'} ${esc(when(at, ctx.timeZone))}</span>`;
+    };
+    const list = (items: Item[]) =>
+      `<div class="qlist">${items
+        .map((i, n) =>
+          row(ctx, i, data, { pos: n, count: items.length, kinds, reorder, eta: eta(approved.indexOf(i)) }),
+        )
+        .join('')}</div>`;
+    // When the queue last sent something.
+    const last = mine(data.finished ?? []).sort((a, b) => (b.finishedAt ?? 0) - (a.finishedAt ?? 0))[0];
+    const lastOut = last
+      ? last.status === 'failed'
+        ? `<span class="tag bad">last run failed ${esc(relative(last.finishedAt, data.now))}</span>`
+        : `<span>last out ${esc(relative(last.finishedAt, data.now))}</span>`
+      : '';
     const groups = alternate.length
       ? [...new Set([...alternate, ...approved.map((i) => i.kind)])]
           .map((k) => [k, approved.filter((i) => i.kind === k)] as const)
@@ -207,8 +295,8 @@ export function queuePage(ctx: DashboardContext, data: QueueData): string {
       : list(approved);
     const approvals = `/approvals?project=${encodeURIComponent(project)}`;
     const head = `<div class="sec-head"><h2>${esc(queueTitle(queue))}</h2>${multi ? projectTag(ctx, project) : ''}<span>${approved.length} in line · ${esc(
-      howItRuns(ctx, cfg, cfg?.fills ? data.queues(project)[cfg.fills] : undefined, data.now),
-    )}</span>${pending ? `<a class="more" href="${approvals}">${pending} to approve →</a>` : ''}</div>`;
+      howItRuns(ctx, cfg, filled, data.now, ahead),
+    )}</span>${lastOut}${pending ? `<a class="more" href="${approvals}">${pending} to approve →</a>` : ''}</div>`;
     return `<section class="section">${head}${
       running.length
         ? `<div class="qlist">${running.map((i) => row(ctx, i, data, { kinds })).join('')}</div>`
@@ -218,6 +306,11 @@ export function queuePage(ctx: DashboardContext, data: QueueData): string {
   const all = [...queues.values()];
   const ordered = all.filter((q) => data.queues(q.project)[q.queue]?.reorder).map(section);
   const others = all.filter((q) => !data.queues(q.project)[q.queue]?.reorder);
+  const othersStale = data.approved.some(
+    (i) =>
+      others.some((q) => q.project === i.project && q.queue === i.queue) &&
+      data.now - (i.decidedAt ?? data.now) > STALE_MS,
+  );
   const othersCount = others.reduce(
     (n, q) => n + data.approved.filter((i) => i.project === q.project && i.queue === q.queue).length,
     0,
@@ -231,7 +324,7 @@ export function queuePage(ctx: DashboardContext, data: QueueData): string {
 ${data.canDecide ? '' : '<div class="lock">This browser can look but not reorder. <a href="/unlock">Unlock it</a> once with the approvals key (only from your own phone or computer, never from Jarvis).</div>'}
 ${projectChips ? `<div class="toolbar"><div class="chips">${projectChips}</div></div>` : ''}
 ${ordered.join('') || '<div class="empty">No queue is set to be reordered. Add <code>"reorder": true</code> to a queue in its project\'s <code>.tara/queues.json</code>.</div>'}
-${others.length ? `<details class="others"><summary>Other queues · ${othersCount} approved, run in approval order</summary>${others.map(section).join('')}</details>` : ''}`,
+${others.length ? `<details class="others"${othersStale ? ' open' : ''}><summary>Other queues · ${othersCount} approved, run in approval order</summary>${others.map(section).join('')}</details>` : ''}`,
     { refresh: true, script: SCRIPT },
   );
 }

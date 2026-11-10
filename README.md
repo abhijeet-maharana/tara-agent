@@ -119,10 +119,9 @@ Open `http://127.0.0.1:4100` (or the address you set under `http`).
 |---|---|
 | **Home** | What's running (each links to its live transcript), Claude usage, what needs attention (waiting cards by project and kind, the cards to start with, failing and paused jobs), recent runs that did something with their first line (each opens its transcript), and what's coming up (jobs every 30 min or more often on one line) |
 | **Command** | Talk to tara: every project's health, and a panel for each thing it looks up or does (with `live` set) |
-| **Approvals** | Cards waiting for a decision, scheduled drafts, and past decisions |
-| **Jobs** | Every job with its schedule, recent results, **Run now** and **Pause** |
-| **Schedule** | A day's timeline of jobs, with overlaps and free time |
-| **Sessions** | Every Slack thread and job run, with full transcripts |
+| **Approvals** | Questions (paused runs first), drafts to send (Approve all per kind) and notices (Mark all seen), folded to one card line each; past decisions |
+| **Jobs** | **List**: every job with its schedule, recent results, usage, **Run now** and **Pause**. **Timeline** (`/schedule`): a day of runs with queue slots, overlaps, free time and missed runs |
+| **Sessions** | Every Slack thread and job run, with full transcripts; a running one shows its steps live, with **Stop** |
 | **Code** | Each repo's uncommitted changes, diffs and files (read-only) |
 
 ## Security
