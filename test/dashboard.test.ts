@@ -627,7 +627,6 @@ describe('models section', () => {
 
   it('lists each purpose with its model, most-used first', () => {
     const uses = modelUses(projects, jobs, {
-      live: { model: 'gemini-3.8-live', askModel: 'haiku' },
       voice: ['gemini-a', 'gemini-b'],
     });
     expect(uses).toEqual([
@@ -641,12 +640,6 @@ describe('models section', () => {
         model: 'same as the run',
         used: 'a turn after a chat or job run, in its session',
       },
-      {
-        purpose: 'Command (voice)',
-        model: 'gemini-3.8-live',
-        used: 'talking to the agent from the dashboard',
-      },
-      { purpose: 'Command questions', model: 'haiku', used: 'read-only questions about a project' },
       {
         purpose: 'Voice notes',
         model: 'gemini-a → gemini-b',
@@ -672,7 +665,7 @@ describe('models section', () => {
     expect(page).toContain('<h2>Models</h2><span>effort high</span>');
     expect(page).toContain('<span class="when">Job steps</span>');
     expect(page).toContain('<code>agy · gemini-3-pro</code>');
-    expect(page).not.toContain('Command (voice)');
+    expect(page).not.toContain('Voice notes');
   });
 });
 
@@ -844,6 +837,33 @@ describe('approvals page', () => {
       '<h3>Application</h3><span>2</span><button type="button" class="btn ghost more" data-bulk="Approve"',
     );
     expect(page).toContain('data-bulk="Seen" data-notice data-label="Mark all seen"');
+  });
+
+  it('merges several drafts of one kind into one card, and says why an option is off', () => {
+    expect(page).toContain(
+      '<div data-group class="card merged"><div class="sec-head sub-head"><h3>Application</h3>',
+    );
+    // One draft of a kind stays a card of its own.
+    expect(page).not.toContain('class="card merged"><div class="sec-head sub-head"><h3>SEO code change</h3>');
+    const stuck = approvalsPage(ctx, {
+      tab: 'waiting',
+      items: [
+        card('b1', 'application', 'queue', 1, {
+          checks: [{ text: 'Role closed', blocking: true }],
+          reply: 'Use the new link',
+        }),
+        card('b2', 'application', 'queue', 2),
+      ],
+      counts: { waiting: 2, done: 0 },
+      queues: () => ({}),
+      canDecide: true,
+      now: NOW,
+    });
+    expect(stuck).toContain('<span>2 · 1 need a fix</span>');
+    expect(stuck).toContain('disabled title="Can&#39;t approve yet: Role closed"');
+    expect(stuck).toContain('<div class="why">⛔ Approve is off: Role closed.');
+    expect(stuck).toContain('data-open-note>Fix it…</button>');
+    expect(stuck).toContain('✏️ Revising: Use the new link. Jarvis is on it');
   });
 
   it('folds cards, names the job, warns before expiry and caps the Done count', () => {

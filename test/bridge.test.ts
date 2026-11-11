@@ -76,7 +76,7 @@ function setup(p = project()) {
     kind: 'chat',
     permissionPrompts: true,
   };
-  return { chat, store, bridge, decisions, ctx, project: p };
+  return { chat, store, bridge, approvals, decisions, ctx, project: p };
 }
 
 /** Opens a run and returns its token (read back from the MCP config, as the MCP server gets it). */
@@ -185,14 +185,16 @@ describe('approvals', () => {
     expect(decisions).toHaveLength(0);
   });
 
-  it('withdraws a waiting card of its own thread only', async () => {
+  it("withdraws any waiting card of its own project, never another project's", async () => {
     const { chat, store, bridge, decisions, ctx } = setup();
     const { token } = openRun(bridge, ctx);
     await bridge.requestApproval(token, { title: 'Send email', details: 'D' });
-    const other = openRun(bridge, { ...ctx, threadTs: '200.2' });
-    expect(() => bridge.withdrawCard(other.token, { id: 'id1' })).toThrow(/not raised in this thread/);
+    const elsewhere = openRun(bridge, { ...ctx, project: project({ name: 'blog' }) });
+    expect(() => bridge.withdrawCard(elsewhere.token, { id: 'id1' })).toThrow(/not a card of blog/);
 
-    expect(bridge.withdrawCard(token, { id: 'id1', reason: 'Sent it himself' })).toEqual({
+    // Another run of the same project (e.g. a tidy-up job in its own thread) may close it.
+    const other = openRun(bridge, { ...ctx, threadTs: '200.2' });
+    expect(bridge.withdrawCard(other.token, { id: 'id1', reason: 'Sent it himself' })).toEqual({
       id: 'id1',
       status: 'cancelled',
     });
@@ -408,7 +410,7 @@ describe('claude args', () => {
 
 describe('a decision resumes the session', () => {
   it('runs the next turn in the same thread with the decision as the prompt', async () => {
-    const { bridge, store, chat, project: p } = setup();
+    const { bridge, store, chat, approvals, project: p } = setup();
     const calls: RunOptions[] = [];
     const host = testHost({
       concurrency: 1,
@@ -460,6 +462,7 @@ describe('a decision resumes the session', () => {
       channel: 'C1',
       messageTs: approval.ts,
     });
+    await approvals.settled();
     expect(calls).toHaveLength(2);
     expect(calls[1]?.args).toEqual(expect.arrayContaining(['--resume', 'sid']));
     expect(calls[1]?.prompt).toBe('<@U1>: USER DECISION on "Publish post": Approve (tapped at 08:30)');

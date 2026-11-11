@@ -1,9 +1,9 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { RepoReader } from '../code/repo.js';
-import { FAILED } from '../http/dashboard.js';
 import type { JobInfo } from '../scheduler/scheduler.js';
 import type { Item, StoredRun } from '../store/store.js';
+import { FAILED } from './dashboard.js';
 
 const exec = promisify(execFile);
 

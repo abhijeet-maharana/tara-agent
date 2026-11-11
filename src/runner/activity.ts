@@ -1,11 +1,11 @@
 import { randomUUID } from 'node:crypto';
-import type { RunLabel, Runner, RunOutcome, RunStatus } from '../runner/run.js';
-import type { RateLimit, StreamEvent } from '../runner/stream.js';
+import type { RunLabel, Runner, RunOutcome, RunStatus } from './run.js';
+import type { RateLimit, StreamEvent } from './stream.js';
 
 /**
- * Every labelled Claude run, live: what Command's Live tasks column shows. `wrap` puts the bus around
- * the one Runner the whole process uses, so chat turns, job runs and `ask` answers all report here
- * whoever started them (Slack, a schedule, the voice). Each task can be stopped from here: the run
+ * Every labelled Claude run, live: a running session's steps and Stop on its dashboard page. `wrap`
+ * puts the bus around the one Runner the whole process uses, so chat turns and job runs all report
+ * here whoever started them (Slack, a schedule, the dashboard). Each task can be stopped from here: the run
  * gets a second abort signal, and ends as `aborted` the way a "stop" in Slack ends it.
  */
 

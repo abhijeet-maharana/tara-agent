@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { Activity, type ActivityEvent, MAX_STEPS, redact } from '../src/live/activity.js';
+import { Activity, type ActivityEvent, MAX_STEPS, redact } from '../src/runner/activity.js';
 import type { Runner, RunOptions, RunOutcome } from '../src/runner/run.js';
 import type { StreamEvent } from '../src/runner/stream.js';
 

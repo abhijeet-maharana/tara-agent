@@ -27,8 +27,6 @@ export interface DashboardContext {
   failing?: number;
   /** The Code page is on. */
   code?: boolean;
-  /** Command (talking to the agent) is on. */
-  live?: boolean;
   /** The Browsers page is on. */
   browsers?: boolean;
 }
@@ -129,10 +127,9 @@ export interface HomeData {
   effort?: string;
 }
 
-/** Host-level model settings the dashboard shows: Command (`live`) and voice notes (`voice`). */
+/** Host-level model settings the dashboard shows: effort and voice notes (`voice`). */
 export interface HostModels {
   effort?: string;
-  live?: { model: string; askModel: string };
   voice?: string[];
 }
 
@@ -608,16 +605,7 @@ export const jobViewTabs = (view: JobsView, project?: string) => {
   return `<div class="toolbar"><div class="chips views">${tab('list', '/jobs', 'List')}${tab('ondemand', '/jobs', 'On demand')}${tab('timeline', '/schedule', 'Timeline')}</div></div>`;
 };
 
-export type Page =
-  | 'Home'
-  | 'Command'
-  | 'Approvals'
-  | 'Queue'
-  | 'Jobs'
-  | 'Sessions'
-  | 'Code'
-  | 'Browsers'
-  | '';
+export type Page = 'Home' | 'Approvals' | 'Queue' | 'Jobs' | 'Sessions' | 'Code' | 'Browsers' | '';
 
 /** Projects whose app pages show here as tabs (`tabs` plus `dashboardUrl`). */
 export const tabbed = (projects: Project[]) =>
@@ -652,7 +640,6 @@ export function layout(
   const nav = (
     [
       ['/', 'Home', '🏠', 0, ''],
-      ...(ctx.live ? ([['/command', 'Command', '🎙️', 0, '']] as const) : []),
       ['/approvals', 'Approvals', '✅', waiting, 'waiting for a decision'],
       ['/queue', 'Queue', '📤', 0, ''],
       ['/jobs', 'Jobs', '⏱️', failing, 'failing jobs'],
@@ -726,7 +713,7 @@ const nameList = (names: string[], max = 4) =>
 const onHarness = (harness: string | undefined, model: string) =>
   harness === 'agy' ? `agy · ${model}` : model;
 
-/** Which model does what: chat per project, jobs (and their steps and handoffs) per model, Command, voice notes. */
+/** Which model does what: chat per project, jobs (and their steps and handoffs) per model, voice notes. */
 export function modelUses(projects: Project[], jobs: JobInfo[], host: HostModels = {}): ModelUse[] {
   const out: ModelUse[] = [];
   const grouped = (purpose: string, pairs: Array<[model: string, name: string]>, kind?: string) => {
@@ -767,18 +754,6 @@ export function modelUses(projects: Project[], jobs: JobInfo[], host: HostModels
       model: 'same as the run',
       used: 'a turn after a chat or job run, in its session',
     });
-  if (host.live) {
-    out.push({
-      purpose: 'Command (voice)',
-      model: host.live.model,
-      used: 'talking to the agent from the dashboard',
-    });
-    out.push({
-      purpose: 'Command questions',
-      model: host.live.askModel,
-      used: 'read-only questions about a project',
-    });
-  }
   if (host.voice?.length)
     out.push({
       purpose: 'Voice notes',

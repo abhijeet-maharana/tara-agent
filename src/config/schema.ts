@@ -1,6 +1,5 @@
 import { Cron } from 'croner';
 import { z } from 'zod';
-import { GEMINI_LIVE_URL } from '../live/gemini.js';
 
 /** Claude Code permission modes (`default` is the older name of `manual`). */
 export const permissionModes = [
@@ -40,17 +39,6 @@ export const mcpServerSchema = z.object({
 });
 export type McpServer = z.infer<typeof mcpServerSchema>;
 
-/** A key that older jobs files had, refused with where it goes now. */
-const movedToSkill = (
-  key: string,
-  where = 'a job\'s instructions live in its skill, under "## Job: <id>" (steps: "### Step: <name>")',
-) =>
-  z
-    .never({
-      error: `\`${key}\` is no longer read: ${where}. Run \`tara-agent move-prompts <repo>\` to move it`,
-    })
-    .optional();
-
 /**
  * One step of a job: a fresh session of the job's harness and model that runs before the main prompt,
  * with the job's MCP servers but no Slack tools. Its reply goes into the main prompt. What it does is
@@ -60,8 +48,6 @@ export const jobStepSchema = z.object({
   name: z.string().min(1).max(80),
   /** The skill holding this step's part. Defaults to the job's first skill. */
   skill: z.string().min(1).optional(),
-  prompt: movedToSkill('prompt'),
-  promptFile: movedToSkill('promptFile'),
   /** Defaults to the job's `timeoutMinutes`. */
   timeoutMinutes: z.number().positive().optional(),
   /** Defaults to the job's `model` (same harness), e.g. a faster model for long browser steps. */
@@ -254,8 +240,8 @@ export const hostConfigSchema = z.object({
     })
     .default({ enabled: true, exclude: ['**/.env*', '**/*.pem', '**/*.key'] }),
   /**
-   * What needs you (`GET /attention`, and what Live reads out): approvals, permission prompts,
-   * failing jobs, uncommitted work, and your GitHub PRs. See docs/command.md.
+   * What needs you (`GET /attention`): approvals, permission prompts, failing jobs, uncommitted work,
+   * and your GitHub PRs.
    */
   attention: z
     .object({
@@ -282,50 +268,10 @@ export const hostConfigSchema = z.object({
         .default([]),
     })
     .default({ github: true, urgent: [] }),
-  /**
-   * Command: talk to tara out loud from the dashboard (`/command`), through a Gemini Live session. The key
-   * (Google AI Studio) comes from TARA_LIVE_API_KEY. Unset = off. See docs/command.md.
-   */
-  live: z
-    .object({
-      /** A Gemini Live (`BidiGenerateContent`) WebSocket endpoint. */
-      url: z
-        .string()
-        .regex(/^wss?:\/\//, 'Use a ws:// or wss:// URL')
-        .default(GEMINI_LIVE_URL),
-      model: z.string().min(1).default('gemini-3.8-live'),
-      voice: z.string().min(1).default('Kore'),
-      /**
-       * How it should speak, in plain words; Live models pick the language themselves and take no
-       * language code. E.g. "Indian English with an Indian accent. If I speak Hindi or Hinglish,
-       * answer in the same."
-       */
-      language: z.string().min(1).max(500).optional(),
-      /** Close the voice session after this long with nothing said by either side. */
-      idleSeconds: z.number().min(5).max(600).default(20),
-      /** Model for `ask`: read-only questions about a project, answered by Claude. */
-      askModel: z.string().min(1).default('haiku'),
-      askTimeoutSeconds: z.number().min(10).max(900).default(120),
-      /** At most one spoken urgent alert per this many minutes; later ones are shown, not said. */
-      urgentGapMinutes: z.number().min(0).max(1440).default(30),
-      /** Jobs (`project/jobId`) whose urgent failures are said even in focus mode, and without the gap. */
-      alwaysInterrupt: z
-        .array(z.string().regex(/^[a-z0-9][a-z0-9-]*\/[^/\s]+$/, 'project/jobId, e.g. shop/payments-sync'))
-        .default([]),
-      /**
-       * The browser voice for alerts said while the voice session is closed, as a language tag
-       * (e.g. `en-IN`). Unset: the browser's default voice.
-       */
-      alertLang: z.string().min(2).max(35).optional(),
-    })
-    .optional(),
 });
 
-/** `true`/`false` are kept for configs written before the modes existed. */
-const selfImproveSchema = z
-  .union([z.boolean(), z.enum(['always', 'trouble', 'off'])])
-  .transform((v): SelfImprove => (v === true ? 'always' : v === false ? 'off' : v));
-export type SelfImprove = 'always' | 'trouble' | 'off';
+const selfImproveSchema = z.enum(['always', 'trouble', 'off']);
+export type SelfImprove = z.infer<typeof selfImproveSchema>;
 
 /** `<repo>/.tara/config.json`: committed in the project repo. */
 export const projectConfigSchema = z.object({
@@ -448,21 +394,12 @@ export const jobSchema = z
     tz: z.string().optional(),
     /** Typical run time, for schedule planning tools (overlap checks, calendars). tara doesn't use it. */
     durationMinutes: z.number().positive().optional(),
-    prompt: movedToSkill('prompt'),
     /**
      * Skills the job loads first (at least one). The first one holds the job's instructions: its
      * `## Job: <id>` section, with the scripts to run first (`### Before you start`) and a
      * `### Step: <name>` part per step.
      */
     skills: z.array(z.string()).default([]),
-    preScript: movedToSkill(
-      'preScript',
-      'the job\'s skill runs its scripts (the "### Before you start" part of its "## Job: <id>" section)',
-    ),
-    agent: movedToSkill(
-      'agent',
-      "every job runs the model; a script-only job's skill runs the script and posts what it printed",
-    ),
     /** The CLI the job runs on. `agy` jobs need an agy `model` (`agy models` lists them). */
     harness: z.enum(harnesses).default('claude'),
     model: z.string().min(1).default('sonnet'),

@@ -245,6 +245,15 @@ export async function runJob(
       recipient && chat.stream && !chat.stream.disabled
         ? new StreamReply(chat, chat.stream, channel, rootTs, recipient, false, Math.min(intervalMs, 1000))
         : undefined;
+    // The latest text block reaches the thread once the next step starts: a final reply that is only
+    // a headline already shows in the channel status line, so the thread doesn't repeat it.
+    let block = '';
+    const flushBlock = () => {
+      if (!block) return;
+      live?.textBreak();
+      live?.text(block);
+      block = '';
+    };
 
     const mcpServers = expandMcpServers(job.mcpServers, env);
     // Steps run first (not when continuing after a decision or running queue items), each in its own session.
@@ -350,14 +359,15 @@ export async function runJob(
           }
           if ('parent' in event && event.parent) return;
           if (event.kind === 'tool') {
+            flushBlock();
             steps++;
             status.push(`⏳ ${title} · step ${steps}\n> ${event.status}`);
             live?.toolStart(event.id, event.status);
           } else if (event.kind === 'tool_result') {
             if (event.isError) toolErrors++;
             live?.toolEnd(event.id, !event.isError);
-          } else if (event.kind === 'text_start') live?.textBreak();
-          else if (event.kind === 'text') live?.text(event.text);
+          } else if (event.kind === 'text_start') flushBlock();
+          else if (event.kind === 'text' && live) block += event.text;
         },
       })
       .finally(() => bridged?.dispose());
@@ -421,6 +431,7 @@ export async function runJob(
               ? '⏹ stopped'
               : `❌ failed: ${(outcome.error ?? 'unknown error').slice(0, 500)}`;
       await chat.update(channel, statusTs, `${title} · ${reason}`);
+      flushBlock();
       await live?.finish({ summary: reason, ok: false, answer: '', notes: [] });
       learnIf(undefined, rootTs);
       return record(outcome.status, { ...usage, error: outcome.error, output: outcome.text });
@@ -430,6 +441,7 @@ export async function runJob(
       // The thread stays, with the steps the run took and its session, to see what it checked and
       // to ask about it.
       await chat.update(channel, statusTs, `🔇 ${title} · ${meta} · nothing to report`);
+      flushBlock();
       await live?.finish({ summary: `🔇 Nothing to report · ${meta}`, ok: true, answer: '', notes: [] });
       learnIf(undefined, rootTs);
       return record('silent', { ...usage, output: outcome.text });
@@ -442,11 +454,13 @@ export async function runJob(
     const icon = failure ? '❌' : '✅';
     await chat.update(channel, statusTs, `${icon} ${title} · ${meta}\n${toSlackMrkdwn(headline)}`);
     if (live) {
-      // The whole reply was streamed into the thread already.
+      // With details the whole reply goes into the thread; a headline-only reply stays in the channel.
+      const inThread = Boolean(failure || details);
+      if (inThread) flushBlock();
       await live.finish({
         summary: failure ? `❌ ${headline}` : `✅ Done · ${meta}`,
         ok: !failure,
-        answer: outcome.text,
+        answer: inThread ? outcome.text : null,
         notes: [],
       });
     } else if (details) {

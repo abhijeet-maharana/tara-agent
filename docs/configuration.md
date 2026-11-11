@@ -41,10 +41,9 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `http` | `127.0.0.1:4100` | Local API and dashboard (`enabled`, `bind`, `port`, `allowFrom`). Set `TARA_HTTP_TOKEN` to require a bearer token (open a page once with `?token=…` to sign a browser in). The MCP tools need it enabled |
 | `http.allowFrom` | `127.0.0.0/8`, `::1/128` | CIDR ranges allowed to connect. Transcripts hold everything Claude saw, so keep this to a trusted network, e.g. add `100.64.0.0/10` and `fd7a:115c:a1e0::/48` for Tailscale |
 | `http.fallback` | none | URL that receives every request tara-agent doesn't serve, passed through unchanged. Useful when taking over a port from another service |
-| `http.tls` | off | Also serve HTTPS on `port` (default `4443`) with `cert` and `key` files, e.g. from `tailscale cert`. Browsers only allow the microphone ([Command](command.md)) over HTTPS. The certificate is re-read when its file changes, so renewing it needs no restart |
+| `http.tls` | off | Also serve HTTPS on `port` (default `4443`) with `cert` and `key` files, e.g. from `tailscale cert`. The certificate is re-read when its file changes, so renewing it needs no restart |
 | `code` | on, the projects | The Code page: `repos` (`path`, `gitDir`, `title`, `askIn`) and `exclude` globs never shown (default `.env*`, `*.pem`, `*.key`). See [code-view.md](code-view.md) |
-| `attention` | GitHub on, nothing urgent | What needs you (`GET /attention`, read out by [Command](command.md)): `github` (your open PRs and review requests through `gh`, logged in as the user tara-agent runs as) and `urgent` rules that let a failing job interrupt: `{consecutiveFailures: 3}` or `{job: "project/jobId"}` |
-| `live` | off | The voice behind the Command page ([command.md](command.md)): `url` (default Google's Gemini Live endpoint), `model` (`gemini-3.8-live`), `voice` (`Kore`), `language` (how to speak, in plain words, e.g. "Indian English; Hindi when I speak Hindi"), `idleSeconds` (`20`), `askModel` (`haiku`), `askTimeoutSeconds` (`120`), `urgentGapMinutes` (`30`: at most one spoken urgent alert per this long), `alwaysInterrupt` (`project/jobId` jobs said even in focus mode), `alertLang` (browser voice for alerts, e.g. `en-IN`). Key from `TARA_LIVE_API_KEY` (Google AI Studio) |
+| `attention` | GitHub on, nothing urgent | What needs you (`GET /attention`): `github` (your open PRs and review requests through `gh`, logged in as the user tara-agent runs as) and `urgent` rules that put a failing job in the urgent tier: `{consecutiveFailures: 3}` or `{job: "project/jobId"}` |
 
 ## Project config
 
@@ -123,8 +122,7 @@ What a job does lives in its **first skill**, in a section named after the job, 
 
 ### Before you start
 
-Run `python3 scripts/sla-gate.py` from the repo root. If it prints nothing, or its last line is
-`{"wakeAgent": false}`, reply with exactly `[SILENT]` and stop. Otherwise its output is your input.
+Run `python3 scripts/sla-gate.py` from the repo root. If it prints nothing, reply with exactly `[SILENT]` and stop. Otherwise its output is your input.
 
 Check yesterday's late orders in that output and summarise them. On STATUS: FAILED, …
 ```
@@ -134,7 +132,6 @@ Check yesterday's late orders in that output and summarise them. On STATUS: FAIL
 - A job with several skills gets a skill of its own (named after the job, listed first) that holds the section and names the others.
 - Steps: `### Step: <name>` parts inside the section, plus an optional `### Every step` part.
 - Learning turns improve this section along with the rest of the skill.
-- **Older jobs files** with `prompt`, `preScript`, `agent` (or a step's `prompt` / `promptFile`) are refused. Move them with `tara-agent move-prompts <repo>` (prints the plan) and `--write`: a one-skill job's prompt goes into that skill (version bumped), any other job's into a new skill named after it; `preScript` becomes the section's `### Before you start` part (a script-only job gets a skill that runs it and posts its output); a restated schedule ("Every Monday at 9 AM IST, …") is dropped, since `cron` has it. `import-hermes` does the same for Hermes prompts and scripts.
 
 ### How a run goes
 
@@ -142,7 +139,7 @@ Check yesterday's late orders in that output and summarise them. On STATUS: FAIL
 
 1. **Trigger message.** At cron time a `Run <job name>` message is posted (the job's `name`, e.g. `Run Weekly GA4 Audit`; its `id` only if another job has the same name) in the project channel, as the `SLACK_USER_TOKEN` person if set (else, or when that person isn't in the channel, as the bot). The bot picks it up and runs the job in its thread; if Slack doesn't deliver it within 2 minutes, the scheduler starts it there itself.
 2. **Claude** runs the job's skill section (its scripts first, as the section says), streaming into the thread.
-3. **The reply**: the part before a `---` line is the headline on the status line (the thread's first reply), the rest goes in the thread.
+3. **The reply**: the part before a `---` line is the headline on the status line (the thread's first reply), the rest goes in the thread. A short reply with no `---` is all headline: it shows only on the status line, not again in the thread.
    - A reply of `[SILENT]` shows "🔇 nothing to report"; the thread and session stay, so you can ask why.
    - A first line of `[CRON_FAILURE]` marks the run failed.
 4. **Replying** in the job's thread continues its session, so a job can ask a question and act on your answer.
@@ -150,12 +147,7 @@ Check yesterday's late orders in that output and summarise them. On STATUS: FAIL
 Other rules:
 
 - **Every slot runs at most once**, even across restarts. A job added while tara-agent was down doesn't run for past slots.
-- **Watching live:** every run streams its steps and text into its Slack thread (the status line, its first reply, keeps the current step and, at the end, the headline). A run you start with `run <job name>` streams in your message's thread; scheduled, queue and dashboard/API runs stream in their `Run <job name>` thread, addressed to the project `owner` (Slack's streaming needs a recipient; without `owner` they post only the status line and the details at the end). A script-only job (`agent: false`) posts its result line and the script's output in its thread. A run with no thread of its own (a queue, Run now) opens its `Run <job name>` thread. A run that ends `[SILENT]` keeps its thread, with the steps it took, its session and a `🔇 … · nothing to report` status line.
-- These conventions match Hermes Agent's, so Hermes jobs run unchanged. To import them:
-  ```sh
-  tara-agent import-hermes --from ~/.hermes/cron/jobs.json --out <repo>/.tara/jobs.json \
-    --env REPO_ROOT=~/Projects/my-repo
-  ```
+- **Watching live:** every run streams its steps and text into its Slack thread (the status line, its first reply, keeps the current step and, at the end, the headline). A run you start with `run <job name>` streams in your message's thread; scheduled, queue and dashboard/API runs stream in their `Run <job name>` thread, addressed to the project `owner` (Slack's streaming needs a recipient; without `owner` they post only the status line and the details at the end). A run with no thread of its own (a queue, Run now) opens its `Run <job name>` thread. A run that ends `[SILENT]` keeps its thread, with the steps it took, its session and a `🔇 … · nothing to report` status line.
 
 ### agy jobs
 
@@ -256,7 +248,7 @@ Every run gets tara-agent's own MCP server alongside the repo's `.mcp.json` serv
 | `send_file` | Uploads a file (screenshot, PDF, CSV, image) into the thread. Only files inside the project or temp directory, up to 100 MB |
 | `permission` | In chat, when Claude wants a tool not in `allowedTools`, the thread gets **Allow / Deny** buttons (denied after 10 minutes). Scheduled jobs never wait on this |
 | `propose_item`, `list_items`, `finish_item` | Drafts that go out later (a message, email, post): each becomes a card on the Approvals page and, once approved, runs through a [queue](#queues) |
-| `withdraw_card` | Closes a waiting card raised in the same thread (the person did it themselves, or it no longer applies). It ends as cancelled with the reason; cards of other threads are refused |
+| `withdraw_card` | Closes any waiting card of the run's project, no approval needed (the person did it themselves, it no longer applies, a duplicate, or a newer card replaces it). It ends as cancelled with the reason; another project's cards are refused |
 | `run_job` | Starts one of the project's jobs |
 | `start_pull_request`, `open_pull_request` | Only for host `github` projects: a workspace copy of the base branch (or of the PR's branch), then a commit pushed to `<agentName>/<name>` and the PR opened or updated. See [pull requests](security.md#pull-requests) |
 | `read_ci_job` | Only for host `github` projects, read-only: a GitHub Actions job (URL or id) of the project's repo: workflow, branch, commit, conclusion, failed steps, the lines around the first `##[error]` and the last 300 log lines. Other repos are refused. See [CI jobs](security.md#ci-jobs) |
@@ -297,7 +289,9 @@ An item that is never reported ends as failed and is not retried, so nothing goe
 **Decisions**
 
 - The first option (default **Approve**) queues the item. A negative option (Reject, Skip…) closes it as rejected; any other closes it as done.
-- **Revise** keeps the card pending and asks the agent for a new version.
+- **Revise** keeps the card pending (it stays on the page, marked as being revised) and asks the agent for a new version, which replaces it in place.
+- A project server's `ask` with the `key` of a waiting card updates that card in place (page and Slack message), so a project can keep one live card (e.g. one a day) and add to it.
+- When an option is off because of a blocking check, the card says why next to the buttons and offers **Fix it…**. Several drafts of one kind show as one card with a row each.
 - `slack: true` on a queue also posts each card in Slack (decisions stay on the dashboard): a card a run proposed goes in that run's thread; any other card goes in the day's `Run <queue>` thread (one per queue a day). A refresh edits it there, and its outcome and the run that sends it follow in that thread.
 - `approvals.validateUrl` gets POST `{kind, key, fields}` and returns `{checks: [{text, blocking}]}`; blocking checks stop approval.
 - `approvals.hookUrl` gets POST `{event: "decided" | "finished", item}`, signed with HMAC-SHA256 of the body using `APPROVAL_SEAL_KEY` in the `x-tara-signature` header. Best effort only.

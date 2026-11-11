@@ -290,10 +290,10 @@ server.registerTool(
   {
     title: 'Close a waiting card',
     description:
-      'Close an approval card raised in this thread that is still waiting, when it is no longer needed: the ' +
-      'person did the work themselves, or it no longer applies. It ends as cancelled with your reason, on the ' +
-      'Approvals page and in Slack. Never ask the person to tap a button just to clear a card. Find the id ' +
-      'with list_items.',
+      "Close any of this project's approval cards that is still waiting, when it no longer needs the person: " +
+      'they did the work themselves, it no longer applies (role closed, post deleted), it is a duplicate, or a ' +
+      'newer card replaces it. No approval needed. It ends as cancelled with your reason, on the Approvals page ' +
+      'and in Slack. Never ask the person to tap a button just to clear a card. Find the id with list_items.',
     inputSchema: {
       id: z.string().min(1).describe('Card id from list_items'),
       reason: z.string().max(500).optional().describe('Why, e.g. "Sent the email himself"'),

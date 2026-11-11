@@ -94,7 +94,7 @@ export const BRIDGE_PROMPT = `Slack tools (tara MCP server):
   - something only a person can do (a login, an OTP, a captcha, a call, a failure you could not fix): say exactly what, with options like "Done, continue" / "Skip".
   No card for OK or FYI news: that stays in your reply.
 - Drafts that should go out later (messages, emails, applications, posts) go through \`propose_item\` with the queue that sends them: one card each, approved or edited on the Approvals page, then run at the queue's time. Never send them yourself.
-- When a person says they did a waiting card's work themselves, or it no longer applies, close it with \`withdraw_card\` (its id from \`list_items\`, and why). Never ask them to tap a button just to clear it.
+- Close a waiting card yourself with \`withdraw_card\` (its id from \`list_items\`, and why) whenever it no longer needs the person: they did it themselves, the role or post is gone, it is a duplicate, or a newer card replaces it. No approval is needed to close a card. Never ask them to tap a button just to clear it, and never leave a card they cannot act on.
 - To share a screenshot, PDF, CSV or image, save it inside the project (e.g. .scratch/) and call \`send_file\`.`;
 
 /** Without root actions on the host: a run can still ask a person to run a command for it. */
@@ -309,19 +309,15 @@ export class Bridge {
   }
 
   /**
-   * Takes back a card raised in this run's thread that is still waiting (the person did it themselves,
-   * or it no longer applies). Only cards of this thread, so a run cannot clear other people's cards.
+   * Takes back a waiting card of this run's project (the person did it themselves, it no longer applies,
+   * a duplicate). Any card of the project, so a tidy-up job can clear what other runs raised; never
+   * another project's.
    */
   withdrawCard(token: string | undefined, input: { id: string; reason?: string }) {
     const ctx = this.run(token);
     const item = this.deps.store.getItem(input.id);
-    if (
-      !item ||
-      item.project !== ctx.project.config.name ||
-      item.channel !== ctx.channel ||
-      item.threadTs !== ctx.threadTs
-    )
-      throw new BridgeError(403, `Card ${input.id} was not raised in this thread`);
+    if (!item || item.project !== ctx.project.config.name)
+      throw new BridgeError(403, `Card ${input.id} is not a card of ${ctx.project.config.name}`);
     try {
       const withdrawn = this.deps.approvals.withdraw(item.id, input.reason, ctx.jobId ?? 'chat');
       return { id: withdrawn.id, status: withdrawn.status };

@@ -25,14 +25,12 @@
     "@modelcontextprotocol/sdk": "^1.32.2",
     "@slack/bolt": "^5.1.0",
     "croner": "^10.0.1",
-    "ws": "^8.22.0",
     "yaml": "^2.9.1",
     "zod": "^4.6.7"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.3",
     "@types/node": "^22.20.5",
-    "@types/ws": "^8.18.2",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"

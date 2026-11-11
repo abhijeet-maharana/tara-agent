@@ -22,7 +22,6 @@ tara-agent runs on your own server around the clock. It runs scheduled jobs, ans
 **Talk to it**
 - **Chat in Slack.** Each channel is one project. A message starts a session, and replies in the thread continue it. Progress streams live. Photos and files posted with a message (up to 10, 20 MB each) are saved to the session's scratch folder and their paths added to the prompt, so Claude can read them.
 - **Many projects, one agent.** Every project keeps its own repo, instructions, skills and tools.
-- **Command: talk to it out loud** (optional, Gemini Live). Ask what needs you, how every project is doing, or about the code; run and pause jobs, decide approvals, hand work to Slack. Answers are spoken in a sentence, and the details appear on screen as panels next to a live view of every project.
 
 **See everything**
 - **Web dashboard.** What's running, what needs you, failing jobs, the day's schedule, full transcripts of every run, and your repos' uncommitted changes. Works on a phone.
@@ -53,7 +52,7 @@ Anything that goes out to other people (an email, a post, a reply) waits as a ca
    npm ci && npm run build
    ```
 3. **Host config:** copy [`examples/config.yaml`](examples/config.yaml) to `~/.config/tara-agent/config.yaml` and list your project paths.
-4. **Secrets:** put `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` in `~/.config/tara-agent/env` (see [`.env.example`](.env.example)). Optional: `SLACK_USER_TOKEN` (a person's `xoxp-…` token with `chat:write`) posts each scheduled run's `⏰` trigger message as that person instead of the bot.
+4. **Secrets:** put `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` in `~/.config/tara-agent/env` (see [`.env.example`](.env.example)). Optional: `SLACK_USER_TOKEN` (a person's `xoxp-…` token with `chat:write`) posts each scheduled run's trigger message as that person instead of the bot, and Approvals-page notes (and decisions that start a new chat) in a card's thread.
 5. **Each project:** add `<repo>/.tara/config.json` with at least a `name` and a `slackChannel` (see [`examples/project`](examples/project/.tara)).
 6. **Run:** `node dist/index.js`.
 
@@ -121,7 +120,6 @@ Open `http://127.0.0.1:4100` (or the address you set under `http`).
 | Page | Shows |
 |---|---|
 | **Home** | What's running (each links to its live transcript), Claude usage, what needs attention (waiting cards by project and kind, the cards to start with, failing and paused jobs), recent runs that did something with their first line (each opens its transcript), and what's coming up (jobs every 30 min or more often on one line) |
-| **Command** | Talk to tara: every project's health, and a panel for each thing it looks up or does (with `live` set) |
 | **Approvals** | Questions (paused runs first), drafts to send (Approve all per kind) and notices (Mark all seen), folded to one card line each; past decisions |
 | **Jobs** | **List**: every job with its schedule, recent results, usage, **Run now** and **Pause**. **Timeline** (`/schedule`): a day of runs with queue slots, overlaps, free time and missed runs |
 | **Sessions** | Every Slack thread and job run, with full transcripts; a running one shows its steps live, with **Stop** |
@@ -146,7 +144,6 @@ Full threat model: [`docs/security.md`](docs/security.md).
 | [`docs/security.md`](docs/security.md) | Threat model, dedicated user, split users, privileged actions |
 | [`docs/architecture.md`](docs/architecture.md) | Modules and how a chat turn, job and approval flow |
 | [`docs/code-view.md`](docs/code-view.md) | The Code page |
-| [`docs/command.md`](docs/command.md) | Command: the voice control room, its tools and protocol |
 | [`docs/dashboard-look.md`](docs/dashboard-look.md) | Reusing the dashboard style in your own project dashboards |
 | [`CHANGELOG.md`](CHANGELOG.md), [`CONTRIBUTING.md`](CONTRIBUTING.md) | Changes and how to contribute |
 

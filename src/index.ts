@@ -1,34 +1,18 @@
 #!/usr/bin/env -S node --disable-warning=ExperimentalWarning
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
-import type { WebSocket } from 'ws';
 import { Approvals } from './approvals/approvals.js';
 import { Bridge } from './bridge/bridge.js';
 import { codeReaders } from './code/repo.js';
-import {
-  DEFAULT_HOST_CONFIG,
-  expandHome,
-  JOBS_FILE,
-  loadHostConfig,
-  loadJobs,
-  loadProjects,
-} from './config/load.js';
-import { applyPromptMove, planPromptMove, type RawJobsFile } from './config/move-prompts.js';
+import { DEFAULT_HOST_CONFIG, expandHome, loadHostConfig, loadJobs, loadProjects } from './config/load.js';
 import { CiJobs } from './github/actions.js';
 import { PullRequests } from './github/pull-requests.js';
-import { jobState } from './http/dashboard.js';
+import { gatherAttention, githubPullRequests } from './http/attention.js';
 import { startHttpServer } from './http/server.js';
-import { convertHermesJobs } from './import-hermes.js';
-import { Activity } from './live/activity.js';
-import { Alerts } from './live/alerts.js';
-import { askProject } from './live/ask.js';
-import { gatherAttention, githubPullRequests } from './live/attention.js';
-import { LiveSession } from './live/session.js';
-import type { JobSummary, LiveDeps, LiveState } from './live/tools.js';
 import { Privileged } from './privileged/privileged.js';
+import { Activity } from './runner/activity.js';
 import { runAgy } from './runner/agy.js';
 import { resolveRunAs } from './runner/as-user.js';
 import { type Runner, runClaude } from './runner/run.js';
@@ -49,12 +33,7 @@ const log: Logger = {
 
 const USAGE = `Usage:
   tara-agent [--config <file>]               run the gateway
-  tara-agent validate [--config <file>]      check host, project and job config, then exit
-  tara-agent import-hermes --from <hermes jobs json> --out <repo>/.tara/jobs.json
-      [--scripts-dir .agents/hermes/cron/scripts] [--default-model haiku] [--tz UTC]
-      [--env KEY=VALUE ...] [--force]
-  tara-agent move-prompts <repo> [--write]   move job and step prompts into the jobs' skills
-      (prints the plan; --write writes the skills and .tara/jobs.json)`;
+  tara-agent validate [--config <file>]      check host, project and job config, then exit`;
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -90,61 +69,6 @@ function validate(configFlag: string | undefined): void {
   log.info(`✓ config OK (timezone ${host.timezone}, jobConcurrency ${host.jobConcurrency})`);
 }
 
-function importHermes(args: string[]): void {
-  const { values } = parseArgs({
-    args,
-    options: {
-      from: { type: 'string' },
-      out: { type: 'string' },
-      'scripts-dir': { type: 'string', default: '.agents/hermes/cron/scripts' },
-      'default-model': { type: 'string', default: 'haiku' },
-      tz: { type: 'string', default: 'UTC' },
-      env: { type: 'string', multiple: true, default: [] },
-      force: { type: 'boolean', default: false },
-    },
-  });
-  if (!values.from || !values.out) throw new Error(USAGE);
-  const out = path.resolve(expandHome(values.out));
-  if (existsSync(out) && !values.force) throw new Error(`${out} exists; pass --force to overwrite it`);
-  const env = Object.fromEntries(
-    (values.env ?? []).map((pair) => {
-      const i = pair.indexOf('=');
-      if (i < 1) throw new Error(`--env expects KEY=VALUE, got "${pair}"`);
-      return [pair.slice(0, i), pair.slice(i + 1)];
-    }),
-  );
-  const result = convertHermesJobs(JSON.parse(readFileSync(path.resolve(expandHome(values.from)), 'utf8')), {
-    scriptsDir: values['scripts-dir'] as string,
-    defaultModel: values['default-model'] as string,
-    tz: values.tz as string,
-    env,
-  });
-  // <repo>/.tara/jobs.json: each Hermes prompt goes into its job's skill in that repo.
-  const move = planPromptMove(path.dirname(path.dirname(out)), result);
-  applyPromptMove(move, out);
-  log.info(`Wrote ${result.jobs.length} jobs to ${out}; their prompts went into their skills:`);
-  for (const line of move.moved) log.info(`  ${line}`);
-}
-
-function movePrompts(args: string[]): void {
-  const { values, positionals } = parseArgs({
-    args,
-    allowPositionals: true,
-    options: { write: { type: 'boolean', default: false } },
-  });
-  if (positionals.length !== 1) throw new Error(USAGE);
-  const repo = path.resolve(expandHome(positionals[0] as string));
-  const jobsPath = path.join(repo, JOBS_FILE);
-  const move = planPromptMove(repo, JSON.parse(readFileSync(jobsPath, 'utf8')) as RawJobsFile);
-  if (move.moved.length === 0) return void log.info('Nothing to move: no job or step has a prompt.');
-  for (const line of move.moved) log.info(line);
-  if (!values.write)
-    return void log.info(`\n${move.moved.length} jobs to move. Run again with --write to do it.`);
-  applyPromptMove(move, jobsPath);
-  log.info(`\nMoved ${move.moved.length} jobs. Check the skills' new "## Job: <id>" sections.`);
-  for (const f of move.unusedPromptFiles) log.info(`No longer read: ${f} (its text is in the skill now)`);
-}
-
 async function serve(configFlag: string | undefined) {
   const { host, projects } = loadAll(configFlag);
   log.info(`Claude Code: ${claudeVersion(host.claude.bin, host.claude.runAs)}`);
@@ -165,7 +89,7 @@ async function serve(configFlag: string | undefined) {
     const base = slack.workspaceUrl();
     return base && `${base}archives/${channel}/p${ts.replace('.', '')}`;
   };
-  // Every labelled run, live, for Command's Live tasks (and its Stop).
+  // Every labelled run, live, for a running session's page (its steps and Stop).
   const activity = new Activity({ threadUrl });
   // Each run goes through the CLI it names (`harness`): Claude Code, or agy for agy jobs.
   const run: Runner = activity.wrap((o) =>
@@ -178,7 +102,15 @@ async function serve(configFlag: string | undefined) {
     appToken: requireEnv('SLACK_APP_TOKEN'),
     userToken: process.env.SLACK_USER_TOKEN || undefined,
     log,
-    onMessage: (msg) => manager?.handle(msg) ?? Promise.resolve(),
+    onMessage: (msg) => {
+      // A message Approvals posted as the person arrived (see Approvals.toThread); a note's answer mentions them.
+      const mine = approvals.delivered(msg);
+      if (mine) {
+        msg.text = mine.text; // Slack shows a short line; Jarvis gets the full text
+        msg.mentionWhenDone = mine.mention;
+      }
+      return manager?.handle(msg) ?? Promise.resolve();
+    },
     onButton: (tap) =>
       tap.actionId.startsWith('tara:runjob:')
         ? (manager?.runButton(tap) ?? Promise.resolve())
@@ -307,127 +239,6 @@ async function serve(configFlag: string | undefined) {
       pullRequests,
       urgent: host.attention.urgent,
     });
-  const liveState: LiveState = { focusUntil: 0 };
-  // The urgent tier: one alert watcher for every Command tab.
-  const alerts =
-    host.live &&
-    new Alerts({
-      attention,
-      state: liveState,
-      gapMinutes: host.live.urgentGapMinutes,
-      alwaysInterrupt: host.live.alwaysInterrupt,
-    });
-  if (alerts) {
-    alerts.start();
-    // A job that ended may have made something urgent.
-    activity.subscribe((e) => {
-      if (e.type === 'task' && e.task.kind === 'job' && e.task.status !== 'running') alerts.poke();
-    });
-  }
-  const liveEndpoint = (cfg: NonNullable<typeof host.live>) => {
-    const apiKey = requireEnv('TARA_LIVE_API_KEY');
-    const askDeps = {
-      run,
-      bin: host.claude.bin,
-      agentName: host.agentName,
-      model: cfg.askModel,
-      timeoutMs: cfg.askTimeoutSeconds * 1000,
-      store,
-    };
-    const jobs = (): JobSummary[] =>
-      projects.flatMap(({ config: { name } }) =>
-        scheduler.list(name).map((j) => ({
-          project: name,
-          id: j.id,
-          name: j.name,
-          state: jobState(j),
-          cron: j.cron,
-          nextRun: j.nextRun?.getTime(),
-          lastRunAt: j.lastRunAt?.getTime(),
-          lastError: j.lastError,
-          recent: store
-            .jobRuns(name, j.id, 12)
-            .map((r) => ({ status: r.status, at: r.startedAt, ms: r.endedAt - r.startedAt })),
-        })),
-      );
-    const pending = () => store.items({ statuses: ['pending'], limit: 500 });
-    const reader = (name: string) => readers.find((r) => r.repo.name === name);
-    const deps: LiveDeps = {
-      agentName: host.agentName,
-      projects: projects.map((p) => p.config.name),
-      repos: readers.map((r) => r.repo.name),
-      overview: async () => {
-        const all = jobs();
-        const waiting = pending();
-        return Promise.all(
-          projects.map(async ({ config }) => {
-            const own = all.filter((j) => j.project === config.name);
-            const r = reader(config.name);
-            const status = r && (await r.status().catch((e: Error) => ({ changes: [], error: e.message })));
-            return {
-              name: config.name,
-              title: config.title ?? config.name,
-              jobs: {
-                total: own.length,
-                running: own.filter((j) => j.state === 'running').map((j) => j.name),
-                failing: own.filter((j) => j.state === 'failing').map((j) => j.name),
-                paused: own.filter((j) => j.state === 'paused').length,
-              },
-              approvals: waiting.filter((i) => i.project === config.name).length,
-              repo: status && {
-                branch: 'branch' in status ? status.branch : undefined,
-                changes: status.changes.length,
-                error: status.error,
-              },
-              dashboardUrl: config.tabs?.length ? `/p/${config.name}` : config.dashboardUrl,
-            };
-          }),
-        );
-      },
-      attention,
-      ask: async (name, question, signal) => {
-        const project = projects.find((p) => p.config.name === name);
-        if (!project) throw new Error(`No project "${name}"`);
-        return askProject(askDeps, project, question, signal);
-      },
-      activity,
-      alerts: alerts || undefined,
-      dispatch: (name, task) =>
-        startThread(name, 'voice-task', `🎙️ ${task.split('\n')[0]?.slice(0, 120)}`, task),
-      jobs,
-      runJob: (project, id) => scheduler.trigger(project, id, 'command'),
-      setJobEnabled: (project, id, enabled) => scheduler.setEnabled(project, id, enabled),
-      repo: async (name) => {
-        const r = reader(name);
-        if (!r) throw new Error(`No repo "${name}"`);
-        return r.status();
-      },
-      diff: async (name, file) => {
-        const r = reader(name);
-        if (!r) throw new Error(`No repo "${name}"`);
-        return r.diff(file);
-      },
-      approvals: () =>
-        pending().map((i) => ({
-          id: i.id,
-          project: i.project,
-          title: i.title,
-          kind: i.kind,
-          options: i.options,
-          body: i.body?.slice(0, 600),
-          createdAt: i.createdAt,
-        })),
-      decide: async (id, option) => {
-        const item = store.getItem(id);
-        const owner = projects.find((p) => p.config.name === item?.project)?.config.owner;
-        const decided = await approvals.decide(id, { option, by: owner ?? 'dashboard', via: 'dashboard' });
-        return { status: decided.status };
-      },
-    };
-    return {
-      connect: (ws: WebSocket) => new LiveSession(ws, { ...cfg, apiKey }, deps, liveState, log),
-    };
-  };
   // HTTP first: when tara-agent takes over a port, the hand-over gap is as short as possible.
   const http = host.http.enabled
     ? await startHttpServer({
@@ -442,7 +253,6 @@ async function serve(configFlag: string | undefined) {
         continueThread: (msg) => (manager as SessionManager).handle(msg),
         attention,
         activity,
-        live: host.live && liveEndpoint(host.live),
         code: readers.length
           ? {
               readers,
@@ -460,7 +270,6 @@ async function serve(configFlag: string | undefined) {
           hostName: hostname(),
           models: {
             effort: host.claude.effort,
-            live: host.live && { model: host.live.model, askModel: host.live.askModel },
             voice: host.voice?.models,
           },
         },
@@ -528,8 +337,6 @@ async function serve(configFlag: string | undefined) {
 
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
-  if (command === 'import-hermes') return importHermes(rest);
-  if (command === 'move-prompts') return movePrompts(rest);
   if (command === '--help' || command === 'help') return void log.info(USAGE);
   const args = command === 'validate' ? rest : process.argv.slice(2);
   const { values } = parseArgs({ args, options: { config: { type: 'string', short: 'c' } } });

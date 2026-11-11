@@ -4,7 +4,13 @@ import type { Project } from '../config/schema.js';
 import type { Privileged, PrivilegedResult } from '../privileged/privileged.js';
 import type { DecidedCard } from '../scheduler/prompt.js';
 import { openRunThread } from '../scheduler/slack-trigger.js';
-import type { ChatPort, IncomingMessage, Logger, SlackBlock } from '../sessions/manager.js';
+import {
+  type ChatPort,
+  type IncomingMessage,
+  type Logger,
+  type SlackBlock,
+  threadKey,
+} from '../sessions/manager.js';
 import { splitMessage, toSlackMrkdwn } from '../slack/format.js';
 import type { Item, ItemCheck, ItemField, ItemMedia, Store } from '../store/store.js';
 import { sealItem } from './seal.js';
@@ -97,6 +103,18 @@ export interface ApprovalsDeps {
   fetch?: typeof fetch;
   now?: () => number;
   newId?: () => string;
+  /** How long a message posted as the person may wait for Slack to deliver it before it goes directly. */
+  pickupTimeoutMs?: number;
+}
+
+/** A message `toThread` posted as the person, until Slack delivers it (`delivered`). */
+export interface Awaiting {
+  /** The full text for Jarvis (Slack shows a shorter one). */
+  text: string;
+  /** Who the answer mentions (`IncomingMessage.mentionWhenDone`). */
+  mention?: string;
+  /** Its ts, once the post has returned. */
+  ts?: string;
 }
 
 export class Approvals {
@@ -112,6 +130,14 @@ export class Approvals {
   private readonly now: () => number;
   /** Day threads being opened, so two cards at once share one `Run` message. */
   private readonly opening = new Map<string, Promise<string>>();
+  /** Decisions still being handed to their run or chat (see `handOff`). */
+  private readonly handing = new Set<Promise<void>>();
+  /**
+   * Messages posted as the person that Slack hasn't delivered yet, oldest first, per thread
+   * (`toThread`): the full text for Jarvis, who the answer should mention, and the message ts once the
+   * post has returned.
+   */
+  private readonly awaiting = new Map<string, Awaiting[]>();
 
   constructor(private readonly deps: ApprovalsDeps) {
     this.now = deps.now ?? Date.now;
@@ -123,7 +149,10 @@ export class Approvals {
     return project;
   }
 
-  /** A paused run's decision: stored as a card and posted with buttons in the run's Slack thread. */
+  /**
+   * A paused run's decision: stored as a card and posted with buttons in the run's Slack thread. A
+   * pending card with the same `key` is updated in place (page and Slack message) instead.
+   */
   async requestDecision(
     ctx: { project: Project; channel: string; threadTs: string; jobId?: string },
     input: {
@@ -154,8 +183,13 @@ export class Approvals {
       threadTs: ctx.threadTs,
     });
 
+    const refresh =
+      item.messageTs && item.channel ? { channel: item.channel, ts: item.messageTs } : undefined;
     let details = toSlackMrkdwn(input.details.trim());
-    if (details.length > SECTION_MAX) {
+    if (details.length > SECTION_MAX && refresh) {
+      // An update edits the one message: the full text stays on the Approvals page.
+      details = `${details.slice(0, SECTION_MAX - 200)}…\n_Full text on the Approvals page._`;
+    } else if (details.length > SECTION_MAX) {
       // Too long for one block: post it in full first, then the buttons under it.
       for (const chunk of splitMessage(details)) await this.deps.chat.post(ctx.channel, ctx.threadTs, chunk);
       details = '_Full proposal above._';
@@ -177,6 +211,14 @@ export class Approvals {
         elements: [{ type: 'mrkdwn', text: 'Or decide on the Approvals page, or reply in this thread.' }],
       },
     ];
+    if (refresh) {
+      await this.deps.chat
+        .update(refresh.channel, refresh.ts, `Approval needed: ${title}`, blocks)
+        .catch((err: Error) =>
+          this.deps.log.warn(`could not update card ${item.id} in Slack: ${err.message}`),
+        );
+      return { id: item.id, options };
+    }
     const ts = await this.deps.chat.postBlocks(
       ctx.channel,
       ctx.threadTs,
@@ -190,7 +232,8 @@ export class Approvals {
   /**
    * A card a project server raises outside any run (a login that expired, a send that bounced): posted
    * with its buttons in the day's `Run <kind>` thread and on the Approvals page, and the decision goes
-   * to the agent in that thread like a reply. A pending card with the same `key` is returned instead.
+   * to the agent in that thread like a reply. A pending card with the same `key` is updated in place
+   * (a project keeps one live card, e.g. one a day, and adds to it); unchanged, it is returned as is.
    */
   async ask(
     project: Project,
@@ -204,7 +247,19 @@ export class Approvals {
           .items({ project: project.config.name, statuses: ['pending'], limit: 500 })
           .find((i) => i.key === input.key)
       : undefined;
-    if (pending) return pending;
+    if (pending) {
+      const options = cleanOptions(input.options);
+      const same =
+        pending.title === title &&
+        (pending.body ?? '') === input.details.trim() &&
+        JSON.stringify(pending.options) === JSON.stringify(options);
+      if (same || !pending.channel || !pending.threadTs) return pending;
+      await this.requestDecision(
+        { project, channel: pending.channel, threadTs: pending.threadTs },
+        { ...input, title, kind: input.kind || pending.kind },
+      );
+      return this.deps.store.getItem(pending.id) as Item;
+    }
     const { channel, ts } = await this.dayThread(project, input.kind || 'decision');
     const { id } = await this.requestDecision({ project, channel, threadTs: ts }, { ...input, title });
     return store.getItem(id) as Item;
@@ -450,7 +505,14 @@ export class Approvals {
     const when = this.clock();
     if (revise && item.mode === 'queue') {
       store.noteRevision(id, (d.reply as string).trim());
-      await this.continueConversation(project, item, d.by, reviseText(item, (d.reply as string).trim()));
+      this.handOff(
+        item,
+        this.continueConversation(project, item, d.by, reviseText(item, (d.reply as string).trim()), {
+          fromPage: d.via !== 'slack',
+          visible: (who) =>
+            `*From ${who} on the Approvals page:* ✏️ Revise "${item.title}"\n${(d.reply as string).trim()}`,
+        }),
+      );
       return store.getItem(id) as Item;
     }
 
@@ -501,11 +563,15 @@ export class Approvals {
         d.fields && Object.keys(d.fields).length ? `\nEdited values: ${JSON.stringify(d.fields)}` : '';
       const note = d.reply?.trim() ? `\nNote: ${d.reply.trim()}` : '';
       const text = `USER DECISION on "${decided.title}": ${d.option}${note}${edits} (${d.via === 'slack' ? 'tapped' : 'chosen on the Approvals page'} at ${when})${ran}`;
-      await this.continueConversation(project, decided, d.by, text, {
-        title: decided.title,
-        body: decided.body ?? '',
-        declined: negative,
-      });
+      this.handOff(
+        decided,
+        this.continueConversation(project, decided, d.by, text, {
+          card: { title: decided.title, body: decided.body ?? '', declined: negative },
+          fromPage: d.via !== 'slack',
+          visible: (who) =>
+            `*From ${who} on the Approvals page:* ${negative ? '❌' : '✅'} ${d.option} on "${decided.title}"${d.reply?.trim() ? `\n${d.reply.trim()}` : ''}`,
+        }),
+      );
     }
     const final = action ? (store.getItem(id) as Item) : decided;
     this.notify(final, 'decided');
@@ -638,6 +704,7 @@ export class Approvals {
    * A note or question about a waiting card, from the Approvals page, without deciding it. It shows in
    * the card's Slack thread as the owner's reply and goes to Jarvis there, who answers in the thread;
    * the card keeps waiting. (A note typed before picking an option still goes with that decision.)
+   * See `toThread` for when it is posted as the person and Slack starts the chat.
    */
   async note(id: string, text: string, by: string): Promise<Item> {
     const item = this.deps.store.getItem(id);
@@ -654,14 +721,18 @@ export class Approvals {
       threadTs = await openRunThread(this.deps.chat, channel, item.kind);
       await this.deps.chat.post(channel, threadTs, `📝 *${item.title}*`);
     }
-    await this.deps.chat.post(channel, threadTs, `📝 Note from the Approvals page: ${text}`);
-    this.onChat({
-      channel,
-      threadTs,
-      ts: threadTs,
-      user,
-      text: `About the waiting card "${item.title}" (item ${id}), sent from the Approvals page without a decision. The card is still waiting: answer in this thread, and change or withdraw the card only if the note asks for that.\n\n${text}`,
-    }).catch((err) => this.deps.log.error(`[${item.project}] note on item ${id}: ${(err as Error).message}`));
+    await this.toThread(
+      { channel, threadTs, ts: threadTs, user },
+      `About the waiting card "${item.title}" (item ${id}), sent from the Approvals page without a decision. The card is still waiting: answer in this thread, and change or withdraw the card only if the note asks for that.\n\n${text}`,
+      {
+        fromPage: true,
+        always: true,
+        mention: true,
+        visible: (who) => `*From ${who} on the Approvals page:* ${text}`,
+        shown: `📝 Note from ${/^[UW][A-Z0-9]+$/.test(user) ? `<@${user}>` : 'the owner'} on the Approvals page: ${text}`,
+        background: true,
+      },
+    );
     return item;
   }
 
@@ -758,12 +829,22 @@ export class Approvals {
     item: Item,
     by: string,
     text: string,
-    card?: DecidedCard,
+    opts: { card?: DecidedCard; fromPage?: boolean; visible?: (who: string) => string } = {},
   ): Promise<void> {
     const user = /^[UW][A-Z0-9]+$/.test(by) ? by : (project.config.owner ?? by);
     if (item.jobId && item.threadTs && item.mode === 'resume' && this.onJob) {
-      await this.onJob(project.config.name, item.jobId, { threadTs: item.threadTs, text, by: user, card });
-      return;
+      const status = await this.onJob(project.config.name, item.jobId, {
+        threadTs: item.threadTs,
+        text,
+        by: user,
+        card: opts.card,
+      });
+      if (status !== 'unknown') return;
+      // The job was renamed or removed after it asked (e.g. merged into another job): without this the
+      // decision would be dropped. A chat in the card's thread acts on it instead.
+      this.deps.log.warn(
+        `[${project.config.name}] item ${item.id}: job ${item.jobId} no longer exists, continuing as a chat`,
+      );
     }
     let channel = item.channel ?? project.config.slackChannel;
     let threadTs = item.threadTs;
@@ -773,7 +854,117 @@ export class Approvals {
       threadTs = await openRunThread(this.deps.chat, channel, item.kind);
       await this.deps.chat.post(channel, threadTs, `📝 *${item.title}*`);
     }
-    await this.onChat?.({ channel, threadTs, ts: item.messageTs ?? threadTs, user, text });
+    await this.toThread({ channel, threadTs, ts: item.messageTs ?? threadTs, user }, text, {
+      fromPage: opts.fromPage,
+      visible: opts.visible,
+    });
+  }
+
+  /**
+   * Hands Jarvis a message in a card's thread. From the Approvals page it is posted there as the person
+   * (SLACK_USER_TOKEN) and Slack hands it on like any reply, so the thread shows exactly what Jarvis
+   * was asked: always for a note (`always`, a chat either way), and for a decision only when the thread
+   * has no session yet (a job's decision resumes the job, which a Slack reply can't). Everything else
+   * goes directly, as does everything when there is no user token or that post fails. If Slack doesn't
+   * deliver the posted message in time (see `delivered`), it goes directly then. With `mention`, the
+   * person who sent it (`msg.user`: the project owner from the page) is mentioned once Jarvis has
+   * answered (`IncomingMessage.mentionWhenDone`), so they get a notification: Slack doesn't notify on a
+   * streamed answer, and the user token may be another account (e.g. a brand account) than theirs.
+   * Slack shows `visible` (who sent it, mentioned so they are notified at once, and what they said) and
+   * Jarvis still gets `text` (`delivered` swaps it back), since the user token's account isn't theirs.
+   */
+  private async toThread(
+    msg: Omit<IncomingMessage, 'text'>,
+    text: string,
+    /** `background`: resolve once posted, without waiting for Jarvis's turn. */
+    opts: {
+      fromPage?: boolean;
+      always?: boolean;
+      mention?: boolean;
+      /** What Slack shows when it is posted as the person, given the sender (a mention). */
+      visible?: (who: string) => string;
+      shown?: string;
+      background?: boolean;
+    },
+  ): Promise<void> {
+    const { chat, store, log } = this.deps;
+    const key = threadKey(msg.channel, msg.threadTs);
+    const mention = opts.mention && /^[UW][A-Z0-9]+$/.test(msg.user) ? msg.user : undefined;
+    const asPerson =
+      opts.fromPage && (opts.always || !store.getSession(key)) ? chat.postAsUser?.bind(chat) : undefined;
+    if (asPerson) {
+      // A mention, so the sender is notified at once (the post is the user token's account, not theirs).
+      const who = /^[UW][A-Z0-9]+$/.test(msg.user) ? `<@${msg.user}>` : msg.user;
+      const shownText = opts.visible ? opts.visible(who) : text;
+      // Registered before posting: Slack can deliver the message before the post call returns.
+      const entry: Awaiting = { text, mention };
+      this.awaiting.set(key, [...(this.awaiting.get(key) ?? []), entry]);
+      const drop = () => {
+        const left = (this.awaiting.get(key) ?? []).filter((a) => a !== entry);
+        if (left.length) this.awaiting.set(key, left);
+        else this.awaiting.delete(key);
+      };
+      try {
+        const ts = await asPerson(msg.channel, shownText, msg.threadTs);
+        entry.ts = ts;
+        const timer = setTimeout(() => {
+          if (!this.awaiting.get(key)?.includes(entry)) return; // Slack delivered it
+          drop();
+          log.warn(
+            `${key}: message from the Approvals page not picked up from Slack in time; sending it directly`,
+          );
+          this.onChat?.({ ...msg, ts, text, mentionWhenDone: mention }).catch((err: Error) =>
+            log.error(`${key}: ${err.message}`),
+          );
+        }, this.deps.pickupTimeoutMs ?? 120_000);
+        timer.unref();
+        return;
+      } catch (err) {
+        drop();
+        log.warn(`${key}: not posted as the user (${(err as Error).message}); sending it directly`);
+      }
+    }
+    if (opts.shown) await chat.post(msg.channel, msg.threadTs, opts.shown);
+    const turn = this.onChat?.({ ...msg, text, mentionWhenDone: mention });
+    if (!opts.background) return turn;
+    turn?.catch((err: Error) => log.error(`${key}: ${err.message}`));
+  }
+
+  /**
+   * Slack delivered a message. One `toThread` posted as the person (same ts, or one still being posted
+   * in that thread, since Slack can deliver it before the post returns) is no longer sent directly, and
+   * its full text for Jarvis and who to mention are returned; undefined for any other message.
+   */
+  delivered(msg: Pick<IncomingMessage, 'channel' | 'threadTs' | 'ts'>): Awaiting | undefined {
+    if (msg.threadTs === msg.ts) return undefined;
+    const key = threadKey(msg.channel, msg.threadTs);
+    const waiting = this.awaiting.get(key) ?? [];
+    const mine = waiting.find((a) => a.ts === msg.ts) ?? waiting.find((a) => a.ts === undefined);
+    if (!mine) return undefined;
+    const left = waiting.filter((a) => a !== mine);
+    if (left.length) this.awaiting.set(key, left);
+    else this.awaiting.delete(key);
+    return mine;
+  }
+
+  /**
+   * The run or chat a decision continues can take minutes (and waits for its job to be free first), so
+   * `decide` does not wait for it: the card is decided and its Slack message updated at once.
+   */
+  private handOff(item: Item, work: Promise<void>): void {
+    const p = work
+      .catch((err: Error) =>
+        this.deps.log.error(
+          `[${item.project}] item ${item.id}: could not continue with the decision: ${err.message}`,
+        ),
+      )
+      .finally(() => this.handing.delete(p));
+    this.handing.add(p);
+  }
+
+  /** Resolves once every decision handed off so far has reached its run or chat and that has ended. */
+  async settled(): Promise<void> {
+    while (this.handing.size) await Promise.all([...this.handing]);
   }
 
   private clock(): string {

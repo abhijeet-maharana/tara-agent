@@ -40,7 +40,7 @@ describe('toIncoming', () => {
   });
 
   it('accepts our own scheduled-run trigger message, marked as ours', () => {
-    const text = '⏰ Scheduled: *Find jobs* (`find-jobs`)';
+    const text = 'Run Find jobs';
     expect(toIncoming({ ...base, user: BOT, bot_id: 'B9', text }, BOT)).toEqual({
       channel: 'C1',
       threadTs: '100.1',
@@ -79,13 +79,6 @@ describe('toIncoming', () => {
     expect(findRunJob(jobs, 'the ga audit')).toBeUndefined();
     expect(runName(jobs[0] as (typeof jobs)[0], jobs)).toBe('Weekly GA4 Audit');
     expect(runName(jobs[1] as (typeof jobs)[0], jobs)).toBe('pnl');
-  });
-
-  it('reads an older trigger back the way Slack sends it (emoji as :alarm_clock:)', () => {
-    const text = ':alarm_clock: Catch-up: *Application Form Prep* (`application-form-prep`)';
-    expect(toIncoming({ ...base, user: BOT, bot_id: 'B9', text }, BOT, 'B9')?.fromSelf).toBe(true);
-    expect(parseScheduledRun(text)).toBe('application-form-prep');
-    expect(parseScheduledRun(':alarm_clock: Scheduled: *X* (`x`) and more')).toBeUndefined();
   });
 
   it('treats a person posting through our app (our bot_id, their user) as that person', () => {

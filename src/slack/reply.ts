@@ -36,8 +36,11 @@ export interface Finish {
   /** One line for the card/status, e.g. "✅ Done · 12s · 3 steps · claude-opus-5-5". */
   summary: string;
   ok: boolean;
-  /** The final answer (posted only when it wasn't already streamed). */
-  answer: string;
+  /**
+   * The final answer (posted only when it wasn't already streamed). `null`: it is shown elsewhere
+   * (e.g. a job's headline in its channel status line), so the thread adds nothing for it.
+   */
+  answer: string | null;
   /** Extra notes after the answer (e.g. blocked tools). */
   notes: string[];
 }
@@ -91,7 +94,7 @@ export class EditReply implements TurnReply {
   async finish({ summary, ok, answer, notes }: Finish): Promise<void> {
     await this.status.flush();
     await this.chat.update(this.channel, await this.statusTs, summary);
-    if (ok) {
+    if (ok && answer !== null) {
       for (const chunk of splitMessage(toSlackMrkdwn(answer.trim() || '_(no text reply)_'))) {
         await this.chat.post(this.channel, this.threadTs, chunk);
       }
@@ -180,7 +183,7 @@ export class StreamReply implements TurnReply {
         this.pendingTasks.add(id);
       }
     }
-    if (result.ok && !(this.streamed + this.leftover + this.buffer).trim()) {
+    if (result.ok && result.answer !== null && !(this.streamed + this.leftover + this.buffer).trim()) {
       this.buffer += result.answer.trim() || '_(no text reply)_';
     }
     if (!result.ok) {

@@ -80,13 +80,12 @@ describe('loadProject', () => {
 });
 
 describe('selfImprove', () => {
-  it('defaults to always and keeps old booleans working', () => {
+  it('defaults to always and takes only the named modes', () => {
     const parse = (v?: unknown) =>
       projectConfigSchema.parse({ name: 'shop', slackChannel: 'C0123ABC', selfImprove: v }).selfImprove;
     expect(parse()).toBe('always');
-    expect(parse(true)).toBe('always');
-    expect(parse(false)).toBe('off');
     expect(parse('trouble')).toBe('trouble');
+    expect(() => parse(true)).toThrow();
     expect(() => parse('sometimes')).toThrow();
   });
 });

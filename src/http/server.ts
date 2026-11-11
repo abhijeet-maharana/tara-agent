@@ -10,16 +10,13 @@ import {
 import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https';
 import { networkInterfaces } from 'node:os';
 import path from 'node:path';
-import type { Duplex } from 'node:stream';
 import { Cron } from 'croner';
-import { type WebSocket, WebSocketServer } from 'ws';
 import { ApprovalError, type Approvals, type ProposeInput } from '../approvals/approvals.js';
 import { type Bridge, BridgeError } from '../bridge/bridge.js';
 import { CodeError, type CodeRepo, MIN_QUERY, type RepoReader } from '../code/repo.js';
 import { loadQueues } from '../config/load.js';
 import type { HostConfig, Project, QueueConfig } from '../config/schema.js';
-import type { Activity } from '../live/activity.js';
-import type { Attention } from '../live/attention.js';
+import type { Activity } from '../runner/activity.js';
 import type { Scheduler } from '../scheduler/scheduler.js';
 import { type IncomingMessage as ChatMessage, type Logger, threadKey } from '../sessions/manager.js';
 import { ITEM_STATUSES, type ItemStatus, type Store } from '../store/store.js';
@@ -33,6 +30,7 @@ import {
   safeMediaUrl,
   unlockPage,
 } from './approvals.js';
+import type { Attention } from './attention.js';
 import { probeBrowser, projectNeeds, SiteScanner } from './browser-usage.js';
 import { browsersPage } from './browsers.js';
 import {
@@ -44,7 +42,6 @@ import {
   codeTreePage,
   staleWork,
 } from './code.js';
-import { commandPage } from './command-page.js';
 import {
   type DashboardContext,
   errorPage,
@@ -117,13 +114,8 @@ export interface HttpOptions {
    * transcript, and the usage figure on the home page.
    */
   activity?: Pick<Activity, 'tasks' | 'usage' | 'stop'>;
-  /**
-   * A second, HTTPS listener on the same address (browsers only allow the microphone over HTTPS).
-   * The certificate is re-read when its file changes.
-   */
+  /** A second, HTTPS listener on the same address. The certificate is re-read when its file changes. */
   tls?: { port: number; cert: string; key: string };
-  /** Command (voice): takes each browser connection to `/command/ws` (unlocked browsers only). */
-  live?: { connect: (ws: WebSocket) => void };
   /** The shared Chromes (host `browsers`): the Browsers page shows them and what each project needs. */
   browsers?: HostConfig['browsers'];
   /** Enables the HTML pages (sessions, transcripts, jobs) for browsers. */
@@ -149,13 +141,6 @@ class HttpError extends Error {
 }
 
 const iso = (d?: Date) => d?.toISOString() ?? null;
-const originHost = (origin: string) => {
-  try {
-    return new URL(origin).host;
-  } catch {
-    return '';
-  }
-};
 /** Runs per job shown on the dashboard (recent-runs strip and history). */
 const RECENT_RUNS = 10;
 const DAY_MS = 86_400_000;
@@ -216,11 +201,11 @@ async function readJson(req: IncomingMessage, limit = 10_000): Promise<Record<st
  *   POST /internal/permission          {tool_name, input}  → {id}
  *   GET  /internal/permission/<id>?wait=45                 → {decision | null}
  *   GET  /internal/jobs, POST /internal/run-job {id}        (chat turns only)
- *   POST /internal/withdraw            {id, reason?}  closes a waiting card raised in the run's thread
+ *   POST /internal/withdraw            {id, reason?}  closes a waiting card of the run's project
  */
 /** Paths tara-agent serves itself; with a fallback, everything else is passed through. */
 const OWN_PATH =
-  /^\/(?:$|(?:health|reload|attention|command|live|jobs|runs|sessions|schedule|approvals|queue|items|unlock|code|internal|p|app)(?:\/|$))/;
+  /^\/(?:$|(?:health|reload|attention|jobs|runs|sessions|schedule|approvals|queue|items|unlock|code|internal|p|app)(?:\/|$))/;
 const TOKEN_COOKIE = 'tara_token';
 const ADMIN_COOKIE = 'tara_admin';
 /** Finished items shown on the Done tab. */
@@ -1053,7 +1038,6 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         .flatMap((p) => options.scheduler.list(p))
         .filter((j) => jobState(j) === 'failing').length,
       code: Boolean(options.code),
-      live: Boolean(options.live),
       browsers: Boolean(options.browsers),
     };
   };
@@ -1154,8 +1138,6 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         now: at,
       });
     }
-    if (parts[0] === 'command' && parts.length === 1 && options.live)
-      return commandPage(ctx, { unlocked: canDecide(req) });
     if ((parts[0] === 'approvals' || parts[0] === 'queue') && parts.length === 1 && options.approvals) {
       const at = now();
       const project = projectParam();
@@ -1510,12 +1492,6 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       res.end();
       return;
     }
-    // Command was called Live before.
-    if (options.live && req.method === 'GET' && (url.pathname === '/live' || url.pathname === '/live/')) {
-      res.writeHead(301, { location: `/command${url.search}` });
-      res.end();
-      return;
-    }
     const ctx = pageContext();
     const wantsHtml =
       Boolean(ctx) && req.method === 'GET' && (req.headers.accept ?? '').includes('text/html');
@@ -1565,34 +1541,8 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     res.end(JSON.stringify(payload));
   };
 
-  const sockets = options.live ? new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 }) : undefined;
-  /**
-   * `/command/ws` (and `/live/ws`, its old name): the same checks as a decision (it can start Claude
-   * conversations and decide approvals), plus same-origin.
-   */
-  const upgrade = (req: IncomingMessage, socket: Duplex, head: Buffer) => {
-    const refuse = (status: number, message: string) => {
-      socket.end(`HTTP/1.1 ${status} ${message}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
-    };
-    const url = new URL(req.url ?? '/', 'http://localhost');
-    if (!sockets || !options.live || !['/command/ws', '/live/ws'].includes(url.pathname))
-      return refuse(404, 'Not Found');
-    if (!allowed(req.socket.remoteAddress) || crossSite(req, options.bind)) return refuse(403, 'Forbidden');
-    if (req.headers.origin && originHost(req.headers.origin) !== req.headers.host)
-      return refuse(403, 'Forbidden');
-    if (!authorized(req)) return refuse(401, 'Unauthorized');
-    try {
-      human(req);
-    } catch {
-      return refuse(403, 'Forbidden');
-    }
-    const live = options.live;
-    sockets.handleUpgrade(req, socket, head, (ws) => live.connect(ws));
-  };
-
   const listen = <S extends Server | HttpsServer>(server: S, port: number, label: string) =>
     new Promise<S>((resolve, reject) => {
-      server.on('upgrade', upgrade);
       server.once('error', reject);
       server.listen(port, options.bind, () => {
         options.log.info(`${label} on ${label === 'HTTPS' ? 'https' : 'http'}://${options.bind}:${port}`);

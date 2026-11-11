@@ -50,14 +50,6 @@ export function openRunThread(
 }
 
 const RUN = /^run\s+`?([^`\n]{1,150}?)`?$/i;
-// The older form, still read back so a trigger posted before an upgrade runs. Slack stores the emoji
-// as its name, so it comes back as ":alarm_clock: Scheduled: …".
-const LEGACY = /^(?:⏰|:alarm_clock:) (?:Scheduled|Catch-up): .* \(`([a-z0-9][a-z0-9-]*)`\)$/s;
-
-/** Starts like an older trigger message, whether or not the rest parses. */
-export function looksLikeTrigger(text: string): boolean {
-  return /^(?:⏰|:alarm_clock:) (?:Scheduled|Catch-up): /.test(text.trim());
-}
 
 /**
  * What a trigger message names (a job's name or id; `findRunJob` finds the job), or undefined when the
@@ -65,6 +57,5 @@ export function looksLikeTrigger(text: string): boolean {
  * is waiting for that job (see the manager).
  */
 export function parseScheduledRun(text: string): string | undefined {
-  const t = text.trim();
-  return LEGACY.exec(t)?.[1] ?? RUN.exec(t)?.[1]?.trim();
+  return RUN.exec(text.trim())?.[1]?.trim();
 }

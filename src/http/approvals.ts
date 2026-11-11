@@ -102,15 +102,26 @@ const editedFields = (c) => {
 const decide = async (c, option, runNow) => {
   const reply = c.querySelector('[data-reply]')?.value.trim() || undefined;
   if (option === 'Revise' && !reply) { c.classList.add('open'); c.querySelector('[data-reply]').focus(); return toast('Say what to change, then press Revise again'); }
+  const was = [...c.querySelectorAll('button')].map((b) => b.disabled);
   c.querySelectorAll('button').forEach((b) => (b.disabled = true));
   try {
-    await post('/items/' + c.dataset.item + '/decide', { option, fields: editedFields(c), reply, runNow: Boolean(runNow), seen: Number(c.dataset.version) });
-    toast(option === 'Revise' ? 'Sent back to Jarvis for a new version' : option + ': ' + c.dataset.title);
+    const r = await post('/items/' + c.dataset.item + '/decide', { option, fields: editedFields(c), reply, runNow: Boolean(runNow), seen: Number(c.dataset.version) });
+    if (option === 'Revise') {
+      // The card keeps waiting: it shows the request until Jarvis's new version replaces it.
+      if (r.item?.updatedAt) c.dataset.version = r.item.updatedAt;
+      let note = c.querySelector('.revising');
+      if (!note) { note = document.createElement('div'); note.className = 'revising'; c.querySelector('.reply').before(note); }
+      note.textContent = '✏️ Revising: ' + reply + '. Jarvis is on it; this card updates when the new version is ready.';
+      c.querySelector('[data-reply]').value = '';
+      c.querySelectorAll('button').forEach((b, i) => (b.disabled = was[i]));
+      return toast('Sent to Jarvis. The card stays here and updates with the new version.');
+    }
+    toast(option + ': ' + c.dataset.title);
     c.remove();
     document.querySelectorAll('[data-group]').forEach((g) => { if (!g.querySelector('[data-item]')) g.remove(); });
   } catch (err) {
     toast(err.message, { error: true });
-    c.querySelectorAll('button').forEach((b) => (b.disabled = false));
+    c.querySelectorAll('button').forEach((b, i) => (b.disabled = was[i]));
   }
 };
 document.addEventListener('click', async (e) => {
@@ -191,6 +202,10 @@ const CSS = `<style>
 .sent-note{font-size:13px;color:var(--text-dim);margin-top:8px;overflow-wrap:anywhere}
 .item .actions{margin-top:12px}.pick{width:18px;height:18px;accent-color:var(--accent)}
 .revising{color:var(--amber);font-size:13px;margin-top:8px}
+.why{color:var(--red);font-size:13px;margin-top:10px;line-height:1.4}
+.merged{padding:4px 15px 2px}.merged .sub-head{margin:8px 0}
+.merged>.item{border:0;border-top:1px solid var(--border);border-radius:0;margin:0;padding-left:0;padding-right:0;background:none}
+.merged>.item.bad .title{color:var(--red)}
 .result{font-size:13px;color:var(--text-dim);margin-top:4px;overflow-wrap:anywhere}
 .item:not(.open) .fold{display:none}.item:not(.open) .actions{margin-top:8px}.item:not(.open){padding-top:10px;padding-bottom:10px}
 .kinds-more>summary{display:block;list-style:none}.kinds-more>summary::-webkit-details-marker{display:none}
@@ -264,6 +279,7 @@ function waitingCard(
   open = false,
 ): string {
   const blocking = item.checks.some((c) => c.blocking);
+  const blockers = item.checks.filter((c) => c.blocking).map((c) => c.text);
   const source = item.source ? (data.jobNames?.get(`${item.project}:${item.source}`) ?? item.source) : '';
   const expiry = expiresSoon(ctx, item, data.now);
   const long = (item.body?.length ?? 0) > 700;
@@ -272,13 +288,19 @@ function waitingCard(
         ...item.options.map((o, i) => {
           const negative = /^(reject|deny|no|cancel|stop|decline|skip)/i.test(o);
           const kind = i === 0 ? 'green' : negative ? 'quiet' : 'ghost';
-          return `<button type="button" class="btn ${kind}" data-decide="${esc(o)}"${!negative && blocking ? ' disabled title="Fix the problems first"' : ''}>${esc(o)}</button>`;
+          return `<button type="button" class="btn ${kind}" data-decide="${esc(o)}"${!negative && blocking ? ` disabled title="${esc(`Can't ${o.toLowerCase()} yet: ${blockers.join('; ')}`)}"` : ''}>${esc(o)}</button>`;
         }),
         item.mode === 'queue' && item.options[0]
           ? `<button type="button" class="btn quiet" data-decide="${esc(item.options[0])}" data-now="1"${blocking ? ' disabled' : ''} title="Skip the window and run as soon as the queue is free">${esc(item.options[0])} &amp; run now</button>`
           : '',
-        `<button type="button" class="btn quiet" data-open-note>${item.mode === 'queue' ? 'Revise or note…' : 'Note…'}</button>`,
+        `<button type="button" class="btn ${blocking ? 'ghost' : 'quiet'}" data-open-note>${blocking ? 'Fix it…' : item.mode === 'queue' ? 'Revise or note…' : 'Note…'}</button>`,
       ].join('')
+    : '';
+  // Why an option is off, next to it: the checks alone sit inside the folded card.
+  const why = blocking
+    ? `<div class="why">⛔ ${item.options[0] ? `${esc(item.options[0])} is off: ` : ''}${esc(blockers.join('; '))}.${
+        data.canDecide ? ' Tell Jarvis the fix with <b>Fix it…</b> (it makes a new version), or skip it.' : ''
+      }</div>`
     : '';
   return `<article class="card item${blocking ? ' bad' : ''}${open ? ' open' : ''}" id="item-${esc(item.id)}" data-item="${esc(item.id)}" data-version="${item.updatedAt}" data-title="${esc(item.title)}"${
     blocking ? '' : ' data-clean'
@@ -300,7 +322,7 @@ ${item.body ? `<div class="body${long ? ' long' : ''}">${md(item.body)}</div>${l
 ${mediaHtml(item)}
 ${item.fields.length ? `<div class="fieldset">${item.fields.map((f) => fieldHtml(f, data.canDecide)).join('')}</div>` : ''}
 ${item.checks.length ? `<ul class="checks">${item.checks.map((c) => `<li class="${c.blocking ? 'bad' : 'warn'}">${esc(c.text)}</li>`).join('')}</ul>` : ''}
-${item.reply ? `<div class="revising">✏️ Revision asked: ${esc(item.reply)}</div>` : ''}
+${item.reply ? `<div class="revising">✏️ Revising: ${esc(item.reply)}. Jarvis is on it; this card updates when the new version is ready.</div>` : ''}
 ${
   data.canDecide
     ? `<div class="reply"><textarea class="input" data-reply rows="2" placeholder="${
@@ -315,7 +337,7 @@ ${
     : ''
 }
 </div>
-${buttons ? `<div class="actions">${buttons}</div>` : ''}</article>`;
+${why}${buttons ? `<div class="actions">${buttons}</div>` : ''}</article>`;
 }
 
 function doneRow(ctx: DashboardContext, item: Item, data: ApprovalsData, multi: boolean): string {
@@ -413,7 +435,12 @@ export function approvalsPage(ctx: DashboardContext, data: ApprovalsData): strin
                 data.canDecide && clean.length > 1 && group[0]?.options[0]
                   ? `<button type="button" class="btn ghost more" data-bulk="${esc(group[0].options[0])}" data-label="${esc(label)}">${esc(label)}</button>`
                   : '';
-              return `<div data-group><div class="sec-head sub-head"><h3>${esc(kindLabel(k))}</h3><span>${group.length}</span>${bulk}</div>${cards(group)}</div>`;
+              const stuck = group.length - clean.length;
+              const head = `<h3>${esc(kindLabel(k))}</h3><span>${group.length}${stuck ? ` · ${stuck} need a fix` : ''}</span>${bulk}`;
+              // Several drafts of one kind: one card with a row each (tap a row to open it), not a stack of cards.
+              return group.length > 1
+                ? `<div data-group class="card merged"><div class="sec-head sub-head">${head}</div>${cards(group)}</div>`
+                : `<div data-group><div class="sec-head sub-head">${head}</div>${cards(group)}</div>`;
             })
             .join('')}</section>`
         : '',

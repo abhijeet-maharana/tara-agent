@@ -18,7 +18,7 @@ export interface ButtonTap {
 export interface SlackOptions {
   botToken: string;
   appToken: string;
-  /** A person's token (xoxp-…): scheduled-run triggers are posted as them. */
+  /** A person's token (xoxp-…): scheduled-run triggers and Approvals-page messages are posted as them. */
   userToken?: string;
   log: Logger;
   onMessage: (msg: IncomingMessage) => Promise<void>;
@@ -286,8 +286,15 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
     },
     ...(options.userToken
       ? {
-          async postAsUser(channel: string, text: string) {
-            const res = await app.client.chat.postMessage({ token: options.userToken, channel, text });
+          async postAsUser(channel: string, text: string, threadTs?: string) {
+            const res = await app.client.chat.postMessage({
+              token: options.userToken,
+              channel,
+              thread_ts: threadTs,
+              text,
+              unfurl_links: false,
+              unfurl_media: false,
+            });
             return res.ts as string;
           },
         }

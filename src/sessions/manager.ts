@@ -10,7 +10,7 @@ import type { Runner, RunOutcome } from '../runner/run.js';
 import { sessionScratch } from '../runner/workspace.js';
 import { foldersNote, identityPrompt } from '../scheduler/prompt.js';
 import type { JobControl, JobInfo } from '../scheduler/scheduler.js';
-import { findRunJob, looksLikeTrigger, parseScheduledRun, SCHEDULE_BY } from '../scheduler/slack-trigger.js';
+import { findRunJob, parseScheduledRun, SCHEDULE_BY } from '../scheduler/slack-trigger.js';
 import type { ButtonTap } from '../slack/app.js';
 import { formatDuration } from '../slack/format.js';
 import { EditReply, type StreamPort, StreamReply, type TurnReply } from '../slack/reply.js';
@@ -24,8 +24,11 @@ import { Threads } from './threads.js';
 export interface ChatPort {
   /** Posts into a thread (or top-level when `threadTs` is undefined) and returns the new message's ts. */
   post(channel: string, threadTs: string | undefined, text: string): Promise<string>;
-  /** Posts top-level as a person (a user token), for scheduled-run triggers. Unset: `post` as the bot. */
-  postAsUser?(channel: string, text: string): Promise<string>;
+  /**
+   * Posts as a person (a user token): scheduled-run triggers (top-level) and messages from the Approvals
+   * page that start a chat in a card's thread. Unset: they are posted as the bot.
+   */
+  postAsUser?(channel: string, text: string, threadTs?: string): Promise<string>;
   delete(channel: string, ts: string): Promise<void>;
   update(channel: string, ts: string, text: string, blocks?: SlackBlock[]): Promise<void>;
   /** Posts a Block Kit message (text is the notification/fallback text), top-level without `threadTs`. */
@@ -63,6 +66,12 @@ export interface IncomingMessage {
   attachments?: Attachment[];
   /** Posted by the bot itself: only its scheduled-run trigger messages get this far. */
   fromSelf?: boolean;
+  /**
+   * A Slack user id to mention in a new message once the turn has answered (whoever sent a note from
+   * the Approvals page, not `user`, which may be the user token's account), so they get a notification:
+   * Slack doesn't notify on a streamed or edited answer.
+   */
+  mentionWhenDone?: string;
 }
 
 export interface Attachment {
@@ -144,18 +153,6 @@ export class SessionManager {
     }
     const text = msg.text.trim();
     if (!text && !msg.attachments?.length) return;
-    // A trigger posted as a person (SLACK_USER_TOKEN). It runs only a slot the scheduler posted.
-    if (msg.threadTs === msg.ts && looksLikeTrigger(text)) {
-      if (parseScheduledRun(text)) {
-        await this.scheduledRun(project, msg);
-        return;
-      }
-      // Never hand a trigger to Claude as a chat message: it would improvise the job without its setup.
-      this.log.warn(
-        `[${project.config.name}] ignored a trigger message that doesn't parse: ${text.slice(0, 120)}`,
-      );
-      return;
-    }
     // "Run <id>" at the top level: the scheduler's trigger when a slot of that job is waiting for it,
     // otherwise a person's own request, handled as "run <job name>" below.
     if (msg.threadTs === msg.ts && parseScheduledRun(text) && (await this.scheduledRun(project, msg))) return;
@@ -558,6 +555,14 @@ export class SessionManager {
           ]
         : [];
     await reply.finish({ summary, ok: o.status === 'ok', answer: o.text, notes });
+    if (msg.mentionWhenDone)
+      await chat
+        .post(
+          msg.channel,
+          msg.threadTs,
+          `<@${msg.mentionWhenDone}> ↑ answered your note from the Approvals page.`,
+        )
+        .catch((err: Error) => this.log.warn(`could not mention ${msg.mentionWhenDone}: ${err.message}`));
     await chat.unreact(msg.channel, msg.ts, 'eyes').catch(() => {});
     await chat.react(msg.channel, msg.ts, reaction).catch(() => {});
   }

@@ -6,7 +6,7 @@ import {
   type AttentionSources,
   gatherAttention,
   parsePullRequests,
-} from '../src/live/attention.js';
+} from '../src/http/attention.js';
 import type { Item, StoredRun } from '../src/store/store.js';
 
 const run = (status: string, startedAt = 1): StoredRun => ({

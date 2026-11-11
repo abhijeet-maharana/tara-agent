@@ -345,7 +345,9 @@ describe('Scheduler', () => {
     scheduler.trigger('shop', 'sla', 'U1');
     await scheduler.idle();
     expect(chat.deleted).toEqual([]);
-    expect(chat.log.some((l) => l.startsWith('update ts2: 🔇 *SLA Report*') && l.endsWith('· nothing to report'))).toBe(true);
+    expect(
+      chat.log.some((l) => l.startsWith('update ts2: 🔇 *SLA Report*') && l.endsWith('· nothing to report')),
+    ).toBe(true);
     expect(store.getSession('C1:ts1')).toBeDefined();
     await scheduler.stop();
   });
@@ -832,6 +834,34 @@ describe('job streaming', () => {
     await scheduler.stop();
   });
 
+  it('keeps a headline-only reply in the channel status line, not repeated in the thread', async () => {
+    const stream = new FakeStream();
+    const { chat, scheduler } = setup({
+      jobs: [baseJob],
+      stream,
+      replies: ['All 12 orders shipped on time.'],
+    });
+    scheduler.start();
+    scheduler.trigger('shop', 'sla', 'U1');
+    await scheduler.idle();
+    expect(
+      chat.log.some(
+        (l) => l.startsWith('update ts2: ✅ *SLA Report*') && l.endsWith('All 12 orders shipped on time.'),
+      ),
+    ).toBe(true);
+    // The thread has the steps and the summary only: no reply text, no "(no text reply)" placeholder.
+    expect(stream.text()).toBe('');
+    expect(stream.state()).toEqual({
+      title: '✅ Done · 2s · 2 steps · claude-haiku-5-5',
+      tasks: { 'Bash: curl': 'complete' },
+    });
+    expect(chat.posts.filter((p) => p.thread === 'ts1').map((p) => p.text)).toEqual([
+      '⏳ *SLA Report* (run by <@U1>)',
+    ]);
+    expect(stream.calls.at(-1)).toMatch(/^stop s1/);
+    await scheduler.stop();
+  });
+
   it('streams board/API runs to the owner, and posts details without an owner', async () => {
     const stream = new FakeStream();
     const { chat, scheduler } = setup({ jobs: [baseJob], stream, owner: 'UOWNER' });
@@ -862,7 +892,10 @@ describe('job streaming', () => {
     await scheduler.idle();
     // The stream (its steps) is finished, not removed, so the thread shows what the run checked.
     expect(chat.deleted).toEqual([]);
-    expect(stream.appended.flat()).toContainEqual({ type: 'plan_update', title: expect.stringMatching(/^🔇 Nothing to report/) });
+    expect(stream.appended.flat()).toContainEqual({
+      type: 'plan_update',
+      title: expect.stringMatching(/^🔇 Nothing to report/),
+    });
     expect(stream.calls.at(-1)).toMatch(/^stop s1/);
     await scheduler.stop();
   });
@@ -1090,7 +1123,11 @@ describe('scheduled runs through Slack', () => {
     const { chat, scheduler, store } = missedSlot({ replies: ['[SILENT]'] });
     await pickUp(scheduler, chat);
     expect(chat.deleted).toEqual([]);
-    expect(chat.log.some((l) => l.startsWith('update ts2: 🔇 *SLA Report* (catch-up) ·') && l.endsWith('· nothing to report'))).toBe(true);
+    expect(
+      chat.log.some(
+        (l) => l.startsWith('update ts2: 🔇 *SLA Report* (catch-up) ·') && l.endsWith('· nothing to report'),
+      ),
+    ).toBe(true);
     expect(store.getSession('C1:ts1')).toBeDefined();
     await scheduler.stop();
   });

@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { Approvals } from '../src/approvals/approvals.js';
+import { Approvals, type Awaiting } from '../src/approvals/approvals.js';
 import { verifySeal } from '../src/approvals/seal.js';
 import type { Project, QueueConfig } from '../src/config/schema.js';
 import { startHttpServer } from '../src/http/server.js';
@@ -100,6 +100,7 @@ function setup(
     fetch?: typeof fetch;
     project?: Project;
     autoApprove?: { project: string; kind: string; url: string }[];
+    pickupTimeoutMs?: number;
   } = {},
 ) {
   const project = opts.project ?? makeProject();
@@ -115,6 +116,7 @@ function setup(
     fetch: opts.fetch,
     now: opts.now,
     autoApprove: opts.autoApprove,
+    pickupTimeoutMs: opts.pickupTimeoutMs,
   });
   const chats: IncomingMessage[] = [];
   const jobs: Array<{ jobId: string; text: string }> = [];
@@ -256,6 +258,42 @@ describe('proposing and deciding', () => {
         text: expect.stringContaining('USER DECISION on "Cut bids": Approve\nNote: only two'),
       },
     ]);
+  });
+
+  it('returns once the card is decided, without waiting for the run the decision resumes', async () => {
+    const { project, store, chat, approvals } = setup();
+    let finish = () => {};
+    const run = new Promise<void>((r) => (finish = r));
+    approvals.onJob = async () => run;
+    const ask = await approvals.requestDecision(
+      { project, channel: 'C1', threadTs: '90.1', jobId: 'sender' },
+      { title: 'Send it', details: 'D' },
+    );
+    const decided = await approvals.decide(ask.id, { option: 'Approve', by: 'U1', via: 'dashboard' });
+    expect(decided.status).toBe('done');
+    expect(store.getItem(ask.id)?.status).toBe('done');
+    expect(chat.updates.at(-1)?.text).toBe('Send it: Approve');
+    let settled = false;
+    const waiting = approvals.settled().then(() => (settled = true));
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    finish();
+    await waiting;
+    expect(settled).toBe(true);
+  });
+
+  it('hands a decision to a chat in its thread when the job that asked no longer exists', async () => {
+    const { project, approvals, chats } = setup();
+    approvals.onJob = async () => 'unknown';
+    const ask = await approvals.requestDecision(
+      { project, channel: 'C1', threadTs: '80.1', jobId: 'merged-away' },
+      { title: 'Resolve issue', details: 'D' },
+    );
+    await approvals.decide(ask.id, { option: 'Approve', by: 'U1', via: 'dashboard' });
+    await approvals.settled();
+    expect(chats).toHaveLength(1);
+    expect(chats[0]).toMatchObject({ channel: 'C1', threadTs: '80.1' });
+    expect(chats[0]?.text).toContain('USER DECISION on "Resolve issue": Approve');
   });
 
   it('closes a notice on its first option without a run; its other options go to the agent', async () => {
@@ -783,6 +821,39 @@ describe('decisions over HTTP', () => {
     server.close();
   });
 
+  it('updates a waiting card with the same key in place instead of adding another', async () => {
+    const { project, store, chat, approvals } = setup();
+    const first = await approvals.ask(project, {
+      key: 'warmup-reply:2026-11-10',
+      kind: 'warmup-reply',
+      title: 'Reply to 1 warmup email',
+      details: 'A',
+      options: ['Replied', 'Skip today'],
+    });
+    const posted = chat.blockPosts.length;
+    const again = await approvals.ask(project, {
+      key: 'warmup-reply:2026-11-10',
+      kind: 'warmup-reply',
+      title: 'Reply to 1 warmup email',
+      details: 'A',
+      options: ['Replied', 'Skip today'],
+    });
+    expect(again.updatedAt).toBe(first.updatedAt);
+    const second = await approvals.ask(project, {
+      key: 'warmup-reply:2026-11-10',
+      kind: 'warmup-reply',
+      title: 'Reply to 2 warmup emails',
+      details: 'A\n\nB',
+      options: ['Replied', 'Skip today'],
+    });
+    expect(second.id).toBe(first.id);
+    expect(second).toMatchObject({ title: 'Reply to 2 warmup emails', body: 'A\n\nB', status: 'pending' });
+    expect(chat.blockPosts).toHaveLength(posted);
+    expect(chat.updates.at(-1)).toMatchObject({ ts: first.messageTs });
+    expect(JSON.stringify(chat.updates.at(-1)?.blocks)).toContain('Reply to 2 warmup emails');
+    expect(store.items({ project: 'shop', statuses: ['pending'] })).toHaveLength(1);
+  });
+
   it('takes a note on a waiting card without deciding it: shown in its thread, sent to Jarvis there', async () => {
     const { project, store, chat, approvals, chats } = setup();
     const server = await startHttpServer({
@@ -816,7 +887,7 @@ describe('decisions over HTTP', () => {
     const thread = chat.posts[0]?.ts;
     expect(chat.posts.at(-1)).toMatchObject({
       thread,
-      text: '📝 Note from the Approvals page: Which portal?',
+      text: '📝 Note from <@U1> on the Approvals page: Which portal?',
     });
     await new Promise((r) => setTimeout(r, 10));
     expect(chats.at(-1)).toMatchObject({ channel: 'C1', threadTs: thread, user: 'U1' });
@@ -1315,5 +1386,140 @@ describe('closing options and the project hook', () => {
     ]);
     const { createHmac } = await import('node:crypto');
     for (const h of hooks) expect(h.signature).toBe(createHmac('sha256', KEY).update(h.body).digest('hex'));
+  });
+});
+
+describe('Approvals page messages go through Slack (as the person)', () => {
+  /** `deliver`: Slack delivers each post at once, before the post call returns (as it can). */
+  const setupAsUser = (opts: { fail?: boolean; deliver?: boolean } = {}) => {
+    const t = setup({ pickupTimeoutMs: 20 });
+    const asUser: { thread?: string; text: string; ts: string }[] = [];
+    const delivered: (Awaiting | undefined)[] = [];
+    t.chat.postAsUser = async (channel, text, thread) => {
+      if (opts.fail) throw new Error('not_in_channel');
+      const ts = `user.${asUser.length + 1}`;
+      asUser.push({ thread, text, ts });
+      if (opts.deliver && thread) delivered.push(t.approvals.delivered({ channel, threadTs: thread, ts }));
+      return ts;
+    };
+    return { ...t, asUser, delivered };
+  };
+  const saveSession = (store: Store, thread: string) =>
+    store.saveSession({
+      threadKey: `C1:${thread}`,
+      project: 'shop',
+      sessionId: 's1',
+      model: 'opus',
+      started: true,
+    });
+  const card = (approvals: Approvals, project: Project) =>
+    approvals.ask(project, {
+      title: 'Log in to the portal',
+      details: 'Expired.',
+      options: ['Done', 'Dismiss'],
+    });
+  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  it('posts a decision as the person in a thread with no session; Slack starts the chat', async () => {
+    const { project, chat, approvals, chats, asUser, delivered } = setupAsUser({ deliver: true });
+    const item = await card(approvals, project);
+    const thread = chat.posts[0]?.ts as string;
+    await approvals.decide(item.id, { option: 'Done', by: 'U1', via: 'dashboard', reply: 'did it' });
+    await approvals.settled();
+    // Slack shows who decided (mentioned, so notified at once) and what; Jarvis gets the full text.
+    expect(asUser).toEqual([
+      {
+        thread,
+        text: '*From <@U1> on the Approvals page:* ✅ Done on "Log in to the portal"\ndid it',
+        ts: 'user.1',
+      },
+    ]);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]?.text).toContain('USER DECISION on "Log in to the portal": Done');
+    expect(delivered[0]?.text).toContain('Note: did it');
+    expect(delivered[0]?.mention).toBeUndefined(); // a decision's answer mentions no one
+    expect(chats).toHaveLength(0); // Slack delivers it to the session manager, not this path
+    // Slack delivered it (even before the post returned), so nothing goes directly later.
+    await wait(40);
+    expect(chats).toHaveLength(0);
+  });
+
+  it('sends it directly when Slack never delivers the posted message', async () => {
+    const { project, chat, approvals, chats, asUser } = setupAsUser();
+    const item = await card(approvals, project);
+    await approvals.decide(item.id, { option: 'Done', by: 'U1', via: 'dashboard' });
+    await approvals.settled();
+    expect(asUser).toHaveLength(1);
+    await wait(40);
+    expect(chats).toHaveLength(1);
+    expect(chats[0]).toMatchObject({ channel: 'C1', threadTs: chat.posts[0]?.ts, ts: 'user.1' });
+  });
+
+  it('continues a session already in the thread directly, and a Slack tap always directly', async () => {
+    const { project, store, chat, approvals, chats, asUser } = setupAsUser();
+    const first = await card(approvals, project);
+    const thread = chat.posts[0]?.ts as string;
+    await approvals.decide(first.id, { option: 'Done', by: 'U1', via: 'slack' });
+    await approvals.settled();
+    expect(asUser).toHaveLength(0);
+    expect(chats).toHaveLength(1);
+
+    saveSession(store, thread);
+    const second = await approvals.ask(project, {
+      title: 'Another',
+      details: 'x',
+      options: ['Done', 'Dismiss'],
+    });
+    await approvals.decide(second.id, { option: 'Done', by: 'U1', via: 'dashboard' });
+    await approvals.settled();
+    expect(asUser).toHaveLength(0);
+    expect(chats).toHaveLength(2);
+    expect(chats[1]?.text).toContain('USER DECISION on "Another": Done');
+  });
+
+  it('posts a note as the person instead of the bot line, even in a thread with a session', async () => {
+    const { project, store, chat, approvals, chats, asUser } = setupAsUser();
+    const item = await card(approvals, project);
+    const thread = chat.posts[0]?.ts as string;
+    saveSession(store, thread);
+    await approvals.note(item.id, 'Which portal?', 'U1');
+    expect(asUser).toHaveLength(1);
+    expect(asUser[0]).toMatchObject({ thread });
+    expect(asUser[0]?.text).toBe('*From <@U1> on the Approvals page:* Which portal?');
+    expect(chat.texts().some((t) => t.startsWith('📝 Note'))).toBe(false);
+    expect(chats).toHaveLength(0);
+    // Someone else's reply in the thread is theirs: not swapped, and the note still waits.
+    expect(approvals.delivered({ channel: 'C1', threadTs: thread, ts: 'other.1' })).toBeUndefined();
+    // Slack delivered it: Jarvis gets the full text, and the answer mentions the person.
+    const mine = approvals.delivered({ channel: 'C1', threadTs: thread, ts: 'user.1' });
+    expect(mine?.mention).toBe('U1');
+    expect(mine?.text).toContain('sent from the Approvals page without a decision');
+    expect(mine?.text).toContain('Which portal?');
+    await wait(40);
+    expect(chats).toHaveLength(0);
+  });
+
+  it('sends a note directly when Slack never delivers it, once', async () => {
+    const { project, store, chat, approvals, chats } = setupAsUser();
+    const item = await card(approvals, project);
+    saveSession(store, chat.posts[0]?.ts as string);
+    await approvals.note(item.id, 'First', 'U1');
+    await approvals.note(item.id, 'Second', 'U1');
+    // Only the first arrived, so only the second goes directly.
+    approvals.delivered({ channel: 'C1', threadTs: chat.posts[0]?.ts as string, ts: 'user.1' });
+    await wait(40);
+    expect(chats).toHaveLength(1);
+    expect(chats[0]).toMatchObject({ ts: 'user.2', mentionWhenDone: 'U1' });
+    expect(chats[0]?.text).toContain('Second');
+  });
+
+  it('falls back to the bot line and a direct chat when posting as the person fails', async () => {
+    const { project, chat, approvals, chats } = setupAsUser({ fail: true });
+    const item = await card(approvals, project);
+    await approvals.note(item.id, 'Which portal?', 'U1');
+    await wait(5);
+    expect(chat.texts()).toContain('📝 Note from <@U1> on the Approvals page: Which portal?');
+    expect(chats).toHaveLength(1);
+    expect(chats[0]?.mentionWhenDone).toBe('U1');
   });
 });
