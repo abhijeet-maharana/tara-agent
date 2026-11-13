@@ -672,14 +672,6 @@ export class Store {
     return result.changes > 0;
   }
 
-  /** Slots of a job claimed in [from, to], for spotting missed runs. */
-  claimedSlots(jobKey: string, from: number, to: number): Set<number> {
-    const rows = this.db
-      .prepare('SELECT slot FROM job_claims WHERE job_key = ? AND slot BETWEEN ? AND ?')
-      .all(jobKey, from, to) as { slot: number }[];
-    return new Set(rows.map((r) => r.slot));
-  }
-
   finishSlot(jobKey: string, slot: number, status: string): void {
     this.db
       .prepare('UPDATE job_claims SET status = ? WHERE job_key = ? AND slot = ?')
@@ -757,6 +749,52 @@ export class Store {
   getItem(id: string): Item | undefined {
     const row = this.db.prepare('SELECT * FROM items WHERE id = ?').get(id);
     return row ? toItem(row as Record<string, unknown>) : undefined;
+  }
+
+  /**
+   * Moves a project's job ids to new ones (`old → new`), e.g. after jobs were renamed to their skill:
+   * run history, cards (so a waiting one still resumes its job) and slot claims. Returns rows changed.
+   */
+  renameJobs(project: string, renames: Record<string, string>): number {
+    let changed = 0;
+    this.db.exec('BEGIN');
+    try {
+      for (const [from, to] of Object.entries(renames)) {
+        if (from === to) continue;
+        const run = (sql: string, ...args: string[]) => {
+          changed += Number(this.db.prepare(sql).run(...args).changes);
+        };
+        run('UPDATE runs SET job_id = ? WHERE project = ? AND job_id = ?', to, project, from);
+        run('UPDATE items SET job_id = ? WHERE project = ? AND job_id = ?', to, project, from);
+        run('UPDATE items SET source = ? WHERE project = ? AND source = ?', to, project, from);
+        run(
+          'UPDATE OR REPLACE job_claims SET job_key = ? WHERE job_key = ?',
+          `${project}:${to}`,
+          `${project}:${from}`,
+        );
+        run(
+          'UPDATE OR REPLACE job_seen SET job_key = ? WHERE job_key = ?',
+          `${project}:${to}`,
+          `${project}:${from}`,
+        );
+      }
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+    return changed;
+  }
+
+  /** The items posted in one Slack thread, oldest first (at most `limit`). */
+  itemsInThread(channel: string, threadTs: string, limit = 20): Item[] {
+    return (
+      this.db
+        .prepare('SELECT * FROM items WHERE channel = ? AND thread_ts = ? ORDER BY created_at DESC LIMIT ?')
+        .all(channel, threadTs, limit) as Record<string, unknown>[]
+    )
+      .map(toItem)
+      .reverse();
   }
 
   /** True when the project has ever had an item with this key (any status). */

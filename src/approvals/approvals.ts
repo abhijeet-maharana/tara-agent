@@ -1,9 +1,8 @@
 import { createHmac } from 'node:crypto';
 import { loadQueues } from '../config/load.js';
-import type { Project } from '../config/schema.js';
+import { type Project, skillJobName } from '../config/schema.js';
 import type { Privileged, PrivilegedResult } from '../privileged/privileged.js';
 import type { DecidedCard } from '../scheduler/prompt.js';
-import { openRunThread } from '../scheduler/slack-trigger.js';
 import {
   type ChatPort,
   type IncomingMessage,
@@ -717,9 +716,8 @@ export class Approvals {
     let threadTs = item.threadTs;
     if (!threadTs) {
       channel = project.config.slackChannel;
-      // A card no run proposed has no thread: open a "Run <kind>" one, naming the card.
-      threadTs = await openRunThread(this.deps.chat, channel, item.kind);
-      await this.deps.chat.post(channel, threadTs, `📝 *${item.title}*`);
+      // A card no run proposed has no thread: open one, named after the card.
+      threadTs = await this.deps.chat.post(channel, undefined, `📝 *${item.title}*`);
     }
     await this.toThread(
       { channel, threadTs, ts: threadTs, user },
@@ -801,8 +799,9 @@ export class Approvals {
   }
 
   /**
-   * The day's `Run <name>` thread in the project's channel (host timezone), opened on first use and
-   * shared by every card of that name that day, so a channel holds one line per queue a day.
+   * The day's thread for cards of one kind or queue that no run raised, e.g. `📌 Notices · Thu 13 Nov`
+   * (host timezone), opened on first use and shared by every such card that day. It is not a `Run`
+   * message: no job runs it. A chat started in it is told which cards it holds (sessions/manager.ts).
    */
   private async dayThread(project: Project, name: string): Promise<{ channel: string; ts: string }> {
     const channel = project.config.slackChannel;
@@ -812,7 +811,16 @@ export class Approvals {
     if (known) return known;
     let opening = this.opening.get(key);
     if (!opening) {
-      opening = openRunThread(this.deps.chat, channel, name)
+      const when = new Intl.DateTimeFormat('en-GB', {
+        timeZone: this.deps.timeZone,
+        weekday: 'short',
+        day: 'numeric',
+        month: 'short',
+      })
+        .format(this.now())
+        .replace(',', '');
+      opening = this.deps.chat
+        .post(channel, undefined, `📌 ${dayThreadName(name, project.config.words)} · ${when}`)
         .then((ts) => {
           this.deps.store.saveDayThread(key, channel, ts);
           return ts;
@@ -849,10 +857,9 @@ export class Approvals {
     let channel = item.channel ?? project.config.slackChannel;
     let threadTs = item.threadTs;
     if (!threadTs) {
-      // Proposed by a project server, not a run: open a "Run <kind>" thread for it, naming the card.
+      // Proposed by a project server, not a run: open a thread for it, named after the card.
       channel = project.config.slackChannel;
-      threadTs = await openRunThread(this.deps.chat, channel, item.kind);
-      await this.deps.chat.post(channel, threadTs, `📝 *${item.title}*`);
+      threadTs = await this.deps.chat.post(channel, undefined, `📝 *${item.title}*`);
     }
     await this.toThread({ channel, threadTs, ts: item.messageTs ?? threadTs, user }, text, {
       fromPage: opts.fromPage,
@@ -1022,3 +1029,10 @@ function cleanField(f: ItemField): ItemField {
 const reviseText = (item: Item, reply: string) =>
   `USER REVISE REQUEST for ${item.kind} "${item.title}"${item.key ? ` (key ${item.key})` : ''}, item ${item.id}: ${reply}
 Make the change. If your skill says the project's server makes these cards, change it through the project and the card refreshes; otherwise call propose_item again with the same key and queue. Either way the new version replaces this card.`;
+
+/** The day thread's name: "Notices" for notice cards, else the kind or queue's words and "cards". */
+export function dayThreadName(name: string, words?: Record<string, string>): string {
+  if (name === 'notice') return 'Notices';
+  if (name === 'decision') return 'Decisions';
+  return `${skillJobName(name, words)} cards`;
+}

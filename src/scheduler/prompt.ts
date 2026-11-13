@@ -101,7 +101,7 @@ export function jobInstructions(job: Pick<JobConfig, 'id' | 'name' | 'skills' | 
     job.steps.length > 0
       ? ' Its "### Step" parts were done by the sessions before you (their output is above): do the rest.'
       : '';
-  return `Run the job "${job.name}" (\`${job.id}\`): do what the "## Job: \`${job.id}\`" section of the \`${job.skills[0]}\` skill says, with the rest of that skill.${steps}`;
+  return `Run the job "${job.name}" (\`${job.id}\`): do what the "## Job" section of the \`${job.skills[0]}\` skill says (in an older skill: "## Job: \`${job.id}\`"), with the rest of that skill.${steps}`;
 }
 
 /** What one step's session is told to do: its part of the job's section. */
@@ -110,7 +110,7 @@ export function stepInstructions(
   step: Pick<JobConfig['steps'][number], 'name' | 'skill'>,
 ): string {
   const skill = step.skill ?? job.skills[0];
-  return `This is the step "${step.name}" of the job "${job.name}" (\`${job.id}\`). Load the \`${skill}\` skill (the Skill tool, or its SKILL.md). In its "## Job: \`${job.id}\`" section, do only the "### Step: ${step.name}" part (and the "### Every step" part, if there is one); the rest of that section is for the session after the steps.`;
+  return `This is the step "${step.name}" of the job "${job.name}" (\`${job.id}\`). Load the \`${skill}\` skill (the Skill tool, or its SKILL.md). In its "## Job" section (in an older skill: "## Job: \`${job.id}\`"), do only the "### Step: ${step.name}" part (and the "### Every step" part, if there is one); the rest of that section is for the session after the steps.`;
 }
 
 /** The user prompt for one run: approved items and step output, then what to do, its skills and folders. */
@@ -125,7 +125,7 @@ export function buildJobPrompt(
   if (items?.length) parts.push(approvedItemsBlock(items));
   if (stepOutput) parts.push(stepOutput);
   parts.push(jobInstructions(job));
-  if (job.skills.length > 0) {
+  if (job.skills.length > 1) {
     parts.push(
       `Skills for this job: ${job.skills.map((s) => `\`${s}\``).join(', ')}. ` +
         'Load each one before you start (the Skill tool, or its SKILL.md) and follow it.',

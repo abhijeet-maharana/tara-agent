@@ -1,9 +1,12 @@
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { chmodSync, chownSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
+import { fileURLToPath } from 'node:url';
 import type { Harness, McpServer } from '../config/schema.js';
+import { projectBrowser } from '../http/browser-usage.js';
 import { asUser, type RunAs, signalGroup } from './as-user.js';
 import { parseStreamLine, type RateLimit, type StreamEvent, type TokenUsage } from './stream.js';
 
@@ -211,6 +214,24 @@ export function emit(options: RunOptions, event: StreamEvent): void {
 }
 
 /** Runs one headless `claude -p` turn and resolves when the process exits. Never rejects. */
+/** The own-tabs hook script, built next to this file (dist/hooks/own-tabs.js). */
+export const OWN_TABS_HOOK = fileURLToPath(new URL('../hooks/own-tabs.js', import.meta.url));
+
+/**
+ * `--settings` with the own-tabs hook on the repo's browser MCP servers (its `.mcp.json`), or undefined
+ * when it has none. Settings from a flag add to the user's and project's own, hooks included.
+ */
+export function ownTabsSettings(cwd: string): string | undefined {
+  const { servers } = projectBrowser(cwd);
+  if (servers.length === 0) return undefined;
+  const names = servers.map((s) => s.replace(/[^\w-]/g, '')).join('|');
+  const hook = [{ type: 'command', command: `"${process.execPath}" "${OWN_TABS_HOOK}"`, timeout: 10 }];
+  const matcher = `mcp__(${names})__.*`;
+  return JSON.stringify({
+    hooks: { PreToolUse: [{ matcher, hooks: hook }], PostToolUse: [{ matcher, hooks: hook }] },
+  });
+}
+
 export const runClaude: Runner = async (options) => {
   const started = Date.now();
   let result: Extract<StreamEvent, { kind: 'result' }> | undefined;
@@ -224,8 +245,12 @@ export const runClaude: Runner = async (options) => {
       ? withMcpServers(options.args, options.mcpServers, options.runAs)
       : undefined;
   const base = servers?.args ?? options.args;
-  const args = prompt ? beforeAllowedTools(base, ['--append-system-prompt-file', prompt.file]) : base;
-  const exit = await spawnCli(options, args, options.prompt, (line) => {
+  const withPrompt = prompt ? beforeAllowedTools(base, ['--append-system-prompt-file', prompt.file]) : base;
+  // A shared browser: keep this run on its own tabs (hooks/own-tabs.ts), whoever else uses it.
+  const tabHooks = ownTabsSettings(options.cwd);
+  const args = tabHooks ? beforeAllowedTools(withPrompt, ['--settings', tabHooks]) : withPrompt;
+  const env = tabHooks ? { ...options.env, TARA_RUN_NONCE: randomUUID() } : options.env;
+  const exit = await spawnCli({ ...options, env }, args, options.prompt, (line) => {
     for (const event of parseStreamLine(line)) {
       if (event.kind === 'init') init = event;
       else if (event.kind === 'tool') toolCalls++;

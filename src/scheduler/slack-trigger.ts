@@ -39,7 +39,7 @@ export function findRunJob<J extends { id: string; name: string }>(jobs: J[], sa
 /**
  * The one kind of message tara starts in a project channel: a top-level "Run <name>". Everything
  * else (status, the answer, cards, notes) goes in its thread, so the channel is a list of runs.
- * `name` is a job's name (`runName`), or what runs when it isn't a job (`health-digest`, a card's kind).
+ * `name` is a job's name (`runName`), or what runs when it isn't a job (a card's kind).
  */
 export function openRunThread(
   chat: { post(channel: string, threadTs: string | undefined, text: string): Promise<string> },

@@ -29,12 +29,11 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `scratchDays` | `3` | Days after its last use that a session's scratch folder is deleted (see [Files](#files)) |
 | `retentionDays` | `90` | Days of history kept in the state database (min 14). Runs, slot claims and sessions not used since are deleted daily; each job's latest run and all approval cards are kept |
 | `streaming` | `true` | Stream replies as a live task card and text. Needs the Slack app's "Agents & AI Apps" feature and the `assistant:write` scope; without them, tara-agent falls back to one edited status message |
-| `browsers` | `[{lock: chrome, cdpUrl: http://127.0.0.1:9222, closeTabs: true}]` | The shared Chromes jobs drive, one entry per Chrome instance (e.g. one per signed-in identity: its own `--user-data-dir` and `--remote-debugging-port`), each with its own `lock`. After every run of a job holding a browser's `lock` (scheduled, on demand, queue or continued after a decision; also when it fails or times out), the tabs the run opened or moved to another page in that browser are closed through its DevTools endpoint; one new-tab page stays if they were all the run's. Chat turns, jobs without the lock and the other browsers are left alone. Point the project's Chrome MCP server (`--browserUrl`) at the same `cdpUrl` |
+| `browsers` | `[{lock: chrome, cdpUrl: http://127.0.0.1:9222, closeTabs: true, staleMinutes: 30}]` | The shared Chromes runs drive (e.g. one per signed-in identity: its own `--user-data-dir` and `--remote-debugging-port`). `lock` is its name on the Browsers page. Runs share a browser without locks ([shared browsers](#shared-browsers)); with `closeTabs`, tara closes stale tabs every 5 minutes: open over `staleMinutes` and since before every run still going in that browser started, never a kept tab (project `keepTabsUrl`) or the last tab. Point the project's Chrome MCP server (`--browserUrl`) at the same `cdpUrl` |
 | `voice` | unset | Speech-to-text for Slack voice notes that Slack didn't transcribe (it skips short clips and some languages): `url` (an OpenAI-compatible chat completions endpoint whose models take `input_audio`, e.g. Gemini) and `models` (tried in order). Key from `TARA_VOICE_API_KEY`. Unset = Slack's transcript only, and voice notes without one get a "please type it" reply |
 | `statusIntervalSeconds` | `5` | Min gap between status edits in the fallback mode |
 | `catchUpHours` | `6` | After downtime, run a job's latest missed slot if it is at most this old (`0` = never) |
 | `timezone` | host's | Default timezone for job schedules and times shown in Slack |
-| `healthDigest` | on, `0 9 * * *` | Daily summary per project channel (`enabled`, `cron`): runs, problems, missed slots, peak usage. Silent when there is nothing to report |
 | `autoApprove` | none | Draft cards a project's own server may approve without a person: a list of `{project, kind, url}`. A card of that kind proposed over `POST /items` with `autoApprove: true` is approved as `auto` (sealed, then queued as usual) when `url` answers `{approve: true, reason}` to `POST {kind, key, fields}`. Only a key's first card and only one with no checks; anything else waits for a person. Host config only, so a run can't turn it on ([auto-approved cards](security.md#auto-approved-cards)) |
 | `github` | none | Projects whose runs may open pull requests: a list of `{project, repo, base}` (`repo` is `owner/name`, `base` defaults to `main`). Token: `TARA_GITHUB_TOKEN` in tara-agent's env, never given to a run. Runs get `start_pull_request` (a fresh copy of `base`, or of the PR's branch, in a temp folder) and `open_pull_request` (commit, push to `<agentName>/<name>`, open or update the PR). No merges, no force pushes, no `.github/`, env or key files ([pull requests](security.md#pull-requests)). They also get `read_ci_job` (read-only: a job's failed steps and log excerpt; the token needs **Actions** read) ([CI jobs](security.md#ci-jobs)) |
 | `privileged.command` | off | Root actions a run may ask for through the root-owned helper `deploy/tara-priv.mjs`, usually `["sudo", "-n", "/usr/local/sbin/tara-priv"]` ([privileged actions](security.md#privileged-actions)) |
@@ -64,6 +63,8 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `scratchDir` | `<stateDir>/scratch/<name>` | Parent of per-session scratch folders, relative to the repo. Keep it out of git |
 | `jobDataDir` | `<stateDir>/job-data/<name>` | Parent of per-job data folders, relative to the repo |
 | `selfImprove` | `"always"` | After every run (`always`), only runs with trouble (`trouble`), or never (`off`), let Claude fix the skill it followed (see [Self-improvement](#self-improvement)) |
+| `keepTabsUrl` | none | Tabs tara never closes as stale (host `browsers`): GET returns a JSON list of `{url}` or URL strings, bare or under `result`, matched without query or fragment. For a page a person must finish, such as a form stopped at a captcha. If it doesn't answer, no tab in that browser is closed |
+| `words` | none | How skill-name words are written in job names: `{"linkedin": "LinkedIn", "sla": "SLA"}`; other words are capitalised |
 | `approvals.validateUrl` | none | Asked for extra checks on every proposed or edited draft (see [Queues](#queues)) |
 | `approvals.hookUrl` | none | Told when a draft is decided or finished |
 | `approvals.expireDays` | `7` | Pending drafts expire after this many days |
@@ -76,35 +77,30 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 {
   "tz": "Asia/Kolkata",
   "env": { "DATA_DIR": "~/data" },
-  "defaults": { "model": "opus", "locks": ["chrome"], "timeoutMinutes": 40 },
+  "defaults": { "model": "opus", "timeoutMinutes": 40 },
   "jobs": [
-    {
-      "id": "daily-sla-report",
-      "name": "Daily SLA report",
-      "cron": "45 10 * * *",
-      "durationMinutes": 5,
-      "skills": ["order-sla-report"],
-      "model": "haiku"
-    }
+    { "skill": "order-sla-report", "cron": "45 10 * * *", "durationMinutes": 5, "model": "haiku" }
   ]
 }
 ```
 
-**`defaults`** (optional) sets `harness`, `model`, `locks` or `timeoutMinutes` for every job in the file, so a value most jobs share is written once. A job's own value wins, including an empty one (`"locks": []` for a job that doesn't drive the browser). Other keys are refused. The defaults in the table below apply when neither the job nor `defaults` sets the key.
+**A job is its skill.** `skill` names the one skill that holds the job's instructions; it is also the job's id, and its name is the skill's words capitalised (`order-sla-report` → `Run Order SLA Report` with project `words` `{"sla": "SLA"}`). One job per skill in a project. Other skills it needs are named in its skill, which loads them. There are no locks: runs share a browser, each on its own tabs ([shared browsers](#shared-browsers)).
+
+**`defaults`** (optional) sets `harness`, `model` or `timeoutMinutes` for every job in the file, so a value most jobs share is written once. A job's own value wins. Other keys are refused. The defaults in the table below apply when neither the job nor `defaults` sets the key.
+
+*Older form, still read:* `id`, `name`, `skills` (a list, the first holding a `## Job: <id>` section) and `locks` instead of `skill`. A job with `skill` refuses those four keys.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `id`, `name` | required | Slug, display name |
+| `skill` | required | The job's skill: its instructions, id and name |
 | `cron` | none | Cron expression (5 or 6 fields). Leave it out for a job a queue runs (its `executor`) or an **on-demand** job, listed on the Jobs page's **On demand** tab and started only with **Run now** there, `POST /jobs/<project>/<id>/run`, or by asking in chat (`run_job`) |
 | `tz` | file-level `tz`, else host `timezone` | Timezone of `cron` |
-| `skills` | required | Skills Claude loads first. The **first** one holds the job's instructions and the scripts it runs ([job instructions](#job-instructions)) |
 | `harness` | `claude` | The CLI the job runs on: `claude`, or `agy` ([agy jobs](#agy-jobs)) |
 | `model` | `sonnet` | Model for this job (for `agy`, an id from `agy models`, e.g. `gemini-3.8-flash-high`) |
 | `agyPermissions` | none | `agy` jobs only: `{allow, deny, ask}` rules ([agy jobs](#agy-jobs)) |
 | `handoff` | none | `{harness, model}`: an approved card continues in a fresh session on this harness ([handoff](#handoff)) |
 | `mcpServers` | none | The job's own stdio MCP servers by name (`{command, args, env}`), for every session of the job ([steps and MCP servers](#steps-and-mcp-servers)) |
 | `steps` | `[]` | Sessions run one after the other before the main prompt ([steps and MCP servers](#steps-and-mcp-servers)) |
-| `locks` | `[]` | Named locks held during the run, e.g. `["chrome"]` so jobs don't share a browser (a browser's `lock` from host `browsers`) |
 | `timeoutMinutes` | `30` | Time limit for the run, and for any one command it runs (Claude's Bash timeout is set to it) |
 | `catchUp` | `true` | Run the latest missed slot after downtime |
 | `selfImprove` | project's | Overrides the project's `selfImprove` for this job, e.g. `"trouble"` for a monitor that runs every few minutes |
@@ -115,10 +111,10 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 
 ### Job instructions
 
-What a job does lives in its **first skill**, in a section named after the job, not in `jobs.json`:
+What a job does lives in its skill, in a `## Job` section, not in `jobs.json`:
 
 ```markdown
-## Job: `daily-sla-report`
+## Job
 
 ### Before you start
 
@@ -127,17 +123,17 @@ Run `python3 scripts/sla-gate.py` from the repo root. If it prints nothing, repl
 Check yesterday's late orders in that output and summarise them. On STATUS: FAILED, …
 ```
 
-- The run is told: *do what the "## Job: `<id>`" section of the `<skill>` skill says, with the rest of that skill.* The skill's other sections are the reusable how-to; this one is the job's wiring (which scripts to run first, what to do with their output, where to report).
+- The run is told: *do what the "## Job" section of the `<skill>` skill says, with the rest of that skill.* The skill's other sections are the reusable how-to; this one is the job's wiring (which scripts to run first, what to do with their output, where to report).
 - **Scripts:** Claude runs them itself, as the skill says, any number and in any order. Each Bash call may take up to the job's `timeoutMinutes`. A job that is only a script has a skill that runs it and replies with what it printed. Scripts worth keeping go in the skill's `scripts/` folder; runs and learning turns may add or fix them there (and in `.tara/scripts/`), with `SKILL.md` saying when and how to run them. A script that must run without the model (a monitor every few minutes) belongs in the host's crontab, posting through `POST /items/ask` (`kind: "notice"`).
-- A job with several skills gets a skill of its own (named after the job, listed first) that holds the section and names the others.
+- A job that needs other skills names them in its `## Job` section ("Load these skills first: `a`, `b`"); Claude loads them with the Skill tool.
 - Steps: `### Step: <name>` parts inside the section, plus an optional `### Every step` part.
 - Learning turns improve this section along with the rest of the skill.
 
 ### How a run goes
 
-**A project channel holds only `Run <name>` messages.** Every run starts with one at the top level, and everything else (status, the answer, cards, notes, learning notes) goes in its thread. `Run` messages are never edited. Things that aren't job runs follow the same rule: the daily digest is a `Run health-digest` thread, an invalid jobs file a `Run jobs-reload` thread, a Code-page question a `Run code-question` thread. Cards a project server raises (drafts, `POST /items/ask` questions) go in one `Run <queue>` (or `Run <kind>`) thread per day, opened by the first such card that day: the card, its outcome, a revise and the run that sends it all follow there.
+**A project channel holds only `Run <name>` messages.** Every run starts with one at the top level, and everything else (status, the answer, cards, notes, learning notes) goes in its thread. `Run` messages are never edited. Things that aren't job runs follow the same rule: an invalid jobs file a `Run jobs-reload` thread, a Code-page question a `Run code-question` thread. Cards a project server raises (drafts, `POST /items/ask` questions and notices) are not runs: they go in one `📌 <queue> cards · Thu 13 Nov` (notices: `📌 Notices · …`) thread per day, opened by the first such card that day: the card, its outcome, a revise and the run that sends it all follow there. A chat started in such a thread is told which cards it holds.
 
-1. **Trigger message.** At cron time a `Run <job name>` message is posted (the job's `name`, e.g. `Run Weekly GA4 Audit`; its `id` only if another job has the same name) in the project channel, as the `SLACK_USER_TOKEN` person if set (else, or when that person isn't in the channel, as the bot). The bot picks it up and runs the job in its thread; if Slack doesn't deliver it within 2 minutes, the scheduler starts it there itself.
+1. **Trigger message.** At cron time a `Run <job name>` message is posted (the skill's words capitalised, e.g. `Run Google Analytics`) in the project channel, as the `SLACK_USER_TOKEN` person if set (else, or when that person isn't in the channel, as the bot). The bot picks it up and runs the job in its thread; if Slack doesn't deliver it within 2 minutes, the scheduler starts it there itself.
 2. **Claude** runs the job's skill section (its scripts first, as the section says), streaming into the thread.
 3. **The reply**: the part before a `---` line is the headline on the status line (the thread's first reply), the rest goes in the thread. A short reply with no `---` is all headline: it shows only on the status line, not again in the thread.
    - A reply of `[SILENT]` shows "🔇 nothing to report"; the thread and session stay, so you can ask why.
@@ -221,7 +217,7 @@ After a job run or chat turn, tara-agent resumes the same session once and asks 
 
 - Usage-limit and stopped runs, agy runs, and replies that used no tool never get one.
 - Claude replies `NONE` when nothing should change.
-- A change is posted in the thread (`🔧 … learned from this run`) and listed in the daily health digest.
+- A change is posted in the thread (`🔧 … learned from this run`).
 - Cost: one extra short turn per run, on the run's cached prompt. For jobs that run every few minutes, set `"selfImprove": "trouble"` on the job.
 
 ## Files
@@ -237,6 +233,10 @@ Each session gets its own folders, passed as environment variables and as absolu
 - Cleanup only deletes folders tara-agent made (they hold a `.tara-scratch` marker).
 - Claude is told to keep temporary files out of the repo.
 
+## Shared browsers
+
+Jobs and chats use a project's Chrome (its `.mcp.json` `--browserUrl`) at the same time, with no locks. Each Claude run there gets a hook on that MCP server (`src/hooks/own-tabs.ts`, through `--settings`): page tools are refused until the run opens its own tab with `new_page`, and `select_page`/`close_page` work only on tabs it opened. A later turn of the same session gets its tabs back by address (`list_pages`, then `select_page`). Runs close their own tabs; tara closes stale ones (host `browsers`). A page a person must finish, such as a form stopped at a captcha, is listed by the project's `keepTabsUrl` and never closed. Scripts that drive the same Chrome over CDP should follow the same rules: open their own tab, never reuse another, close only theirs.
+
 ## Approval tools
 
 Every run gets tara-agent's own MCP server alongside the repo's `.mcp.json` servers:
@@ -249,7 +249,7 @@ Every run gets tara-agent's own MCP server alongside the repo's `.mcp.json` serv
 | `permission` | In chat, when Claude wants a tool not in `allowedTools`, the thread gets **Allow / Deny** buttons (denied after 10 minutes). Scheduled jobs never wait on this |
 | `propose_item`, `list_items`, `finish_item` | Drafts that go out later (a message, email, post): each becomes a card on the Approvals page and, once approved, runs through a [queue](#queues) |
 | `withdraw_card` | Closes any waiting card of the run's project, no approval needed (the person did it themselves, it no longer applies, a duplicate, or a newer card replaces it). It ends as cancelled with the reason; another project's cards are refused |
-| `run_job` | Starts one of the project's jobs |
+| `list_jobs`, `run_job` | Chat turns only: lists the channel's jobs (id, next run, last status), or starts one now in its own `Run` thread |
 | `start_pull_request`, `open_pull_request` | Only for host `github` projects: a workspace copy of the base branch (or of the PR's branch), then a commit pushed to `<agentName>/<name>` and the PR opened or updated. See [pull requests](security.md#pull-requests) |
 | `read_ci_job` | Only for host `github` projects, read-only: a GitHub Actions job (URL or id) of the project's repo: workflow, branch, commit, conclusion, failed steps, the lines around the first `##[error]` and the last 300 log lines. Other repos are refused. See [CI jobs](security.md#ci-jobs) |
 
@@ -261,18 +261,18 @@ Approved drafts are sent through queues declared in `<repo>/.tara/queues.json`:
 
 ```json
 { "queues": {
-  "linkedin": { "executor": { "job": "linkedin-sender" }, "batch": 5,
+  "linkedin": { "executor": { "skill": "linkedin-sender" }, "batch": 5,
     "windows": { "EU": { "tz": "Europe/Berlin", "days": "tue-thu", "from": "10:00", "to": "12:00" } },
     "caps": { "perDay": 12, "perWeek": 40 }, "gapMinutes": 3 },
   "email":    { "executor": { "url": "http://127.0.0.1:4002/api/send" }, "caps": { "perDay": 10 } },
-  "content":  { "executor": { "job": "publisher" }, "slots": "30 18 * * 1,3,5", "alternate": ["image-post", "reel"] } } }
+  "content":  { "executor": { "skill": "publisher" }, "slots": "30 18 * * 1,3,5", "alternate": ["image-post", "reel"] } } }
 ```
 
 **When items run**
 
 - One batch at a time per queue, oldest approval first. With `"reorder": true`, a person sets the order on the **Queue** page instead (drag a row, or **Top**, **↑**, **↓**, **Bottom** per item). Items approved after a move go to the end. In a queue with `alternate`, an item moves among items of its own kind, because kinds take turns.
 - `windows`: items run only while their window is open. `slots`: one batch per cron slot instead, rotating through the `alternate` kinds.
-- `fills`: instead of windows or slots, the queue runs only in the slots of the named queue that it leaves empty (nothing of its own due), e.g. `"channel": { "executor": { "job": "publisher" }, "fills": "content" }` posts only on `content` slots with no approved item waiting. The filled queue must have `slots`.
+- `fills`: instead of windows or slots, the queue runs only in the slots of the named queue that it leaves empty (nothing of its own due), e.g. `"channel": { "executor": { "skill": "publisher" }, "fills": "content" }` posts only on `content` slots with no approved item waiting. The filled queue must have `slots`.
 - `caps` (per day, per rolling week) and `gapMinutes` limit how fast items go out.
 - "Approve & run now" skips windows and slots.
 

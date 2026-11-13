@@ -97,9 +97,55 @@ describe('queueSchema', () => {
     expect(queueSchema.safeParse({ ...base, slots: '0 99 * * *' }).success).toBe(false);
     expect(queueSchema.safeParse({ ...base, slots: '0 9 * * *', tz: 'Mars/Olympus' }).success).toBe(false);
   });
+
+  it('takes a skill as its executor: the job named after it', () => {
+    const q = queueSchema.parse({ executor: { skill: 'post-publisher' } });
+    expect(q.executor).toEqual({ job: 'post-publisher' });
+  });
 });
 
 describe('loadJobs', () => {
+  it('reads a job as its one skill: the id, the name (from words) and no locks', () => {
+    const dir = makeProject({
+      name: 'shop',
+      slackChannel: 'C0123ABC',
+      words: { linkedin: 'LinkedIn', sla: 'SLA' },
+    });
+    writeFileSync(
+      path.join(dir, '.tara', 'jobs.json'),
+      JSON.stringify({
+        defaults: { model: 'opus', locks: ['chrome'] },
+        jobs: [
+          { skill: 'linkedin-job-scout', cron: '0 9 * * *' },
+          { skill: 'pickup-sla-check', model: 'haiku' },
+          { id: 'old', name: 'Old Style', skills: ['old', 'humanizer'] },
+        ],
+      }),
+    );
+    const [a, b, c] = loadJobs(loadProject(dir));
+    expect(a?.job).toMatchObject({
+      id: 'linkedin-job-scout',
+      name: 'LinkedIn Job Scout',
+      skills: ['linkedin-job-scout'],
+      locks: [],
+      model: 'opus',
+      cron: '0 9 * * *',
+    });
+    expect(b?.job).toMatchObject({ id: 'pickup-sla-check', name: 'Pickup SLA Check', model: 'haiku' });
+    expect(c?.job).toMatchObject({ id: 'old', name: 'Old Style', locks: ['chrome'] });
+  });
+
+  it('refuses id, name, skills or locks next to skill, and a skill scheduled twice', () => {
+    const dir = makeProject({ name: 'shop', slackChannel: 'C0123ABC' });
+    const file = path.join(dir, '.tara', 'jobs.json');
+    writeFileSync(file, JSON.stringify({ jobs: [{ skill: 'a', name: 'A' }] }));
+    expect(() => loadJobs(loadProject(dir))).toThrow(/jobs\.0\.name: a job with "skill" has no "name"/);
+    writeFileSync(file, JSON.stringify({ jobs: [{ skill: 'a', locks: [] }] }));
+    expect(() => loadJobs(loadProject(dir))).toThrow(/no "locks"/);
+    writeFileSync(file, JSON.stringify({ jobs: [{ skill: 'a' }, { skill: 'a', cron: '0 9 * * *' }] }));
+    expect(() => loadJobs(loadProject(dir))).toThrow(/duplicate job id "a"/);
+  });
+
   it('uses the file tz unless a job sets its own', () => {
     const dir = makeProject({ name: 'shop', slackChannel: 'C0123ABC' });
     writeFileSync(
@@ -278,5 +324,29 @@ describe('Store', () => {
     ]);
     expect(reopened.runsSince(1500)).toEqual([]);
     reopened.close();
+  });
+});
+
+describe('Store.renameJobs', () => {
+  it('moves run history, cards and slot claims to the new job id, in that project only', () => {
+    const store = new Store(path.join(tempDir(), 'tara.db'));
+    const db = (store as unknown as { db: DatabaseSync }).db;
+    db.prepare(
+      `INSERT INTO runs (kind, project, job_id, status, started_at, ended_at) VALUES ('job', 'shop', 'old-job', 'ok', 1, 2), ('job', 'other', 'old-job', 'ok', 1, 2)`,
+    ).run();
+    db.prepare(
+      `INSERT INTO items (id, project, kind, mode, title, options, status, source, job_id, created_at, updated_at)
+       VALUES ('i1', 'shop', 'decision', 'resume', 'T', '[]', 'pending', 'old-job', 'old-job', 1, 1)`,
+    ).run();
+    expect(store.claimSlot('shop:old-job', 100)).toBe(true);
+    const changed = store.renameJobs('shop', { 'old-job': 'new-skill' });
+    expect(changed).toBe(4);
+    expect(store.getItem('i1')).toMatchObject({ jobId: 'new-skill', source: 'new-skill' });
+    const runs = db.prepare('SELECT project, job_id FROM runs ORDER BY project').all();
+    expect(runs).toEqual([
+      { project: 'other', job_id: 'old-job' },
+      { project: 'shop', job_id: 'new-skill' },
+    ]);
+    expect(store.claimSlot('shop:new-skill', 100)).toBe(false); // already claimed, under its new key
   });
 });

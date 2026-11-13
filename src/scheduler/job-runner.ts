@@ -3,7 +3,6 @@ import type { Bridge, RunContext } from '../bridge/bridge.js';
 import type { HostConfig, ScheduledJob } from '../config/schema.js';
 import { buildAgyArgs } from '../runner/agy.js';
 import { buildClaudeArgs } from '../runner/args.js';
-import { closeRunTabs, openTabs, type Tabs } from '../runner/browser-tabs.js';
 import { buildChildEnv } from '../runner/env.js';
 import type { Runner, RunOutcome } from '../runner/run.js';
 import { jobDataDir, sessionScratch } from '../runner/workspace.js';
@@ -144,13 +143,6 @@ export async function runJob(
     : undefined;
   const releaseSlot = await deps.slots.acquire();
   const releaseLocks = await deps.locks.acquire(job.locks);
-  // Holding a browser's lock: note its tabs now, to close the ones this run opens or uses.
-  const tabsBefore: { cdpUrl: string; tabs: Tabs }[] = [];
-  for (const b of deps.host.browsers ?? []) {
-    if (!b.closeTabs || !job.locks.includes(b.lock)) continue;
-    const tabs = await openTabs(b.cdpUrl);
-    if (tabs) tabsBefore.push({ cdpUrl: b.cdpUrl, tabs });
-  }
   const startedAt = now();
   let lesson: LearnRequest | undefined;
   const record = (status: JobStatus, extra: Partial<RunRecord> = {}) => {
@@ -374,7 +366,7 @@ export async function runJob(
     await status.flush();
 
     /** Sets up this run's learning turn (`selfImprove`); it runs once the job's locks are released. */
-    const learnIf = (failure: string | undefined, threadTs: string | undefined) => {
+    const learnIf = (failure: string | undefined, threadTs: string) => {
       // Learning turns resume the session with Claude, so agy runs don't get one.
       if (harness !== 'claude') return;
       const reasons = learnReasons(
@@ -472,13 +464,6 @@ export async function runJob(
     log.error(`[${project.config.name}] job ${job.id} crashed: ${(err as Error).stack ?? err}`);
     return record('error', { error: (err as Error).message });
   } finally {
-    for (const { cdpUrl, tabs } of tabsBefore) {
-      const closed = await closeRunTabs(cdpUrl, tabs, (m) => log.warn(`[${project.config.name}] ${m}`));
-      if (closed)
-        log.info(
-          `[${project.config.name}] job ${job.id}: closed ${closed} browser tab${closed === 1 ? '' : 's'} (${cdpUrl})`,
-        );
-    }
     releaseLocks();
     try {
       // Still inside the job slot, so learning turns count towards jobConcurrency.

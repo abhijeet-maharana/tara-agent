@@ -1,5 +1,6 @@
 #!/usr/bin/env -S node --disable-warning=ExperimentalWarning
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
@@ -10,11 +11,13 @@ import { DEFAULT_HOST_CONFIG, expandHome, loadHostConfig, loadJobs, loadProjects
 import { CiJobs } from './github/actions.js';
 import { PullRequests } from './github/pull-requests.js';
 import { gatherAttention, githubPullRequests } from './http/attention.js';
+import { projectBrowser } from './http/browser-usage.js';
 import { startHttpServer } from './http/server.js';
 import { Privileged } from './privileged/privileged.js';
 import { Activity } from './runner/activity.js';
 import { runAgy } from './runner/agy.js';
 import { resolveRunAs } from './runner/as-user.js';
+import { TabSweeper } from './runner/browser-tabs.js';
 import { type Runner, runClaude } from './runner/run.js';
 import { sweepScratch } from './runner/workspace.js';
 import { QueueWorker } from './scheduler/queues.js';
@@ -33,7 +36,10 @@ const log: Logger = {
 
 const USAGE = `Usage:
   tara-agent [--config <file>]               run the gateway
-  tara-agent validate [--config <file>]      check host, project and job config, then exit`;
+  tara-agent validate [--config <file>]      check host, project and job config, then exit
+  tara-agent rename-jobs <project> <map.json> [--config <file>]
+                                             move run history, cards and slot claims from old job ids
+                                             to new ones ({"old-id": "new-id"}); stop the service first`;
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -67,6 +73,15 @@ function validate(configFlag: string | undefined): void {
     log.info(`✓ ${p.config.name} (${p.dir}): ${enabled}/${jobs.length} jobs enabled`);
   }
   log.info(`✓ config OK (timezone ${host.timezone}, jobConcurrency ${host.jobConcurrency})`);
+}
+
+function renameJobs(configFlag: string | undefined, [project, mapFile]: string[]): void {
+  if (!project || !mapFile) throw new Error(USAGE);
+  const host = loadHostConfig(path.resolve(expandHome(configFlag ?? DEFAULT_HOST_CONFIG)));
+  const renames = JSON.parse(readFileSync(mapFile, 'utf8')) as Record<string, string>;
+  const store = new Store(path.join(host.stateDir as string, 'tara.db'));
+  const changed = store.renameJobs(project, renames);
+  log.info(`✓ ${project}: ${Object.keys(renames).length} job ids renamed, ${changed} rows changed`);
 }
 
 async function serve(configFlag: string | undefined) {
@@ -303,6 +318,40 @@ async function serve(configFlag: string | undefined) {
   prune();
   setInterval(prune, 86_400_000).unref();
 
+  // Stale browser tabs: runs share each Chrome without locks and close their own tabs; this closes
+  // what is left (runner/browser-tabs.ts), never a tab a run still going may own or a kept one.
+  const sameUrl = (a: string, b: string) =>
+    a.replace(/^ws:/, 'http:').replace(/\/$/, '').replace('localhost', '127.0.0.1') ===
+    b.replace(/^ws:/, 'http:').replace(/\/$/, '').replace('localhost', '127.0.0.1');
+  const tabSweeper = new TabSweeper({
+    browsers: () =>
+      host.browsers
+        .filter((b) => b.closeTabs)
+        .map((b) => {
+          const using = projects.filter((p) => {
+            const url = projectBrowser(p.dir).cdpUrl;
+            return url !== undefined && sameUrl(url, b.cdpUrl);
+          });
+          return {
+            cdpUrl: b.cdpUrl,
+            staleMs: b.staleMinutes * 60_000,
+            projects: using.map((p) => p.config.name),
+            keepUrls: using.flatMap((p) => (p.config.keepTabsUrl ? [p.config.keepTabsUrl] : [])),
+          };
+        }),
+    oldestRun: (names) => {
+      const starts = activity
+        .tasks()
+        .filter((t) => t.status === 'running' && names.includes(t.project))
+        .map((t) => t.startedAt);
+      return starts.length ? Math.min(...starts) : undefined;
+    },
+    log: (m) => log.info(m),
+  });
+  const sweepTabs = () =>
+    void tabSweeper.sweep().catch((err) => log.warn(`Tab sweep: ${(err as Error).message}`));
+  setInterval(sweepTabs, 300_000).unref();
+
   let stopping = false;
   const shutdown = async (signal: string) => {
     if (stopping) return;
@@ -338,9 +387,14 @@ async function serve(configFlag: string | undefined) {
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
   if (command === '--help' || command === 'help') return void log.info(USAGE);
-  const args = command === 'validate' ? rest : process.argv.slice(2);
-  const { values } = parseArgs({ args, options: { config: { type: 'string', short: 'c' } } });
+  const args = command === 'validate' || command === 'rename-jobs' ? rest : process.argv.slice(2);
+  const { values, positionals } = parseArgs({
+    args,
+    options: { config: { type: 'string', short: 'c' } },
+    allowPositionals: command === 'rename-jobs',
+  });
   if (command === 'validate') return validate(values.config);
+  if (command === 'rename-jobs') return renameJobs(values.config, positionals);
   await serve(values.config);
 }
 

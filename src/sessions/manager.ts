@@ -361,7 +361,8 @@ export class SessionManager {
       env = { ...buildChildEnv(this.env, project.config.billing), TARA_SCRATCH: scratch };
       const files = await this.saveAttachments(scratch, msg);
       // The first message of a session says where the folder is (the Write tool needs absolute paths).
-      const prompt = `<@${msg.user}>: ${msg.text}${files}${session.started ? '' : `\n\n${foldersNote({ scratch })}`}`;
+      const cards = session.started ? '' : threadCards(store, msg.channel, msg.threadTs);
+      const prompt = `${cards}<@${msg.user}>: ${msg.text}${files}${session.started ? '' : `\n\n${foldersNote({ scratch })}`}`;
       // A reply in the thread of a job that ran on agy continues that agy conversation, under the job's
       // own rules. Without them (the job is gone or has none) only tara's tools are allowed: a reply must
       // never get more than the run had, so it never skips agy's checks.
@@ -566,4 +567,18 @@ export class SessionManager {
     await chat.unreact(msg.channel, msg.ts, 'eyes').catch(() => {});
     await chat.react(msg.channel, msg.ts, reaction).catch(() => {});
   }
+}
+
+/**
+ * What a chat that starts in a thread of cards needs to know first: the cards posted there (a day's
+ * `📌` thread of cards no run raised, or a card's own thread), so "this one" or "the captcha" makes sense.
+ */
+export function threadCards(store: Pick<Store, 'itemsInThread'>, channel: string, threadTs: string): string {
+  const items = store.itemsInThread(channel, threadTs);
+  if (items.length === 0) return '';
+  const lines = items.map((i) => {
+    const detail = (i.body ?? '').replace(/\s+/g, ' ').trim().slice(0, 400);
+    return `- ${i.title} (item ${i.id}, ${i.kind}, ${i.status}${i.decision ? `: ${i.decision}` : ''})${detail ? `: ${detail}` : ''}`;
+  });
+  return `## Cards in this thread\nThese cards were posted in this Slack thread (oldest first). The message below is most likely about them.\n${lines.join('\n')}\n\n`;
 }

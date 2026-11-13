@@ -425,6 +425,15 @@ export function approvalsPage(ctx: DashboardContext, data: ApprovalsData): strin
             sub: `${questions.length} · paused runs first, then the oldest`,
           })}</div>`
         : '',
+      notices.length
+        ? `<div data-group id="fyi">${section('For your information', cards(notices), {
+            sub: `${notices.length} · not counted as waiting`,
+            more:
+              data.canDecide && seen && notices.length > 1
+                ? `<button type="button" class="btn ghost more" data-bulk="${esc(seen)}" data-notice data-label="Mark all ${esc(seen.toLowerCase())}">Mark all ${esc(seen.toLowerCase())}</button>`
+                : '',
+          })}</div>`
+        : '',
       draftKinds.length
         ? `<section class="section"><div class="sec-head"><h2>Drafts to send</h2><span>${drafts.length} · go out at their queue's time once approved</span></div>${draftKinds
             .map((k) => {
@@ -443,15 +452,6 @@ export function approvalsPage(ctx: DashboardContext, data: ApprovalsData): strin
                 : `<div data-group><div class="sec-head sub-head">${head}</div>${cards(group)}</div>`;
             })
             .join('')}</section>`
-        : '',
-      notices.length
-        ? `<div data-group id="fyi">${section('For your information', cards(notices), {
-            sub: `${notices.length} · not counted as waiting`,
-            more:
-              data.canDecide && seen && notices.length > 1
-                ? `<button type="button" class="btn ghost more" data-bulk="${esc(seen)}" data-notice data-label="Mark all ${esc(seen.toLowerCase())}">Mark all ${esc(seen.toLowerCase())}</button>`
-                : '',
-          })}</div>`
         : '',
     ].join('');
     if (!body) body = '<div class="clear">✓ Nothing waiting for you.</div>';

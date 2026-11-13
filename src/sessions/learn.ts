@@ -95,8 +95,8 @@ export interface LearnRequest {
   /** What went wrong; empty for a clean run (`selfImprove: "always"`). */
   reasons: string[];
   channel: string;
-  /** Thread to report a change in; undefined: no Slack note (the run's thread was removed). */
-  threadTs?: string;
+  /** The run's thread, where a change is reported. */
+  threadTs: string;
   threadKey?: string;
   jobId?: string;
   /** Names the run in the Slack note, e.g. "*SLA Report*" or "This conversation". */
@@ -162,9 +162,8 @@ export async function learnFromRun(deps: LearnDeps, req: LearnRequest): Promise<
     const warning = overreach.length
       ? `\n⚠️ It also did more than edit instruction files, please check: ${overreach.slice(0, 10).join(', ')}`
       : '';
-    // Only in the run's thread: a channel holds only "Run" threads. Without one (a silent run's thread
-    // was removed) the change is in the log and the daily health digest.
-    if ((changed || warning) && req.threadTs) {
+    // Only in the run's thread: a channel holds only "Run" threads.
+    if (changed || warning) {
       await deps.chat.post(
         req.channel,
         req.threadTs,

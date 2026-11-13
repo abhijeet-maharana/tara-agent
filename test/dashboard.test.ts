@@ -188,7 +188,6 @@ describe('dashboard pages', () => {
           lastStatus: 'failed',
         },
       ],
-      digest: () => null,
       plannedRuns: (_p: string, _from: number, to: number) =>
         to > Date.parse('2026-10-26T05:00:00Z')
           ? [{ id: 'sla', starts: [Date.parse('2026-10-26T05:00:00Z')] }]
@@ -828,9 +827,9 @@ describe('approvals page', () => {
   });
   const at = (text: string) => page.indexOf(text);
 
-  it('puts questions first (paused runs, then the oldest), then drafts by kind, then notices', () => {
-    expect(at('Needs your answer')).toBeLessThan(at('Drafts to send'));
-    expect(at('Drafts to send')).toBeLessThan(at('For your information'));
+  it('puts questions first (paused runs, then the oldest), then notices, then drafts by kind', () => {
+    expect(at('Needs your answer')).toBeLessThan(at('For your information'));
+    expect(at('For your information')).toBeLessThan(at('Drafts to send'));
     expect(at('id="item-q-run"')).toBeLessThan(at('id="item-q-old"'));
     expect(at('id="item-q-old"')).toBeLessThan(at('id="item-q-new"'));
     expect(page).toContain(

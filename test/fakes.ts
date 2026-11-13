@@ -58,16 +58,15 @@ export class FakeChat implements ChatPort {
   }
 }
 
-/** A host config with the schema's defaults, for tests (no HTTP server, no health cron). */
+/** A host config with the schema's defaults, for tests (no HTTP server). */
 export function testHost(overrides: Partial<HostConfig> = {}): HostConfig {
   return {
     ...hostConfigSchema.parse({ projects: ['/repo'], timezone: 'UTC' }),
     stateDir: '/tmp',
     statusIntervalSeconds: 0,
     http: { enabled: false, bind: '127.0.0.1', port: 0, allowFrom: ['127.0.0.0/8'] },
-    healthDigest: { enabled: false, cron: '0 9 * * *' },
     // Never touch a real Chrome on :9222 (the suite may run on the host that has one).
-    browsers: [{ cdpUrl: 'http://127.0.0.1:9', lock: 'chrome', closeTabs: false }],
+    browsers: [{ cdpUrl: 'http://127.0.0.1:9', lock: 'chrome', closeTabs: false, staleMinutes: 30 }],
     ...overrides,
   };
 }

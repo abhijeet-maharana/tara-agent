@@ -357,7 +357,10 @@ describe('auto-approved cards', () => {
     expect(verifySeal(item, KEY)).toBe(true);
     expect(asked).toEqual([{ kind: 'application', key: 'application:1', fields: { note: 'Hi Acme' } }]);
     // No run proposed it: it goes in the day's "Run <queue>" thread.
-    expect(chat.posts[0]).toMatchObject({ thread: '', text: 'Run replies' });
+    expect(chat.posts[0]).toMatchObject({
+      thread: '',
+      text: expect.stringMatching(/^📌 Replies cards · \w{3} \d{1,2} \w{3}$/),
+    });
     expect(chat.blockPosts[0]?.thread).toBe(chat.posts[0]?.ts);
     expect(JSON.stringify(chat.blockPosts[0]?.blocks)).toContain(
       'Auto-approved: every answer is from the profile',
@@ -403,7 +406,7 @@ describe('auto-approved cards', () => {
 });
 
 describe('cards of a slack queue', () => {
-  it("posts cards no run proposed in the day's Run <queue> thread, edits them there, and closes them on a decision or a withdrawal", async () => {
+  it("posts cards no run proposed in the day's 📌 <queue> cards thread, edits them there, and closes them on a decision or a withdrawal", async () => {
     const { project, store, chat, approvals } = setup();
     const reply = (value: string) => ({ key: 'reply', label: 'Reply', type: 'textarea' as const, value });
     const card = await approvals.propose(project, {
@@ -416,7 +419,12 @@ describe('cards of a slack queue', () => {
       fields: [reply('Locks need a timeout.'), { key: 'link', label: 'Link', type: 'text', value: '' }],
     });
     // One top-level "Run replies" for the day; the whole card is a reply in its thread.
-    expect(chat.posts).toEqual([expect.objectContaining({ thread: '', text: 'Run replies' })]);
+    expect(chat.posts).toEqual([
+      expect.objectContaining({
+        thread: '',
+        text: expect.stringMatching(/^📌 Replies cards · \w{3} \d{1,2} \w{3}$/),
+      }),
+    ]);
     const day = chat.posts[0]?.ts;
     expect(chat.blockPosts).toHaveLength(1);
     const posted = chat.blockPosts[0];
@@ -538,7 +546,7 @@ describe('cards of a slack queue', () => {
     approvals.report(card.id, 'done', 'Note sent');
     await new Promise((r) => setImmediate(r));
     // Its progress and result go in the card's thread: the day's "Run linkedin" thread.
-    expect(chat.posts[0]).toMatchObject({ thread: '', text: 'Run linkedin' });
+    expect(chat.posts[0]).toMatchObject({ thread: '', text: expect.stringMatching(/^📌 Linkedin cards · /) });
     expect(card.threadTs).toBe(chat.posts[0]?.ts);
     expect(chat.posts.slice(1).map((p) => [p.thread, p.text])).toEqual([
       [card.threadTs, '⏳ Comment posted; the note goes out next send day'],
@@ -773,7 +781,7 @@ describe('queue worker', () => {
 });
 
 describe('decisions over HTTP', () => {
-  it("lets a project server ask outside any run: in the day's Run thread, one card per key, the decision goes to Jarvis there", async () => {
+  it("lets a project server ask outside any run: in the day's 📌 thread, one card per key, the decision goes to Jarvis there", async () => {
     const { project, store, chat, approvals, chats } = setup();
     const server = await startHttpServer({
       bind: '127.0.0.1',
@@ -805,7 +813,9 @@ describe('decisions over HTTP', () => {
       options: ['Done', 'Dismiss'],
     });
     // In the day's "Run decision" thread, with its buttons.
-    expect(chat.posts).toEqual([expect.objectContaining({ thread: '', text: 'Run decision' })]);
+    expect(chat.posts).toEqual([
+      expect.objectContaining({ thread: '', text: expect.stringMatching(/^📌 Decisions · /) }),
+    ]);
     expect(chat.blockPosts[0]?.thread).toBe(chat.posts[0]?.ts);
     expect(chat.blockPosts[0]?.blocks.some((b) => b.type === 'actions')).toBe(true);
     expect((await ask(body)).item.id).toBe(item.id);

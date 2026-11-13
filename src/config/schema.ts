@@ -154,25 +154,27 @@ export const hostConfigSchema = z.object({
     })
     .optional(),
   /**
-   * The shared browsers jobs drive (Chrome with remote debugging), one per Chrome instance, e.g. one
-   * per signed-in identity. After every run of a job that holds a browser's `lock`, the tabs the run
-   * opened or moved to another page in that browser are closed, also when it failed.
+   * The shared browsers runs drive (Chrome with remote debugging), one per Chrome instance, e.g. one
+   * per signed-in identity. Runs share them without locks: each opens and closes its own tabs, and
+   * every 5 minutes tara closes stale ones (`staleMinutes`; see runner/browser-tabs.ts).
    */
   browsers: z
     .array(
       z.object({
-        /** The job lock that means "this run drives this browser". */
+        /** The browser's name on the Browsers page (also a job lock in older jobs files). */
         lock: z.string().min(1),
         /** Chrome's DevTools address, as in the Chrome MCP server's `--browserUrl`. */
         cdpUrl: z.string().url(),
-        /** false: leave tabs as the run left them. */
+        /** false: never close stale tabs in this browser. */
         closeTabs: z.boolean().default(true),
+        /** A tab open this long, since before every run still going in this browser, is closed. */
+        staleMinutes: z.number().positive().default(30),
       }),
     )
     .refine((b) => new Set(b.map((x) => x.lock)).size === b.length, {
       message: 'each browser needs its own lock',
     })
-    .default([{ lock: 'chrome', cdpUrl: 'http://127.0.0.1:9222', closeTabs: true }]),
+    .default([{ lock: 'chrome', cdpUrl: 'http://127.0.0.1:9222', closeTabs: true, staleMinutes: 30 }]),
   /** Minimum gap between edits of the live status message. */
   statusIntervalSeconds: z.number().min(1).default(5),
   /** Max scheduled jobs running at once (separate from chat). */
@@ -181,14 +183,6 @@ export const hostConfigSchema = z.object({
   catchUpHours: z.number().min(0).default(6),
   /** Default timezone for job schedules and for times shown in Slack. Defaults to the host's. */
   timezone: z.string().default(Intl.DateTimeFormat().resolvedOptions().timeZone),
-  /** Daily code-only health summary per project channel (runs, failures, missed slots, usage). */
-  healthDigest: z
-    .object({
-      enabled: z.boolean().default(true),
-      /** Cron expression in the host `timezone`. */
-      cron: z.string().default('0 9 * * *'),
-    })
-    .default({ enabled: true, cron: '0 9 * * *' }),
   /** Local control API (jobs, runs, health). Set TARA_HTTP_TOKEN to require a bearer token. */
   http: z
     .object({
@@ -319,6 +313,18 @@ export const projectConfigSchema = z.object({
       }),
     )
     .optional(),
+  /**
+   * Tabs to leave open when a job's browser tabs are closed (host `browsers[].closeTabs`): GET → a JSON
+   * list of `{url}` or URL strings (bare or under `result`), matched without query or fragment. For a
+   * page a person must finish, such as a form stopped at a captcha. If it doesn't answer, the run's
+   * tabs are left open.
+   */
+  keepTabsUrl: z.string().url().optional(),
+  /**
+   * How words of a skill name are written in its job's name (`Run <name>`): a skill name's dash-separated
+   * words are capitalised unless listed here, e.g. `{"linkedin": "LinkedIn", "sla": "SLA"}`.
+   */
+  words: z.record(z.string().regex(/^[a-z0-9]+$/), z.string().min(1)).optional(),
   /** Approval items (the Approvals page). */
   approvals: z
     .object({
@@ -380,7 +386,11 @@ const timeZoneString = z.string().refine(
   { message: 'not a known timezone' },
 );
 
-/** One scheduled job in `<repo>/.tara/jobs.json`. */
+/**
+ * One scheduled job in `<repo>/.tara/jobs.json`, as tara uses it. The file writes a job as
+ * `{"skill": "<name>", "cron": …}`: one skill, which is also its id, and its name is the skill's words
+ * capitalised (`loadJobs`). The older form (`id`, `name`, `skills`, `locks`) is still read.
+ */
 export const jobSchema = z
   .object({
     id: z.string().regex(jobIdPattern, 'lowercase letters, digits and dashes'),
@@ -467,6 +477,8 @@ export const queueSchema = z
      */
     executor: z.union([
       z.object({ job: z.string().regex(jobIdPattern) }),
+      // The job that runs a skill is named after it: `{skill}` is the same as `{job}`.
+      z.object({ skill: z.string().regex(jobIdPattern) }).transform(({ skill }) => ({ job: skill })),
       z.object({ url: z.string().url() }),
       z.object({ external: z.literal(true) }),
     ]),
@@ -546,29 +558,62 @@ const jobsArraySchema = z.array(jobSchema).superRefine((jobs, ctx) => {
   }
 });
 
-export const jobsFileSchema = z
-  .object({
-    /** IANA timezone for every job's `cron` that doesn't set its own `tz`. Defaults to the host timezone. */
-    tz: z.string().optional(),
-    /** Environment shared by every job in this repo. `~/` is expanded. */
-    env: z.record(z.string(), z.string()).default({}),
-    defaults: jobDefaultsSchema.default({}),
-    jobs: z.array(z.record(z.string(), z.unknown())),
-  })
-  .transform((file, ctx) => {
-    // Applied before each job is parsed, so the job's own value (even `[]`) wins and errors point at the job.
-    const jobs = jobsArraySchema.safeParse(file.jobs.map((job) => ({ ...file.defaults, ...job })));
-    if (!jobs.success) {
-      for (const issue of jobs.error.issues) ctx.addIssue({ ...issue, path: ['jobs', ...issue.path] });
-      return z.NEVER;
-    }
-    const { defaults: _applied, ...rest } = file;
-    return { ...rest, jobs: jobs.data };
-  });
+/**
+ * A skill's job name: its dash-separated words capitalised, or as `words` writes them
+ * (`job-application-submitter` → "Job Application Submitter", `linkedin` → "LinkedIn" with that word).
+ */
+export function skillJobName(skill: string, words: Record<string, string> = {}): string {
+  return skill
+    .split('-')
+    .filter(Boolean)
+    .map((w) => words[w] ?? w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+/** Keys a `{"skill": …}` job doesn't take: the skill is its id, name and only skill, and runs hold no locks. */
+const SKILL_JOB_DERIVED = ['id', 'name', 'skills', 'locks'] as const;
+
+/** `<repo>/.tara/jobs.json`; `words` names its `{"skill": …}` jobs (project config `words`). */
+export const jobsFileSchemaFor = (words: Record<string, string> = {}) =>
+  z
+    .object({
+      /** IANA timezone for every job's `cron` that doesn't set its own `tz`. Defaults to the host timezone. */
+      tz: z.string().optional(),
+      /** Environment shared by every job in this repo. `~/` is expanded. */
+      env: z.record(z.string(), z.string()).default({}),
+      defaults: jobDefaultsSchema.default({}),
+      jobs: z.array(z.record(z.string(), z.unknown())),
+    })
+    .transform((file, ctx) => {
+      const raw = file.jobs.map((job, i) => {
+        if (!('skill' in job)) return { ...file.defaults, ...job };
+        for (const key of SKILL_JOB_DERIVED)
+          if (key in job)
+            ctx.addIssue({
+              code: 'custom',
+              path: ['jobs', i, key],
+              message: `a job with "skill" has no "${key}": its skill is its id and name, and runs hold no locks`,
+            });
+        const { skill, ...rest } = job;
+        const { locks: _none, ...defaults } = file.defaults;
+        if (typeof skill !== 'string') return { ...defaults, ...rest };
+        return { ...defaults, ...rest, id: skill, name: skillJobName(skill, words), skills: [skill] };
+      });
+      // Applied before each job is parsed, so the job's own value (even `[]`) wins and errors point at the job.
+      const jobs = jobsArraySchema.safeParse(raw);
+      if (!jobs.success) {
+        for (const issue of jobs.error.issues) ctx.addIssue({ ...issue, path: ['jobs', ...issue.path] });
+        return z.NEVER;
+      }
+      const { defaults: _applied, ...rest } = file;
+      return { ...rest, jobs: jobs.data };
+    });
+
+export const jobsFileSchema = jobsFileSchemaFor();
 
 export type HostConfig = z.infer<typeof hostConfigSchema>;
 export type JobConfig = z.infer<typeof jobSchema>;
-export type JobsFile = z.infer<typeof jobsFileSchema>;
+export type JobsFile = z.infer<ReturnType<typeof jobsFileSchemaFor>>;
 export type ProjectConfig = z.infer<typeof projectConfigSchema>;
 export type PermissionMode = (typeof permissionModes)[number];
 

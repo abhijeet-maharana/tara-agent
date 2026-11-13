@@ -6,12 +6,11 @@ import { describe, expect, it } from 'vitest';
 import type { HostConfig, Project, SelfImprove } from '../src/config/schema.js';
 import { startHttpServer } from '../src/http/server.js';
 import type { RunOptions, RunOutcome } from '../src/runner/run.js';
-import { buildDigest } from '../src/scheduler/health.js';
 import { streamRecipient } from '../src/scheduler/job-runner.js';
 import { Scheduler } from '../src/scheduler/scheduler.js';
 import { findRunJob, parseScheduledRun, SCHEDULE_BY } from '../src/scheduler/slack-trigger.js';
 import { Threads } from '../src/sessions/threads.js';
-import { type Item, Store, type StoredRun } from '../src/store/store.js';
+import { type Item, Store } from '../src/store/store.js';
 import { FakeChat, FakeStream, fakeChrome, testHost } from './fakes.js';
 
 const host = testHost({ concurrency: 2, catchUpHours: 6, claude: { bin: 'claude', chatTimeoutMinutes: 20 } });
@@ -90,7 +89,10 @@ function setup(opts: {
     host: opts.browsers
       ? { ...host, browsers: opts.browsers }
       : opts.browserUrl
-        ? { ...host, browsers: [{ cdpUrl: opts.browserUrl, lock: 'chrome', closeTabs: true }] }
+        ? {
+            ...host,
+            browsers: [{ cdpUrl: opts.browserUrl, lock: 'chrome', closeTabs: true, staleMinutes: 30 }],
+          }
         : host,
     store,
     chat,
@@ -174,7 +176,7 @@ describe('Scheduler', () => {
 
     const call = calls[0] as RunOptions;
     expect(call.prompt).toMatch(
-      /^Run the job "SLA Report" \(`sla`\): do what the "## Job: `sla`" section of the `sla-report` skill says[\s\S]*Skills for this job: `sla-report`/,
+      /^Run the job "SLA Report" \(`sla`\): do what the "## Job" section of the `sla-report` skill says/,
     );
     // The job's env (no Slack token), and Bash may take as long as the job: the skill runs its scripts.
     expect(call.env.ROOT).toMatch(/\/repo$/);
@@ -280,7 +282,7 @@ describe('Scheduler', () => {
     expect(fix.prompt).toContain('### Footer\nWhatsApp button covers the footer.');
     expect(fix.prompt).toContain('## The decision\nUSER DECISION on "Footer": Fix it');
     expect(fix.prompt).toContain(
-      '## The job\'s instructions\nRun the job "SLA Report" (`sla`): do what the "## Job: `sla`" section of the `sla-report` skill says',
+      '## The job\'s instructions\nRun the job "SLA Report" (`sla`): do what the "## Job" section of the `sla-report` skill says (in an older skill: "## Job: `sla`")',
     );
     expect(store.getSession('C1:ts1')).toMatchObject({
       harness: 'claude',
@@ -692,83 +694,6 @@ describe('HTTP API', () => {
   });
 });
 
-describe('health digest', () => {
-  const run = (o: Partial<StoredRun>): StoredRun => ({
-    id: 1,
-    kind: 'job',
-    project: 'shop',
-    jobId: 'sla',
-    startedAt: Date.parse('2026-10-25T05:00:00Z'),
-    endedAt: Date.parse('2026-10-25T05:02:00Z'),
-    status: 'ok',
-    ...o,
-  });
-
-  it('stays quiet when nothing ran or was missed', () => {
-    expect(buildDigest({ project: 'shop', runs: [], missed: [], timeZone: 'UTC' })).toBeNull();
-  });
-
-  it('summarises runs, problems, missed slots and usage', () => {
-    const digest = buildDigest({
-      project: 'shop',
-      timeZone: 'UTC',
-      runs: [
-        run({ rateLimitUtilization: 0.41, inputTokens: 1000, outputTokens: 500, cacheReadTokens: 2_000_000 }),
-        run({ status: 'silent' }),
-        run({ status: 'failed', jobId: 'ads', error: 'Portal login expired\nmore' }),
-        run({ kind: 'chat', jobId: undefined }),
-      ],
-      missed: [{ id: 'labels', name: 'Labels', slots: [Date.parse('2026-10-25T00:00:00Z')] }],
-    });
-    expect(digest?.headline).toBe(
-      '⚠️ *Daily health · shop* · last 24h: 3 job runs (1 ok, 1 silent, 1 with problems), 1 chat turns · *1 missed* · peak 5h usage 41%',
-    );
-    expect(digest?.details).toContain('• `ads` failed at Sun 05:00: Portal login expired');
-    expect(digest?.details).toContain('• `labels` Labels: Sun 00:00');
-    expect(digest?.details).toContain('1.5k tokens in/out, 2.00M cache reads');
-  });
-
-  it('lists skill fixes from learning turns, without counting them as job runs or problems', () => {
-    const digest = buildDigest({
-      project: 'shop',
-      timeZone: 'UTC',
-      runs: [
-        run({ status: 'failed', jobId: 'ads', error: 'Save button not found' }),
-        run({ kind: 'learn', jobId: 'ads', output: '.claude/skills/ads/SKILL.md: new Save selector' }),
-        run({ kind: 'learn', jobId: 'ads', output: 'NONE' }),
-        run({ kind: 'learn', jobId: 'ads', status: 'timeout' }),
-      ],
-      missed: [],
-    });
-    expect(digest?.headline).toBe(
-      '⚠️ *Daily health · shop* · last 24h: 1 job runs (0 ok, 0 silent, 1 with problems), 0 chat turns · 🔧 1 skill fix · peak 5h usage 0%',
-    );
-    expect(digest?.details).toContain('*Learned*');
-    expect(digest?.details).toContain('• `ads` at Sun 05:00: .claude/skills/ads/SKILL.md: new Save selector');
-  });
-
-  it('finds slots that were never claimed (downtime) but not slots that ran', async () => {
-    let now = Date.parse('2026-10-25T00:30:00Z');
-    const store = new Store(':memory:', () => now);
-    const ctx = setup({ jobs: [{ ...baseJob, cron: '0 */6 * * *', catchUp: false }], store, now: () => now });
-    ctx.scheduler.start(); // first seen 00:30
-    await ctx.scheduler.stop();
-    now = Date.parse('2026-10-25T13:00:00Z');
-    store.claimSlot('shop:sla', Date.parse('2026-10-25T06:00:00Z')); // 06:00 ran, 12:00 was missed
-    const later = setup({
-      jobs: [{ ...baseJob, cron: '0 */6 * * *', catchUp: false }],
-      store,
-      now: () => now,
-    });
-    later.scheduler.start();
-    await later.scheduler.idle();
-    const digest = later.scheduler.digest('shop');
-    expect(digest?.headline).toContain('*1 missed*');
-    expect(digest?.details).toContain('• `sla` SLA Report: Sun 12:00');
-    await later.scheduler.stop();
-  });
-});
-
 describe('job threads', () => {
   it('holds its thread while it runs, and a stop there ends the run', async () => {
     const threads = new Threads();
@@ -936,92 +861,25 @@ function missedSlot(
 }
 
 describe('the shared browser', () => {
-  it('closes the tabs a job holding its lock opened, also when the run fails', async () => {
-    const chrome = await fakeChrome({ a: 'chrome://new-tab-page/' });
-    try {
-      for (const firstStatus of [undefined, 'error'] as const) {
-        const { scheduler } = setup({
-          jobs: [{ ...baseJob, locks: ['chrome'] }],
-          browserUrl: chrome.url,
-          firstStatus,
-          during: async () => {
-            await fetch(`${chrome.url}/json/new?https://seller.example/`, { method: 'PUT' });
-          },
-        });
-        scheduler.start();
-        scheduler.trigger('shop', 'sla', 'U1');
-        await scheduler.idle();
-        expect(chrome.pages()).toEqual(['a chrome://new-tab-page/']);
-        await scheduler.stop();
-      }
-    } finally {
-      chrome.server.close();
-    }
-  });
-
-  it('leaves the browser alone for a job without its lock', async () => {
+  it('leaves tabs alone when a job ends: runs close their own, the tab sweeper the rest', async () => {
     const chrome = await fakeChrome({ a: 'chrome://new-tab-page/' });
     try {
       const { scheduler } = setup({
-        jobs: [baseJob],
+        jobs: [{ ...baseJob, locks: ['chrome'] }],
         browserUrl: chrome.url,
         during: async () => {
-          await fetch(`${chrome.url}/json/new?https://own-browser.example/`, { method: 'PUT' });
+          await fetch(`${chrome.url}/json/new?https://seller.example/`, { method: 'PUT' });
         },
       });
       scheduler.start();
       scheduler.trigger('shop', 'sla', 'U1');
       await scheduler.idle();
       expect(chrome.pages()).toHaveLength(2);
-      expect(chrome.calls.some((c) => c.startsWith('GET /json/list'))).toBe(false);
+      expect(chrome.calls.some((c) => c.startsWith('GET /json/close'))).toBe(false);
       await scheduler.stop();
     } finally {
       chrome.server.close();
     }
-  });
-
-  it('with several browsers, tidies only the one whose lock the job holds', async () => {
-    const work = await fakeChrome({ a: 'chrome://new-tab-page/' });
-    const other = await fakeChrome({ b: 'chrome://new-tab-page/' });
-    try {
-      const { scheduler } = setup({
-        jobs: [{ ...baseJob, locks: ['chrome-work'] }],
-        browsers: [
-          { lock: 'chrome', cdpUrl: other.url, closeTabs: true },
-          { lock: 'chrome-work', cdpUrl: work.url, closeTabs: true },
-        ],
-        during: async () => {
-          await fetch(`${work.url}/json/new?https://jobs.example/`, { method: 'PUT' });
-          await fetch(`${other.url}/json/new?https://shop.example/`, { method: 'PUT' });
-        },
-      });
-      scheduler.start();
-      scheduler.trigger('shop', 'sla', 'U1');
-      await scheduler.idle();
-      expect(work.pages()).toEqual(['a chrome://new-tab-page/']);
-      expect(other.pages()).toHaveLength(2);
-      expect(other.calls.some((c) => c.startsWith('GET /json/list'))).toBe(false);
-      await scheduler.stop();
-    } finally {
-      work.server.close();
-      other.server.close();
-    }
-  });
-});
-
-describe('the channel holds only Run threads', () => {
-  it('posts the health digest in a "Run health-digest" thread', async () => {
-    const { chat, scheduler } = setup({ jobs: [baseJob] });
-    scheduler.start();
-    scheduler.trigger('shop', 'sla', 'U1');
-    await scheduler.idle();
-    const before = chat.posts.length;
-    await scheduler.postDigests();
-    const digest = chat.posts.slice(before);
-    expect(digest[0]).toMatchObject({ thread: '', text: 'Run health-digest' });
-    expect(digest.slice(1).every((p) => p.thread === digest[0]?.ts)).toBe(true);
-    expect(digest.length).toBeGreaterThan(1);
-    await scheduler.stop();
   });
 });
 
@@ -1090,15 +948,22 @@ describe('scheduled runs through Slack', () => {
   });
 
   it('never starts a job paused between its trigger post and pickup', async () => {
-    const { calls, scheduler, store } = missedSlot({ pickupTimeoutMs: 20 });
+    const { calls, scheduler, store, jobs, setNow } = missedSlot({ pickupTimeoutMs: 20 });
     expect(scheduler.setEnabled('shop', 'sla', false)).toBe('ok');
     await new Promise((r) => setTimeout(r, 60));
     await scheduler.idle();
     expect(calls).toHaveLength(0);
-    // The slot is closed as skipped, so it isn't caught up later either.
-    expect([...store.claimedSlots('shop:sla', 0, Date.now() * 2)]).toHaveLength(1);
-    expect(store.claimSlot('shop:sla', Date.parse('2026-10-25T12:00:00Z'))).toBe(false);
     await scheduler.stop();
+    // The slot is closed as skipped (not left `running`), so the next start doesn't catch it up.
+    expect(store.claimSlot('shop:sla', Date.parse('2026-10-25T12:00:00Z'))).toBe(false);
+    setNow('2026-10-25T12:40:00Z');
+    const next = setup({ jobs, store, now: () => Date.parse('2026-10-25T12:40:00Z') });
+    next.scheduler.start();
+    await new Promise((r) => setTimeout(r, 20));
+    await next.scheduler.idle();
+    expect(next.chat.texts()).not.toContain('Run SLA Report');
+    expect(next.calls).toHaveLength(0);
+    await next.scheduler.stop();
   });
 
   it('leaves a trigger the bot picked up to the bot', async () => {

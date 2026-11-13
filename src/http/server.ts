@@ -1271,6 +1271,8 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         (p) => sites.sessions(p.dir),
         (sid) => jobOf.get(sid),
         (p) => options.scheduler.list(p),
+        undefined,
+        options.browsers,
       ),
       jobNames,
       scanning: sites.scanning,

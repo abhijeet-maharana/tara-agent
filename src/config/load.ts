@@ -6,7 +6,7 @@ import type { z } from 'zod';
 import {
   type HostConfig,
   hostConfigSchema,
-  jobsFileSchema,
+  jobsFileSchemaFor,
   type Project,
   projectConfigSchema,
   type QueueConfig,
@@ -102,7 +102,7 @@ export function loadJobs(project: Project): ScheduledJob[] {
   } catch (err) {
     throw new Error(`Invalid JSON in ${file}: ${(err as Error).message}`);
   }
-  const jobsFile = parseWith(jobsFileSchema, json, file);
+  const jobsFile = parseWith(jobsFileSchemaFor(project.config.words), json, file);
   const expand = (env: Record<string, string>) =>
     Object.fromEntries(Object.entries(env).map(([k, v]) => [k, expandHome(v)]));
   return jobsFile.jobs.map((job) => ({

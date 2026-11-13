@@ -303,7 +303,7 @@ export interface LoginUse extends Use, Login {
 export interface ProjectNeeds {
   project: string;
   browser: ProjectBrowser;
-  /** Its jobs that hold a lock, by lock. */
+  /** Its jobs by the browser they use (its `.mcp.json` Chrome, or a lock in an older jobs file), by browser lock name. */
   lockJobs: Map<string, { id: string; name: string }[]>;
   /** Sessions that opened any site. */
   sessions: number;
@@ -336,7 +336,13 @@ export function projectNeeds(
   jobOf: (sessionId: string) => string | undefined,
   jobs: (project: string) => { id: string; name: string; locks?: string[] }[],
   logins: (p: Project) => ReturnType<typeof loadLogins> = (p) => loadLogins(p.dir),
+  browsers: { lock: string; cdpUrl: string }[] = [],
 ): ProjectNeeds[] {
+  const sameUrl = (a: string, b: string) => {
+    const norm = (u: string) =>
+      u.replace(/^ws:/, 'http:').replace(/\/$/, '').replace('localhost', '127.0.0.1');
+    return norm(a) === norm(b);
+  };
   const out = projects.map((p): ProjectNeeds => {
     const file = logins(p);
     const listed = file && !('error' in file && file.error) ? (file as LoginsFile) : undefined;
@@ -357,8 +363,11 @@ export function projectNeeds(
       for (const [l, at] of used) count(l, job, at);
     }
     const lockJobs = new Map<string, { id: string; name: string }[]>();
+    const cdpUrl = projectBrowser(p.dir).cdpUrl;
+    const own = cdpUrl ? browsers.find((b) => sameUrl(b.cdpUrl, cdpUrl))?.lock : undefined;
     for (const j of jobs(p.config.name))
-      for (const lock of j.locks ?? []) lockJobs.set(lock, [...(lockJobs.get(lock) ?? []), j]);
+      for (const lock of new Set([...(j.locks ?? []), ...(own ? [own] : [])]))
+        lockJobs.set(lock, [...(lockJobs.get(lock) ?? []), j]);
     const sites = [...bySite.values()].sort((a, b) => b.sessions - a.sessions || b.last - a.last);
     const covered = [...(listed?.logins.flatMap((l) => l.sites) ?? []), ...(listed?.public ?? [])];
     return {

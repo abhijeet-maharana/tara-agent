@@ -8,7 +8,7 @@ const job = (o: object = {}) =>
 describe('buildJobPrompt', () => {
   it("is the job's section in its first skill, then the skills to load", () => {
     expect(buildJobPrompt(job({ skills: ['sla-report', 'humanizer'] }))).toBe(
-      'Run the job "J" (`j`): do what the "## Job: `j`" section of the `sla-report` skill says, with the rest of that skill.\n\n' +
+      'Run the job "J" (`j`): do what the "## Job" section of the `sla-report` skill says (in an older skill: "## Job: `j`"), with the rest of that skill.\n\n' +
         'Skills for this job: `sla-report`, `humanizer`. Load each one before you start (the Skill tool, or its SKILL.md) and follow it.',
     );
   });

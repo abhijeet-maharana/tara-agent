@@ -25,7 +25,6 @@ tara-agent runs on your own server around the clock. It runs scheduled jobs, ans
 
 **See everything**
 - **Web dashboard.** What's running, what needs you, failing jobs, the day's schedule, full transcripts of every run, and your repos' uncommitted changes. Works on a phone.
-- **Daily health digest** in each project channel, as a `Run health-digest` thread.
 
 ## How it works
 
@@ -66,7 +65,7 @@ Create `<repo>/.tara/jobs.json`. tara-agent picks up changes within 30 seconds.
 {
   "tz": "Asia/Kolkata",
   "jobs": [
-    { "id": "daily-report", "name": "Daily report", "cron": "45 10 * * *", "skills": ["order-report"] }
+    { "skill": "order-report", "cron": "45 10 * * *" }
   ]
 }
 ```
@@ -107,7 +106,7 @@ No commands to remember: just write.
 | A reply while it's working | Waits, and is read as soon as the current work finishes (the thread says so). This includes a scheduled job's thread |
 | `stop` (or `cancel`) | Stops whatever is running in the thread, a chat turn or a job. Only the word on its own; "stop the ads" is a normal message |
 | `run <job name>` | Runs a job now, in your message's thread. A job id or a skill the job uses works too (`run google-analytics`); several matches get buttons |
-| "Which jobs run today?" | Claude answers with its `list_jobs` tool; the health digest posts itself daily |
+| "Which jobs run today?" | Claude answers with its `list_jobs` tool |
 
 ## Dashboard
 
