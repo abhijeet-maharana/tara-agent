@@ -16,6 +16,8 @@ import { type Bridge, BridgeError } from '../bridge/bridge.js';
 import { CodeError, type CodeRepo, MIN_QUERY, type RepoReader } from '../code/repo.js';
 import { loadQueues } from '../config/load.js';
 import type { HostConfig, Project, QueueConfig } from '../config/schema.js';
+import type { HealthMonitor } from '../health/monitor.js';
+import type { Observability } from '../health/observability.js';
 import type { Activity } from '../runner/activity.js';
 import type { Scheduler } from '../scheduler/scheduler.js';
 import { type IncomingMessage as ChatMessage, type Logger, threadKey } from '../sessions/manager.js';
@@ -60,6 +62,8 @@ import {
   tabbed,
   tabPage,
 } from './dashboard.js';
+import { healthPage } from './health.js';
+import { logsPage, trendsPage } from './observe.js';
 import { queuePage } from './queue.js';
 import { isDayKey, MAX_RUNS_PER_DAY, type PlanJob, planDay, schedulePage } from './schedule.js';
 import { firstPromptOf, readTranscript } from './transcript.js';
@@ -116,6 +120,10 @@ export interface HttpOptions {
   activity?: Pick<Activity, 'tasks' | 'usage' | 'stop'>;
   /** A second, HTTPS listener on the same address. The certificate is re-read when its file changes. */
   tls?: { port: number; cert: string; key: string };
+  /** The Health page (`/health` in a browser) and `GET /health/checks`, `POST /health/check`. */
+  health?: Pick<HealthMonitor, 'snapshot' | 'check' | 'history' | 'label'>;
+  /** The Health page's Trends and Logs views, and `GET /metrics` (Prometheus text). */
+  observe?: Pick<Observability, 'trends' | 'logs' | 'metrics'>;
   /** The shared Chromes (host `browsers`): the Browsers page shows them and what each project needs. */
   browsers?: HostConfig['browsers'];
   /** Enables the HTML pages (sessions, transcripts, jobs) for browsers. */
@@ -205,7 +213,7 @@ async function readJson(req: IncomingMessage, limit = 10_000): Promise<Record<st
  */
 /** Paths tara-agent serves itself; with a fallback, everything else is passed through. */
 const OWN_PATH =
-  /^\/(?:$|(?:health|reload|attention|jobs|runs|sessions|schedule|approvals|queue|items|unlock|code|internal|p|app)(?:\/|$))/;
+  /^\/(?:$|(?:health|metrics|reload|attention|jobs|runs|sessions|schedule|approvals|queue|items|unlock|code|internal|p|app)(?:\/|$))/;
 const TOKEN_COOKIE = 'tara_token';
 const ADMIN_COOKIE = 'tara_admin';
 /** Finished items shown on the Done tab. */
@@ -500,8 +508,10 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
 
     if (method === 'GET' && url.pathname === '/health') {
       const jobs = options.projects.flatMap((p) => options.scheduler.list(p));
+      const counts = options.health?.snapshot()?.counts;
       return {
         ok: true,
+        ...(counts && { checks: counts }),
         uptimeSeconds: Math.floor((now() - started) / 1000),
         projects: options.projects,
         jobs: {
@@ -510,6 +520,13 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
           running: jobs.filter((j) => j.running).length,
         },
       };
+    }
+    if (method === 'GET' && url.pathname === '/health/checks' && options.health) {
+      return options.health.snapshot() ?? (await options.health.check());
+    }
+    if (method === 'POST' && url.pathname === '/health/check' && options.health) {
+      const { counts, checkedAt } = await options.health.check();
+      return { counts, checkedAt };
     }
     if (method === 'GET' && url.pathname === '/attention' && options.attention) {
       return options.attention();
@@ -1039,8 +1056,13 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         .filter((j) => jobState(j) === 'failing').length,
       code: Boolean(options.code),
       browsers: Boolean(options.browsers),
+      unhealthy: options.health ? redChecks().length : undefined,
     };
   };
+
+  /** Confirmed red Health checks. */
+  const redChecks = () =>
+    (options.health?.snapshot()?.checks ?? []).filter((c) => c.status === 'bad' && !c.unconfirmed);
 
   /** Browser pages; undefined when this request should get JSON instead. */
   const canDecide = (req: IncomingMessage) => {
@@ -1106,6 +1128,22 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
           queues: runBy.get(job.id),
         }));
       });
+    if (parts[0] === 'health' && parts[1] === 'trends' && parts.length === 2 && options.observe) {
+      const days = [7, 14, 30].includes(Number(url.searchParams.get('days')))
+        ? Number(url.searchParams.get('days'))
+        : 14;
+      return trendsPage(ctx, options.observe.trends(days));
+    }
+    if (parts[0] === 'health' && parts.length === 1 && options.health) {
+      const health = options.health;
+      return healthPage(ctx, {
+        snapshot: health.snapshot(),
+        history: health.history(7),
+        label: (key) => health.label(key),
+        uptimeSeconds: Math.floor((now() - started) / 1000),
+        now: now(),
+      });
+    }
     if (parts.length === 0) {
       const at = now();
       const runs = options.store.recentJobRuns(400);
@@ -1133,6 +1171,20 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         quietRuns: runs.filter((r) => r.status === 'silent' && r.startedAt >= at - DAY_MS).length,
         pending: options.approvals ? options.store.items({ statuses: ['pending'], limit: ITEMS_LIMIT }) : [],
         usage: usageNow(at),
+        health: options.health
+          ? (() => {
+              const snap = options.health.snapshot();
+              const sources = new Map((snap?.sources ?? []).map((x) => [x.id, x.title]));
+              const where = (key: string) =>
+                [...sources.entries()].find(([id]) => key.startsWith(`${id}:`))?.[1] ?? '';
+              return {
+                problems: redChecks()
+                  .filter((c) => !c.key.startsWith('jobs:'))
+                  .map((c) => ({ name: c.name, where: where(c.key) })),
+                watch: (snap?.checks ?? []).filter((c) => c.status === 'warn').length,
+              };
+            })()
+          : undefined,
         staleRepos: extra.staleRepos,
         uptimeSeconds: Math.floor((at - started) / 1000),
         now: at,
@@ -1506,7 +1558,13 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     if (wantsHtml && ctx) {
       try {
         const home = new URL(req.url ?? '/', 'http://localhost').pathname === '/';
+        const logsPath =
+          new URL(req.url ?? '/', 'http://localhost').pathname.replace(/\/$/, '') === '/health/logs';
+        const hours = Number(new URL(req.url ?? '/', 'http://localhost').searchParams.get('hours'));
         const html =
+          (logsPath && options.observe
+            ? logsPage(ctx, await options.observe.logs([1, 24, 168].includes(hours) ? hours : 24))
+            : undefined) ??
           (await codePage(req, ctx)) ??
           (await browsersPageFor(req, ctx)) ??
           page(req, ctx, home ? { staleRepos: await staleRepos(now()) } : {});
@@ -1517,6 +1575,16 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         options.log.error(`http page ${req.url}: ${(err as Error).stack ?? err}`);
         return sendHtml(res, 500, errorPage(ctx, 500));
       }
+    }
+    if (req.method === 'GET' && url.pathname === '/metrics' && options.observe) {
+      if (!authorized(req)) {
+        res.writeHead(401, { 'content-type': 'text/plain' });
+        res.end('Missing or wrong bearer token');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' });
+      res.end(options.observe.metrics());
+      return;
     }
     let status = 200;
     let payload: unknown;

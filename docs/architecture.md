@@ -32,6 +32,7 @@ tara-agent is one Node process per host. It never calls the Anthropic API: every
 | `src/privileged/` | Root actions through the root-owned helper `deploy/tara-priv.mjs` (list, plan, run) |
 | `src/http/server.ts` | Local API for other tools, plus `/internal/*` for the MCP server |
 | `src/code/repo.ts`, `src/http/code.ts` | The Code page: read-only git status, diffs and files of each repo, through a private index copy ([code-view.md](code-view.md)) |
+| `src/health/`, `src/http/health.ts`, `src/http/observe.ts` | The Health page. Now: checks of tara-agent, each project's jobs and each project's `healthUrl`, with red-twice-in-a-row alerts and recoveries in a `📌 Health` day thread. Trends: runs, cost, usage, job lengths, uptime and machine samples over days. Logs: tara-agent's own warnings and errors plus `logUnits` from the journal, grouped. `GET /metrics` for Prometheus |
 | `src/http/dashboard.ts` | Server-rendered dashboard (home, jobs, runs, sessions); `cron-text.ts` turns schedules into plain English |
 | `src/slack/` | Bolt app, mrkdwn conversion, message splitting |
 | `src/store/store.ts` | `node:sqlite` with numbered migrations |
@@ -52,7 +53,7 @@ Scheduled runs go through Slack: the scheduler only posts a message, and the bot
 2. It posts a trigger message in the project channel: `Run <job name>` (e.g. `Run Weekly GA4 Audit`; the id only when two jobs share a name), the words a person would type (`src/scheduler/slack-trigger.ts`). With `SLACK_USER_TOKEN` set it is posted as that person, otherwise as the bot. It starts the scheduled slot only while one is waiting for that job; a person typing `Run <name>` otherwise gets a normal run.
 3. The bot receives its own message from Slack (`ignoreSelf: false`; `toIncoming` lets through only its top-level trigger messages, as `fromSelf`) and starts that job in the message's thread. The scheduler takes the slot once, so a redelivered event starts nothing. A trigger not picked up within 2 minutes (a dropped event) is started by the scheduler itself in the same thread; one lost to a restart leaves the slot `running`, and the next start catches it up. A trigger-looking message that doesn't parse is dropped, never sent to Claude.
 4. The job waits for a job slot (`jobConcurrency`) and its named locks (for example `chrome`).
-5. The status line is the thread's first reply (the trigger message is never edited: a channel holds only `Run <name>` messages), and the run streams its steps and text live into the thread (addressed to the project `owner`). Replies `[SILENT]` → "🔇 nothing to report", the thread and session stay; `[CRON_FAILURE]` → marked failed; otherwise the headline on the status line and the full reply in the thread (a reply that is only a headline, with no details, stays on the status line: the thread keeps just the steps and the `✅ Done` summary).
+5. The status line is the thread's first reply (the trigger message is never edited: a channel holds only `Run <name>` messages), and the run streams its steps and text live into the thread (addressed to the project `owner`). An empty reply → "🔇 nothing to report", the thread and session stay; a reply starting with `❌` → marked failed; otherwise the headline on the status line and the full reply in the thread (a reply that is only a headline, with no details, stays on the status line: the thread keeps just the steps and the `✅ Done` summary).
 6. The job thread is saved as a session, so replying to it continues the job's conversation ("why didn't you check X?").
 
 On start, each enabled job posts its most recent missed slot once if it is younger than `catchUpHours` and after the job was first seen on this host (also `Run <job name>`). Runs started with `run <job name>` or a card decision run in that thread; a queue and Run now open their own `Run <job name>` thread (`openRunThread`).
@@ -70,7 +71,7 @@ Permission prompts work the same way, except the MCP call blocks (polling every 
 ## Design choices
 
 - **One CLI process per turn**, not a long-lived process: sessions live in the CLI's own storage (Claude Code sessions, agy conversations), so restarts lose nothing. A session remembers its harness, so later turns use the same CLI.
-- **Hermes-compatible replies** (`[SILENT]`, `[CRON_FAILURE]`).
+- **Plain replies**: a `✅`/`⚠️` headline, or `❌` first when the job could not be done (no code words).
 - **A job's instructions and scripts live in its skill**, not in `jobs.json`: one place to read and edit, and learning turns improve them with the rest of the skill. `jobs.json` holds only when and how a job runs.
 - **Local HTTP for the MCP bridge** instead of a socket per session: one code path, easy to test, token per run.
-- **No outbound calls except Slack and the CLI.** No telemetry.
+- **No outbound calls except Slack and the CLI.** No telemetry: `/metrics` is only scraped by what you point at it.

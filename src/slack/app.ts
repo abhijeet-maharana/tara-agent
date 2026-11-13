@@ -1,6 +1,7 @@
 import { App, type BlockAction, type ButtonAction, LogLevel } from '@slack/bolt';
 import { parseScheduledRun } from '../scheduler/slack-trigger.js';
 import type { ChatPort, IncomingMessage, Logger } from '../sessions/manager.js';
+import { sendWithFallback } from './format.js';
 import { StreamError, type StreamPort } from './reply.js';
 import { transcribeAudio, type VoiceOptions } from './voice.js';
 
@@ -135,6 +136,8 @@ export interface SlackGateway {
   chat: ChatPort;
   /** The workspace URL (https://acme.slack.com/), known after start(). */
   workspaceUrl(): string | undefined;
+  /** The Socket Mode connection's state since when, and when Slack last sent anything (Health page). */
+  link(): { state: string; since: number; lastEventAt?: number };
   start(): Promise<void>;
   stop(): Promise<void>;
 }
@@ -153,6 +156,21 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
   let botId: string | undefined;
   let teamId: string | undefined;
   let workspaceUrl: string | undefined;
+  // Socket Mode's state for the Health page: connecting, connected, reconnecting, disconnected.
+  const link: { state: string; since: number; lastEventAt?: number } = {
+    state: 'connecting',
+    since: Date.now(),
+  };
+  const socket = (app as unknown as { receiver?: { client?: { on?: (e: string, f: () => void) => void } } })
+    .receiver?.client;
+  for (const state of ['connecting', 'connected', 'reconnecting', 'disconnecting', 'disconnected'])
+    socket?.on?.(state, () => {
+      if (link.state !== state) Object.assign(link, { state, since: Date.now() });
+    });
+  app.use(async ({ next }) => {
+    link.lastEventAt = Date.now();
+    await next();
+  });
 
   /** Calls a streaming method, turning Slack errors into StreamError with Slack's error code. */
   const streamCall = async (method: string, args: Record<string, unknown>) => {
@@ -303,10 +321,14 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
       await app.client.chat.delete({ channel, ts });
     },
     async update(channel, ts, text, blocks) {
-      await app.client.chat.update({ channel, ts, text, ...(blocks ? { blocks } : {}) });
+      await sendWithFallback(blocks, (b) =>
+        app.client.chat.update({ channel, ts, text, ...(b ? { blocks: b } : {}) }),
+      );
     },
     async postBlocks(channel, threadTs, text, blocks) {
-      const res = await app.client.chat.postMessage({ channel, thread_ts: threadTs, text, blocks });
+      const res = await sendWithFallback(blocks, (b) =>
+        app.client.chat.postMessage({ channel, thread_ts: threadTs, text, blocks: b }),
+      );
       return res.ts as string;
     },
     async uploadFile(channel, threadTs, file, comment) {
@@ -329,6 +351,7 @@ export function createSlackGateway(options: SlackOptions): SlackGateway {
   return {
     chat,
     workspaceUrl: () => workspaceUrl,
+    link: () => ({ ...link }),
     async start() {
       const auth = await app.client.auth.test();
       botUserId = auth.user_id;

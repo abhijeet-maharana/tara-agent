@@ -225,9 +225,10 @@ describe('Store', () => {
     const db = new DatabaseSync(file);
     const { user_version: v } = db.prepare('PRAGMA user_version').get() as { user_version: number };
     // The database as it was before the upgrade: totals in cost_usd, no session_cost_usd.
-    // (two migrations back: the cost one, then day_threads)
+    // (four migrations back: the cost one, day_threads, the health tables, then samples and logs)
     db.exec(
-      `DROP TABLE day_threads; ALTER TABLE runs DROP COLUMN session_cost_usd; PRAGMA user_version = ${v - 2};`,
+      `DROP TABLE log_events; DROP TABLE host_samples; DROP TABLE health_events; DROP TABLE health_state;
+       DROP TABLE day_threads; ALTER TABLE runs DROP COLUMN session_cost_usd; PRAGMA user_version = ${v - 4};`,
     );
     const add = db.prepare(
       `INSERT INTO runs (kind, project, session_id, started_at, ended_at, status, cost_usd) VALUES ('chat', 'p', ?, ?, ?, 'ok', ?)`,

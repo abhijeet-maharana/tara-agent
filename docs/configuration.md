@@ -43,6 +43,7 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `http.tls` | off | Also serve HTTPS on `port` (default `4443`) with `cert` and `key` files, e.g. from `tailscale cert`. The certificate is re-read when its file changes, so renewing it needs no restart |
 | `code` | on, the projects | The Code page: `repos` (`path`, `gitDir`, `title`, `askIn`) and `exclude` globs never shown (default `.env*`, `*.pem`, `*.key`). See [code-view.md](code-view.md) |
 | `attention` | GitHub on, nothing urgent | What needs you (`GET /attention`): `github` (your open PRs and review requests through `gh`, logged in as the user tara-agent runs as) and `urgent` rules that put a failing job in the urgent tier: `{consecutiveFailures: 3}` or `{job: "project/jobId"}` |
+| `health` | on, every 5 min, alerts on | The Health page (see [Dashboard](#dashboard)): `enabled`, `intervalMinutes`, `alerts` (post red checks and recoveries in Slack), `alertProject` (whose channel hears about tara-agent itself; default the first project), `stuckMinutes` (180: a run going longer is stuck), `failingAfter` (3: failures in a row that turn a job red), `diskWarnPercent` / `diskBadPercent` (85 / 95), `logUnits` (systemd units whose warnings and errors the Logs view shows; tara-agent's user must read the journal: `sudo usermod -aG systemd-journal <user>`) |
 
 ## Project config
 
@@ -63,6 +64,7 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `scratchDir` | `<stateDir>/scratch/<name>` | Parent of per-session scratch folders, relative to the repo. Keep it out of git |
 | `jobDataDir` | `<stateDir>/job-data/<name>` | Parent of per-job data folders, relative to the repo |
 | `selfImprove` | `"always"` | After every run (`always`), only runs with trouble (`trouble`), or never (`off`), let Claude fix the skill it followed (see [Self-improvement](#self-improvement)) |
+| `healthUrl` | none | The project's own checks for the Health page: GET returns `{checks: [{name, ok, warn?, detail, group?, link?}]}` (also bare, or under `result`). Without it, `dashboardUrl` is only checked for an answer |
 | `keepTabsUrl` | none | Tabs tara never closes as stale (host `browsers`): GET returns a JSON list of `{url}` or URL strings, bare or under `result`, matched without query or fragment. For a page a person must finish, such as a form stopped at a captcha. If it doesn't answer, no tab in that browser is closed |
 | `words` | none | How skill-name words are written in job names: `{"linkedin": "LinkedIn", "sla": "SLA"}`; other words are capitalised |
 | `approvals.validateUrl` | none | Asked for extra checks on every proposed or edited draft (see [Queues](#queues)) |
@@ -118,7 +120,7 @@ What a job does lives in its skill, in a `## Job` section, not in `jobs.json`:
 
 ### Before you start
 
-Run `python3 scripts/sla-gate.py` from the repo root. If it prints nothing, reply with exactly `[SILENT]` and stop. Otherwise its output is your input.
+Run `python3 scripts/sla-gate.py` from the repo root. If it prints nothing, reply with one line `✅ Nothing to do` and stop. Otherwise its output is your input.
 
 Check yesterday's late orders in that output and summarise them. On STATUS: FAILED, …
 ```
@@ -136,18 +138,18 @@ Check yesterday's late orders in that output and summarise them. On STATUS: FAIL
 1. **Trigger message.** At cron time a `Run <job name>` message is posted (the skill's words capitalised, e.g. `Run Google Analytics`) in the project channel, as the `SLACK_USER_TOKEN` person if set (else, or when that person isn't in the channel, as the bot). The bot picks it up and runs the job in its thread; if Slack doesn't deliver it within 2 minutes, the scheduler starts it there itself.
 2. **Claude** runs the job's skill section (its scripts first, as the section says), streaming into the thread.
 3. **The reply**: the part before a `---` line is the headline on the status line (the thread's first reply), the rest goes in the thread. A short reply with no `---` is all headline: it shows only on the status line, not again in the thread.
-   - A reply of `[SILENT]` shows "🔇 nothing to report"; the thread and session stay, so you can ask why.
-   - A first line of `[CRON_FAILURE]` marks the run failed.
+   - Nothing to report: a one-line `✅ …` reply. An empty reply shows "🔇 nothing to report"; the thread and session stay, so you can ask why.
+   - A reply starting with `❌` marks the run failed (problems the job found are `⚠️`, not failures).
 4. **Replying** in the job's thread continues its session, so a job can ask a question and act on your answer.
 
 Other rules:
 
 - **Every slot runs at most once**, even across restarts. A job added while tara-agent was down doesn't run for past slots.
-- **Watching live:** every run streams its steps and text into its Slack thread (the status line, its first reply, keeps the current step and, at the end, the headline). A run you start with `run <job name>` streams in your message's thread; scheduled, queue and dashboard/API runs stream in their `Run <job name>` thread, addressed to the project `owner` (Slack's streaming needs a recipient; without `owner` they post only the status line and the details at the end). A run with no thread of its own (a queue, Run now) opens its `Run <job name>` thread. A run that ends `[SILENT]` keeps its thread, with the steps it took, its session and a `🔇 … · nothing to report` status line.
+- **Watching live:** every run streams its steps and text into its Slack thread (the status line, its first reply, keeps the current step and, at the end, the headline). A run you start with `run <job name>` streams in your message's thread; scheduled, queue and dashboard/API runs stream in their `Run <job name>` thread, addressed to the project `owner` (Slack's streaming needs a recipient; without `owner` they post only the status line and the details at the end). A run with no thread of its own (a queue, Run now) opens its `Run <job name>` thread. A run that replies nothing keeps its thread, with the steps it took, its session and a `🔇 … · nothing to report` status line.
 
 ### agy jobs
 
-A job with `"harness": "agy"` runs on Google's Antigravity CLI (`agy`) instead of Claude Code, e.g. to use an idle Google AI Pro plan. Everything else works the same: the skill section, `[SILENT]`/`[CRON_FAILURE]`, Slack thread, tara's tools (`request_approval`, `send_file`, …), and a decision on its card or a reply in its thread continues the same agy conversation.
+A job with `"harness": "agy"` runs on Google's Antigravity CLI (`agy`) instead of Claude Code, e.g. to use an idle Google AI Pro plan. Everything else works the same: the skill section, the ✅/❌ headline, Slack thread, tara's tools (`request_approval`, `send_file`, …), and a decision on its card or a reply in its thread continues the same agy conversation.
 
 - **Setup:** install agy as the run user and sign in once interactively (`agy`, then Google OAuth); check with `agy models`. Set host `agy.bin` if it isn't on the service's `PATH`.
 - **How it runs:** one `agy` process per turn in stream-json mode, the prompt on stdin (no TTY needed, nothing on the command line), `--print-timeout` 30 s inside `timeoutMinutes` so agy stops and reports by itself. tara's MCP server and the system prompt reach agy as a plugin `tara` in a per-run folder added with `--add-dir` (agy has no `--mcp-config`); agy names the server `tara_tara`.
@@ -322,6 +324,14 @@ Open the HTTP address in a browser. Every page also answers JSON to tools.
 
   `sites` are hosts; `*.example.com` covers example.com and its subdomains. `public` lists hosts the runs open that need no login.
 
+- **Health** (`/health`): is everything working? Every `health.intervalMinutes` tara-agent checks itself (Slack connection, Claude runs ending in errors, the usage limit, runs stuck past `stuckMinutes`, disk, memory and load, each Chrome), each project's jobs (a jobs file that didn't load, a failing streak, a scheduled slot that never started or never finished), and each project's own `healthUrl` (or whether its dashboard answers). **Needs you** lists what is red or amber; below it every source with its checks, then every change of state over the last 7 days. The sidebar badge and Home count red checks; `GET /attention` lists them as `health` items.
+
+  **Trends** (`/health/trends?days=7|14|30`): against the same number of days before, runs and failure rate, typical job length, API-equivalent cost and how many checks were up; runs per day by result and cost per day by project; the Claude usage window per hour; a jobs table (runs, failures, typical and slowest-5% length, whether the last 3 days ran longer, cost; failing or slowing jobs first); uptime strips of every check that had trouble; and the machine's load, memory and disk (sampled every 5 minutes). Every bar and line has a hover tip and a **Table** view.
+
+  **Logs** (`/health/logs?hours=1|24|168`): tara-agent's own warnings and errors (kept 31 days) and those of host `health.logUnits` from the journal, per hour, then grouped: the same message with other numbers, ids or times counts once, with how often and when it was last seen.
+
+  A check counts as red only after two red checks in a row. Then it is posted once in the day's `📌 Health · <day>` thread of its project's channel (tara-agent's own checks: `health.alertProject`), mentioning the `owner`, and once more when it is fine again. A job's single failure isn't posted (its thread already has the ❌ reply), nor is a jobs file that didn't load (the scheduler posts that itself). The state is kept in the database, so a restart repeats no alert.
+
 Project dashboards can share the look: see [dashboard-look.md](dashboard-look.md).
 
 ## Local API
@@ -332,7 +342,10 @@ For scripts and dashboards on the same host (`127.0.0.1:4100` by default).
 
 | Call | Does |
 |---|---|
-| `GET /health` | Uptime and job counts |
+| `GET /health` | Uptime, job counts and the Health page's `checks` counts (`ok`, `warn`, `bad`) |
+| `GET /health/checks` | The latest checks: `checks` (`key`, `group`, `name`, `status`, `detail`, `since`, `outages`), `sources`, `counts`, `checkedAt` |
+| `POST /health/check` | Check everything now; returns `counts` |
+| `GET /metrics` | Prometheus text: health check status, runs, cost and tokens of the last 24 hours by project, kind and result, each job's last run, failure streak and pause state, running runs, the usage window, the machine. Behind the bearer token like the rest |
 | `GET /attention` | What needs you, most pressing first: `items` (`tier` urgent / waiting / later, `kind`, `title`, `project`, `url`) and `notes` for sources that couldn't be read |
 | `GET /jobs?project=<name>` | Jobs with next run, last status and error; `&upcoming=7` adds start times for the next 7 days |
 | `POST /jobs/<project>/<id>/run` `{"by": "who"}` | Run a job now |

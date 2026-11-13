@@ -9,18 +9,17 @@ import { jobDataDir, sessionScratch } from '../runner/workspace.js';
 import { type LearnRequest, learnFromRun, learnReasons } from '../sessions/learn.js';
 import { type ChatPort, type Logger, threadKey } from '../sessions/manager.js';
 import type { ThreadHold, Threads } from '../sessions/threads.js';
-import { formatDuration, splitMessage, toSlackMrkdwn } from '../slack/format.js';
+import { formatDuration, postMarkdown, toSlackMrkdwn } from '../slack/format.js';
 import { StreamReply } from '../slack/reply.js';
 import type { Item, RunRecord, Store } from '../store/store.js';
 import { type Locks, type Semaphore, Throttle } from '../util/concurrency.js';
 import {
   buildHandoffPrompt,
   buildJobPrompt,
-  cronFailure,
   type DecidedCard,
   decisionWithCard,
+  failedReply,
   identityPrompt,
-  isSilentReply,
   JOB_SYSTEM_PROMPT,
   splitHeadline,
 } from './prompt.js';
@@ -429,9 +428,9 @@ export async function runJob(
       return record(outcome.status, { ...usage, error: outcome.error, output: outcome.text });
     }
 
-    if (isSilentReply(outcome.text)) {
-      // The thread stays, with the steps the run took and its session, to see what it checked and
-      // to ask about it.
+    if (!outcome.text.trim()) {
+      // No reply at all. The thread stays, with the steps the run took and its session, to see what
+      // it checked and to ask about it.
       await chat.update(channel, statusTs, `🔇 ${title} · ${meta} · nothing to report`);
       flushBlock();
       await live?.finish({ summary: `🔇 Nothing to report · ${meta}`, ok: true, answer: '', notes: [] });
@@ -439,7 +438,7 @@ export async function runJob(
       return record('silent', { ...usage, output: outcome.text });
     }
 
-    const failure = cronFailure(outcome.text);
+    const failure = failedReply(outcome.text);
     const { headline, details } = failure
       ? { headline: failure.split('\n')[0] ?? '', details: failure }
       : splitHeadline(outcome.text);
@@ -456,7 +455,7 @@ export async function runJob(
         notes: [],
       });
     } else if (details) {
-      for (const chunk of splitMessage(toSlackMrkdwn(details))) await chat.post(channel, rootTs, chunk);
+      await postMarkdown(chat, channel, rootTs, details);
     }
     learnIf(failure, rootTs);
     return record(failure ? 'failed' : 'ok', { ...usage, error: failure, output: outcome.text });

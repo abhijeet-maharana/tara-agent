@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { jobSchema } from '../src/config/schema.js';
-import { buildJobPrompt, cronFailure, isSilentReply, splitHeadline } from '../src/scheduler/prompt.js';
+import { buildJobPrompt, failedReply, splitHeadline } from '../src/scheduler/prompt.js';
 
 const job = (o: object = {}) =>
   jobSchema.parse({ id: 'j', name: 'J', cron: '* * * * *', skills: ['do-it'], ...o });
@@ -26,27 +26,26 @@ describe('buildJobPrompt', () => {
   });
 });
 
-describe('isSilentReply / cronFailure', () => {
-  it.each([
-    ['[SILENT]', true],
-    ['  silent  ', true],
-    ['NO_REPLY', true],
-    ['Nothing new.\n[SILENT]', true],
-    ['[SILENT]\nignored', true],
-    ['We stay [SILENT] on this', false],
-    ['Report: 3 orders', false],
-  ])('%j silent=%s', (text, silent) => {
-    expect(isSilentReply(text)).toBe(silent);
-  });
-
-  it('reads [CRON_FAILURE] only as the exact first line', () => {
-    expect(cronFailure('[CRON_FAILURE]\nlogin expired')).toBe('login expired');
-    expect(cronFailure('[CRON_FAILURE]')).toBe('The job reported a failure.');
-    expect(cronFailure('Note: [CRON_FAILURE] is a marker')).toBeUndefined();
+describe('failedReply', () => {
+  it('reads a reply whose first line starts with ❌ as a failure', () => {
+    expect(failedReply('❌ Flipkart login expired\nlogin page shown')).toBe(
+      'Flipkart login expired\nlogin page shown',
+    );
+    expect(failedReply('❌')).toBe('The job reported a failure.');
+    expect(failedReply('⚠️ 2 SKUs below floor')).toBeUndefined();
+    expect(failedReply('✅ All good, ❌ none failed')).toBeUndefined();
   });
 });
 
 describe('splitHeadline', () => {
+  it('moves a table out of the headline into the details', () => {
+    const table = '| SKU | Left |\n| --- | --- |\n| car-v2 | 12 |';
+    expect(splitHeadline(`✅ Stock checked\n${table}\n---\nAll fine`)).toEqual({
+      headline: '✅ Stock checked',
+      details: `${table}\n\nAll fine`,
+    });
+  });
+
   it('splits at a --- line', () => {
     expect(splitHeadline('*3 orders late*\n\n---\n• a\n• b')).toEqual({
       headline: '*3 orders late*',

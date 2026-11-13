@@ -106,6 +106,8 @@ export class Scheduler implements JobControl {
   /** Watchdogs of posted triggers, cleared on stop. */
   private readonly pickups = new Set<NodeJS.Timeout>();
   private readonly fileStamps = new Map<string, number>();
+  /** A project's jobs file that failed to load (the old jobs keep running), until it loads again. */
+  private readonly fileErrors = new Map<string, { message: string; at: number }>();
   private readonly slots: Semaphore;
   private readonly locks = new Locks();
   private readonly threads: Threads;
@@ -139,6 +141,32 @@ export class Scheduler implements JobControl {
     this.pickups.clear();
     this.controller.abort();
     await Promise.allSettled([...this.inflight]);
+  }
+
+  /** When this scheduler started: slots before it were missed by an earlier process (or downtime). */
+  get started(): number {
+    return this.startedAt;
+  }
+
+  /** Projects whose `.tara/jobs.json` didn't load, with the error; their previous jobs keep running. */
+  jobFileErrors(): Map<string, { message: string; at: number }> {
+    return new Map(this.fileErrors);
+  }
+
+  /**
+   * Each enabled scheduled job's latest slot at or before `at`, its claim key and when the job was first
+   * seen here, for the Health page's missed-slot check.
+   */
+  latestSlots(
+    project: string,
+    at: number,
+  ): Array<{ id: string; key: string; slot: number; firstSeen: number }> {
+    return [...this.entries.values()].flatMap(({ scheduled: { project: p, job }, clock }) => {
+      if (p.config.name !== project || !job.enabled || !clock) return [];
+      const slot = this.slotAtOrBefore(clock, at);
+      const key = jobKey(project, job.id);
+      return slot === undefined ? [] : [{ id: job.id, key, slot, firstSeen: this.deps.store.firstSeen(key) }];
+    });
   }
 
   agyPermissions(project: string, id: string): AgyPermissions | undefined {
@@ -299,6 +327,7 @@ export class Scheduler implements JobControl {
           new Cron(job.cron, { paused: true, timezone: job.tz ?? this.deps.host.timezone }).stop();
     } catch (err) {
       const message = (err as Error).message;
+      this.fileErrors.set(name, { message, at: this.now() });
       this.deps.log.error(`[${name}] jobs not reloaded: ${message}`);
       void openRunThread(this.deps.chat, project.config.slackChannel, 'jobs-reload')
         .then((ts) =>
@@ -312,6 +341,7 @@ export class Scheduler implements JobControl {
       return;
     }
 
+    this.fileErrors.delete(name);
     for (const [key, entry] of this.entries) {
       if (entry.scheduled.project.config.name === name) {
         this.stopEntry(entry);

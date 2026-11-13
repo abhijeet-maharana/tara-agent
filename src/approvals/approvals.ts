@@ -10,7 +10,7 @@ import {
   type SlackBlock,
   threadKey,
 } from '../sessions/manager.js';
-import { splitMessage, toSlackMrkdwn } from '../slack/format.js';
+import { hasTable, MARKDOWN_MAX, postMarkdown, textBlock, toSlackMrkdwn } from '../slack/format.js';
 import type { Item, ItemCheck, ItemField, ItemMedia, Store } from '../store/store.js';
 import { sealItem } from './seal.js';
 
@@ -184,17 +184,18 @@ export class Approvals {
 
     const refresh =
       item.messageTs && item.channel ? { channel: item.channel, ts: item.messageTs } : undefined;
-    let details = toSlackMrkdwn(input.details.trim());
-    if (details.length > SECTION_MAX && refresh) {
+    let details = input.details.trim();
+    const max = hasTable(details) ? MARKDOWN_MAX : SECTION_MAX;
+    if (details.length > max && refresh) {
       // An update edits the one message: the full text stays on the Approvals page.
-      details = `${details.slice(0, SECTION_MAX - 200)}…\n_Full text on the Approvals page._`;
-    } else if (details.length > SECTION_MAX) {
+      details = `${details.slice(0, max - 200)}…\n_Full text on the Approvals page._`;
+    } else if (details.length > max) {
       // Too long for one block: post it in full first, then the buttons under it.
-      for (const chunk of splitMessage(details)) await this.deps.chat.post(ctx.channel, ctx.threadTs, chunk);
+      await postMarkdown(this.deps.chat, ctx.channel, ctx.threadTs, details);
       details = '_Full proposal above._';
     }
     const blocks: SlackBlock[] = [
-      { type: 'section', text: { type: 'mrkdwn', text: `*🟡 Approval needed: ${title}*\n${details}` } },
+      textBlock(`**🟡 Approval needed: ${title}**\n${details}`, SECTION_MAX + 200),
       {
         type: 'actions',
         elements: options.map((option, i) => ({
@@ -378,20 +379,18 @@ export class Approvals {
       .filter((f) => shown(f.value))
       .map((f) => {
         const value = shown(f.value).slice(0, 1_200);
-        return `*${f.label}*\n${value
+        return `**${f.label}**\n${value
           .split('\n')
           .map((l) => `> ${l}`)
           .join('\n')}`;
       });
     const checks = item.checks.map((c) => `${c.blocking ? '⛔' : '⚠️'} ${c.text}`);
-    const text = [toSlackMrkdwn(item.body ?? ''), ...fields, ...checks].filter(Boolean).join('\n\n');
+    const text = [item.body ?? '', ...fields, ...checks].filter(Boolean).join('\n\n');
     const card = (body: string): SlackBlock[] => [
-      { type: 'section', text: { type: 'mrkdwn', text: `*📝 ${item.title}*${body}`.slice(0, SECTION_MAX) } },
+      textBlock(`**📝 ${item.title}**${body}`, SECTION_MAX),
       { type: 'context', elements: [{ type: 'mrkdwn', text: status }] },
     ];
-    const detail: SlackBlock[] = [
-      { type: 'section', text: { type: 'mrkdwn', text: text.slice(0, SECTION_MAX) } },
-    ];
+    const detail: SlackBlock[] = [textBlock(text, SECTION_MAX)];
     // Its own channel message: only cards posted before channels held only `Run` threads.
     const ownMessage = !!item.messageTs && item.threadTs === item.messageTs;
     try {

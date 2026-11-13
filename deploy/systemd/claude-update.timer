@@ -1,0 +1,12 @@
+# Nightly Claude Code update for the run user (see claude-update.service).
+[Unit]
+Description=Nightly Claude Code update for the tara-agent run user
+
+[Timer]
+OnCalendar=*-*-* 04:30
+RandomizedDelaySec=30min
+# Missed while the machine was off: run once at the next boot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

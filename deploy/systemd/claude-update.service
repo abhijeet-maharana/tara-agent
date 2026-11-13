@@ -1,0 +1,24 @@
+# Updates the run user's Claude Code CLI. tara-agent only starts headless runs (`claude -p`), which
+# never update the CLI themselves, so without this the run user's copy stays on the version it was
+# installed with. Started nightly by claude-update.timer. Safe during a run: the native installer
+# puts each version in its own file and swaps the ~/.local/bin/claude link; a running process keeps
+# the old file, the next run starts the new one.
+# Install (adjust User and the paths when the run user isn't tara):
+#   sudo cp deploy/systemd/claude-update.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now claude-update.timer
+# Run it now: sudo systemctl start claude-update.service; logs: journalctl -u claude-update
+[Unit]
+Description=Update Claude Code for the tara-agent run user
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tara
+Group=tara
+Environment=HOME=/home/tara
+Environment=CLAUDE_CONFIG_DIR=/home/tara/.claude
+Environment=PATH=/home/tara/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/tara/.local/bin/claude update
+TimeoutStartSec=10min
+Nice=10

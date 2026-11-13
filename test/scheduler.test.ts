@@ -341,8 +341,8 @@ describe('Scheduler', () => {
     await scheduler.stop();
   });
 
-  it('keeps its own Run thread and session when the model replies [SILENT]', async () => {
-    const { chat, scheduler, store } = setup({ jobs: [baseJob], replies: ['[SILENT]'] });
+  it('keeps its own Run thread and session when the model replies nothing', async () => {
+    const { chat, scheduler, store } = setup({ jobs: [baseJob], replies: [''] });
     scheduler.start();
     scheduler.trigger('shop', 'sla', 'U1');
     await scheduler.idle();
@@ -354,8 +354,8 @@ describe('Scheduler', () => {
     await scheduler.stop();
   });
 
-  it('marks [CRON_FAILURE] replies as failed', async () => {
-    const { chat, scheduler } = setup({ jobs: [baseJob], replies: ['[CRON_FAILURE]\nPortal login expired'] });
+  it('marks replies that start with ❌ as failed', async () => {
+    const { chat, scheduler } = setup({ jobs: [baseJob], replies: ['❌ Portal login expired'] });
     scheduler.start();
     scheduler.trigger('shop', 'sla', 'U1');
     await scheduler.idle();
@@ -371,7 +371,7 @@ describe('Scheduler', () => {
       const { chat, calls, scheduler, store } = setup({
         jobs: [baseJob],
         selfImprove: 'trouble',
-        replies: ['[CRON_FAILURE]\nSave button not found', '.claude/skills/sla/SKILL.md: new Save selector'],
+        replies: ['❌ Save button not found', '.claude/skills/sla/SKILL.md: new Save selector'],
       });
       scheduler.start();
       scheduler.trigger('shop', 'sla', 'U1');
@@ -435,7 +435,7 @@ describe('Scheduler', () => {
       const none = setup({
         jobs: [baseJob],
         selfImprove: 'trouble',
-        replies: ['[CRON_FAILURE]\nPortal down', 'NONE'],
+        replies: ['❌ Portal down', 'NONE'],
       });
       none.scheduler.start();
       none.scheduler.trigger('shop', 'sla', 'U1');
@@ -450,7 +450,7 @@ describe('Scheduler', () => {
         jobs: [baseJob],
         selfImprove: 'trouble',
         toolErrors: 2,
-        replies: ['[SILENT]', 'SKILL.md: dismiss the cookie banner first'],
+        replies: ['', 'SKILL.md: dismiss the cookie banner first'],
       });
       scheduler.start();
       scheduler.trigger('shop', 'sla', 'U1');
@@ -463,7 +463,7 @@ describe('Scheduler', () => {
     });
 
     it('stays off when the project turns it off', async () => {
-      const { calls, scheduler } = setup({ jobs: [baseJob], replies: ['[CRON_FAILURE]\nBroken'] });
+      const { calls, scheduler } = setup({ jobs: [baseJob], replies: ['❌ Broken'] });
       scheduler.start();
       scheduler.trigger('shop', 'sla', 'U1');
       await scheduler.idle();
@@ -811,7 +811,7 @@ describe('job streaming', () => {
 
   it('keeps the streamed steps when the job had nothing to report', async () => {
     const stream = new FakeStream();
-    const { chat, scheduler } = setup({ jobs: [baseJob], stream, replies: ['[SILENT]'] });
+    const { chat, scheduler } = setup({ jobs: [baseJob], stream, replies: [''] });
     scheduler.start();
     scheduler.trigger('shop', 'sla', 'U1');
     await scheduler.idle();
@@ -984,8 +984,8 @@ describe('scheduled runs through Slack', () => {
     await scheduler.stop();
   });
 
-  it('keeps the thread and its session when the run finds nothing ([SILENT])', async () => {
-    const { chat, scheduler, store } = missedSlot({ replies: ['[SILENT]'] });
+  it('keeps the thread and its session when the run replies nothing', async () => {
+    const { chat, scheduler, store } = missedSlot({ replies: [''] });
     await pickUp(scheduler, chat);
     expect(chat.deleted).toEqual([]);
     expect(

@@ -1,6 +1,6 @@
 import type { ChatPort } from '../sessions/manager.js';
 import { Throttle } from '../util/concurrency.js';
-import { defuseBroadcasts, splitMessage, toSlackMrkdwn } from './format.js';
+import { defuseBroadcasts, postMarkdown } from './format.js';
 
 export type TaskStatus = 'in_progress' | 'complete' | 'error';
 
@@ -95,9 +95,7 @@ export class EditReply implements TurnReply {
     await this.status.flush();
     await this.chat.update(this.channel, await this.statusTs, summary);
     if (ok && answer !== null) {
-      for (const chunk of splitMessage(toSlackMrkdwn(answer.trim() || '_(no text reply)_'))) {
-        await this.chat.post(this.channel, this.threadTs, chunk);
-      }
+      await postMarkdown(this.chat, this.channel, this.threadTs, answer.trim() || '_(no text reply)_');
     }
     for (const note of notes) await this.chat.post(this.channel, this.threadTs, note);
   }
@@ -202,9 +200,7 @@ export class StreamReply implements TurnReply {
     const fallback = this.fallback as EditReply | undefined;
     if (fallback) return fallback.finish(result);
     if (this.ts) await this.port.stop(this.channel, this.ts).catch(() => {});
-    for (const chunk of splitMessage(toSlackMrkdwn(this.leftover.trim()))) {
-      if (chunk.trim()) await this.chat.post(this.channel, this.threadTs, chunk);
-    }
+    await postMarkdown(this.chat, this.channel, this.threadTs, this.leftover.trim());
   }
 
   private setTitle(title: string): void {

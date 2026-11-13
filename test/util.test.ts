@@ -1,6 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { defuseBroadcasts, formatDuration, splitMessage, toSlackMrkdwn } from '../src/slack/format.js';
+import {
+  defuseBroadcasts,
+  formatDuration,
+  postMarkdown,
+  sendWithFallback,
+  splitMessage,
+  textBlock,
+  toSlackMrkdwn,
+} from '../src/slack/format.js';
 import { KeyedQueue, Semaphore, Throttle } from '../src/util/concurrency.js';
+import { FakeChat } from './fakes.js';
 
 describe('defuseBroadcasts', () => {
   it('turns channel-wide mentions into text and keeps person mentions', () => {
@@ -26,6 +35,69 @@ describe('toSlackMrkdwn', () => {
 
   it('leaves code blocks alone and drops the language tag', () => {
     expect(toSlackMrkdwn('```ts\nconst a = **b**;\n```\n**x**')).toBe('```\nconst a = **b**;\n```\n*x*');
+  });
+});
+
+describe('textBlock', () => {
+  it('is a markdown block for a table and a mrkdwn section otherwise', () => {
+    expect(textBlock('| a | b |\n| --- | --- |\n| 1 | 2 |', 100).type).toBe('markdown');
+    expect(textBlock('**Done**', 100)).toEqual({ type: 'section', text: { type: 'mrkdwn', text: '*Done*' } });
+  });
+});
+
+describe('sendWithFallback', () => {
+  const table = { type: 'markdown', text: '**Card**\n\n| a | b |\n| --- | --- |\n| 1 | 2 |' };
+
+  it('resends markdown blocks as mrkdwn sections when Slack refuses them', async () => {
+    const sent: unknown[] = [];
+    const ts = await sendWithFallback([table, { type: 'actions' }], async (blocks) => {
+      sent.push(blocks);
+      if (sent.length === 1) throw new Error('invalid_blocks');
+      return 'ts1';
+    });
+    expect(ts).toBe('ts1');
+    expect(sent[1]).toEqual([
+      { type: 'section', text: { type: 'mrkdwn', text: '*Card*\n\n| a | b |\n| --- | --- |\n| 1 | 2 |' } },
+      { type: 'actions' },
+    ]);
+  });
+
+  it('rethrows when there was no markdown block to fall back from', async () => {
+    await expect(
+      sendWithFallback([{ type: 'section' }], async () => {
+        throw new Error('channel_not_found');
+      }),
+    ).rejects.toThrow('channel_not_found');
+  });
+});
+
+describe('postMarkdown', () => {
+  const table = '**Stock**\n\n| SKU | Left |\n| --- | ---: |\n| car-v2 | 12 |';
+
+  it('posts plain markdown as mrkdwn text', async () => {
+    const chat = new FakeChat();
+    await postMarkdown(chat, 'C1', 't1', '**Done** with [log](https://x.io)');
+    expect(chat.posts.map((p) => p.text)).toEqual(['*Done* with <https://x.io|log>']);
+    expect(chat.blockPosts).toEqual([]);
+  });
+
+  it('posts a chunk holding a table as a markdown block, with mrkdwn as the fallback text', async () => {
+    const chat = new FakeChat();
+    await postMarkdown(chat, 'C1', 't1', `${table}\n<!channel>`);
+    expect(chat.posts).toEqual([]);
+    const [post] = chat.blockPosts;
+    expect(post?.blocks).toEqual([{ type: 'markdown', text: `${table}\n@\u200bchannel` }]);
+    expect(post?.text).toContain('*Stock*');
+  });
+
+  it('falls back to mrkdwn text when Slack refuses the markdown block', async () => {
+    const chat = new FakeChat();
+    chat.postBlocks = async () => {
+      throw new Error('invalid_blocks');
+    };
+    await postMarkdown(chat, 'C1', 't1', table);
+    expect(chat.posts).toHaveLength(1);
+    expect(chat.posts[0]?.text).toContain('| car-v2 | 12 |');
   });
 });
 

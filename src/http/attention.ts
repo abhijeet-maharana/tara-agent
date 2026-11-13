@@ -26,7 +26,8 @@ export interface AttentionItem {
     | 'pr-review'
     | 'pr-checks'
     | 'pr-changes'
-    | 'pr-ready';
+    | 'pr-ready'
+    | 'health';
   project?: string;
   /** One short line, fit to be read aloud. */
   title: string;
@@ -71,6 +72,8 @@ export interface AttentionSources {
   repos?: RepoReader[];
   pullRequests?: () => Promise<PullRequest[]>;
   urgent?: UrgentRule[];
+  /** Red Health checks other than jobs (jobs come from `jobs`). */
+  health?: () => Array<{ key: string; project?: string; name: string; detail: string; since: number }>;
 }
 
 const TIER_ORDER: Record<Tier, number> = { urgent: 0, waiting: 1, later: 2 };
@@ -141,6 +144,18 @@ export async function gatherAttention(src: AttentionSources): Promise<Attention>
       at: job.lastRunAt?.getTime(),
     });
   }
+
+  for (const h of src.health?.() ?? [])
+    items.push({
+      key: `health:${h.key}:${h.since}`,
+      tier: 'waiting',
+      kind: 'health',
+      ...(h.project && { project: h.project }),
+      title: `${h.name} has a problem`,
+      detail: h.detail.slice(0, 300),
+      url: '/health',
+      at: h.since,
+    });
 
   const statuses = await Promise.all(
     (src.repos ?? []).map(async (r) => ({

@@ -61,7 +61,61 @@ export interface SessionOverview extends SessionRow {
   jobId?: string;
 }
 
+export type HealthStatus = 'ok' | 'warn' | 'bad';
+
+/** A health check's confirmed state: since when, and whether its problem was sent to Slack. */
+export interface HealthState {
+  status: HealthStatus;
+  since: number;
+  detail?: string;
+  /** The check's name and group as last shown ("WhatsApp (Services)"), for a message after it is gone. */
+  label?: string;
+  alerted: boolean;
+}
+
+export interface HealthEvent {
+  key: string;
+  status: HealthStatus;
+  detail?: string;
+  at: number;
+}
+
+/** A run without its texts, for charts and tables over many runs. */
+export type RunStat = Pick<
+  StoredRun,
+  | 'kind'
+  | 'project'
+  | 'jobId'
+  | 'model'
+  | 'startedAt'
+  | 'endedAt'
+  | 'status'
+  | 'costUsd'
+  | 'inputTokens'
+  | 'outputTokens'
+  | 'cacheReadTokens'
+  | 'toolCalls'
+  | 'rateLimitUtilization'
+  | 'error'
+>;
+
+export interface HostSample {
+  at: number;
+  /** 1-minute load average. */
+  load: number;
+  /** 0–1. */
+  memUsed: number;
+  diskUsed?: number;
+}
+
+export interface LogEvent {
+  at: number;
+  level: 'warn' | 'error';
+  message: string;
+}
+
 const OUTPUT_CAP = 20_000;
+const LOG_CAP = 2_000;
 
 const MIGRATIONS = [
   `CREATE TABLE sessions (
@@ -223,6 +277,38 @@ const MIGRATIONS = [
      ts         TEXT NOT NULL,
      created_at INTEGER NOT NULL
    );`,
+  // The Health page: each check's confirmed state (so a restart neither re-alerts nor forgets an
+  // outage) and its changes over time (src/health/monitor.ts).
+  `CREATE TABLE health_state (
+     key        TEXT PRIMARY KEY,
+     status     TEXT NOT NULL,
+     since      INTEGER NOT NULL,
+     detail     TEXT,
+     label      TEXT,
+     alerted    INTEGER NOT NULL DEFAULT 0
+   );
+   CREATE TABLE health_events (
+     id         INTEGER PRIMARY KEY AUTOINCREMENT,
+     key        TEXT NOT NULL,
+     status     TEXT NOT NULL,
+     detail     TEXT,
+     at         INTEGER NOT NULL
+   );
+   CREATE INDEX health_events_at ON health_events (at);`,
+  // Observability: the machine every few minutes, and tara-agent's own warnings and errors.
+  `CREATE TABLE host_samples (
+     at         INTEGER PRIMARY KEY,
+     load       REAL NOT NULL,
+     mem_used   REAL NOT NULL,
+     disk_used  REAL
+   );
+   CREATE TABLE log_events (
+     id         INTEGER PRIMARY KEY AUTOINCREMENT,
+     at         INTEGER NOT NULL,
+     level      TEXT NOT NULL,
+     message    TEXT NOT NULL
+   );
+   CREATE INDEX log_events_at ON log_events (at);`,
 ];
 
 export const ITEM_STATUSES = [
@@ -554,6 +640,11 @@ export class Store {
     const claims = this.db.prepare('DELETE FROM job_claims WHERE slot < ?').run(before).changes;
     const sessions = this.db.prepare('DELETE FROM sessions WHERE updated_at < ?').run(before).changes;
     this.db.prepare('DELETE FROM day_threads WHERE created_at < ?').run(before);
+    this.db.prepare('DELETE FROM health_events WHERE at < ?').run(before);
+    // Samples and log lines are only charted for weeks; a month is plenty.
+    const month = Math.max(before, this.now() - 31 * 86_400_000);
+    this.db.prepare('DELETE FROM host_samples WHERE at < ?').run(month);
+    this.db.prepare('DELETE FROM log_events WHERE at < ?').run(month);
     return { runs: Number(runs), claims: Number(claims), sessions: Number(sessions) };
   }
 
@@ -612,6 +703,61 @@ export class Store {
   runsSince(since: number): StoredRun[] {
     const rows = this.db.prepare('SELECT * FROM runs WHERE started_at >= ? ORDER BY started_at').all(since);
     return (rows as Record<string, unknown>[]).map(toRun);
+  }
+
+  /** Runs started since `since`, oldest first, without their texts (errors cut to one line). */
+  runStats(since: number): RunStat[] {
+    const rows = this.db
+      .prepare(
+        `SELECT kind, project, job_id, model, started_at, ended_at, status, cost_usd, input_tokens, output_tokens,
+           cache_read_tokens, tool_calls, rate_limit_util, substr(error, 1, 300) AS error
+         FROM runs WHERE started_at >= ? ORDER BY started_at`,
+      )
+      .all(since) as Record<string, unknown>[];
+    const opt = <T>(v: unknown) => (v ?? undefined) as T | undefined;
+    return rows.map((r) => ({
+      kind: r.kind as RunStat['kind'],
+      project: r.project as string,
+      jobId: opt(r.job_id),
+      model: opt(r.model),
+      startedAt: r.started_at as number,
+      endedAt: r.ended_at as number,
+      status: r.status as string,
+      costUsd: opt(r.cost_usd),
+      inputTokens: opt(r.input_tokens),
+      outputTokens: opt(r.output_tokens),
+      cacheReadTokens: opt(r.cache_read_tokens),
+      toolCalls: opt(r.tool_calls),
+      rateLimitUtilization: opt(r.rate_limit_util),
+      error: opt(r.error),
+    }));
+  }
+
+  addHostSample(s: HostSample): void {
+    this.db
+      .prepare('INSERT OR REPLACE INTO host_samples (at, load, mem_used, disk_used) VALUES (?, ?, ?, ?)')
+      .run(s.at, s.load, s.memUsed, s.diskUsed ?? null);
+  }
+
+  hostSamples(since: number): HostSample[] {
+    return (
+      this.db
+        .prepare('SELECT at, load, mem_used, disk_used FROM host_samples WHERE at >= ? ORDER BY at')
+        .all(since) as Array<{ at: number; load: number; mem_used: number; disk_used: number | null }>
+    ).map((r) => ({ at: r.at, load: r.load, memUsed: r.mem_used, diskUsed: r.disk_used ?? undefined }));
+  }
+
+  addLog(e: LogEvent): void {
+    this.db
+      .prepare('INSERT INTO log_events (at, level, message) VALUES (?, ?, ?)')
+      .run(e.at, e.level, e.message.slice(0, LOG_CAP));
+  }
+
+  /** tara-agent's own warnings and errors since `since`, newest first. */
+  logs(since: number, limit = 5_000): LogEvent[] {
+    return this.db
+      .prepare('SELECT at, level, message FROM log_events WHERE at >= ? ORDER BY at DESC, id DESC LIMIT ?')
+      .all(since, limit) as unknown as LogEvent[];
   }
 
   /** A job's runs, newest first. */
@@ -687,6 +833,69 @@ export class Store {
       first_seen: number;
     };
     return row.first_seen;
+  }
+
+  /** A scheduled slot's claim status (`running`, `ok`, `skipped`, `aborted`…), or undefined if never claimed. */
+  slotClaim(jobKey: string, slot: number): { status: string; claimedAt: number } | undefined {
+    const row = this.db
+      .prepare('SELECT status, claimed_at FROM job_claims WHERE job_key = ? AND slot = ?')
+      .get(jobKey, slot) as { status: string; claimed_at: number } | undefined;
+    return row && { status: row.status, claimedAt: row.claimed_at };
+  }
+
+  /** Every health check's confirmed state, by key. */
+  healthStates(): Map<string, HealthState> {
+    const rows = this.db
+      .prepare('SELECT key, status, since, detail, label, alerted FROM health_state')
+      .all() as Array<{
+      key: string;
+      status: string;
+      since: number;
+      detail: string | null;
+      label: string | null;
+      alerted: number;
+    }>;
+    return new Map(
+      rows.map((r) => [
+        r.key,
+        {
+          status: r.status as HealthStatus,
+          since: r.since,
+          detail: r.detail ?? undefined,
+          label: r.label ?? undefined,
+          alerted: r.alerted === 1,
+        },
+      ]),
+    );
+  }
+
+  /** Saves a check's confirmed state; a change of status is also kept as an event. */
+  saveHealthState(key: string, state: HealthState, changed: boolean): void {
+    this.db
+      .prepare(
+        `INSERT INTO health_state (key, status, since, detail, label, alerted) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (key) DO UPDATE SET status = excluded.status, since = excluded.since,
+           detail = excluded.detail, label = excluded.label, alerted = excluded.alerted`,
+      )
+      .run(key, state.status, state.since, state.detail ?? null, state.label ?? null, state.alerted ? 1 : 0);
+    if (changed)
+      this.db
+        .prepare('INSERT INTO health_events (key, status, detail, at) VALUES (?, ?, ?, ?)')
+        .run(key, state.status, state.detail ?? null, state.since);
+  }
+
+  /** Forgets a check's state (it is no longer reported). */
+  dropHealthState(key: string): void {
+    this.db.prepare('DELETE FROM health_state WHERE key = ?').run(key);
+  }
+
+  /** Health status changes since `since`, oldest first. */
+  healthEvents(since: number): HealthEvent[] {
+    return (
+      this.db
+        .prepare('SELECT key, status, detail, at FROM health_events WHERE at >= ? ORDER BY at, id')
+        .all(since) as Array<{ key: string; status: string; detail: string | null; at: number }>
+    ).map((r) => ({ key: r.key, status: r.status as HealthStatus, detail: r.detail ?? undefined, at: r.at }));
   }
 
   /** Most recent run of a job, if any. */

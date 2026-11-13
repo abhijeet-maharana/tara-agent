@@ -1,3 +1,5 @@
+import type { ChatPort, SlackBlock } from '../sessions/manager.js';
+
 /** Slack rejects messages over 40k chars and truncates display far earlier; keep chunks readable. */
 export const MAX_CHUNK = 3_500;
 
@@ -87,6 +89,77 @@ export function splitMessage(text: string, max = MAX_CHUNK): string[] {
   }
   if (current.trim() && current !== '```') chunks.push(current);
   return chunks.length ? chunks : [''];
+}
+
+/** A GFM table's separator row, e.g. `| --- | :---: |`. */
+const TABLE_RULE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/m;
+
+/** Slack's limit for markdown blocks is 12,000 characters per message; leave room for the rest. */
+export const MARKDOWN_MAX = 10_000;
+
+/** Whether the markdown holds a table (mrkdwn can't draw one; a markdown block can). */
+export function hasTable(markdown: string): boolean {
+  return TABLE_RULE.test(markdown);
+}
+
+/** A text block for Claude's markdown: a markdown block when it holds a table, else a mrkdwn section. */
+export function textBlock(markdown: string, max: number): SlackBlock {
+  return hasTable(markdown)
+    ? { type: 'markdown', text: defuseBroadcasts(markdown).slice(0, MARKDOWN_MAX) }
+    : { type: 'section', text: { type: 'mrkdwn', text: toSlackMrkdwn(markdown).slice(0, max) } };
+}
+
+/** Slack's limit for a section's text. */
+const SECTION_TEXT_MAX = 3_000;
+
+/**
+ * Sends a message's blocks; if Slack refuses one holding a markdown block, sends it once more with
+ * each markdown block as a mrkdwn section (a table then shows as plain text, but the message goes out).
+ */
+export async function sendWithFallback<T>(
+  blocks: SlackBlock[] | undefined,
+  send: (blocks: SlackBlock[] | undefined) => Promise<T>,
+): Promise<T> {
+  try {
+    return await send(blocks);
+  } catch (err) {
+    if (!blocks?.some((b) => b.type === 'markdown')) throw err;
+    return send(
+      blocks.map((b) =>
+        b.type === 'markdown'
+          ? {
+              type: 'section',
+              text: { type: 'mrkdwn', text: toSlackMrkdwn(String(b.text)).slice(0, SECTION_TEXT_MAX) },
+            }
+          : b,
+      ),
+    );
+  }
+}
+
+/**
+ * Posts Claude's markdown into a thread, split to Slack's size. Mrkdwn can't draw tables, so a chunk
+ * holding one goes as a markdown block (Slack renders the table) and, if Slack refuses it, as mrkdwn.
+ */
+export async function postMarkdown(
+  chat: ChatPort,
+  channel: string,
+  threadTs: string | undefined,
+  markdown: string,
+): Promise<void> {
+  for (const chunk of splitMessage(markdown)) {
+    const text = toSlackMrkdwn(chunk);
+    if (!text.trim()) continue;
+    if (hasTable(chunk)) {
+      const block = { type: 'markdown', text: defuseBroadcasts(chunk) };
+      const posted = await chat.postBlocks(channel, threadTs, text, [block]).then(
+        () => true,
+        () => false,
+      );
+      if (posted) continue;
+    }
+    await chat.post(channel, threadTs, text);
+  }
 }
 
 export function formatDuration(ms: number): string {

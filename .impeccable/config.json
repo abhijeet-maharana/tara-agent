@@ -11,6 +11,15 @@
         ],
         "createdAt": "2026-10-31T03:21:15.424Z",
         "reason": "Claude: matches the dashboard's shared look, where every .card and .nowbar has a 3px left status border (src/http/dashboard.ts, docs/dashboard-look.md)"
+      },
+      {
+        "rule": "side-tab",
+        "value": "*",
+        "files": [
+          "src/http/health.ts"
+        ],
+        "createdAt": "2026-11-13T15:23:40.765Z",
+        "reason": "Project convention: docs/dashboard-look.md 'Rows and cards have a coloured left border for state'; matches .card in src/http/dashboard.ts"
       }
     ]
   }

@@ -262,6 +262,43 @@ export const hostConfigSchema = z.object({
         .default([]),
     })
     .default({ github: true, urgent: [] }),
+  /**
+   * The Health page (`/health` in a browser): tara-agent's own checks, every project's jobs, and each
+   * project's `healthUrl`, checked every `intervalMinutes`. A check that turns red (twice in a row) or
+   * recovers is posted once in a day thread (`📌 Health · <day>`) of its project's channel.
+   */
+  health: z
+    .object({
+      enabled: z.boolean().default(true),
+      intervalMinutes: z.number().min(1).max(60).default(5),
+      /** Post problems and recoveries in Slack. */
+      alerts: z.boolean().default(true),
+      /** The project whose channel gets alerts about tara-agent itself. Defaults to the first project. */
+      alertProject: z.string().optional(),
+      /** A run going this long is reported as stuck. */
+      stuckMinutes: z.number().positive().default(180),
+      /** A job failing this many times in a row is red (once is amber). */
+      failingAfter: z.number().int().min(1).default(3),
+      /** Disk use (state folder's disk) that turns amber and red, in percent. */
+      diskWarnPercent: z.number().min(1).max(100).default(85),
+      diskBadPercent: z.number().min(1).max(100).default(95),
+      /**
+       * systemd units whose warnings and errors the Logs view shows next to tara-agent's own (e.g. the
+       * projects' dashboard services). Needs the journal readable by tara-agent's user (group
+       * `systemd-journal`).
+       */
+      logUnits: z.array(z.string().min(1)).default([]),
+    })
+    .default({
+      enabled: true,
+      intervalMinutes: 5,
+      alerts: true,
+      stuckMinutes: 180,
+      failingAfter: 3,
+      diskWarnPercent: 85,
+      diskBadPercent: 95,
+      logUnits: [],
+    }),
 });
 
 const selfImproveSchema = z.enum(['always', 'trouble', 'off']);
@@ -300,6 +337,11 @@ export const projectConfigSchema = z.object({
    * inside tara-agent's dashboard (see docs/dashboard-look.md).
    */
   dashboardUrl: z.string().url().optional(),
+  /**
+   * The project's own health checks for the Health page: GET → `{checks: [{name, ok, warn?, detail,
+   * group?, link?}]}` (or just the list). Without it, a `dashboardUrl` is only checked for an answer.
+   */
+  healthUrl: z.string().url().optional(),
   /**
    * Pages of the project's app (`dashboardUrl`) listed in tara-agent's sidebar, in order. Each opens at
    * `/p/<name><path>`, with the app proxied from `/app/<name>/`. The first is the project's landing page.

@@ -29,6 +29,8 @@ export interface DashboardContext {
   code?: boolean;
   /** The Browsers page is on. */
   browsers?: boolean;
+  /** Red checks on the Health page, for its sidebar badge; undefined when the page is off. */
+  unhealthy?: number;
 }
 
 /** A job with its project and latest runs (newest first), as the home and jobs pages show it. */
@@ -125,6 +127,8 @@ export interface HomeData {
   models?: ModelUse[];
   /** Host `claude.effort`, shown next to the models. */
   effort?: string;
+  /** Red Health checks other than jobs (Home lists failing jobs itself); undefined when the page is off. */
+  health?: { problems: Array<{ name: string; where: string }>; watch: number };
 }
 
 /** Host-level model settings the dashboard shows: effort and voice notes (`voice`). */
@@ -605,7 +609,7 @@ export const jobViewTabs = (view: JobsView, project?: string) => {
   return `<div class="toolbar"><div class="chips views">${tab('list', '/jobs', 'List')}${tab('ondemand', '/jobs', 'On demand')}${tab('timeline', '/schedule', 'Timeline')}</div></div>`;
 };
 
-export type Page = 'Home' | 'Approvals' | 'Queue' | 'Jobs' | 'Sessions' | 'Code' | 'Browsers' | '';
+export type Page = 'Home' | 'Approvals' | 'Queue' | 'Jobs' | 'Sessions' | 'Code' | 'Browsers' | 'Health' | '';
 
 /** Projects whose app pages show here as tabs (`tabs` plus `dashboardUrl`). */
 export const tabbed = (projects: Project[]) =>
@@ -646,6 +650,9 @@ export function layout(
       ['/sessions', 'Sessions', '💬', 0, ''],
       ...(ctx.code ? ([['/code', 'Code', '📝', 0, '']] as const) : []),
       ...(ctx.browsers ? ([['/browsers', 'Browsers', '🌐', 0, '']] as const) : []),
+      ...(ctx.unhealthy !== undefined
+        ? ([['/health', 'Health', '❤️', ctx.unhealthy, 'health problems']] as const)
+        : []),
     ] as const
   )
     .map(
@@ -848,7 +855,23 @@ export function homePage(ctx: DashboardContext, data: HomeData): string {
       )}</span></span></span><span class="dim">Approvals →</span></a>`;
     });
 
+  const health = data.health;
+  const healthRows = health?.problems.length
+    ? [
+        `<a class="row" href="/health"><span class="dot bad"></span><span class="grow"><span class="title">${esc(
+          health.problems.length === 1
+            ? `${health.problems[0]?.name} has a problem`
+            : `${health.problems.length} health problems`,
+        )}</span><span class="meta"><span>${esc(
+          health.problems
+            .slice(0, 4)
+            .map((p) => (health.problems.length === 1 ? p.where : `${p.name} (${p.where})`))
+            .join(' · '),
+        )}</span></span></span><span class="dim">Health →</span></a>`,
+      ]
+    : [];
   const attention = [
+    ...healthRows,
     ...approvalRows,
     ...(data.staleRepos ?? []).map(
       (r) =>

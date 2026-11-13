@@ -26,6 +26,19 @@ What the app does:
 - **Shows nothing tara-agent already shows**: jobs, failing runs, Run now, approvals, queue, schedule, sessions.
 
 
+## Health checks
+A project app that knows how its own services are doing (a WhatsApp session, a login, a certificate, a backup) offers them at one URL and sets `healthUrl` in `.tara/config.json`. tara-agent's Health page shows them with everything else and posts a check that turns red in the project's channel.
+
+```json
+{ "checks": [
+  { "group": "Services", "name": "WhatsApp", "ok": true, "detail": "7377097497: WORKING", "link": "http://jarvis:3000/dashboard/" },
+  { "group": "Storage", "name": "Backup (R2)", "ok": true, "warn": true, "detail": "Last backup 30h ago" }
+] }
+```
+
+- `ok: false` is red, `warn: true` amber. `detail` is one plain line. `name` stays the same from one answer to the next (it is the check's identity).
+- Answer within 12 seconds; it is asked every few minutes, so keep paid API calls out of it.
+
 ## One home for each thing
 - **Agent things live in tara-agent only.** That covers job lists, Run now, Pause and Resume, run history, the schedule, sessions and **approval cards** (everything that needs a person: every decision, suggestion, login and draft). A project dashboard may show a one-line summary, e.g. "41 jobs · 0 failing". It links to tara-agent for the rest and never re-implements those pages.
 - **Project dashboards show the project's own work and history**, such as orders, a pipeline or what was sent, plus one row "N approvals waiting →" that links to the Approvals page filtered to the project.
