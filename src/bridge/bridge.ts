@@ -84,6 +84,9 @@ export class BridgeError extends Error {
 }
 
 /** Appended for chat turns, which can also start the channel's scheduled jobs. */
+/** An item reported `later` without a time is tried again after this long (as for a URL executor). */
+const LATER_MS = 3_600_000;
+
 export const JOB_TOOLS_PROMPT = `- To run one of this channel's scheduled jobs now, call \`run_job\` (\`list_jobs\` shows them). The job runs in its own message in the channel; tell the person it started, don't wait for it.`;
 
 /** Appended to the system prompt of every run that has tara's MCP tools. */
@@ -297,11 +300,24 @@ export class Bridge {
     return { id: item.id, status: item.status, reply: item.reply, checks: item.checks };
   }
 
-  /** The executor's report on one item it was given. */
-  finishItem(token: string | undefined, input: { id: string; status: 'done' | 'failed'; result?: string }) {
+  /**
+   * The executor's report on one item it was given: done, failed, or later (it can't go yet, e.g. a daily
+   * cap: back in its queue until `retryAt`, or an hour from now), as a URL executor answers.
+   */
+  finishItem(
+    token: string | undefined,
+    input: { id: string; status: 'done' | 'failed' | 'later'; result?: string; retryAt?: number },
+  ) {
     const ctx = this.run(token);
     if (!ctx.items?.includes(input.id))
       throw new BridgeError(403, `Item ${input.id} was not given to this run`);
+    if (input.status === 'later') {
+      const now = this.now();
+      const at = input.retryAt && input.retryAt > now ? input.retryAt : now + LATER_MS;
+      const item = this.deps.store.deferItem(input.id, at, input.result);
+      if (!item) throw new BridgeError(409, `Item ${input.id} is not running (already reported?)`);
+      return { id: item.id, status: item.status, runAfter: at };
+    }
     const item = this.deps.store.finishItem(input.id, input.status, input.result);
     if (!item) throw new BridgeError(409, `Item ${input.id} is not running (already reported?)`);
     this.deps.approvals.finished(item, ctx.threadTs);

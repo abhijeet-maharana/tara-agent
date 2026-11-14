@@ -129,7 +129,8 @@ export async function runJob(
   // level of the channel only ever holds those "Run" messages; they are never edited.
   let inThread = trigger.kind === 'resume' ? trigger.threadTs : requestTs;
   const thread = async () => {
-    if (!inThread) inThread = await openRunThread(chat, channel, scheduled.runName ?? job.name);
+    if (!inThread)
+      inThread = await openRunThread(chat, channel, scheduled.runName ?? job.name, project.config.words);
     return inThread;
   };
   const postMain = async (text: string) => chat.post(channel, await thread(), text);
@@ -226,7 +227,9 @@ export async function runJob(
       scratch: sessionScratch(project, stateDir, job.id, scratchId),
       jobData: env.TARA_JOB_DATA,
     };
-    env = { ...env, TARA_SCRATCH: folders.scratch };
+    // TARA_THREAD: a project server that makes a card for this run (the run calls it) passes it on to
+    // tara-agent's `/items` API, so the card lands in this run's thread instead of a day thread.
+    env = { ...env, TARA_SCRATCH: folders.scratch, TARA_THREAD: key };
     let steps = 0;
     let toolErrors = 0;
     const intervalMs = deps.host.statusIntervalSeconds * 1000;
@@ -236,8 +239,8 @@ export async function runJob(
       recipient && chat.stream && !chat.stream.disabled
         ? new StreamReply(chat, chat.stream, channel, rootTs, recipient, false, Math.min(intervalMs, 1000))
         : undefined;
-    // The latest text block reaches the thread once the next step starts: a final reply that is only
-    // a headline already shows in the channel status line, so the thread doesn't repeat it.
+    // The latest text block reaches the thread once the next step starts; the final one when the run
+    // ends, so the thread always holds Claude's whole reply.
     let block = '';
     const flushBlock = () => {
       if (!block) return;
@@ -424,38 +427,45 @@ export async function runJob(
       await chat.update(channel, statusTs, `${title} · ${reason}`);
       flushBlock();
       await live?.finish({ summary: reason, ok: false, answer: '', notes: [] });
+      // Not streamed: what Claude wrote before it stopped still goes in the thread, to debug the run.
+      if (!live && outcome.text.trim()) await postMarkdown(chat, channel, rootTs, outcome.text);
       learnIf(undefined, rootTs);
       return record(outcome.status, { ...usage, error: outcome.error, output: outcome.text });
     }
 
     if (!outcome.text.trim()) {
-      // No reply at all. The thread stays, with the steps the run took and its session, to see what
-      // it checked and to ask about it.
+      // No reply at all. The thread still says so in words (never left empty), with the steps the run
+      // took and its session above it, to see what it checked and to ask about it.
+      const said = `🔇 Claude finished without a written reply · ${meta}`;
       await chat.update(channel, statusTs, `🔇 ${title} · ${meta} · nothing to report`);
       flushBlock();
-      await live?.finish({ summary: `🔇 Nothing to report · ${meta}`, ok: true, answer: '', notes: [] });
+      if (live)
+        await live.finish({
+          summary: `🔇 Nothing to report · ${meta}`,
+          ok: true,
+          answer: null,
+          notes: [said],
+        });
+      else await chat.post(channel, rootTs, said);
       learnIf(undefined, rootTs);
       return record('silent', { ...usage, output: outcome.text });
     }
 
     const failure = failedReply(outcome.text);
-    const { headline, details } = failure
-      ? { headline: failure.split('\n')[0] ?? '', details: failure }
-      : splitHeadline(outcome.text);
+    const { headline } = failure ? { headline: failure.split('\n')[0] ?? '' } : splitHeadline(outcome.text);
     const icon = failure ? '❌' : '✅';
     await chat.update(channel, statusTs, `${icon} ${title} · ${meta}\n${toSlackMrkdwn(headline)}`);
+    // Claude's whole reply, exactly as written, always goes in the thread: it is the run's audit log.
     if (live) {
-      // With details the whole reply goes into the thread; a headline-only reply stays in the channel.
-      const inThread = Boolean(failure || details);
-      if (inThread) flushBlock();
+      flushBlock();
       await live.finish({
         summary: failure ? `❌ ${headline}` : `✅ Done · ${meta}`,
         ok: !failure,
-        answer: inThread ? outcome.text : null,
+        answer: outcome.text,
         notes: [],
       });
-    } else if (details) {
-      await postMarkdown(chat, channel, rootTs, details);
+    } else {
+      await postMarkdown(chat, channel, rootTs, outcome.text);
     }
     learnIf(failure, rootTs);
     return record(failure ? 'failed' : 'ok', { ...usage, error: failure, output: outcome.text });

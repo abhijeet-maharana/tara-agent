@@ -133,19 +133,19 @@ Check yesterday's late orders in that output and summarise them. On STATUS: FAIL
 
 ### How a run goes
 
-**A project channel holds only `Run <name>` messages.** Every run starts with one at the top level, and everything else (status, the answer, cards, notes, learning notes) goes in its thread. `Run` messages are never edited. Things that aren't job runs follow the same rule: an invalid jobs file a `Run jobs-reload` thread, a Code-page question a `Run code-question` thread. Cards a project server raises (drafts, `POST /items/ask` questions and notices) are not runs: they go in one `📌 <queue> cards · Thu 13 Nov` (notices: `📌 Notices · …`) thread per day, opened by the first such card that day: the card, its outcome, a revise and the run that sends it all follow there. A chat started in such a thread is told which cards it holds.
+**A project channel holds only `Run <name>` messages.** Every run starts with one at the top level, and everything else (status, the answer, cards, notes, learning notes) goes in its thread. `Run` messages are never edited. The name is always in title case: a kebab-case id is never shown raw (`code-question` → `Run Code Question`; two jobs sharing a name → their ids, e.g. `Run Pnl 2`). Things that aren't job runs follow the same rule: a Code-page question opens a `Run Code Question` thread. An invalid jobs file posts nothing in Slack: it is in the logs and on the dashboard. A trigger that can't run (the job is paused or already running) says so inside its own thread and gets a ⏸ / 🔁 reaction. A card a project server raises **for a run** (the run called the server) goes in that run's thread too: the server passes the run's `TARA_THREAD` as `thread` to `POST /items` or `POST /items/ask`. Cards a project server raises on its own (drafts, `POST /items/ask` questions and notices, no `thread`) are not runs: they wait on the Approvals page only, with nothing posted in Slack. Once Jarvis has to act on one (a decision on a question, a revise, a note from the page), a `Run <Kind>` thread opens for it (e.g. `Run Decision`, `Run Replies`) with the card's title as its first reply; its outcome follows there. A chat started in a thread of cards is told which cards it holds.
 
 1. **Trigger message.** At cron time a `Run <job name>` message is posted (the skill's words capitalised, e.g. `Run Google Analytics`) in the project channel, as the `SLACK_USER_TOKEN` person if set (else, or when that person isn't in the channel, as the bot). The bot picks it up and runs the job in its thread; if Slack doesn't deliver it within 2 minutes, the scheduler starts it there itself.
 2. **Claude** runs the job's skill section (its scripts first, as the section says), streaming into the thread.
 3. **The reply**: the part before a `---` line is the headline on the status line (the thread's first reply), the rest goes in the thread. A short reply with no `---` is all headline: it shows only on the status line, not again in the thread.
-   - Nothing to report: a one-line `✅ …` reply. An empty reply shows "🔇 nothing to report"; the thread and session stay, so you can ask why.
+   - Nothing to report: a one-line `✅ …` reply. Claude's whole reply always goes in the thread, even a one-liner, so you can see what it checked. An empty reply shows "🔇 nothing to report" and a `🔇 Claude finished without a written reply` line in the thread; the thread and session stay, so you can ask why.
    - A reply starting with `❌` marks the run failed (problems the job found are `⚠️`, not failures).
 4. **Replying** in the job's thread continues its session, so a job can ask a question and act on your answer.
 
 Other rules:
 
 - **Every slot runs at most once**, even across restarts. A job added while tara-agent was down doesn't run for past slots.
-- **Watching live:** every run streams its steps and text into its Slack thread (the status line, its first reply, keeps the current step and, at the end, the headline). A run you start with `run <job name>` streams in your message's thread; scheduled, queue and dashboard/API runs stream in their `Run <job name>` thread, addressed to the project `owner` (Slack's streaming needs a recipient; without `owner` they post only the status line and the details at the end). A run with no thread of its own (a queue, Run now) opens its `Run <job name>` thread. A run that replies nothing keeps its thread, with the steps it took, its session and a `🔇 … · nothing to report` status line.
+- **Watching live:** every run streams its steps and text into its Slack thread (the status line, its first reply, keeps the current step and, at the end, the headline). A run you start with `run <job name>` streams in your message's thread; scheduled, queue and dashboard/API runs stream in their `Run <job name>` thread, addressed to the project `owner` (Slack's streaming needs a recipient; without `owner` they post the status line and Claude's whole reply at the end). A run with no thread of its own (a queue, Run now) opens its `Run <job name>` thread. A run that replies nothing keeps its thread, with the steps it took, its session, a `🔇 … · nothing to report` status line and a line saying Claude wrote no reply.
 
 ### agy jobs
 
@@ -229,6 +229,7 @@ Each session gets its own folders, passed as environment variables and as absolu
 | Variable | What | Lifetime |
 |---|---|---|
 | `TARA_SCRATCH` | This session's scratch folder: helper scripts, downloads, temp files | Deleted `scratchDays` after its last use. An active chat thread keeps its folder |
+| `TARA_THREAD` | This run's or chat's Slack thread, `<channel>:<ts>` | Pass it to your project server, which sends it as `thread` to `POST /items` or `POST /items/ask`: the card then lands in this thread, not only on the Approvals page |
 | `TARA_JOB_DATA` | The job's data folder: what the job needs on its next run. Scripts the run starts get it too | Never deleted |
 
 - A scratch folder is only made when Claude runs, so skipped runs leave nothing behind.
@@ -272,7 +273,7 @@ Approved drafts are sent through queues declared in `<repo>/.tara/queues.json`:
 
 **When items run**
 
-- One batch at a time per queue, oldest approval first. With `"reorder": true`, a person sets the order on the **Queue** page instead (drag a row, or **Top**, **↑**, **↓**, **Bottom** per item). Items approved after a move go to the end. In a queue with `alternate`, an item moves among items of its own kind, because kinds take turns.
+- One batch at a time per queue, oldest approval first. With `"reorder": true`, a person sets the order on the **Queue** page instead (drag a row, or **Top**, **↑**, **↓**, **Bottom** per item). Items approved after a move go to the end, unless they carry a `priority`: those go ahead of the first approved item ranked lower (or unranked). In a queue with `alternate`, an item moves among items of its own kind, because kinds take turns.
 - `windows`: items run only while their window is open. `slots`: one batch per cron slot instead, rotating through the `alternate` kinds.
 - `fills`: instead of windows or slots, the queue runs only in the slots of the named queue that it leaves empty (nothing of its own due), e.g. `"channel": { "executor": { "skill": "publisher" }, "fills": "content" }` posts only on `content` slots with no approved item waiting. The filled queue must have `slots`.
 - `caps` (per day, per rolling week) and `gapMinutes` limit how fast items go out.
@@ -282,7 +283,7 @@ Approved drafts are sent through queues declared in `<repo>/.tara/queues.json`:
 
 | Type | How it works |
 |---|---|
-| `{ "job": "<id>" }` | The job gets the items in its prompt under `## Approved items` and reports each with `finish_item` |
+| `{ "job": "<id>" }` | The job gets the items in its prompt under `## Approved items` and reports each with `finish_item`: `done`, `failed`, or `later` (with an optional `retryAt`) to put it back in the queue, as a URL executor's "later" does |
 | `{ "url": "…" }` | One POST `{item}` per item. Answer `{status: "done" \| "failed", result}`, or `{status: "later", result, retryAt?}` to retry later |
 | `{ "external": true }` | The project's own server runs approved items and reports with `POST /items/<id>/report` |
 
@@ -294,7 +295,7 @@ An item that is never reported ends as failed and is not retried, so nothing goe
 - **Revise** keeps the card pending (it stays on the page, marked as being revised) and asks the agent for a new version, which replaces it in place.
 - A project server's `ask` with the `key` of a waiting card updates that card in place (page and Slack message), so a project can keep one live card (e.g. one a day) and add to it.
 - When an option is off because of a blocking check, the card says why next to the buttons and offers **Fix it…**. Several drafts of one kind show as one card with a row each.
-- `slack: true` on a queue also posts each card in Slack (decisions stay on the dashboard): a card a run proposed goes in that run's thread; any other card goes in the day's `Run <queue>` thread (one per queue a day). A refresh edits it there, and its outcome and the run that sends it follow in that thread.
+- `slack: true` on a queue also posts each card in Slack (decisions stay on the dashboard): a card a run proposed goes in that run's thread; any other card stays on the Approvals page only (a revise opens a `Run <Queue>` thread for Jarvis). A refresh edits it, and its outcome follows in its thread.
 - `approvals.validateUrl` gets POST `{kind, key, fields}` and returns `{checks: [{text, blocking}]}`; blocking checks stop approval.
 - `approvals.hookUrl` gets POST `{event: "decided" | "finished", item}`, signed with HMAC-SHA256 of the body using `APPROVAL_SEAL_KEY` in the `x-tara-signature` header. Best effort only.
 
@@ -330,7 +331,7 @@ Open the HTTP address in a browser. Every page also answers JSON to tools.
 
   **Logs** (`/health/logs?hours=1|24|168`): tara-agent's own warnings and errors (kept 31 days) and those of host `health.logUnits` from the journal, per hour, then grouped: the same message with other numbers, ids or times counts once, with how often and when it was last seen.
 
-  A check counts as red only after two red checks in a row. Then it is posted once in the day's `📌 Health · <day>` thread of its project's channel (tara-agent's own checks: `health.alertProject`), mentioning the `owner`, and once more when it is fine again. A job's single failure isn't posted (its thread already has the ❌ reply), nor is a jobs file that didn't load (the scheduler posts that itself). The state is kept in the database, so a restart repeats no alert.
+  A check counts as red only after two red checks in a row. Then it is posted once in the day's `Run Health Alert` thread of its project's channel (one a day, opened by its first alert) (tara-agent's own checks: `health.alertProject`), mentioning the `owner`, and once more when it is fine again. A job's single failure isn't posted (its thread already has the ❌ reply), nor is a jobs file that didn't load (it is in the logs and on the dashboard). The state is kept in the database, so a restart repeats no alert.
 
 Project dashboards can share the look: see [dashboard-look.md](dashboard-look.md).
 
@@ -373,8 +374,8 @@ For scripts and dashboards on the same host (`127.0.0.1:4100` by default).
 |---|---|
 | `GET /items?project=&status=&kind=` | Approval items |
 | `GET /items/<id>` | One item, with its seal |
-| `POST /items` `{project, kind, key?, title, body?, fields?, media?, checks?, queue, window?, runAfter?}` | Propose a draft |
-| `POST /items/ask` `{project, title, details?, options?, kind?, key?}` | Ask a person something outside any run: posted with its buttons in the day's `Run <kind>` thread, and the answer goes to Claude there. With `kind: "notice"` the first option only acknowledges it (no run) |
+| `POST /items` `{project, kind, key?, title, body?, fields?, media?, checks?, queue, window?, runAfter?, priority?, thread?}` | Propose a draft. `thread` (a run's `TARA_THREAD`) posts it in that run's thread; without it, the day's `<queue> cards` thread. `priority` (a number, higher first) lists the kind's drafts on the Approvals page best first and, once approved, puts the item in its queue ahead of approved items ranked lower |
+| `POST /items/ask` `{project, title, details?, options?, kind?, key?, thread?}` | Ask a person something (2 to 5 options): posted with its buttons in that run's thread when `thread` (a run's `TARA_THREAD`) is given, else in the day's `<kind>` thread, and the answer goes to Claude there. With `kind: "notice"` the first option only acknowledges it (no run) |
 | `POST /items/<id>/withdraw` `{reason?}` | Take back a waiting card |
 | `POST /items/<id>/report` `{status, result?}` | Report an `external` queue item: done, failed or waiting |
 | `GET /queues?project=<p>&upcoming=<n>` | A project's queues with their next slots |

@@ -18,13 +18,7 @@ import type { Item, Store } from '../store/store.js';
 import { Locks, Semaphore } from '../util/concurrency.js';
 import { type JobStatus, type JobTrigger, runJob } from './job-runner.js';
 import type { DecidedCard } from './prompt.js';
-import {
-  openRunThread,
-  runName,
-  SCHEDULE_BY,
-  type ScheduledKind,
-  scheduledRunText,
-} from './slack-trigger.js';
+import { runName, SCHEDULE_BY, type ScheduledKind, scheduledRunText } from './slack-trigger.js';
 
 export interface JobInfo {
   id: string;
@@ -329,15 +323,7 @@ export class Scheduler implements JobControl {
       const message = (err as Error).message;
       this.fileErrors.set(name, { message, at: this.now() });
       this.deps.log.error(`[${name}] jobs not reloaded: ${message}`);
-      void openRunThread(this.deps.chat, project.config.slackChannel, 'jobs-reload')
-        .then((ts) =>
-          this.deps.chat.post(
-            project.config.slackChannel,
-            ts,
-            `⚠️ \`${JOBS_FILE}\` was not reloaded:\n\`\`\`\n${message.slice(0, 2_500)}\n\`\`\``,
-          ),
-        )
-        .catch(() => {});
+      // Logs and the dashboard only (fileErrors): the channel holds nothing but `Run <Skill Name>` messages.
       return;
     }
 
@@ -399,7 +385,8 @@ export class Scheduler implements JobControl {
     if (!this.deps.store.claimSlot(key, slot, this.startedAt)) return;
     const { chat } = this.deps;
     const channel = project.config.slackChannel;
-    const text = scheduledRunText(runName(job, this.jobsOf(project.config.name)));
+    const words = project.config.words;
+    const text = scheduledRunText(runName(job, this.jobsOf(project.config.name), words), words);
     const asBot = () => {
       // Set before posting: Slack can deliver the message event before the post call returns.
       this.pending.set(key, { slot, kind, byPerson: false });
@@ -491,7 +478,11 @@ export class Scheduler implements JobControl {
     let result: JobStatus = 'error';
     const named = {
       ...scheduled,
-      runName: runName(scheduled.job, this.jobsOf(scheduled.project.config.name)),
+      runName: runName(
+        scheduled.job,
+        this.jobsOf(scheduled.project.config.name),
+        scheduled.project.config.words,
+      ),
     };
     const task = runJob(
       {

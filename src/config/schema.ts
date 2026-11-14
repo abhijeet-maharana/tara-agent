@@ -265,7 +265,7 @@ export const hostConfigSchema = z.object({
   /**
    * The Health page (`/health` in a browser): tara-agent's own checks, every project's jobs, and each
    * project's `healthUrl`, checked every `intervalMinutes`. A check that turns red (twice in a row) or
-   * recovers is posted once in a day thread (`📌 Health · <day>`) of its project's channel.
+   * recovers is posted once in the day's `Run Health Alert` thread of its project's channel.
    */
   health: z
     .object({

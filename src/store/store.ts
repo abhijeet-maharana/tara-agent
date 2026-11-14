@@ -309,6 +309,9 @@ const MIGRATIONS = [
      message    TEXT NOT NULL
    );
    CREATE INDEX log_events_at ON log_events (at);`,
+  // A proposer's ranking (higher first): the Approvals page lists a kind's drafts by it, and an approved
+  // item goes into its queue ahead of approved items ranked lower.
+  `ALTER TABLE items ADD COLUMN priority REAL;`,
 ];
 
 export const ITEM_STATUSES = [
@@ -385,6 +388,8 @@ export interface Item {
   runNow: boolean;
   /** Place in its queue once moved on the Approvals page; unset = its approval time. */
   queueRank?: number;
+  /** The proposer's ranking, higher first (e.g. a lead's match score). */
+  priority?: number;
   status: ItemStatus;
   decision?: string;
   reply?: string;
@@ -415,6 +420,7 @@ export type ItemInput = Pick<Item, 'project' | 'kind' | 'mode' | 'title' | 'opti
       | 'queue'
       | 'window'
       | 'runAfter'
+      | 'priority'
     >
   >;
 
@@ -449,6 +455,7 @@ function toItem(r: Record<string, unknown>): Item {
     runAfter: opt(r.run_after),
     runNow: r.run_now === 1,
     queueRank: opt(r.queue_rank),
+    priority: opt(r.priority),
     status: r.status as ItemStatus,
     decision: opt(r.decision),
     reply: opt(r.reply),
@@ -927,6 +934,7 @@ export class Store {
       queue: input.queue ?? null,
       window: input.window ?? null,
       run_after: input.runAfter ?? null,
+      priority: input.priority ?? null,
     };
     const cols = Object.keys(values);
     if (existing) {
@@ -1135,7 +1143,28 @@ export class Store {
         t,
         id,
       );
-    return result.changes > 0 ? this.getItem(id) : undefined;
+    if (result.changes === 0) return undefined;
+    const item = this.getItem(id) as Item;
+    if (d.status === 'approved' && item.queue && item.priority !== undefined) this.placeByPriority(item);
+    return this.getItem(id);
+  }
+
+  /**
+   * Puts a newly approved item ahead of the first approved item in its queue ranked lower (or
+   * unranked), so a queue runs its best items first. Places a person set by moving items keep theirs.
+   */
+  private placeByPriority(item: Item): void {
+    const queue = this.items({
+      project: item.project,
+      queue: item.queue,
+      statuses: ['approved'],
+      limit: 1000,
+    }).filter((i) => i.id !== item.id);
+    const at = queue.findIndex((i) => i.priority === undefined || i.priority < (item.priority as number));
+    if (at < 0) return; // the lowest: its approval time already puts it last
+    const next = queueKey(queue[at] as Item);
+    const prev = at > 0 ? queueKey(queue[at - 1] as Item) : next - 1;
+    this.db.prepare('UPDATE items SET queue_rank = ? WHERE id = ?').run((prev + next) / 2, item.id);
   }
 
   /** A revise request on a pending item: it stays pending until the new draft replaces it. */

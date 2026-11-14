@@ -212,16 +212,21 @@ export class SessionManager {
     if (!job || msg.threadTs !== msg.ts || !this.deps.jobs) return false;
     // The bot's own "Run <id>" that opened a thread for a run already going (a queue, Run now): nothing to start.
     if (!job.enabled && msg.fromSelf) return true;
+    // A trigger that can't run says why inside its own thread (never at the channel's top level) and
+    // gets a reaction, so the channel's list of runs shows it didn't run.
     if (!job.enabled) {
       await this.startJob(project, job, SCHEDULE_BY, msg.channel, msg.ts, true); // says it's paused
+      await this.deps.chat.react(msg.channel, msg.ts, 'double_vertical_bar').catch(() => {});
       return true;
     }
     const result = this.deps.jobs.trigger(project.config.name, job.id, SCHEDULE_BY, {
       channel: msg.channel,
       ts: msg.ts,
     });
-    if (result === 'running')
+    if (result === 'running') {
       await this.deps.chat.post(msg.channel, msg.ts, `🔄 *${job.name}* is already running.`);
+      await this.deps.chat.react(msg.channel, msg.ts, 'repeat').catch(() => {});
+    }
     return result !== 'unknown';
   }
 
@@ -358,7 +363,12 @@ export class SessionManager {
     let outcome: RunOutcome;
     try {
       const scratch = sessionScratch(project, host.stateDir as string, 'chat', session.sessionId);
-      env = { ...buildChildEnv(this.env, project.config.billing), TARA_SCRATCH: scratch };
+      // TARA_THREAD: a project server that makes a card for this chat passes it on, so the card lands here.
+      env = {
+        ...buildChildEnv(this.env, project.config.billing),
+        TARA_SCRATCH: scratch,
+        TARA_THREAD: threadKey(msg.channel, msg.threadTs),
+      };
       const files = await this.saveAttachments(scratch, msg);
       // The first message of a session says where the folder is (the Write tool needs absolute paths).
       const cards = session.started ? '' : threadCards(store, msg.channel, msg.threadTs);
@@ -570,8 +580,8 @@ export class SessionManager {
 }
 
 /**
- * What a chat that starts in a thread of cards needs to know first: the cards posted there (a day's
- * `📌` thread of cards no run raised, or a card's own thread), so "this one" or "the captcha" makes sense.
+ * What a chat that starts in a thread of cards needs to know first: the cards posted there (a run's
+ * thread, a card's `Run <Kind>` thread, or an older `📌` day thread), so "this one" or "the captcha" makes sense.
  */
 export function threadCards(store: Pick<Store, 'itemsInThread'>, channel: string, threadTs: string): string {
   const items = store.itemsInThread(channel, threadTs);

@@ -437,7 +437,13 @@ export function approvalsPage(ctx: DashboardContext, data: ApprovalsData): strin
       draftKinds.length
         ? `<section class="section"><div class="sec-head"><h2>Drafts to send</h2><span>${drafts.length} · go out at their queue's time once approved</span></div>${draftKinds
             .map((k) => {
-              const group = inKind(k).sort(oldest);
+              // Ranked drafts (a proposer's priority) first, highest first; the rest oldest first.
+              const group = inKind(k).sort(
+                (a, b) =>
+                  Number(b.priority !== undefined) - Number(a.priority !== undefined) ||
+                  (b.priority ?? 0) - (a.priority ?? 0) ||
+                  oldest(a, b),
+              );
               const clean = group.filter((i) => !i.checks.some((c) => c.blocking));
               const label = `Approve all ${clean.length}`;
               const bulk =

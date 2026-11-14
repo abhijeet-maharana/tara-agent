@@ -594,3 +594,42 @@ describe('job tools for Claude', () => {
     expect(() => bridge.runJob(jobRun.token, 'sla')).toThrow(/only be started from a chat turn/);
   });
 });
+
+describe('finish_item', () => {
+  it('puts an item back in its queue when the run reports later, as a URL executor can', async () => {
+    const { bridge, store, ctx } = setup();
+    const now = Date.parse('2026-10-25T08:30:00Z');
+    const make = async (key: string) => {
+      const item = store.proposeItem({
+        project: 'shop',
+        kind: 'email',
+        mode: 'queue',
+        key,
+        title: key,
+        options: ['Approve'],
+        queue: 'email',
+      });
+      store.decideItem(item.id, { status: 'approved', decision: 'Approve', by: 'U1' });
+      store.startItems([item.id]);
+      return item.id;
+    };
+    const [a, b, c] = [await make('e1'), await make('e2'), await make('e3')];
+    const { token } = openRun(bridge, { ...ctx, kind: 'job', items: [a, b, c] });
+
+    const retryAt = now + 6 * 3_600_000;
+    expect(bridge.finishItem(token, { id: a, status: 'later', result: 'daily cap', retryAt })).toMatchObject({
+      status: 'approved',
+      runAfter: retryAt,
+    });
+    expect(store.getItem(a)).toMatchObject({ status: 'approved', result: 'daily cap' });
+    // No time (or one in the past): an hour from now.
+    expect(bridge.finishItem(token, { id: b, status: 'later', retryAt: now - 1 })).toMatchObject({
+      runAfter: now + 3_600_000,
+    });
+    expect(bridge.finishItem(token, { id: c, status: 'done', result: 'sent' })).toMatchObject({
+      status: 'done',
+    });
+    // Reported once only.
+    expect(() => bridge.finishItem(token, { id: a, status: 'later' })).toThrow(/not running/);
+  });
+});

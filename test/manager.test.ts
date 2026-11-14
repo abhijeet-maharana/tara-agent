@@ -156,7 +156,11 @@ describe('SessionManager', () => {
     expect(calls[0]?.cwd).toBe('/repo');
     expect(calls[0]?.systemPrompt).toContain('Project rules.');
     expect(calls[0]?.systemPrompt).toContain('Your name is tara.');
-    expect(calls[0]?.env).toEqual({ PATH: '/bin', TARA_SCRATCH: '/tmp/scratch/shop/chat-sid-1' });
+    expect(calls[0]?.env).toEqual({
+      PATH: '/bin',
+      TARA_SCRATCH: '/tmp/scratch/shop/chat-sid-1',
+      TARA_THREAD: expect.stringMatching(/^C\w*:.+/),
+    });
 
     expect(chat.texts()).toContain('*Answer*');
     expect(chat.updates.at(-1)?.text).toMatch(/^✅ Done · 3s · 1 step · claude-sonnet-5-5$/);

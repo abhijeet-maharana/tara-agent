@@ -267,12 +267,14 @@ server.registerTool(
     title: 'Report an approved item',
     description:
       'Report the result of one approved item you were given under "## Approved items": done (with what happened, ' +
-      'e.g. the URL) or failed (with why). Report every item, as soon as it is done. An item you never report is ' +
-      'marked failed and is not run again.',
+      'e.g. the URL), failed (with why), or later when it cannot go yet (a daily cap, outside its window, paused): ' +
+      'it goes back in its queue until retryAt (ISO time or ms), or an hour from now. Report every item, as soon ' +
+      'as it is done. An item you never report is marked failed and is not run again.',
     inputSchema: {
       id: z.string().min(1),
-      status: z.enum(['done', 'failed']),
+      status: z.enum(['done', 'failed', 'later']),
       result: z.string().max(4000).optional(),
+      retryAt: z.union([z.string(), z.number()]).optional(),
     },
   },
   async (args) => {

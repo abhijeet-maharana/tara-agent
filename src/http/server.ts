@@ -261,6 +261,8 @@ export function itemInput(body: Record<string, unknown>): ProposeInput {
         ? Date.parse(body.runAfter as string)
         : undefined;
   if (Number.isNaN(runAfter)) throw new HttpError(400, '"runAfter" must be a time');
+  if (body.priority !== undefined && body.priority !== null && !Number.isFinite(body.priority))
+    throw new HttpError(400, '"priority" must be a number');
   return {
     kind: need(body.kind, 'kind').slice(0, 40),
     key: str(body.key)?.slice(0, 120),
@@ -269,6 +271,7 @@ export function itemInput(body: Record<string, unknown>): ProposeInput {
     queue: need(body.queue, 'queue'),
     window: str(body.window),
     runAfter,
+    priority: typeof body.priority === 'number' ? body.priority : undefined,
     options: arr(body.options).filter((o): o is string => typeof o === 'string'),
     fields: arr(body.fields)
       .slice(0, MAX_FIELDS)
@@ -700,7 +703,15 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         const body = await readJson(req, ITEM_BODY_LIMIT);
         const project = approvals.project(knownProject(str(body.project) ?? null));
         const input = { ...itemInput(body), autoApprove: body.autoApprove === true };
-        return { item: await approvals.propose(project, input, { source: str(body.source) }) };
+        // `thread`: the TARA_THREAD of the run the server works for; the card goes in that run's thread.
+        const thread = approvals.runThread(project, str(body.thread));
+        return {
+          item: await approvals.propose(project, input, {
+            source: str(body.source),
+            channel: thread?.channel,
+            threadTs: thread?.threadTs,
+          }),
+        };
       }
       if (method === 'POST' && parts.length === 2 && parts[1] === 'ask') {
         // A project server asking a person outside any run (a login expired, a send bounced). It only
@@ -710,13 +721,17 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         const title = str(body.title);
         if (!title) throw new HttpError(400, '"title" is required');
         return {
-          item: await approvals.ask(project, {
-            title,
-            details: str(body.details) ?? '',
-            options: arr(body.options).filter((o): o is string => typeof o === 'string'),
-            kind: str(body.kind)?.slice(0, 40),
-            key: str(body.key)?.slice(0, 120),
-          }),
+          item: await approvals.ask(
+            project,
+            {
+              title,
+              details: str(body.details) ?? '',
+              options: arr(body.options).filter((o): o is string => typeof o === 'string'),
+              kind: str(body.kind)?.slice(0, 40),
+              key: str(body.key)?.slice(0, 120),
+            },
+            approvals.runThread(project, str(body.thread)),
+          ),
         };
       }
       if (method === 'GET' && parts.length === 2) {
@@ -999,12 +1014,22 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     }
     if (req.method === 'POST' && parts[1] === 'item-done' && parts.length === 2) {
       const body = await readJson(req);
-      const status = body.status === 'done' || body.status === 'failed' ? body.status : undefined;
-      if (!status) throw new HttpError(400, '"status" must be done or failed');
+      const status =
+        body.status === 'done' || body.status === 'failed' || body.status === 'later'
+          ? body.status
+          : undefined;
+      if (!status) throw new HttpError(400, '"status" must be done, failed or later');
+      const retryAt =
+        typeof body.retryAt === 'number'
+          ? body.retryAt
+          : typeof body.retryAt === 'string'
+            ? Date.parse(body.retryAt)
+            : undefined;
       return bridge.finishItem(token, {
         id: required(body.id, 'id'),
         status,
         result: typeof body.result === 'string' ? body.result : undefined,
+        ...(retryAt !== undefined && Number.isFinite(retryAt) && { retryAt }),
       });
     }
     if (req.method === 'POST' && parts[1] === 'pr-start' && parts.length === 2) {

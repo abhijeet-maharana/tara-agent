@@ -252,7 +252,7 @@ async function serve(configFlag: string | undefined) {
     const project = projects.find((p) => p.config.name === name);
     if (!project) throw new Error(`No project "${name}" to ask in`);
     const channel = project.config.slackChannel;
-    const ts = await openRunThread(slack.chat, channel, what);
+    const ts = await openRunThread(slack.chat, channel, what, project.config.words);
     await slack.chat.post(channel, ts, title);
     const user = project.config.owner ?? project.config.allowedUsers[0] ?? 'dashboard';
     void (manager as SessionManager).handle({ channel, threadTs: ts, ts, user, text: prompt });

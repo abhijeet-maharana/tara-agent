@@ -139,7 +139,7 @@ describe('HealthMonitor', () => {
     };
   };
 
-  it('alerts once after two red checks in a row, in the day thread, and once when fixed', async () => {
+  it("alerts once after two red checks in a row, in the day's Run Health Alert thread, and once when fixed", async () => {
     const h = setup();
     h.set('ok', 'WORKING');
     await h.tick();
@@ -152,7 +152,7 @@ describe('HealthMonitor', () => {
     await h.tick();
     await h.tick();
     expect(h.chat.texts()).toEqual([
-      '📌 Health · Fri 13 Nov',
+      'Run Health Alert',
       '<@U0OWNER> ❌ *WhatsApp* (Services): session FAILED',
     ]);
     expect(h.chat.posts[1]?.thread).toBe(h.chat.posts[0]?.ts);
@@ -160,7 +160,8 @@ describe('HealthMonitor', () => {
     h.set('ok', 'WORKING');
     await h.tick();
     expect(h.chat.texts().at(-1)).toBe('✅ *WhatsApp* (Services) is fine again after 10m: WORKING');
-    expect(h.chat.posts.filter((p) => p.thread === '')).toHaveLength(1); // one day thread
+    // One root message for the day, in the channel's `Run <Name>` format; everything else in its thread.
+    expect(h.chat.posts.filter((p) => p.thread === '').map((p) => p.text)).toEqual(['Run Health Alert']);
     expect(h.monitor.history().map((e) => e.status)).toEqual(['ok', 'bad']);
     expect(h.monitor.label('project:shop:Services:WhatsApp')).toBe('WhatsApp (Services)');
   });

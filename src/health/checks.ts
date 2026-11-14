@@ -270,7 +270,7 @@ export function jobChecks(d: JobsDeps): Check[] {
       name: 'Jobs file',
       status: 'bad',
       detail: `.tara/jobs.json didn't load (the previous jobs keep running): ${firstLine(fileError.message, 300)}`,
-      quiet: true, // the scheduler posts the error in the channel itself
+      quiet: true, // in the logs and on the dashboard; nothing goes to Slack for it
     });
 
   let failing = 0;

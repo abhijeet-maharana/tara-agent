@@ -191,16 +191,18 @@ describe('Scheduler', () => {
     // Its own scratch folder and the job's data folder, as env and as absolute paths in the prompt.
     expect(call.env.TARA_SCRATCH).toBe('/tmp/scratch/shop/sla-sid');
     expect(call.env.TARA_JOB_DATA).toBe('/tmp/job-data/shop/sla');
+    // The run's thread, for a project server that makes a card for this run.
+    expect(call.env.TARA_THREAD).toMatch(/^C\w*:.+/);
     expect(call.prompt).toContain('- Scratch folder (`$TARA_SCRATCH`): /tmp/scratch/shop/sla-sid.');
     expect(call.prompt).toContain('- Job data folder (`$TARA_JOB_DATA`): /tmp/job-data/shop/sla.');
 
-    // The channel gets only "Run SLA Report"; the status line and the details are replies in its thread.
+    // The channel gets only "Run SLA Report"; the status line and Claude's whole reply are in its thread.
     expect(chat.log[0]).toBe('post top ts1: Run SLA Report');
     expect(chat.log[1]).toBe('post ts1 ts2: ⏳ *SLA Report* (run by <@U1>)');
     expect(chat.log.at(-2)).toBe(
       'update ts2: ✅ *SLA Report* (run by <@U1>) · 2s · 2 steps · claude-haiku-5-5\nHeadline',
     );
-    expect(chat.log.at(-1)).toBe('post ts1 ts3: Details here');
+    expect(chat.log.at(-1)).toBe('post ts1 ts3: Headline\n---\nDetails here');
     // Replies in the job thread resume the job's session.
     expect(store.getSession('C1:ts1')).toMatchObject({ sessionId: 'sid', model: 'haiku', started: true });
     expect(scheduler.list('shop')[0]).toMatchObject({ id: 'sla', lastStatus: 'ok', running: false });
@@ -350,6 +352,8 @@ describe('Scheduler', () => {
     expect(
       chat.log.some((l) => l.startsWith('update ts2: 🔇 *SLA Report*') && l.endsWith('· nothing to report')),
     ).toBe(true);
+    // The thread says so in words: it is never left without a reply.
+    expect(chat.log.at(-1)).toMatch(/^post ts1 ts\d+: 🔇 Claude finished without a written reply · /);
     expect(store.getSession('C1:ts1')).toBeDefined();
     await scheduler.stop();
   });
@@ -581,8 +585,9 @@ describe('Scheduler', () => {
     // biome-ignore lint/suspicious/noExplicitAny: reaching into the private poller for a deterministic test
     (scheduler as any).checkFiles();
     await new Promise((r) => setImmediate(r));
-    expect(chat.log[0]).toBe('post top ts1: Run jobs-reload');
-    expect(chat.log[1]).toMatch(/^post ts1 ts2: ⚠️ `\.tara\/jobs\.json` was not reloaded/);
+    // Logs and the dashboard only: nothing goes to Slack for a reload.
+    expect(chat.log).toEqual([]);
+    expect(scheduler.jobFileErrors().get('shop')?.message).toBeTruthy();
     expect(scheduler.list('shop').map((j) => j.id)).toEqual(['sla']);
     await scheduler.stop();
   });
@@ -759,7 +764,7 @@ describe('job streaming', () => {
     await scheduler.stop();
   });
 
-  it('keeps a headline-only reply in the channel status line, not repeated in the thread', async () => {
+  it('puts even a headline-only reply in the thread, as well as in the status line', async () => {
     const stream = new FakeStream();
     const { chat, scheduler } = setup({
       jobs: [baseJob],
@@ -774,8 +779,8 @@ describe('job streaming', () => {
         (l) => l.startsWith('update ts2: ✅ *SLA Report*') && l.endsWith('All 12 orders shipped on time.'),
       ),
     ).toBe(true);
-    // The thread has the steps and the summary only: no reply text, no "(no text reply)" placeholder.
-    expect(stream.text()).toBe('');
+    // The thread always has Claude's exact reply, so a run can be checked from Slack.
+    expect(stream.text()).toBe('All 12 orders shipped on time.');
     expect(stream.state()).toEqual({
       title: '✅ Done · 2s · 2 steps · claude-haiku-5-5',
       tasks: { 'Bash: curl': 'complete' },
@@ -802,7 +807,7 @@ describe('job streaming', () => {
     plain.scheduler.trigger('shop', 'sla', 'api'); // no owner: no stream
     await plain.scheduler.idle();
     expect(quiet.calls).toEqual([]);
-    expect(plain.chat.texts()).toContain('Details here');
+    expect(plain.chat.texts()).toContain('Headline\n---\nDetails here');
     await plain.scheduler.stop();
     expect(chat.posts.filter((p) => p.thread === 'ts1').map((p) => p.text)).toEqual([
       '⏳ *SLA Report* (run by Shop Dashboard)',
@@ -821,6 +826,7 @@ describe('job streaming', () => {
       type: 'plan_update',
       title: expect.stringMatching(/^🔇 Nothing to report/),
     });
+    expect(stream.text()).toMatch(/🔇 Claude finished without a written reply · /);
     expect(stream.calls.at(-1)).toMatch(/^stop s1/);
     await scheduler.stop();
   });
@@ -892,7 +898,7 @@ describe('scheduled runs through Slack', () => {
     await pickUp(scheduler, chat);
     expect(calls).toHaveLength(1);
     expect(chat.updates.at(-1)?.text).toMatch(/^✅ \*SLA Report\* \(catch-up\) · .*\nHeadline$/);
-    expect(chat.log.at(-1)).toBe('post ts1 ts3: Details here');
+    expect(chat.log.at(-1)).toBe('post ts1 ts3: Headline\n---\nDetails here');
     expect(chat.posts.filter((p) => p.thread === '')).toHaveLength(1); // nothing else top-level
     expect(store.getSession('C1:ts1')).toBeDefined();
     await scheduler.stop();

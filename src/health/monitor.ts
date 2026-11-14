@@ -1,3 +1,4 @@
+import { openRunThread } from '../scheduler/slack-trigger.js';
 import type { Logger } from '../sessions/manager.js';
 import type { HealthEvent, HealthState, HealthStatus, Store } from '../store/store.js';
 
@@ -56,7 +57,7 @@ export interface HealthSnapshot {
 
 /** Where alerts about a project (or, with undefined, about tara-agent) go. */
 export interface AlertTarget {
-  /** Project name: the day thread is the project's. */
+  /** Project name: the day's `Run Health Alert` thread is the project's. */
   name: string;
   title: string;
   channel: string;
@@ -333,26 +334,21 @@ export class HealthMonitor {
     }
   }
 
-  /** The day's `📌 Health · <day>` thread in the target's channel (the channel only holds run threads). */
+  /**
+   * The day's `Run Health Alert` thread in the target's channel, opened by its first alert: like every
+   * message tara starts in a channel, a `Run <Name>` one, with the alerts and recoveries in its thread.
+   */
   private async dayThread(target: AlertTarget): Promise<string> {
     const at = new Date(this.now());
     const day = new Intl.DateTimeFormat('en-CA', { timeZone: this.deps.timeZone }).format(at);
-    const key = `${target.name}:health:${day}`;
+    // Not `:health:` (the old `📌 Health` threads), so today's alerts move to the new thread at once.
+    const key = `${target.name}:health-alert:${day}`;
     const known = this.deps.store.dayThread(key);
     if (known && known.channel === target.channel) return known.ts;
     let opening = this.opening.get(key);
     if (!opening) {
-      const when = new Intl.DateTimeFormat('en-GB', {
-        timeZone: this.deps.timeZone,
-        weekday: 'short',
-        day: 'numeric',
-        month: 'short',
-      })
-        .format(at)
-        .replace(',', '');
       const chat = this.deps.chat as NonNullable<MonitorDeps['chat']>;
-      opening = chat
-        .post(target.channel, undefined, `📌 Health · ${when}`)
+      opening = openRunThread(chat, target.channel, 'Health Alert')
         .then((ts) => {
           this.deps.store.saveDayThread(key, target.channel, ts);
           return ts;

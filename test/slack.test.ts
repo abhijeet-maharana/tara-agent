@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { findRunJob, parseScheduledRun, runName } from '../src/scheduler/slack-trigger.js';
+import {
+  findRunJob,
+  parseScheduledRun,
+  runName,
+  scheduledRunText,
+  titleName,
+} from '../src/scheduler/slack-trigger.js';
 import {
   attachedFiles,
   decodeSlackText,
@@ -78,7 +84,21 @@ describe('toIncoming', () => {
     expect(findRunJob(jobs, 'weekly-ga')?.id).toBe('weekly-ga');
     expect(findRunJob(jobs, 'the ga audit')).toBeUndefined();
     expect(runName(jobs[0] as (typeof jobs)[0], jobs)).toBe('Weekly GA4 Audit');
-    expect(runName(jobs[1] as (typeof jobs)[0], jobs)).toBe('pnl');
+    // A shared name falls back to the id, in title case: never a raw kebab-case id in the channel.
+    expect(runName(jobs[1] as (typeof jobs)[0], jobs)).toBe('Pnl');
+    expect(runName(jobs[2] as (typeof jobs)[0], jobs)).toBe('Pnl 2');
+    expect(findRunJob(jobs, 'Pnl')?.id).toBe('pnl');
+    expect(findRunJob(jobs, 'Pnl 2')?.id).toBe('pnl-2');
+  });
+
+  it('writes a Run message name in title case, never as a raw id', () => {
+    expect(scheduledRunText('Weekly GA4 Audit')).toBe('Run Weekly GA4 Audit');
+    expect(scheduledRunText('code-question')).toBe('Run Code Question');
+    expect(scheduledRunText('linkedin_post', { linkedin: 'LinkedIn' })).toBe('Run LinkedIn Post');
+    expect(titleName('weekly-ga4-audit')).toBe('Weekly Ga4 Audit');
+    const jobs = [{ id: 'reply-sender', name: 'reply-sender' }];
+    expect(runName(jobs[0] as (typeof jobs)[0], jobs)).toBe('Reply Sender');
+    expect(findRunJob(jobs, 'Reply Sender')?.id).toBe('reply-sender');
   });
 
   it('treats a person posting through our app (our bot_id, their user) as that person', () => {

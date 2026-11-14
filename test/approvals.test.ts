@@ -356,15 +356,9 @@ describe('auto-approved cards', () => {
     expect(item.reply).toBe('Auto-approved: every answer is from the profile');
     expect(verifySeal(item, KEY)).toBe(true);
     expect(asked).toEqual([{ kind: 'application', key: 'application:1', fields: { note: 'Hi Acme' } }]);
-    // No run proposed it: it goes in the day's "Run <queue>" thread.
-    expect(chat.posts[0]).toMatchObject({
-      thread: '',
-      text: expect.stringMatching(/^📌 Replies cards · \w{3} \d{1,2} \w{3}$/),
-    });
-    expect(chat.blockPosts[0]?.thread).toBe(chat.posts[0]?.ts);
-    expect(JSON.stringify(chat.blockPosts[0]?.blocks)).toContain(
-      'Auto-approved: every answer is from the profile',
-    );
+    // No run proposed it: the Approvals page only, nothing loose in Slack.
+    expect(chat.posts).toEqual([]);
+    expect(chat.blockPosts).toEqual([]);
     // A key that had a decided card before (failed, rejected, done) always waits for a person.
     store.finishItem(item.id, 'failed', 'captcha');
     const retry = await approvals.propose(project, app('application:1'));
@@ -406,7 +400,7 @@ describe('auto-approved cards', () => {
 });
 
 describe('cards of a slack queue', () => {
-  it("posts cards no run proposed in the day's 📌 <queue> cards thread, edits them there, and closes them on a decision or a withdrawal", async () => {
+  it('keeps cards no run proposed on the Approvals page only: refreshed, decided and withdrawn there, never posted loose in Slack', async () => {
     const { project, store, chat, approvals } = setup();
     const reply = (value: string) => ({ key: 'reply', label: 'Reply', type: 'textarea' as const, value });
     const card = await approvals.propose(project, {
@@ -418,31 +412,11 @@ describe('cards of a slack queue', () => {
       options: ['Approve', 'Skip'],
       fields: [reply('Locks need a timeout.'), { key: 'link', label: 'Link', type: 'text', value: '' }],
     });
-    // One top-level "Run replies" for the day; the whole card is a reply in its thread.
-    expect(chat.posts).toEqual([
-      expect.objectContaining({
-        thread: '',
-        text: expect.stringMatching(/^📌 Replies cards · \w{3} \d{1,2} \w{3}$/),
-      }),
-    ]);
-    const day = chat.posts[0]?.ts;
-    expect(chat.blockPosts).toHaveLength(1);
-    const posted = chat.blockPosts[0];
-    expect(posted?.thread).toBe(day);
-    expect(card).toMatchObject({ channel: 'C1', threadTs: day, messageTs: posted?.ts });
-    const section = JSON.stringify(posted?.blocks[0]);
-    expect(section).toContain('*📝 Reply to @ann*');
-    expect(section).toContain('Ann posted *2h* ago');
-    expect(section).toContain('> Locks need a timeout.');
-    expect(section).not.toContain('*Link*'); // empty fields stay out
-    expect(JSON.stringify(posted?.blocks[1])).toContain(
-      'Waiting on the Approvals page (Approve · Skip · Revise)',
-    );
-    // No buttons: decisions stay on the Approvals page.
-    expect(chat.blockPosts.some((p) => p.blocks.some((b) => b.type === 'actions'))).toBe(false);
+    expect(card).toMatchObject({ status: 'pending', title: 'Reply to @ann' });
+    expect(card.threadTs).toBeFalsy();
 
-    // A refresh (same key) edits the same reply.
-    await approvals.propose(project, {
+    // A refresh (same key) updates the same card.
+    const refreshed = await approvals.propose(project, {
       kind: 'x-reply',
       key: 'r1',
       title: 'Reply to @ann',
@@ -450,25 +424,22 @@ describe('cards of a slack queue', () => {
       options: ['Approve', 'Skip'],
       fields: [reply('Set lock_timeout first.')],
     });
-    expect(chat.blockPosts).toHaveLength(1);
-    expect(chat.updates.at(-1)?.ts).toBe(posted?.ts);
-    expect(JSON.stringify(chat.updates.at(-1)?.blocks)).toContain('Set lock_timeout first.');
+    expect(refreshed.id).toBe(card.id);
+    expect(store.getItem(card.id)?.fields[0]?.value).toBe('Set lock_timeout first.');
 
     await approvals.decide(card.id, { option: 'Approve', by: 'U1', via: 'dashboard' });
-    expect(chat.updates.at(-1)?.text).toBe('Reply to @ann: Approve');
-
-    // Another card that day: same thread, no second Run message.
     const other = await approvals.propose(project, {
       kind: 'x-reply',
       key: 'r2',
       title: 'Reply to @bob',
       queue: 'replies',
     });
-    expect(chat.posts).toHaveLength(1);
-    expect(other.threadTs).toBe(day);
     approvals.withdraw(other.id, 'post too old');
-    expect(chat.updates.at(-1)?.text).toBe('Reply to @bob: ➖ Withdrawn: post too old');
     expect(store.getItem(other.id)?.status).toBe('cancelled');
+    // Nothing reached Slack: no Run message, no card, no edits.
+    expect(chat.posts).toEqual([]);
+    expect(chat.blockPosts).toEqual([]);
+    expect(chat.updates).toEqual([]);
   });
 
   it('keeps updating a card that got its own channel message before channels held only Run threads', async () => {
@@ -524,7 +495,7 @@ describe('cards of a slack queue', () => {
     expect(chat.posts).toHaveLength(posts);
   });
 
-  it("posts an external queue's progress and result in the card thread", async () => {
+  it("keeps an external queue's progress and result off Slack when no run proposed the card", async () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'tara-appr-'));
     mkdirSync(path.join(dir, '.tara'));
     writeFileSync(
@@ -545,13 +516,9 @@ describe('cards of a slack queue', () => {
     approvals.report(card.id, 'waiting', 'Comment posted; the note goes out next send day');
     approvals.report(card.id, 'done', 'Note sent');
     await new Promise((r) => setImmediate(r));
-    // Its progress and result go in the card's thread: the day's "Run linkedin" thread.
-    expect(chat.posts[0]).toMatchObject({ thread: '', text: expect.stringMatching(/^📌 Linkedin cards · /) });
-    expect(card.threadTs).toBe(chat.posts[0]?.ts);
-    expect(chat.posts.slice(1).map((p) => [p.thread, p.text])).toEqual([
-      [card.threadTs, '⏳ Comment posted; the note goes out next send day'],
-      [card.threadTs, '✅ Done: Note sent'],
-    ]);
+    // No run proposed it, so it has no thread: its progress and result show on the Approvals page only.
+    expect(card.threadTs).toBeFalsy();
+    expect(chat.posts).toEqual([]);
     expect(store.getItem(card.id)?.status).toBe('done');
   });
 
@@ -781,7 +748,7 @@ describe('queue worker', () => {
 });
 
 describe('decisions over HTTP', () => {
-  it("lets a project server ask outside any run: in the day's 📌 thread, one card per key, the decision goes to Jarvis there", async () => {
+  it('lets a project server ask outside any run: Approvals page only, one card per key; a decision opens a Run thread for Jarvis', async () => {
     const { project, store, chat, approvals, chats } = setup();
     const server = await startHttpServer({
       bind: '127.0.0.1',
@@ -812,23 +779,92 @@ describe('decisions over HTTP', () => {
       key: 'login:portal',
       options: ['Done', 'Dismiss'],
     });
-    // In the day's "Run decision" thread, with its buttons.
-    expect(chat.posts).toEqual([
-      expect.objectContaining({ thread: '', text: expect.stringMatching(/^📌 Decisions · /) }),
-    ]);
-    expect(chat.blockPosts[0]?.thread).toBe(chat.posts[0]?.ts);
-    expect(chat.blockPosts[0]?.blocks.some((b) => b.type === 'actions')).toBe(true);
+    // No run asked: the card waits on the Approvals page, with nothing posted in Slack.
+    expect(chat.posts).toEqual([]);
+    expect(chat.blockPosts).toEqual([]);
     expect((await ask(body)).item.id).toBe(item.id);
-    // Another question the same day shares the thread: still one Run message.
+    // A changed card with the same key updates it, still off Slack.
+    const changed = await ask({ ...body, details: 'The session expired again.' });
+    expect(changed.item).toMatchObject({ id: item.id, body: 'The session expired again.' });
     await ask({ ...body, key: 'login:other', title: 'Log in to the other portal' });
-    expect(chat.posts).toHaveLength(1);
-    expect(chat.blockPosts[1]?.thread).toBe(chat.posts[0]?.ts);
+    expect(chat.posts).toEqual([]);
     expect((await ask({ project: 'shop' })).error).toMatch(/title/);
 
+    // The decision is something for Jarvis to act on: a `Run <Kind>` thread opens for it, with the card's
+    // title as its first reply, and the card keeps that thread.
     await approvals.decide(item.id, { option: 'Done', by: 'U1', via: 'slack' });
+    await approvals.settled();
+    expect(chat.posts[0]).toMatchObject({ thread: '', text: 'Run Decision' });
+    expect(chat.posts[1]).toMatchObject({
+      thread: chat.posts[0]?.ts,
+      text: '📝 *Log in to the portal again*',
+    });
+    expect(chat.posts.filter((p) => p.thread === '')).toHaveLength(1);
+    expect(store.getItem(item.id)).toMatchObject({ channel: 'C1', threadTs: chat.posts[0]?.ts });
     expect(chats[0]).toMatchObject({ channel: 'C1', threadTs: chat.posts[0]?.ts });
     expect(chats[0]?.text).toContain('USER DECISION on "Log in to the portal again": Done');
     server.close();
+  });
+
+  it("puts a project server's card in the run's thread when it passes the run's TARA_THREAD", async () => {
+    const { project, store, chat, approvals } = setup();
+    const server = await startHttpServer({
+      bind: '127.0.0.1',
+      port: 0,
+      scheduler: { list: () => [] } as unknown as Scheduler,
+      store,
+      approvals,
+      projects: ['shop'],
+      log: silent,
+      dashboard: { projects: [project], timeZone: 'UTC', agentName: 'Jarvis' },
+    });
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const post = (p: string, body: object) =>
+      fetch(`${base}${p}`, { method: 'POST', body: JSON.stringify(body) }).then(
+        (r) => r.json() as Promise<{ item: Item; error?: string }>,
+      );
+    store.saveSession({ threadKey: 'C1:run.1', project: 'shop', sessionId: 's1', model: 'm', started: true });
+
+    const asked = await post('/items/ask', {
+      project: 'shop',
+      title: 'Applied today',
+      options: ['Seen', 'Open'],
+      kind: 'notice',
+      thread: 'C1:run.1',
+    });
+    expect(asked.item).toMatchObject({ channel: 'C1', threadTs: 'run.1' });
+    const proposed = await post('/items', {
+      project: 'shop',
+      kind: 'reply',
+      title: 'Short draft',
+      queue: 'replies',
+      thread: 'C1:run.1',
+    });
+    expect(proposed.item).toMatchObject({ channel: 'C1', threadTs: 'run.1' });
+    // Both went in the run's thread: no day thread was opened.
+    expect(chat.posts).toEqual([]);
+    expect(chat.blockPosts.map((p) => p.thread)).toEqual(['run.1', 'run.1']);
+
+    // A thread tara has no session for (or another channel) leaves the card on the Approvals page only.
+    const stray = await post('/items', {
+      project: 'shop',
+      kind: 'reply',
+      title: 'Other draft',
+      queue: 'replies',
+      thread: 'C9:nope',
+    });
+    expect(stray.item.threadTs).toBeFalsy();
+    expect(chat.posts).toEqual([]);
+    expect(chat.blockPosts).toHaveLength(2);
+    server.close();
+  });
+
+  it('refuses a question with fewer than 2 options', async () => {
+    const { project, chat, approvals } = setup();
+    await expect(
+      approvals.ask(project, { title: 'Jarvis restarted', details: '', options: ['Seen'], kind: 'notice' }),
+    ).rejects.toMatchObject({ status: 400 });
+    expect(chat.posts).toEqual([]);
   });
 
   it('updates a waiting card with the same key in place instead of adding another', async () => {
@@ -859,9 +895,36 @@ describe('decisions over HTTP', () => {
     expect(second.id).toBe(first.id);
     expect(second).toMatchObject({ title: 'Reply to 2 warmup emails', body: 'A\n\nB', status: 'pending' });
     expect(chat.blockPosts).toHaveLength(posted);
-    expect(chat.updates.at(-1)).toMatchObject({ ts: first.messageTs });
-    expect(JSON.stringify(chat.updates.at(-1)?.blocks)).toContain('Reply to 2 warmup emails');
     expect(store.items({ project: 'shop', statuses: ['pending'] })).toHaveLength(1);
+
+    // In a run's thread, the same key edits the card's Slack message instead of posting another.
+    const thread = { channel: 'C1', threadTs: 'run.1' };
+    const inRun = await approvals.ask(
+      project,
+      {
+        key: 'warmup-reply:2026-11-11',
+        kind: 'warmup-reply',
+        title: 'Reply to 1',
+        details: 'A',
+        options: ['Replied', 'Skip today'],
+      },
+      thread,
+    );
+    const inRunPosts = chat.blockPosts.length;
+    await approvals.ask(
+      project,
+      {
+        key: 'warmup-reply:2026-11-11',
+        kind: 'warmup-reply',
+        title: 'Reply to 2',
+        details: 'A\n\nB',
+        options: ['Replied', 'Skip today'],
+      },
+      thread,
+    );
+    expect(chat.blockPosts).toHaveLength(inRunPosts);
+    expect(chat.updates.at(-1)).toMatchObject({ ts: inRun.messageTs });
+    expect(JSON.stringify(chat.updates.at(-1)?.blocks)).toContain('Reply to 2');
   });
 
   it('takes a note on a waiting card without deciding it: shown in its thread, sent to Jarvis there', async () => {
@@ -894,6 +957,8 @@ describe('decisions over HTTP', () => {
     expect((await send('Which portal?', '')).status).toBe(403);
     expect((await send('  ')).status).toBe(400);
     expect((await send('Which portal?')).status).toBe(200);
+    // The card had no thread: the note opened its `Run <Kind>` thread (never a loose 📝 post).
+    expect(chat.posts[0]).toMatchObject({ thread: '', text: 'Run Decision' });
     const thread = chat.posts[0]?.ts;
     expect(chat.posts.at(-1)).toMatchObject({
       thread,
@@ -1225,10 +1290,12 @@ describe('a decision continues the job as the job', () => {
     expect(calls).toHaveLength(2);
     expect(calls[1]?.args).toEqual(expect.arrayContaining(['--resume', 'sid']));
     expect(calls[1]?.prompt).toBe('USER DECISION on "X": Approve');
-    expect(chat.posts.at(-1)).toMatchObject({
+    expect(chat.posts.at(-2)).toMatchObject({
       thread: root,
       text: expect.stringContaining('continuing after your decision'),
     });
+    // Claude's reply, exactly as written, follows in the same thread.
+    expect(chat.posts.at(-1)).toMatchObject({ thread: root, text: 'Done after approval.' });
   });
 });
 
@@ -1422,18 +1489,20 @@ describe('Approvals page messages go through Slack (as the person)', () => {
       model: 'opus',
       started: true,
     });
+  /** The run thread the cards are asked in (a card outside any thread stays off Slack). */
+  const RUN = 'run.1';
   const card = (approvals: Approvals, project: Project) =>
-    approvals.ask(project, {
-      title: 'Log in to the portal',
-      details: 'Expired.',
-      options: ['Done', 'Dismiss'],
-    });
+    approvals.ask(
+      project,
+      { title: 'Log in to the portal', details: 'Expired.', options: ['Done', 'Dismiss'] },
+      { channel: 'C1', threadTs: RUN },
+    );
   const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
   it('posts a decision as the person in a thread with no session; Slack starts the chat', async () => {
-    const { project, chat, approvals, chats, asUser, delivered } = setupAsUser({ deliver: true });
+    const { project, approvals, chats, asUser, delivered } = setupAsUser({ deliver: true });
     const item = await card(approvals, project);
-    const thread = chat.posts[0]?.ts as string;
+    const thread = RUN;
     await approvals.decide(item.id, { option: 'Done', by: 'U1', via: 'dashboard', reply: 'did it' });
     await approvals.settled();
     // Slack shows who decided (mentioned, so notified at once) and what; Jarvis gets the full text.
@@ -1455,31 +1524,31 @@ describe('Approvals page messages go through Slack (as the person)', () => {
   });
 
   it('sends it directly when Slack never delivers the posted message', async () => {
-    const { project, chat, approvals, chats, asUser } = setupAsUser();
+    const { project, approvals, chats, asUser } = setupAsUser();
     const item = await card(approvals, project);
     await approvals.decide(item.id, { option: 'Done', by: 'U1', via: 'dashboard' });
     await approvals.settled();
     expect(asUser).toHaveLength(1);
     await wait(40);
     expect(chats).toHaveLength(1);
-    expect(chats[0]).toMatchObject({ channel: 'C1', threadTs: chat.posts[0]?.ts, ts: 'user.1' });
+    expect(chats[0]).toMatchObject({ channel: 'C1', threadTs: RUN, ts: 'user.1' });
   });
 
   it('continues a session already in the thread directly, and a Slack tap always directly', async () => {
-    const { project, store, chat, approvals, chats, asUser } = setupAsUser();
+    const { project, store, approvals, chats, asUser } = setupAsUser();
     const first = await card(approvals, project);
-    const thread = chat.posts[0]?.ts as string;
+    const thread = RUN;
     await approvals.decide(first.id, { option: 'Done', by: 'U1', via: 'slack' });
     await approvals.settled();
     expect(asUser).toHaveLength(0);
     expect(chats).toHaveLength(1);
 
     saveSession(store, thread);
-    const second = await approvals.ask(project, {
-      title: 'Another',
-      details: 'x',
-      options: ['Done', 'Dismiss'],
-    });
+    const second = await approvals.ask(
+      project,
+      { title: 'Another', details: 'x', options: ['Done', 'Dismiss'] },
+      { channel: 'C1', threadTs: RUN },
+    );
     await approvals.decide(second.id, { option: 'Done', by: 'U1', via: 'dashboard' });
     await approvals.settled();
     expect(asUser).toHaveLength(0);
@@ -1490,7 +1559,7 @@ describe('Approvals page messages go through Slack (as the person)', () => {
   it('posts a note as the person instead of the bot line, even in a thread with a session', async () => {
     const { project, store, chat, approvals, chats, asUser } = setupAsUser();
     const item = await card(approvals, project);
-    const thread = chat.posts[0]?.ts as string;
+    const thread = RUN;
     saveSession(store, thread);
     await approvals.note(item.id, 'Which portal?', 'U1');
     expect(asUser).toHaveLength(1);
@@ -1510,13 +1579,13 @@ describe('Approvals page messages go through Slack (as the person)', () => {
   });
 
   it('sends a note directly when Slack never delivers it, once', async () => {
-    const { project, store, chat, approvals, chats } = setupAsUser();
+    const { project, store, approvals, chats } = setupAsUser();
     const item = await card(approvals, project);
-    saveSession(store, chat.posts[0]?.ts as string);
+    saveSession(store, RUN);
     await approvals.note(item.id, 'First', 'U1');
     await approvals.note(item.id, 'Second', 'U1');
     // Only the first arrived, so only the second goes directly.
-    approvals.delivered({ channel: 'C1', threadTs: chat.posts[0]?.ts as string, ts: 'user.1' });
+    approvals.delivered({ channel: 'C1', threadTs: RUN, ts: 'user.1' });
     await wait(40);
     expect(chats).toHaveLength(1);
     expect(chats[0]).toMatchObject({ ts: 'user.2', mentionWhenDone: 'U1' });

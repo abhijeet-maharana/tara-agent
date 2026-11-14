@@ -225,10 +225,10 @@ describe('Store', () => {
     const db = new DatabaseSync(file);
     const { user_version: v } = db.prepare('PRAGMA user_version').get() as { user_version: number };
     // The database as it was before the upgrade: totals in cost_usd, no session_cost_usd.
-    // (four migrations back: the cost one, day_threads, the health tables, then samples and logs)
+    // (five migrations back: the cost one, day_threads, the health tables, samples and logs, item priority)
     db.exec(
-      `DROP TABLE log_events; DROP TABLE host_samples; DROP TABLE health_events; DROP TABLE health_state;
-       DROP TABLE day_threads; ALTER TABLE runs DROP COLUMN session_cost_usd; PRAGMA user_version = ${v - 4};`,
+      `ALTER TABLE items DROP COLUMN priority; DROP TABLE log_events; DROP TABLE host_samples; DROP TABLE health_events;
+       DROP TABLE health_state; DROP TABLE day_threads; ALTER TABLE runs DROP COLUMN session_cost_usd; PRAGMA user_version = ${v - 5};`,
     );
     const add = db.prepare(
       `INSERT INTO runs (kind, project, session_id, started_at, ended_at, status, cost_usd) VALUES ('chat', 'p', ?, ?, ?, 'ok', ?)`,
@@ -278,6 +278,46 @@ describe('Store', () => {
     expect(store.getSession('t1')).toBeUndefined();
     expect(store.getSession('t4')?.sessionId).toBe('s4');
     expect(store.claimSlot('p:monthly', 300)).toBe(false);
+  });
+
+  it('runs approved items by priority, highest first, and keeps a manual move', () => {
+    let now = 1;
+    const store = new Store(':memory:', () => now);
+    const add = (key: string, priority?: number) =>
+      store.proposeItem({
+        project: 'p',
+        kind: 'email',
+        key,
+        mode: 'queue',
+        title: key,
+        options: ['Approve'],
+        queue: 'email',
+        priority,
+      });
+    const approve = (key: string) => {
+      now += 10;
+      const id = store.items({ project: 'p' }).find((i) => i.key === key)?.id as string;
+      store.decideItem(id, { status: 'approved', decision: 'Approve', by: 'U1' });
+      return id;
+    };
+    const order = () =>
+      store.items({ project: 'p', queue: 'email', statuses: ['approved'] }).map((i) => i.key);
+    add('low', 40);
+    add('high', 90);
+    add('mid', 70);
+    add('none');
+    expect(store.items({ project: 'p' }).find((i) => i.key === 'high')?.priority).toBe(90);
+    approve('low');
+    approve('none');
+    approve('high'); // ahead of everything
+    approve('mid'); // between high and low
+    expect(order()).toEqual(['high', 'mid', 'low', 'none']);
+    store.moveItem(store.items({ project: 'p' }).find((i) => i.key === 'low')?.id as string, 'top');
+    expect(order()).toEqual(['low', 'high', 'mid', 'none']);
+    add('top', 99);
+    approve('top'); // ahead of the first item ranked lower, even one moved by hand
+    expect(order()).toEqual(['top', 'low', 'high', 'mid', 'none']);
+    store.close();
   });
 
   it('saves, updates and deletes sessions', () => {
