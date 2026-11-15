@@ -30,6 +30,7 @@ import {
   type StartedPullRequest,
 } from '../github/pull-requests.js';
 import type { Privileged } from '../privileged/privileged.js';
+import { ReminderError, type ReminderInput, type Reminders } from '../reminders/reminders.js';
 import { describeTool } from '../runner/stream.js';
 import type { JobControl } from '../scheduler/scheduler.js';
 import type { ChatPort, IncomingMessage, Logger, SlackBlock } from '../sessions/manager.js';
@@ -144,6 +145,8 @@ export class Bridge {
   onDecision?: (msg: IncomingMessage) => Promise<void>;
   /** The scheduler, for the `list_jobs` / `run_job` tools in chat turns. */
   jobs?: JobControl;
+  /** For the `set_reminder` / `list_reminders` / `cancel_reminder` tools. */
+  reminders?: Reminders;
 
   private readonly runs = new Map<string, RunContext>();
   private readonly permissions = new Map<string, PendingPermission>();
@@ -180,6 +183,7 @@ export class Bridge {
             TARA_RUN_TOKEN: token,
             TARA_PERMISSION_PROMPTS: ctx.permissionPrompts ? '1' : '0',
             TARA_JOB_TOOLS: ctx.kind === 'chat' && this.jobs ? '1' : '0',
+            TARA_REMINDER_TOOLS: this.reminders ? '1' : '0',
             TARA_GITHUB_TOOLS: this.deps.pullRequests?.has(ctx.project.config.name) ? '1' : '0',
           },
         },
@@ -442,6 +446,35 @@ export class Bridge {
       nextRun: j.nextRun?.toISOString() ?? null,
       lastStatus: j.lastStatus ?? null,
     }));
+  }
+
+  setReminder(token: string | undefined, input: Omit<ReminderInput, 'by'>) {
+    const ctx = this.run(token);
+    return this.withReminders((r) =>
+      r.add(ctx.project.config.name, { ...input, by: ctx.user ?? ctx.jobId ?? 'Claude' }),
+    );
+  }
+
+  listReminders(token: string | undefined) {
+    const ctx = this.run(token);
+    return this.withReminders((r) => r.list(ctx.project.config.name));
+  }
+
+  cancelReminder(token: string | undefined, id: string) {
+    const ctx = this.run(token);
+    const cancelled = this.withReminders((r) => r.cancel(ctx.project.config.name, id));
+    if (!cancelled) throw new BridgeError(404, `No reminder "${id}" still to come; call list_reminders`);
+    return { id, cancelled };
+  }
+
+  private withReminders<T>(fn: (r: Reminders) => T): T {
+    if (!this.reminders) throw new BridgeError(403, 'Reminders are off');
+    try {
+      return fn(this.reminders);
+    } catch (err) {
+      if (err instanceof ReminderError) throw new BridgeError(400, err.message);
+      throw err;
+    }
   }
 
   runJob(token: string | undefined, id: string): { result: string; name?: string } {

@@ -73,9 +73,72 @@ export interface SweptBrowser {
   keepUrls: string[];
 }
 
+/** A run as `Conversations` needs it (runner/activity.ts `Task`). */
+export interface RunInfo {
+  id: string;
+  project: string;
+  thread?: { channel: string; ts: string };
+  startedAt: number;
+  endedAt?: number;
+  status: string;
+}
+
+interface Conversation {
+  project: string;
+  /** When its first turn since it was last idle for `idleMs` started. */
+  start: number;
+  /** Its turns running now (task ids). */
+  running: Set<string>;
+  lastEnd: number;
+}
+
+/**
+ * When each conversation still going began, for the sweeper. A chat is many runs (one per turn, each
+ * a new CLI process) that come back to the tabs of earlier turns, so "the oldest run still going" is
+ * not enough: a tab turn 1 opened would be closed while turn 3 uses it, or between turns. Here the
+ * turns of one Slack thread are one conversation, going while a turn runs and for `idleMs` after the
+ * last one ended; a run without a thread (a job) is a conversation of its own.
+ */
+export class Conversations {
+  private readonly all = new Map<string, Conversation>();
+
+  constructor(private readonly idleMs: number) {}
+
+  /** Records a run's start or end (every activity update; repeats are harmless). */
+  update(run: RunInfo): void {
+    const key = run.thread ? `${run.project}:${run.thread.channel}:${run.thread.ts}` : `run:${run.id}`;
+    let c = this.all.get(key);
+    if (run.status === 'running') {
+      if (!c || (c.running.size === 0 && run.startedAt - c.lastEnd >= this.idleMs)) {
+        c = { project: run.project, start: run.startedAt, running: new Set(), lastEnd: run.startedAt };
+        this.all.set(key, c);
+      }
+      c.running.add(run.id);
+    } else if (c) {
+      c.running.delete(run.id);
+      c.lastEnd = Math.max(c.lastEnd, run.endedAt ?? run.startedAt);
+      if (!run.thread && c.running.size === 0) this.all.delete(key);
+    }
+  }
+
+  /** When the oldest conversation of these projects still going began, if any. */
+  oldest(projects: string[], now: number): number | undefined {
+    let oldest: number | undefined;
+    for (const [key, c] of this.all) {
+      const going = c.running.size > 0 || now - c.lastEnd < this.idleMs;
+      if (!going) {
+        this.all.delete(key);
+        continue;
+      }
+      if (projects.includes(c.project) && (oldest === undefined || c.start < oldest)) oldest = c.start;
+    }
+    return oldest;
+  }
+}
+
 export interface TabSweeperDeps {
   browsers: () => SweptBrowser[];
-  /** When the oldest run (job or chat) of these projects that is still going started, if any. */
+  /** When the oldest conversation (job run, or chat turns in one thread) of these projects still going began, if any. */
   oldestRun: (projects: string[]) => number | undefined;
   now?: () => number;
   log: (message: string) => void;

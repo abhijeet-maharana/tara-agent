@@ -6,6 +6,7 @@ import { readJournal, type ServiceLogs } from './journal.js';
 import type { HealthMonitor } from './monitor.js';
 import { prometheusText } from './prometheus.js';
 import {
+  costBreakdown,
   costByDay,
   groupLogs,
   jobTrends,
@@ -81,6 +82,15 @@ export class Observability {
         this.deps.projects.map((p) => p.config.name),
         timeZone,
       ),
+      costRows: costBreakdown(current, previous).map((r) => ({
+        ...r,
+        name:
+          r.kind === 'job'
+            ? (names.get(`${r.project}:${r.jobId}`) ?? r.jobId ?? 'Job')
+            : r.kind === 'chat'
+              ? 'Chats'
+              : 'Learning (tara upkeep)',
+      })),
       projects: this.deps.projects.map((p) => ({
         name: p.config.name,
         title: p.config.title ?? p.config.name,

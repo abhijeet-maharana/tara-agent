@@ -18,10 +18,11 @@ import { gatherAttention, githubPullRequests } from './http/attention.js';
 import { probeBrowser, projectBrowser } from './http/browser-usage.js';
 import { startHttpServer } from './http/server.js';
 import { Privileged } from './privileged/privileged.js';
+import { Reminders } from './reminders/reminders.js';
 import { Activity, redact } from './runner/activity.js';
 import { runAgy } from './runner/agy.js';
 import { resolveRunAs } from './runner/as-user.js';
-import { TabSweeper } from './runner/browser-tabs.js';
+import { Conversations, TabSweeper } from './runner/browser-tabs.js';
 import { type Runner, runClaude } from './runner/run.js';
 import { sweepScratch } from './runner/workspace.js';
 import { QueueWorker } from './scheduler/queues.js';
@@ -230,9 +231,11 @@ async function serve(configFlag: string | undefined) {
     bridge,
     log,
   });
+  const reminders = new Reminders({ store, chat: slack.chat, projects, timeZone: host.timezone, log });
   if (bridge) {
     bridge.onDecision = (msg) => (manager as SessionManager).handle(msg);
     bridge.jobs = scheduler;
+    bridge.reminders = reminders;
   }
   approvals.onChat = (msg) => (manager as SessionManager).handle(msg);
   approvals.onJob = (project, jobId, r) => scheduler.resume(project, jobId, r);
@@ -365,6 +368,7 @@ async function serve(configFlag: string | undefined) {
         store,
         bridge,
         approvals,
+        reminders,
         adminToken: process.env.TARA_ADMIN_TOKEN || undefined,
         readAs: runAs?.user,
         continueThread: (msg) => (manager as SessionManager).handle(msg),
@@ -398,6 +402,7 @@ async function serve(configFlag: string | undefined) {
   await slack.start();
   scheduler.start();
   queues.start();
+  reminders.start();
   // After Slack and the scheduler, so the first checks see them running.
   health?.start();
   // The machine every 5 minutes, for the Trends view's charts.
@@ -438,10 +443,16 @@ async function serve(configFlag: string | undefined) {
   setInterval(prune, 86_400_000).unref();
 
   // Stale browser tabs: runs share each Chrome without locks and close their own tabs; this closes
-  // what is left (runner/browser-tabs.ts), never a tab a run still going may own or a kept one.
+  // what is left (runner/browser-tabs.ts), never a tab a conversation still going may own or a kept one.
   const sameUrl = (a: string, b: string) =>
     a.replace(/^ws:/, 'http:').replace(/\/$/, '').replace('localhost', '127.0.0.1') ===
     b.replace(/^ws:/, 'http:').replace(/\/$/, '').replace('localhost', '127.0.0.1');
+  // A chat's tabs stay its own across turns and between them, until it is idle for staleMinutes.
+  const conversations = new Conversations(Math.max(0, ...host.browsers.map((b) => b.staleMinutes)) * 60_000);
+  for (const t of activity.tasks()) conversations.update(t);
+  activity.subscribe((e) => {
+    if (e.type === 'task') conversations.update(e.task);
+  });
   const tabSweeper = new TabSweeper({
     browsers: () =>
       host.browsers
@@ -458,13 +469,7 @@ async function serve(configFlag: string | undefined) {
             keepUrls: using.flatMap((p) => (p.config.keepTabsUrl ? [p.config.keepTabsUrl] : [])),
           };
         }),
-    oldestRun: (names) => {
-      const starts = activity
-        .tasks()
-        .filter((t) => t.status === 'running' && names.includes(t.project))
-        .map((t) => t.startedAt);
-      return starts.length ? Math.min(...starts) : undefined;
-    },
+    oldestRun: (names) => conversations.oldest(names, Date.now()),
     log: (m) => log.info(m),
   });
   const sweepTabs = () =>
@@ -486,6 +491,7 @@ async function serve(configFlag: string | undefined) {
       process.exit(0);
     }, 8_000);
     queues.stop();
+    reminders.stop();
     await scheduler.stop().catch(() => {});
     clearTimeout(exit);
     setTimeout(() => {

@@ -176,6 +176,46 @@ export function jobTrends(runs: RunStat[], now: number): JobTrend[] {
   });
 }
 
+export interface CostRow {
+  project: string;
+  /** A schedule's runs, a project's chats, or tara's own learning turns. */
+  kind: RunStat['kind'];
+  /** Set for a job row. */
+  jobId?: string;
+  runs: number;
+  cost: number;
+  /** The same row's cost over the period before (0 when it didn't run then). */
+  previousCost: number;
+}
+
+/**
+ * Where the cost goes: one row per job, plus one for each project's chats and one for its learning
+ * turns, most expensive first. Rows that cost nothing in either period are left out.
+ */
+export function costBreakdown(current: RunStat[], previous: RunStat[]): CostRow[] {
+  const key = (r: RunStat) => `${r.project}\u0000${r.kind}\u0000${r.kind === 'job' ? (r.jobId ?? '') : ''}`;
+  const by = new Map<string, CostRow>();
+  const row = (r: RunStat) => {
+    const k = key(r);
+    let x = by.get(k);
+    if (!x) {
+      x = { project: r.project, kind: r.kind, runs: 0, cost: 0, previousCost: 0 };
+      if (r.kind === 'job' && r.jobId) x.jobId = r.jobId;
+      by.set(k, x);
+    }
+    return x;
+  };
+  for (const r of current) {
+    const x = row(r);
+    x.runs++;
+    x.cost += r.costUsd ?? 0;
+  }
+  for (const r of previous) row(r).previousCost += r.costUsd ?? 0;
+  return [...by.values()]
+    .filter((x) => x.cost > 0 || x.previousCost > 0)
+    .sort((a, b) => b.cost - a.cost || b.previousCost - a.previousCost);
+}
+
 export interface Segment {
   from: number;
   to: number;

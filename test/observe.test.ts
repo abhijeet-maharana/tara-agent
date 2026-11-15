@@ -6,6 +6,7 @@ import { HealthMonitor } from '../src/health/monitor.js';
 import { Observability } from '../src/health/observability.js';
 import { prometheusText } from '../src/health/prometheus.js';
 import {
+  costBreakdown,
   costByDay,
   groupLogs,
   jobTrends,
@@ -95,6 +96,30 @@ describe('trends', () => {
     const [t] = jobTrends(runs, NOW);
     expect(t).toMatchObject({ project: 'shop', jobId: 'sync', runs: 6, failed: 1, quiet: 1, slower: 3 });
     expect(t?.cost).toBeCloseTo(0.6);
+  });
+
+  it('ranks where the cost goes: per job, per project chats and learning, against the period before', () => {
+    const before = NOW - 8 * DAY;
+    const rows = costBreakdown(
+      [
+        run({ costUsd: 0.5 }),
+        run({ costUsd: 1.5 }),
+        run({ jobId: 'digest', costUsd: 3 }),
+        run({ kind: 'chat', jobId: undefined, costUsd: 0.7 }),
+        run({ kind: 'chat', project: 'blog', costUsd: 0.2 }),
+        run({ kind: 'learn', costUsd: 0.1 }),
+        run({ jobId: 'free' }),
+      ],
+      [run({ costUsd: 1, startedAt: before }), run({ jobId: 'gone', costUsd: 0.4, startedAt: before })],
+    );
+    expect(rows.map((r) => [r.project, r.kind, r.jobId, r.runs, r.cost, r.previousCost])).toEqual([
+      ['shop', 'job', 'digest', 1, 3, 0],
+      ['shop', 'job', 'sync', 2, 2, 1],
+      ['shop', 'chat', undefined, 1, 0.7, 0],
+      ['blog', 'chat', undefined, 1, 0.2, 0],
+      ['shop', 'learn', undefined, 1, 0.1, 0],
+      ['shop', 'job', 'gone', 0, 0, 0.4],
+    ]);
   });
 
   it('turns health changes into uptime strips, leaving checks that were always fine out', () => {
@@ -319,6 +344,10 @@ describe('Trends, Logs and /metrics in the dashboard', () => {
       expect(trends).toMatch(/data-tip="[^"]*Failed: 1/);
       expect(trends).toContain('<summary>Table</summary>');
       expect(trends).toContain('Memory used');
+      expect(trends).toContain('Where the cost goes');
+      expect(trends).toMatch(
+        /Payments Sync<\/a><small>Shop<\/small><\/td><td>1<\/td><td>\$0\.40<\/td><td>\$0\.40<\/td><td>100%<\/td><td>new/,
+      );
       expect(trends).toMatch(/class="chip on" href="\/health\/trends\?days=7"/);
 
       const logs = await fetch(`${base}/health/logs`, { headers: { accept: 'text/html', ...auth } }).then(

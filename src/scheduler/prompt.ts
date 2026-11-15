@@ -22,15 +22,87 @@ export const STEP_SYSTEM_PROMPT = `You are one step of a scheduled job, running 
  * The follow-up turn after a run (`selfImprove`). `reasons` say what went wrong; empty means the run
  * was clean and only gets a look back for what it had to figure out.
  */
-export function learnPrompt(reasons: string[]): string {
+/** What one session (or a whole job run) used, for a learning turn to weigh. */
+export interface RunUse {
+  /** At API prices; unknown on some CLIs. */
+  costUsd?: number;
+  /** Input tokens including cache reads and writes. */
+  inputTokens: number;
+  outputTokens: number;
+  toolCalls: number;
+  durationMs: number;
+}
+
+/** The numbers a learning turn sees, so it can make the next run cheaper as well as more reliable. */
+export interface UsageNote {
+  /** The session being looked back at (a step's, or the main one). */
+  session: RunUse;
+  /** The whole job run (its steps and the main session) when there were steps. */
+  run?: RunUse;
+  /** The job's usual whole run: the median of its recent scheduled runs. */
+  typical?: { costUsd: number; durationMs: number; runs: number };
+}
+
+/** A run this many times its job's usual cost is called out as expensive. */
+export const EXPENSIVE_RUN = 1.5;
+
+const money = (usd: number) => (usd >= 10 ? `$${Math.round(usd)}` : `$${usd.toFixed(2)}`);
+const tokens = (n: number) =>
+  n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1_000 ? `${Math.round(n / 1_000)}k` : String(n);
+const minutes = (ms: number) => `${Math.max(1, Math.round(ms / 60_000))} min`;
+const describeUse = (u: RunUse) =>
+  [
+    u.costUsd !== undefined ? `${money(u.costUsd)} at API prices` : undefined,
+    `${tokens(u.inputTokens)} input tokens (most of it re-read from cache) and ${tokens(u.outputTokens)} output`,
+    `${u.toolCalls} tool ${u.toolCalls === 1 ? 'call' : 'calls'}`,
+    minutes(u.durationMs),
+  ]
+    .filter(Boolean)
+    .join(', ');
+
+/** The usage paragraph of a learning prompt: what the run used, against the job's usual. */
+export function usageParagraph(note: UsageNote, step?: string): string {
+  const lines = [`What ${step ? 'this step' : 'this session'} used: ${describeUse(note.session)}.`];
+  const whole = note.run;
+  if (whole) {
+    const share =
+      step && whole.costUsd && note.session.costUsd !== undefined
+        ? ` This step was ${Math.round((note.session.costUsd / whole.costUsd) * 100)}% of its cost.`
+        : '';
+    lines.push(`The whole job run (all its steps and the report): ${describeUse(whole)}.${share}`);
+  }
+  const typical = note.typical;
+  const cost = (whole ?? note.session).costUsd;
+  if (typical) {
+    lines.push(
+      `This job's usual run: ${money(typical.costUsd)} and ${minutes(typical.durationMs)} (median of the last ${typical.runs} runs).`,
+    );
+  }
+  const ratio = typical && cost !== undefined && typical.costUsd >= 0.05 ? cost / typical.costUsd : undefined;
+  lines.push(
+    ratio !== undefined && ratio >= EXPENSIVE_RUN
+      ? `This run cost ${ratio.toFixed(1)}× the usual. Find what made it expensive${step ? ' in this step' : ''} (reading more than the task needed, one file or screenshot per turn where several fit in one, retries, a detour) and write down the cheaper way.`
+      : "If you see how to get the same result with fewer turns, tool calls or tokens (several reads in one turn, a step that wasn't needed, a script for repetitive work), write that down too.",
+  );
+  lines.push('Never save cost by checking less: coverage and correctness come first.');
+  return lines.join(' ');
+}
+
+export function learnPrompt(reasons: string[], opts: { step?: string; usage?: UsageNote } = {}): string {
+  const { step, usage } = opts;
   const opening = reasons.length
-    ? `This run had trouble: ${reasons.join('; ')}.
+    ? `This ${step ? 'step' : 'run'} had trouble: ${reasons.join('; ')}.
 
 Before you stop: if a change to the instructions you followed would prevent this next time, make it now with the edit tools.`
-    : `This run is done. Before you stop, look back at it once: did you hit a wrong selector, URL, command or assumption, retry something, find a workaround, take a slow path you would skip next time, or learn a fact about this project the instructions didn't give you?
+    : `This ${step ? 'step' : 'run'} is done. Before you stop, look back at it once: did you hit a wrong selector, URL, command or assumption, retry something, find a workaround, take a slow path you would skip next time, or learn a fact about this project the instructions didn't give you?
 
-Only if writing that down would make the next run faster or more reliable, make the change now with the edit tools. Don't rewrite what already worked, and don't add general advice: only what this run actually discovered.`;
-  return `${opening} That means the skill this run used (its SKILL.md, or a script in its folder that the skill runs) or another instruction (.md) file it used. Keep it small and specific: a corrected selector or URL, a missing step, a known trap and how to get past it, a fixed bug in a script. A new script goes in the skill's \`scripts/\` folder, with SKILL.md saying when and how to run it. If the skill has a version in its front matter, bump it.
+Only if writing that down would make the next run faster, cheaper or more reliable, make the change now with the edit tools. Don't rewrite what already worked, and don't add general advice: only what this run actually discovered.`;
+  const where = step
+    ? `That means only this step's part of the skill (its "### Step: ${step}" part, or "### Every step" when it applies to every step), or a script in the skill's folder that this step runs.`
+    : 'That means the skill this run used (its SKILL.md, or a script in its folder that the skill runs) or another instruction (.md) file it used.';
+  return `${opening}${usage ? `\n\n${usageParagraph(usage, step)}` : ''}
+
+${where} Keep it small and specific: a corrected selector or URL, a missing step, a known trap and how to get past it, a fixed bug in a script, a cheaper way to do the same work. A new script goes in the skill's \`scripts/\` folder, with SKILL.md saying when and how to run it. If the skill has a version in its front matter, bump it.
 
 Do not repeat the task, open the browser or call other services. Do not create new skills.
 

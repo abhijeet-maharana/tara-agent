@@ -22,14 +22,14 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `jobConcurrency` | `1` | Max scheduled jobs at once |
 | `claude.bin` | `claude` | CLI path |
 | `claude.chatTimeoutMinutes` | `20` | Time limit per chat turn |
-| `claude.effort` | model's default | `--effort` for every run: `low`, `medium`, `high` or `xhigh` |
+| `claude.effort` | model's default | `--effort` for every run: `low`, `medium`, `high`, `xhigh` or `max`. A job's own `effort` wins |
 | `claude.runAs` | none | Run Claude and pre-run scripts as this OS user through sudo ([split users](security.md#split-users-approvals)) |
 | `agy.bin` | `agy` | Antigravity CLI path, for [agy jobs](#agy-jobs). Under `claude.runAs` the run user's install, e.g. `/home/tara/.local/bin/agy` |
 | `stateDir` | `~/.local/state/tara-agent` | SQLite database, and default home of scratch and job data folders |
 | `scratchDays` | `3` | Days after its last use that a session's scratch folder is deleted (see [Files](#files)) |
 | `retentionDays` | `90` | Days of history kept in the state database (min 14). Runs, slot claims and sessions not used since are deleted daily; each job's latest run and all approval cards are kept |
 | `streaming` | `true` | Stream replies as a live task card and text. Needs the Slack app's "Agents & AI Apps" feature and the `assistant:write` scope; without them, tara-agent falls back to one edited status message |
-| `browsers` | `[{lock: chrome, cdpUrl: http://127.0.0.1:9222, closeTabs: true, staleMinutes: 30}]` | The shared Chromes runs drive (e.g. one per signed-in identity: its own `--user-data-dir` and `--remote-debugging-port`). `lock` is its name on the Browsers page. Runs share a browser without locks ([shared browsers](#shared-browsers)); with `closeTabs`, tara closes stale tabs every 5 minutes: open over `staleMinutes` and since before every run still going in that browser started, never a kept tab (project `keepTabsUrl`) or the last tab. Point the project's Chrome MCP server (`--browserUrl`) at the same `cdpUrl` |
+| `browsers` | `[{lock: chrome, cdpUrl: http://127.0.0.1:9222, closeTabs: true, staleMinutes: 30}]` | The shared Chromes runs drive (e.g. one per signed-in identity: its own `--user-data-dir` and `--remote-debugging-port`). `lock` is its name on the Browsers page. Runs share a browser without locks ([shared browsers](#shared-browsers)); with `closeTabs`, tara closes stale tabs every 5 minutes: open over `staleMinutes` and since before every conversation still going in that browser began (a job run, or a chat thread: going while a turn runs and for `staleMinutes` after its last turn), never a kept tab (project `keepTabsUrl`) or the last tab. Point the project's Chrome MCP server (`--browserUrl`) at the same `cdpUrl` |
 | `voice` | unset | Speech-to-text for Slack voice notes that Slack didn't transcribe (it skips short clips and some languages): `url` (an OpenAI-compatible chat completions endpoint whose models take `input_audio`, e.g. Gemini) and `models` (tried in order). Key from `TARA_VOICE_API_KEY`. Unset = Slack's transcript only, and voice notes without one get a "please type it" reply |
 | `statusIntervalSeconds` | `5` | Min gap between status edits in the fallback mode |
 | `catchUpHours` | `6` | After downtime, run a job's latest missed slot if it is at most this old (`0` = never) |
@@ -70,6 +70,8 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `approvals.validateUrl` | none | Asked for extra checks on every proposed or edited draft (see [Queues](#queues)) |
 | `approvals.hookUrl` | none | Told when a draft is decided or finished |
 | `approvals.expireDays` | `7` | Pending drafts expire after this many days |
+| `reminders.hookUrl` | none | Where a reminder set with `notify` also goes: POST `{id, text}` (e.g. the project's endpoint that posts to a WhatsApp group). Without it, reminders are Slack only and `notify` is refused |
+| `reminders.label` | `hook` | What the hook sends to, as the Reminders page shows it (e.g. `Ops WhatsApp`) |
 
 ## Jobs
 
@@ -88,7 +90,7 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 
 **A job is its skill.** `skill` names the one skill that holds the job's instructions; it is also the job's id, and its name is the skill's words capitalised (`order-sla-report` → `Run Order SLA Report` with project `words` `{"sla": "SLA"}`). One job per skill in a project. Other skills it needs are named in its skill, which loads them. There are no locks: runs share a browser, each on its own tabs ([shared browsers](#shared-browsers)).
 
-**`defaults`** (optional) sets `harness`, `model` or `timeoutMinutes` for every job in the file, so a value most jobs share is written once. A job's own value wins. Other keys are refused. The defaults in the table below apply when neither the job nor `defaults` sets the key.
+**`defaults`** (optional) sets `harness`, `model`, `effort` or `timeoutMinutes` for every job in the file, so a value most jobs share is written once. A job's own value wins. Other keys are refused. The defaults in the table below apply when neither the job nor `defaults` sets the key.
 
 *Older form, still read:* `id`, `name`, `skills` (a list, the first holding a `## Job: <id>` section) and `locks` instead of `skill`. A job with `skill` refuses those four keys.
 
@@ -99,6 +101,7 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `tz` | file-level `tz`, else host `timezone` | Timezone of `cron` |
 | `harness` | `claude` | The CLI the job runs on: `claude`, or `agy` ([agy jobs](#agy-jobs)) |
 | `model` | `sonnet` | Model for this job (for `agy`, an id from `agy models`, e.g. `gemini-3.8-flash-high`) |
+| `effort` | host `claude.effort` | Claude jobs: `--effort` for the run, its steps, its learning turn and replies in its thread (`low` … `max`), e.g. `max` for a tax filing, `low` for a short summary. A step may set its own |
 | `agyPermissions` | none | `agy` jobs only: `{allow, deny, ask}` rules ([agy jobs](#agy-jobs)) |
 | `handoff` | none | `{harness, model}`: an approved card continues in a fresh session on this harness ([handoff](#handoff)) |
 | `mcpServers` | none | The job's own stdio MCP servers by name (`{command, args, env}`), for every session of the job ([steps and MCP servers](#steps-and-mcp-servers)) |
@@ -204,8 +207,8 @@ Test the cart and checkout.
 ```
 
 - **`mcpServers`**: added next to tara's own server in every session of the job (steps and main), on both harnesses. `${VAR}` in `command`, `args` and `env` is replaced from the run's environment (`TARA_SCRATCH`, `TARA_JOB_DATA`, the job's `env`). Under agy the tools are named `tara_<name>` (permission rule `mcp(tara_<name>/*)`).
-- **`steps`**: each runs in a fresh session of the job's harness and model, before the main prompt. It is told to load the job's skill (or the step's own `skill`) and do only its `### Step: <name>` part (plus `### Every step`), then gets the folders note. Steps get the job's MCP servers but no Slack tools, and share the run's `$TARA_SCRATCH`, so files they save there can be sent by the main session. `timeoutMinutes` and `model` default to the job's (same harness); agy steps can have their own `agyPermissions`. The status line shows `step i/n`.
-- **Main prompt**: gets every step's reply under `## Step Output` (`### <name>`, marked `(timeout)` or `(error)` if it didn't finish; the next step still runs). Steps don't run again when the run continues after a decision. Their tokens and tool calls count towards the run.
+- **`steps`**: each runs in a fresh session of the job's harness and model, before the main prompt. It is told to load the job's skill (or the step's own `skill`) and do only its `### Step: <name>` part (plus `### Every step`), then gets the folders note. Steps get the job's MCP servers but no Slack tools, and share the run's `$TARA_SCRATCH`, so files they save there can be sent by the main session. `timeoutMinutes`, `model` and `effort` default to the job's (same harness); agy steps can have their own `agyPermissions`. The status line shows `step i/n`.
+- **Main prompt**: gets every step's reply under `## Step Output` (`### <name>`, marked `(timeout)` or `(error)` if it didn't finish; the next step still runs). Steps don't run again when the run continues after a decision. Their cost, tokens and tool calls count towards the run (the Jobs page and Trends include them).
 
 ### Self-improvement
 
@@ -217,10 +220,12 @@ After a job run or chat turn, tara-agent resumes the same session once and asks 
 | `"trouble"` | Only after a run that failed, timed out, errored, or had 2+ tool calls error |
 | `"off"` (or `false`) | Never |
 
+- **Steps learn too.** Each Claude step's session gets its own turn under the same rule, told to change only its `### Step: <name>` part (or `### Every step`) and the scripts that step runs. Its note reads `🔧 <job> · step "<name>" learned from this run`.
+- **It sees what the run used**: the session's cost at API prices, tokens, tool calls and minutes, the whole run's when there were steps (and a step's share of it), and the job's usual run: the median of the first run in each thread over the last 14 days, from 3 such runs. A run at 1.5× the usual or more is called out, and Claude is asked what made it expensive; otherwise it is asked for a cheaper path only when it sees one. Coverage and correctness always come first. Runs after a card or for queue items aren't compared.
 - Usage-limit and stopped runs, agy runs, and replies that used no tool never get one.
 - Claude replies `NONE` when nothing should change.
 - A change is posted in the thread (`🔧 … learned from this run`).
-- Cost: one extra short turn per run, on the run's cached prompt. For jobs that run every few minutes, set `"selfImprove": "trouble"` on the job.
+- Cost: one extra short turn per session, on its cached prompt (a job with 3 steps gets up to 4). For jobs that run every few minutes, set `"selfImprove": "trouble"` on the job.
 
 ## Files
 
@@ -238,7 +243,7 @@ Each session gets its own folders, passed as environment variables and as absolu
 
 ## Shared browsers
 
-Jobs and chats use a project's Chrome (its `.mcp.json` `--browserUrl`) at the same time, with no locks. Each Claude run there gets a hook on that MCP server (`src/hooks/own-tabs.ts`, through `--settings`): page tools are refused until the run opens its own tab with `new_page`, and `select_page`/`close_page` work only on tabs it opened. A later turn of the same session gets its tabs back by address (`list_pages`, then `select_page`). Runs close their own tabs; tara closes stale ones (host `browsers`). A page a person must finish, such as a form stopped at a captcha, is listed by the project's `keepTabsUrl` and never closed. Scripts that drive the same Chrome over CDP should follow the same rules: open their own tab, never reuse another, close only theirs.
+Jobs and chats use a project's Chrome (its `.mcp.json` `--browserUrl`) at the same time, with no locks. Each Claude run there gets a hook on that MCP server (`src/hooks/own-tabs.ts`, through `--settings`): page tools are refused until the run opens its own tab with `new_page`, and `select_page`/`close_page` work only on tabs it opened. A later turn of the same session gets its tabs back by address (`list_pages`, then `select_page`). Runs close their own tabs; tara closes stale ones (host `browsers`), but not a chat thread's tabs while that chat is still going. A page a person must finish, such as a form stopped at a captcha, is listed by the project's `keepTabsUrl` and never closed. Scripts that drive the same Chrome over CDP should follow the same rules: open their own tab, never reuse another, close only theirs.
 
 ## Approval tools
 
@@ -252,6 +257,7 @@ Every run gets tara-agent's own MCP server alongside the repo's `.mcp.json` serv
 | `permission` | In chat, when Claude wants a tool not in `allowedTools`, the thread gets **Allow / Deny** buttons (denied after 10 minutes). Scheduled jobs never wait on this |
 | `propose_item`, `list_items`, `finish_item` | Drafts that go out later (a message, email, post): each becomes a card on the Approvals page and, once approved, runs through a [queue](#queues) |
 | `withdraw_card` | Closes any waiting card of the run's project, no approval needed (the person did it themselves, it no longer applies, a duplicate, or a newer card replaces it). It ends as cancelled with the reason; another project's cards are refused |
+| `set_reminder`, `list_reminders`, `cancel_reminder` | A reminder in the channel at a time (`at`, ISO with offset) or on a schedule (`cron`, host timezone). tara-agent posts it itself, no run: a `Run Reminder` thread mentioning the project `owner`, late ones marked late, a missed repeat posted once. `notify` also sends it to the project's `reminders.hookUrl`, only when the person asks |
 | `list_jobs`, `run_job` | Chat turns only: lists the channel's jobs (id, next run, last status), or starts one now in its own `Run` thread |
 | `start_pull_request`, `open_pull_request` | Only for host `github` projects: a workspace copy of the base branch (or of the PR's branch), then a commit pushed to `<agentName>/<name>` and the PR opened or updated. See [pull requests](security.md#pull-requests) |
 | `read_ci_job` | Only for host `github` projects, read-only: a GitHub Actions job (URL or id) of the project's repo: workflow, branch, commit, conclusion, failed steps, the lines around the first `##[error]` and the last 300 log lines. Other repos are refused. See [CI jobs](security.md#ci-jobs) |
@@ -357,6 +363,9 @@ For scripts and dashboards on the same host (`127.0.0.1:4100` by default).
 | `GET /runs?limit=30` | Latest runs of every project |
 | `GET /runs/<id>` | One run, with reply and script output |
 | `POST /reload` | Re-read every `jobs.json` now |
+| `GET /reminders?project=<name>` | Reminders still to come, soonest first |
+| `POST /reminders/<project>` | Add one: `{text, cron? \| at?, notify?, by?}` |
+| `POST /reminders/<project>/<id>/cancel` | Stop one |
 | `GET /schedule?day=YYYY-MM-DD&project=<name>` | One day's runs, overlaps and free windows |
 | `GET /schedule/conflicts?days=7` | Overlapping and back-to-back jobs |
 

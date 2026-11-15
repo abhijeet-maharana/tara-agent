@@ -75,6 +75,8 @@ function setup(opts: {
   browsers?: HostConfig['browsers'];
   /** Called inside each model run, e.g. to open a browser tab. */
   during?: () => Promise<void>;
+  /** The cost each model run reports, in call order (the session's running total, as the CLI does). */
+  costs?: number[];
 }) {
   const chat = new FakeChat('ts');
   chat.stream = opts.stream;
@@ -120,7 +122,8 @@ function setup(opts: {
       o.onEvent?.({ kind: 'text_start' });
       o.onEvent?.({ kind: 'text', text: reply });
       if (calls.length === 1 && opts.firstStatus) return { ...ok(''), status: opts.firstStatus };
-      return ok(reply);
+      const costUsd = opts.costs?.[calls.length - 1];
+      return costUsd === undefined ? ok(reply) : { ...ok(reply), costUsd };
     },
   });
   return { chat, store, calls, callTimes, scheduler, project };
@@ -200,7 +203,7 @@ describe('Scheduler', () => {
     expect(chat.log[0]).toBe('post top ts1: Run SLA Report');
     expect(chat.log[1]).toBe('post ts1 ts2: ⏳ *SLA Report* (run by <@U1>)');
     expect(chat.log.at(-2)).toBe(
-      'update ts2: ✅ *SLA Report* (run by <@U1>) · 2s · 2 steps · claude-haiku-5-5\nHeadline',
+      'update ts2: ✅ *SLA Report* (run by <@U1>) · 2s · 2 steps · claude-haiku-5-5',
     );
     expect(chat.log.at(-1)).toBe('post ts1 ts3: Headline\n---\nDetails here');
     // Replies in the job thread resume the job's session.
@@ -343,6 +346,22 @@ describe('Scheduler', () => {
     await scheduler.stop();
   });
 
+  it("runs a job, its steps and its learning turn at the job's own effort", async () => {
+    const { calls, scheduler } = setup({
+      jobs: [{ ...baseJob, effort: 'max', steps: [{ name: 'Home' }, { name: 'Cart', effort: 'low' }] }],
+      // A failed run gets a learning turn.
+      replies: ['home: fine', 'cart: fine', '❌ Broken', 'No lesson'],
+      selfImprove: 'trouble',
+    });
+    scheduler.start();
+    scheduler.trigger('shop', 'sla', 'U1');
+    await scheduler.idle();
+    const effortOf = (c?: RunOptions) => c?.args[c.args.indexOf('--effort') + 1];
+    expect(calls.map(effortOf)).toEqual(['max', 'low', 'max', 'max']);
+    expect(scheduler.effort('shop', 'sla')).toBe('max');
+    await scheduler.stop();
+  });
+
   it('keeps its own Run thread and session when the model replies nothing', async () => {
     const { chat, scheduler, store } = setup({ jobs: [baseJob], replies: [''] });
     scheduler.start();
@@ -363,9 +382,11 @@ describe('Scheduler', () => {
     scheduler.start();
     scheduler.trigger('shop', 'sla', 'U1');
     await scheduler.idle();
-    expect(
-      chat.log.some((l) => l.startsWith('update ts2: ❌ *SLA Report*') && l.endsWith('Portal login expired')),
-    ).toBe(true);
+    expect(chat.log.some((l) => /^update ts2: ❌ \*SLA Report\* .*claude-haiku-5-5$/.test(l))).toBe(true);
+    // The reason is in Claude's reply, posted once in the thread (not repeated on the status line).
+    expect(chat.log.filter((l) => l.includes('Portal login expired'))).toEqual([
+      'post ts1 ts3: ❌ Portal login expired',
+    ]);
     expect(scheduler.list('shop')[0]?.lastStatus).toBe('failed');
     await scheduler.stop();
   });
@@ -463,6 +484,89 @@ describe('Scheduler', () => {
       expect(calls).toHaveLength(2);
       // A silent run keeps its thread, so the lesson's note goes there.
       expect(chat.log.some((l) => l.startsWith('post ts1') && l.includes('🔧'))).toBe(true);
+      await scheduler.stop();
+    });
+
+    it("gives each step's session its own learning turn, scoped to that step", async () => {
+      const { chat, calls, scheduler } = setup({
+        jobs: [{ ...baseJob, steps: [{ name: 'Home' }, { name: 'Cart' }] }],
+        selfImprove: 'always',
+        replies: [
+          'home: fine',
+          'cart: fine',
+          'Headline\n---\nDone',
+          'NONE',
+          'SKILL.md: read the shots 6 at a time',
+          'NONE',
+        ],
+      });
+      scheduler.start();
+      scheduler.trigger('shop', 'sla', 'U1');
+      await scheduler.idle();
+      expect(calls).toHaveLength(6);
+      const [home, , main, mainLearn, homeLearn, cartLearn] = calls as RunOptions[];
+      expect(mainLearn?.prompt).toContain('This run is done.');
+      expect(mainLearn?.systemPrompt).toBe(main?.systemPrompt);
+      expect(homeLearn?.prompt).toContain('This step is done.');
+      expect(homeLearn?.prompt).toContain('only this step\'s part of the skill (its "### Step: Home" part');
+      expect(homeLearn?.args).toEqual(expect.arrayContaining(['--resume', 'sid']));
+      // Same system prompt as the step, so its cached prompt is reused.
+      expect(homeLearn?.systemPrompt).toBe(home?.systemPrompt);
+      expect(cartLearn?.prompt).toContain('"### Step: Cart"');
+      expect(chat.log.at(-1)).toBe(
+        'post ts1 ts4: 🔧 *SLA Report* · step "Home" learned from this run:\nSKILL.md: read the shots 6 at a time',
+      );
+      await scheduler.stop();
+    });
+
+    it("counts the steps' cost in the job's run and shows the run's numbers to the learning turn", async () => {
+      const { calls, scheduler, store } = setup({
+        jobs: [{ ...baseJob, steps: [{ name: 'Home' }, { name: 'Cart' }] }],
+        selfImprove: 'trouble',
+        // Home, Cart, the main session, then the main session's learning turn.
+        costs: [0.5, 0.25, 1, 1.1],
+        replies: ['home: fine', 'cart: fine', '❌ Broken', 'NONE'],
+      });
+      scheduler.start();
+      scheduler.trigger('shop', 'sla', 'U1');
+      await scheduler.idle();
+      expect(store.jobRuns('shop', 'sla', 10).map((r) => r.costUsd)).toEqual([1.75]);
+      const learn = calls[3] as RunOptions;
+      expect(learn.prompt).toContain('What this session used: $1.00 at API prices');
+      expect(learn.prompt).toContain('The whole job run (all its steps and the report): $1.75 at API prices');
+      expect(learn.prompt).toContain('Never save cost by checking less');
+      // The learning turn is stored with its own share, not the session's running total.
+      expect(store.runsSince(0).find((r) => r.kind === 'learn')?.costUsd).toBeCloseTo(0.1);
+      await scheduler.stop();
+    });
+
+    it("calls out a run that cost well over the job's usual", async () => {
+      const store = new Store(':memory:');
+      const now = Date.now();
+      for (const [i, cost] of [0.5, 0.4, 0.6].entries())
+        store.recordRun({
+          kind: 'job',
+          project: 'shop',
+          jobId: 'sla',
+          threadKey: `C1:old${i}`,
+          startedAt: now - (i + 1) * 86_400_000,
+          endedAt: now - (i + 1) * 86_400_000 + 600_000,
+          status: 'ok',
+          costUsd: cost,
+        });
+      const { calls, scheduler } = setup({
+        jobs: [baseJob],
+        store,
+        selfImprove: 'always',
+        costs: [2],
+        replies: ['Headline\n---\nDone', 'NONE'],
+      });
+      scheduler.start();
+      scheduler.trigger('shop', 'sla', 'U1');
+      await scheduler.idle();
+      const learn = calls[1] as RunOptions;
+      expect(learn.prompt).toContain("This job's usual run: $0.50 and 10 min (median of the last 3 runs).");
+      expect(learn.prompt).toContain('This run cost 4.0× the usual. Find what made it expensive');
       await scheduler.stop();
     });
 
@@ -764,7 +868,7 @@ describe('job streaming', () => {
     await scheduler.stop();
   });
 
-  it('puts even a headline-only reply in the thread, as well as in the status line', async () => {
+  it('puts a one-line reply in the thread once: the status line keeps only the outcome, the step list the numbers', async () => {
     const stream = new FakeStream();
     const { chat, scheduler } = setup({
       jobs: [baseJob],
@@ -774,12 +878,10 @@ describe('job streaming', () => {
     scheduler.start();
     scheduler.trigger('shop', 'sla', 'U1');
     await scheduler.idle();
-    expect(
-      chat.log.some(
-        (l) => l.startsWith('update ts2: ✅ *SLA Report*') && l.endsWith('All 12 orders shipped on time.'),
-      ),
-    ).toBe(true);
-    // The thread always has Claude's exact reply, so a run can be checked from Slack.
+    // Streamed: just "✅ <job>" on the status line; the time, steps and model are on the step list.
+    expect(chat.updates.at(-1)?.text).toBe('✅ *SLA Report* (run by <@U1>)');
+    expect(chat.log.some((l) => l.includes('All 12 orders shipped on time.'))).toBe(false);
+    // The thread has Claude's exact reply once, so a run can be checked from Slack.
     expect(stream.text()).toBe('All 12 orders shipped on time.');
     expect(stream.state()).toEqual({
       title: '✅ Done · 2s · 2 steps · claude-haiku-5-5',
@@ -897,7 +999,7 @@ describe('scheduled runs through Slack', () => {
     expect(chat.log).toEqual(['post top ts1: Run SLA Report']);
     await pickUp(scheduler, chat);
     expect(calls).toHaveLength(1);
-    expect(chat.updates.at(-1)?.text).toMatch(/^✅ \*SLA Report\* \(catch-up\) · .*\nHeadline$/);
+    expect(chat.updates.at(-1)?.text).toMatch(/^✅ \*SLA Report\* \(catch-up\) · [^\n]*$/);
     expect(chat.log.at(-1)).toBe('post ts1 ts3: Headline\n---\nDetails here');
     expect(chat.posts.filter((p) => p.thread === '')).toHaveLength(1); // nothing else top-level
     expect(store.getSession('C1:ts1')).toBeDefined();

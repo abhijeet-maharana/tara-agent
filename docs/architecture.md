@@ -28,13 +28,14 @@ tara-agent is one Node process per host. It never calls the Anthropic API: every
 | `src/sessions/threads.ts` | One run at a time per Slack thread, shared by chat turns and jobs: replies wait for the run, "stop" ends it |
 | `src/scheduler/` | Job timing (croner), slot claims, catch-up, locks, job `steps` (`steps.ts`), job delivery |
 | `src/bridge/bridge.ts` | Per-run MCP config and token, approval buttons, permission prompts, file uploads |
-| `src/mcp/server.ts` | The stdio MCP server Claude starts: `request_approval`, `request_privileged`, `send_file`, `permission`, items and tasks |
+| `src/mcp/server.ts` | The stdio MCP server Claude starts: `request_approval`, `request_privileged`, `send_file`, `permission`, items, jobs and reminders |
 | `src/privileged/` | Root actions through the root-owned helper `deploy/tara-priv.mjs` (list, plan, run) |
 | `src/http/server.ts` | Local API for other tools, plus `/internal/*` for the MCP server |
 | `src/code/repo.ts`, `src/http/code.ts` | The Code page: read-only git status, diffs and files of each repo, through a private index copy ([code-view.md](code-view.md)) |
 | `src/health/`, `src/http/health.ts`, `src/http/observe.ts` | The Health page. Now: checks of tara-agent, each project's jobs and each project's `healthUrl`, with red-twice-in-a-row alerts and recoveries in the day's `Run Health Alert` thread. Trends: runs, cost, usage, job lengths, uptime and machine samples over days. Logs: tara-agent's own warnings and errors plus `logUnits` from the journal, grouped. `GET /metrics` for Prometheus |
 | `src/http/dashboard.ts` | Server-rendered dashboard (home, jobs, runs, sessions); `cron-text.ts` turns schedules into plain English |
 | `src/slack/` | Bolt app, mrkdwn conversion, message splitting |
+| `src/reminders/reminders.ts` | Reminders: stored in SQLite, checked every 30 s, posted with no Claude run (`Run Reminder` thread), optionally sent to the project's `reminders.hookUrl`; `src/http/reminders-page.ts` is the dashboard page |
 | `src/store/store.ts` | `node:sqlite` with numbered migrations |
 
 ## A chat turn

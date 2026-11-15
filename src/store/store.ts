@@ -34,6 +34,11 @@ export interface RunRecord {
   status: string;
   /** As the CLI reports it: the session's running total (recordRun stores this run's share). */
   costUsd?: number;
+  /**
+   * Cost of other sessions that belong to this run (a job's steps, each a fresh session), added to the
+   * stored cost but not to the session's running total. Only set when recording.
+   */
+  extraCostUsd?: number;
   inputTokens?: number;
   outputTokens?: number;
   cacheReadTokens?: number;
@@ -312,7 +317,36 @@ const MIGRATIONS = [
   // A proposer's ranking (higher first): the Approvals page lists a kind's drafts by it, and an approved
   // item goes into its queue ahead of approved items ranked lower.
   `ALTER TABLE items ADD COLUMN priority REAL;`,
+  // Reminders (reminders/reminders.ts): next_at is the next time it is posted, null once done or cancelled.
+  `CREATE TABLE reminders (
+     id           TEXT PRIMARY KEY,
+     project      TEXT NOT NULL,
+     text         TEXT NOT NULL,
+     cron         TEXT,
+     next_at      INTEGER,
+     notify       INTEGER NOT NULL DEFAULT 0,
+     created_by   TEXT,
+     created_at   INTEGER NOT NULL,
+     last_at      INTEGER,
+     cancelled_at INTEGER
+   );
+   CREATE INDEX reminders_next ON reminders (next_at);`,
 ];
+
+/** A line posted in a project's channel at `nextAt`, then again at each `cron` time (none = once). */
+export interface Reminder {
+  id: string;
+  project: string;
+  text: string;
+  cron?: string;
+  /** Next time it is posted; undefined once it is done or cancelled. */
+  nextAt?: number;
+  /** Also sent to the project's `reminders.hookUrl`. */
+  notify: boolean;
+  createdBy?: string;
+  createdAt: number;
+  lastAt?: number;
+}
 
 export const ITEM_STATUSES = [
   'pending',
@@ -496,6 +530,21 @@ function toRun(r: Record<string, unknown>): StoredRun {
   };
 }
 
+function toReminder(r: Record<string, unknown>): Reminder {
+  const opt = <T>(v: unknown) => (v ?? undefined) as T | undefined;
+  return {
+    id: r.id as string,
+    project: r.project as string,
+    text: r.text as string,
+    cron: opt(r.cron),
+    nextAt: opt(r.next_at),
+    notify: r.notify === 1,
+    createdBy: opt(r.created_by),
+    createdAt: r.created_at as number,
+    lastAt: opt(r.last_at),
+  };
+}
+
 /** SQLite state: sessions and run history. Lives outside every project repo. */
 export class Store {
   private readonly db: DatabaseSync;
@@ -675,6 +724,7 @@ export class Store {
         .get(r.sessionId) as { t: number } | undefined;
       if (prev && r.costUsd !== undefined && r.costUsd >= prev.t) cost = r.costUsd - prev.t;
     }
+    if (r.extraCostUsd !== undefined) cost = (cost ?? 0) + r.extraCostUsd;
     const result = this.db
       .prepare(
         `INSERT INTO runs (kind, project, job_id, thread_key, session_id, model, started_at, ended_at, status,
@@ -738,6 +788,58 @@ export class Store {
       rateLimitUtilization: opt(r.rate_limit_util),
       error: opt(r.error),
     }));
+  }
+
+  addReminder(r: Reminder): void {
+    this.db
+      .prepare(
+        `INSERT INTO reminders (id, project, text, cron, next_at, notify, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        r.id,
+        r.project,
+        r.text,
+        r.cron ?? null,
+        r.nextAt ?? null,
+        r.notify ? 1 : 0,
+        r.createdBy ?? null,
+        r.createdAt,
+      );
+  }
+
+  /** A project's reminders still to come, soonest first. */
+  reminders(project: string): Reminder[] {
+    return (
+      this.db
+        .prepare('SELECT * FROM reminders WHERE project = ? AND next_at IS NOT NULL ORDER BY next_at')
+        .all(project) as Record<string, unknown>[]
+    ).map(toReminder);
+  }
+
+  dueReminders(now: number): Reminder[] {
+    return (
+      this.db
+        .prepare('SELECT * FROM reminders WHERE next_at IS NOT NULL AND next_at <= ? ORDER BY next_at')
+        .all(now) as Record<string, unknown>[]
+    ).map(toReminder);
+  }
+
+  /** Moves a due reminder on to `next` (null: done); false when another tick already did. */
+  claimReminder(id: string, due: number, next: number | null, now: number): boolean {
+    const { changes } = this.db
+      .prepare('UPDATE reminders SET next_at = ?, last_at = ? WHERE id = ? AND next_at = ?')
+      .run(next, now, id, due);
+    return Number(changes) === 1;
+  }
+
+  cancelReminder(project: string, id: string, now: number): boolean {
+    const { changes } = this.db
+      .prepare(
+        'UPDATE reminders SET next_at = NULL, cancelled_at = ? WHERE id = ? AND project = ? AND next_at IS NOT NULL',
+      )
+      .run(now, id, project);
+    return Number(changes) === 1;
   }
 
   addHostSample(s: HostSample): void {

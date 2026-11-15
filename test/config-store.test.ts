@@ -180,6 +180,23 @@ describe('loadJobs', () => {
     expect(b?.job).toMatchObject({ model: 'haiku', locks: [], timeoutMinutes: 5 });
   });
 
+  it("takes an effort from the file's defaults, a job's own effort winning", () => {
+    const dir = makeProject({ name: 'shop', slackChannel: 'C0123ABC' });
+    writeFileSync(
+      path.join(dir, '.tara', 'jobs.json'),
+      JSON.stringify({
+        defaults: { effort: 'xhigh' },
+        jobs: [
+          { id: 'a', name: 'A', skills: ['a'] },
+          { id: 'b', name: 'B', skills: ['b'], effort: 'max', steps: [{ name: 'S', effort: 'low' }] },
+        ],
+      }),
+    );
+    const [a, b] = loadJobs(loadProject(dir));
+    expect(a?.job.effort).toBe('xhigh');
+    expect(b?.job).toMatchObject({ effort: 'max', steps: [{ name: 'S', effort: 'low' }] });
+  });
+
   it('refuses an unknown default, and points a bad job at its index', () => {
     const dir = makeProject({ name: 'shop', slackChannel: 'C0123ABC' });
     const file = path.join(dir, '.tara', 'jobs.json');
@@ -225,10 +242,10 @@ describe('Store', () => {
     const db = new DatabaseSync(file);
     const { user_version: v } = db.prepare('PRAGMA user_version').get() as { user_version: number };
     // The database as it was before the upgrade: totals in cost_usd, no session_cost_usd.
-    // (five migrations back: the cost one, day_threads, the health tables, samples and logs, item priority)
+    // (six migrations back: the cost one, day_threads, the health tables, samples and logs, item priority, reminders)
     db.exec(
-      `ALTER TABLE items DROP COLUMN priority; DROP TABLE log_events; DROP TABLE host_samples; DROP TABLE health_events;
-       DROP TABLE health_state; DROP TABLE day_threads; ALTER TABLE runs DROP COLUMN session_cost_usd; PRAGMA user_version = ${v - 5};`,
+      `DROP TABLE reminders; ALTER TABLE items DROP COLUMN priority; DROP TABLE log_events; DROP TABLE host_samples; DROP TABLE health_events;
+       DROP TABLE health_state; DROP TABLE day_threads; ALTER TABLE runs DROP COLUMN session_cost_usd; PRAGMA user_version = ${v - 6};`,
     );
     const add = db.prepare(
       `INSERT INTO runs (kind, project, session_id, started_at, ended_at, status, cost_usd) VALUES ('chat', 'p', ?, ?, ?, 'ok', ?)`,

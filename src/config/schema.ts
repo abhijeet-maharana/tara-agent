@@ -14,6 +14,10 @@ export const permissionModes = [
 
 /** The agent CLI a run goes through: Claude Code, or Google's Antigravity CLI (`agy`). */
 export const harnesses = ['claude', 'agy'] as const;
+/** Claude Code `--effort` levels. */
+export const efforts = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+export const effortSchema = z.enum(efforts);
+export type Effort = z.infer<typeof effortSchema>;
 export type Harness = (typeof harnesses)[number];
 
 /**
@@ -52,6 +56,8 @@ export const jobStepSchema = z.object({
   timeoutMinutes: z.number().positive().optional(),
   /** Defaults to the job's `model` (same harness), e.g. a faster model for long browser steps. */
   model: z.string().min(1).optional(),
+  /** Claude steps: `--effort` for this step. Defaults to the job's `effort`, then the host's. */
+  effort: effortSchema.optional(),
   /** `agy` jobs: rules for this step instead of the job's `agyPermissions`. */
   agyPermissions: agyPermissionsSchema.optional(),
 });
@@ -83,8 +89,8 @@ export const hostConfigSchema = z.object({
       bin: z.string().default('claude'),
       /** Per-turn wall-clock limit for chat turns. */
       chatTimeoutMinutes: z.number().positive().default(20),
-      /** Effort for every run (`--effort`); unset uses each model's default. */
-      effort: z.enum(['low', 'medium', 'high', 'xhigh']).optional(),
+      /** Effort for every run (`--effort`) a job's own `effort` doesn't set; unset uses each model's default. */
+      effort: effortSchema.optional(),
       /**
        * Run Claude and pre-run scripts as this OS user (through sudo), so they can't read tara-agent's
        * database or secrets. See docs/security.md.
@@ -167,7 +173,10 @@ export const hostConfigSchema = z.object({
         cdpUrl: z.string().url(),
         /** false: never close stale tabs in this browser. */
         closeTabs: z.boolean().default(true),
-        /** A tab open this long, since before every run still going in this browser, is closed. */
+        /**
+         * A tab open this long, since before every conversation still going in this browser, is closed.
+         * A chat thread counts as going while a turn runs and for this long after its last turn.
+         */
         staleMinutes: z.number().positive().default(30),
       }),
     )
@@ -367,6 +376,18 @@ export const projectConfigSchema = z.object({
    * words are capitalised unless listed here, e.g. `{"linkedin": "LinkedIn", "sla": "SLA"}`.
    */
   words: z.record(z.string().regex(/^[a-z0-9]+$/), z.string().min(1)).optional(),
+  /** Reminders (set by Claude with `set_reminder`, or the local API). */
+  reminders: z
+    .object({
+      /**
+       * Where a reminder set with `notify` is also sent: POST {id, text}. E.g. the project's own endpoint
+       * that posts to a WhatsApp group. Without it, reminders go to Slack only.
+       */
+      hookUrl: z.string().url().optional(),
+      /** What the hook sends to, as the Reminders page names it (e.g. "Ops WhatsApp"). Default "hook". */
+      label: z.string().min(1).max(30).optional(),
+    })
+    .optional(),
   /** Approval items (the Approvals page). */
   approvals: z
     .object({
@@ -455,6 +476,11 @@ export const jobSchema = z
     /** The CLI the job runs on. `agy` jobs need an agy `model` (`agy models` lists them). */
     harness: z.enum(harnesses).default('claude'),
     model: z.string().min(1).default('sonnet'),
+    /**
+     * Claude jobs: `--effort` for the run, its steps, learning turn and thread replies, e.g. `max` for a
+     * tax filing and `low` for a short summary. Defaults to the host `claude.effort`.
+     */
+    effort: effortSchema.optional(),
     /**
      * `agy` jobs only: allow/deny rules for this job. Without them the project's permission mode
      * applies (`bypassPermissions` skips agy's checks, any other mode allows only tara's own tools).
@@ -585,6 +611,7 @@ export const jobDefaultsSchema = z
   .object({
     harness: z.enum(harnesses),
     model: z.string().min(1),
+    effort: effortSchema,
     locks: z.array(z.string()),
     timeoutMinutes: z.number().positive(),
   })

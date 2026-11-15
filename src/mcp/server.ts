@@ -11,6 +11,7 @@
  *   withdraw_card     close a waiting card of this thread (the person did it themselves)
  *   start_pull_request, open_pull_request   a GitHub PR from a workspace (host `github` projects only)
  *   read_ci_job       a GitHub Actions job: failed steps and log excerpt (read-only; host `github` projects only)
+ *   set_reminder, list_reminders, cancel_reminder   reminders posted in the channel (no run)
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -310,6 +311,73 @@ server.registerTool(
     }
   },
 );
+
+if (process.env.TARA_REMINDER_TOOLS === '1') {
+  server.registerTool(
+    'set_reminder',
+    {
+      title: 'Set a reminder',
+      description:
+        'Post a reminder in this channel at a time (`at`) or on a schedule (`cron`). Posting it starts no run: ' +
+        'tara-agent posts the text itself and mentions the owner. Use it whenever the person asks to be ' +
+        "reminded; check list_reminders first so you don't add the same one twice. Set `notify` only when they " +
+        "ask for it to go out beyond Slack too (the project's reminder hook, e.g. its WhatsApp group).",
+      inputSchema: {
+        text: z.string().min(1).max(1000).describe('What to remind about, as it should read'),
+        cron: z
+          .string()
+          .optional()
+          .describe(
+            'Repeating: five-field cron in the host\'s timezone, e.g. "30 9 19 * *" = 9:30 on the 19th',
+          ),
+        at: z.string().optional().describe('Once: ISO time with its offset, e.g. 2026-11-19T09:30:00+05:30'),
+        notify: z.boolean().optional().describe("Also send through the project's reminder hook"),
+      },
+    },
+    async (args) => {
+      try {
+        const r = await api<{ id: string; nextAt: number }>('/internal/reminder', args);
+        return text(`Reminder ${r.id} set; next at ${new Date(r.nextAt).toISOString()}.`);
+      } catch (err) {
+        return text(`Could not set the reminder: ${(err as Error).message}`, true);
+      }
+    },
+  );
+
+  server.registerTool(
+    'list_reminders',
+    {
+      title: "List this channel's reminders",
+      description: 'Reminders still to come in this channel, soonest first (nextAt in epoch ms).',
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const { reminders } = await api<{ reminders: unknown[] }>('/internal/reminders');
+        return text(JSON.stringify(reminders));
+      } catch (err) {
+        return text(`Could not list reminders: ${(err as Error).message}`, true);
+      }
+    },
+  );
+
+  server.registerTool(
+    'cancel_reminder',
+    {
+      title: 'Cancel a reminder',
+      description: 'Stop a reminder (its id from list_reminders). No approval needed.',
+      inputSchema: { id: z.string().min(1) },
+    },
+    async (args) => {
+      try {
+        await api('/internal/reminder-cancel', args);
+        return text(`Cancelled reminder ${args.id}.`);
+      } catch (err) {
+        return text(`Could not cancel the reminder: ${(err as Error).message}`, true);
+      }
+    },
+  );
+}
 
 if (process.env.TARA_JOB_TOOLS === '1') {
   server.registerTool(

@@ -334,6 +334,8 @@ export class SessionManager {
     // A reply in a job's thread: cards it raises belong to that job, so their decisions continue as the
     // job (its locks, timeout and `handoff`), like the cards of the run itself.
     const jobId = store.threadJob(key);
+    // A job's own effort carries on into replies in its thread (and their learning turns).
+    const effort = (jobId && this.deps.jobs?.effort?.(name, jobId)) || host.claude.effort;
     const bridgeContext: RunContext = {
       project,
       channel: msg.channel,
@@ -401,7 +403,7 @@ export class SessionManager {
             resume: session.started,
             permissionMode: project.config.permissionMode,
             model: session.model,
-            effort: host.claude.effort,
+            effort,
             allowedTools: project.config.allowedTools,
             mcpConfig: bridged?.mcpConfigPath,
             permissionPrompts,
@@ -503,6 +505,7 @@ export class SessionManager {
             threadTs: msg.threadTs,
             threadKey: key,
             label: 'This conversation',
+            effort,
           },
         );
       } finally {

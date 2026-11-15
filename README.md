@@ -107,6 +107,7 @@ No commands to remember: just write.
 | `stop` (or `cancel`) | Stops whatever is running in the thread, a chat turn or a job. Only the word on its own; "stop the ads" is a normal message |
 | `run <job name>` | Runs a job now, in your message's thread. A job id or a skill the job uses works too (`run google-analytics`); several matches get buttons |
 | "Which jobs run today?" | Claude answers with its `list_jobs` tool |
+| "Remind me on the 19th of every month to file GSTR-3B" | Claude sets it with `set_reminder`; tara-agent posts it on time with no Claude run. "What reminders do I have?" and "cancel that one" work too |
 
 ## Dashboard
 

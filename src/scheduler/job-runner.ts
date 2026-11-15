@@ -6,10 +6,10 @@ import { buildClaudeArgs } from '../runner/args.js';
 import { buildChildEnv } from '../runner/env.js';
 import type { Runner, RunOutcome } from '../runner/run.js';
 import { jobDataDir, sessionScratch } from '../runner/workspace.js';
-import { type LearnRequest, learnFromRun, learnReasons } from '../sessions/learn.js';
+import { type LearnRequest, learnFromRun, learnReasons, runUse, typicalRun } from '../sessions/learn.js';
 import { type ChatPort, type Logger, threadKey } from '../sessions/manager.js';
 import type { ThreadHold, Threads } from '../sessions/threads.js';
-import { formatDuration, postMarkdown, toSlackMrkdwn } from '../slack/format.js';
+import { formatDuration, postMarkdown } from '../slack/format.js';
 import { StreamReply } from '../slack/reply.js';
 import type { Item, RunRecord, Store } from '../store/store.js';
 import { type Locks, type Semaphore, Throttle } from '../util/concurrency.js';
@@ -21,7 +21,6 @@ import {
   failedReply,
   identityPrompt,
   JOB_SYSTEM_PROMPT,
-  splitHeadline,
 } from './prompt.js';
 import { openRunThread } from './slack-trigger.js';
 import { expandMcpServers, runSteps, type StepsResult } from './steps.js';
@@ -144,7 +143,7 @@ export async function runJob(
   const releaseSlot = await deps.slots.acquire();
   const releaseLocks = await deps.locks.acquire(job.locks);
   const startedAt = now();
-  let lesson: LearnRequest | undefined;
+  const lessons: LearnRequest[] = [];
   const record = (status: JobStatus, extra: Partial<RunRecord> = {}) => {
     store.recordRun({
       kind: 'job',
@@ -179,7 +178,7 @@ export async function runJob(
       return record('error', { error: (err as Error).message });
     }
 
-    // The status line (⏳ → ✅ with the headline) is the first reply in the run's thread.
+    // The status line (⏳ with the current step → ✅ / ❌) is the first reply in the run's thread.
     const statusTs = await postMain(`⏳ ${title}`);
     const rootTs = await thread();
     const key = threadKey(channel, rootTs);
@@ -313,7 +312,7 @@ export async function runJob(
             resume: resuming,
             permissionMode: project.config.permissionMode,
             model: session.model,
-            effort: deps.host.claude.effort,
+            effort: job.effort ?? deps.host.claude.effort,
             allowedTools,
             mcpConfig: bridged?.mcpConfigPath,
             partialMessages: Boolean(live),
@@ -367,32 +366,76 @@ export async function runJob(
       .finally(() => bridged?.dispose());
     await status.flush();
 
-    /** Sets up this run's learning turn (`selfImprove`); it runs once the job's locks are released. */
+    /**
+     * Sets up this run's learning turns (`selfImprove`): one for the main session and one for each
+     * step's session. They run once the job's locks are released.
+     */
     const learnIf = (failure: string | undefined, threadTs: string) => {
       // Learning turns resume the session with Claude, so agy runs don't get one.
       if (harness !== 'claude') return;
-      const reasons = learnReasons(
-        job.selfImprove ?? project.config.selfImprove,
-        outcome,
-        toolErrors,
-        failure,
-      );
-      if (!reasons) return;
-      lesson = {
+      const mode = job.selfImprove ?? project.config.selfImprove;
+      // The whole run (steps and the main session) against the job's usual scheduled run. A run after a
+      // card or for queue items does other work than the scheduled one, so it isn't compared.
+      const main = runUse(outcome);
+      const whole = stepsDone && {
+        costUsd:
+          outcome.costUsd === undefined && stepsDone.costUsd === undefined
+            ? undefined
+            : (outcome.costUsd ?? 0) + (stepsDone.costUsd ?? 0),
+        inputTokens:
+          main.inputTokens +
+          stepsDone.usage.input +
+          stepsDone.usage.cacheRead +
+          stepsDone.usage.cacheCreation,
+        outputTokens: main.outputTokens + stepsDone.usage.output,
+        toolCalls: main.toolCalls + stepsDone.toolCalls,
+        durationMs: main.durationMs + stepsDone.durationMs,
+      };
+      const typical =
+        trigger.kind === 'resume' || trigger.kind === 'queue'
+          ? undefined
+          : typicalRun(store.jobRuns(project.config.name, job.id, 60), now());
+      const common = {
         project,
-        sessionId: outcome.sessionId ?? session.sessionId,
-        model: session.model,
-        appendSystemPrompt,
-        bridge: bridged ? bridgeContext : undefined,
-        allowedTools,
         env,
-        reasons,
+        mcpServers,
         channel,
         threadTs,
         threadKey: threadTs ? key : undefined,
         jobId: job.id,
-        label: `*${job.name}*`,
       };
+      const reasons = learnReasons(mode, outcome, toolErrors, failure);
+      if (reasons)
+        lessons.push({
+          ...common,
+          sessionId: outcome.sessionId ?? session.sessionId,
+          model: session.model,
+          appendSystemPrompt,
+          bridge: bridged ? bridgeContext : undefined,
+          allowedTools,
+          reasons,
+          label: `*${job.name}*`,
+          effort: job.effort,
+          usage: { session: main, run: whole, typical },
+        });
+      for (const step of stepsDone?.sessions ?? []) {
+        if (step.harness !== 'claude') continue;
+        const stepReasons = learnReasons(mode, step.outcome, step.toolErrors);
+        if (!stepReasons) continue;
+        lessons.push({
+          ...common,
+          sessionId: step.sessionId,
+          model: step.model,
+          appendSystemPrompt: step.systemPrompt,
+          allowedTools: step.allowedTools,
+          reasons: stepReasons,
+          label: `*${job.name}* · step "${step.name}"`,
+          effort: step.effort,
+          step: step.name,
+          priorCostUsd: step.outcome.costUsd,
+          usage: { session: runUse(step.outcome), run: whole, typical },
+        });
+      }
     };
 
     const usage = {
@@ -400,7 +443,8 @@ export async function runJob(
       model: outcome.model ?? job.model,
       threadKey: key,
       costUsd: outcome.costUsd,
-      // Steps count towards the run.
+      // Steps count towards the run: each is a fresh session, so its whole cost is this run's.
+      extraCostUsd: stepsDone?.costUsd,
       inputTokens: sum(outcome.usage?.input, stepsDone?.usage.input),
       outputTokens: sum(outcome.usage?.output, stepsDone?.usage.output),
       cacheReadTokens: sum(outcome.usage?.cacheRead, stepsDone?.usage.cacheRead),
@@ -437,7 +481,8 @@ export async function runJob(
       // No reply at all. The thread still says so in words (never left empty), with the steps the run
       // took and its session above it, to see what it checked and to ask about it.
       const said = `🔇 Claude finished without a written reply · ${meta}`;
-      await chat.update(channel, statusTs, `🔇 ${title} · ${meta} · nothing to report`);
+      // Streamed, the step list below has the numbers; without it the status line keeps them.
+      await chat.update(channel, statusTs, `🔇 ${title}${live ? '' : ` · ${meta}`} · nothing to report`);
       flushBlock();
       if (live)
         await live.finish({
@@ -452,14 +497,15 @@ export async function runJob(
     }
 
     const failure = failedReply(outcome.text);
-    const { headline } = failure ? { headline: failure.split('\n')[0] ?? '' } : splitHeadline(outcome.text);
     const icon = failure ? '❌' : '✅';
-    await chat.update(channel, statusTs, `${icon} ${title} · ${meta}\n${toSlackMrkdwn(headline)}`);
+    // Just the outcome: Claude's reply follows in full below (so no headline), and when streamed the step
+    // list holds the time, steps and model (so no numbers either). Without a stream it keeps the numbers.
+    await chat.update(channel, statusTs, `${icon} ${title}${live ? '' : ` · ${meta}`}`);
     // Claude's whole reply, exactly as written, always goes in the thread: it is the run's audit log.
     if (live) {
       flushBlock();
       await live.finish({
-        summary: failure ? `❌ ${headline}` : `✅ Done · ${meta}`,
+        summary: failure ? `❌ Failed · ${meta}` : `✅ Done · ${meta}`,
         ok: !failure,
         answer: outcome.text,
         notes: [],
@@ -476,7 +522,7 @@ export async function runJob(
     releaseLocks();
     try {
       // Still inside the job slot, so learning turns count towards jobConcurrency.
-      if (lesson) await learnFromRun(deps, lesson);
+      for (const lesson of lessons) await learnFromRun(deps, lesson);
     } finally {
       hold?.release();
       releaseSlot();

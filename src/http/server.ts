@@ -18,6 +18,7 @@ import { loadQueues } from '../config/load.js';
 import type { HostConfig, Project, QueueConfig } from '../config/schema.js';
 import type { HealthMonitor } from '../health/monitor.js';
 import type { Observability } from '../health/observability.js';
+import { ReminderError, type Reminders } from '../reminders/reminders.js';
 import type { Activity } from '../runner/activity.js';
 import type { Scheduler } from '../scheduler/scheduler.js';
 import { type IncomingMessage as ChatMessage, type Logger, threadKey } from '../sessions/manager.js';
@@ -65,6 +66,7 @@ import {
 import { healthPage } from './health.js';
 import { logsPage, trendsPage } from './observe.js';
 import { queuePage } from './queue.js';
+import { remindersPage } from './reminders-page.js';
 import { isDayKey, MAX_RUNS_PER_DAY, type PlanJob, planDay, schedulePage } from './schedule.js';
 import { firstPromptOf, readTranscript } from './transcript.js';
 
@@ -89,6 +91,8 @@ export interface HttpOptions {
   fallback?: string;
   /** Approval items: the Approvals page and its API. */
   approvals?: Approvals;
+  /** Reminders and their API. */
+  reminders?: Reminders;
   /**
    * TARA_ADMIN_TOKEN: the key a browser presents (as a cookie, set on /unlock) to decide approvals.
    * Unset = dashboard decisions are off (Slack buttons still work).
@@ -196,6 +200,9 @@ async function readJson(req: IncomingMessage, limit = 10_000): Promise<Record<st
  *                                      header `x-tara-admin: <TARA_ADMIN_TOKEN>` (for a person's own Claude
  *                                      fixing a run, never for runs)
  *   POST /reload                       re-read every .tara/jobs.json now
+ *   GET  /reminders?project=<name>     reminders still to come, soonest first
+ *   POST /reminders/<project>          {text, cron? | at?, notify?, by?} → the reminder
+ *   POST /reminders/<project>/<id>/cancel
  *   GET  /schedule?day=YYYY-MM-DD&project=<name>   one day's planned runs, overlaps and free windows
  *   GET  /schedule/conflicts?days=7    overlapping and back-to-back jobs over the next days
  *   GET  /code                         each repo's branch, last commit and uncommitted changes
@@ -210,10 +217,12 @@ async function readJson(req: IncomingMessage, limit = 10_000): Promise<Record<st
  *   GET  /internal/permission/<id>?wait=45                 → {decision | null}
  *   GET  /internal/jobs, POST /internal/run-job {id}        (chat turns only)
  *   POST /internal/withdraw            {id, reason?}  closes a waiting card of the run's project
+ *   POST /internal/reminder            {text, cron? | at?, notify?}; GET /internal/reminders;
+ *   POST /internal/reminder-cancel     {id}
  */
 /** Paths tara-agent serves itself; with a fallback, everything else is passed through. */
 const OWN_PATH =
-  /^\/(?:$|(?:health|metrics|reload|attention|jobs|runs|sessions|schedule|approvals|queue|items|unlock|code|internal|p|app)(?:\/|$))/;
+  /^\/(?:$|(?:health|metrics|reload|attention|jobs|runs|sessions|schedule|approvals|queue|items|reminders|unlock|code|internal|p|app)(?:\/|$))/;
 const TOKEN_COOKIE = 'tara_token';
 const ADMIN_COOKIE = 'tara_admin';
 /** Finished items shown on the Done tab. */
@@ -556,6 +565,27 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
           ...(upcoming && { upcoming: upcoming.get(j.id) ?? [] }),
         })),
       };
+    }
+    if (parts[0] === 'reminders' && options.reminders) {
+      const reminders = options.reminders;
+      if (method === 'GET' && parts.length === 1)
+        return { reminders: reminders.list(knownProject(url.searchParams.get('project'))) };
+      if (method === 'POST' && parts.length === 2) {
+        const body = await readJson(req);
+        return reminders.add(knownProject(parts[1] ?? ''), {
+          text: str(body.text) ?? '',
+          cron: str(body.cron),
+          at: typeof body.at === 'number' ? body.at : str(body.at),
+          notify: body.notify === true,
+          by: str(body.by)?.slice(0, 60) ?? 'api',
+        });
+      }
+      if (method === 'POST' && parts.length === 4 && parts[3] === 'cancel') {
+        const project = knownProject(parts[1] ?? '');
+        if (!reminders.cancel(project, parts[2] ?? ''))
+          throw new HttpError(404, `No reminder "${parts[2]}" to come`);
+        return { ok: true };
+      }
     }
     if (method === 'POST' && url.pathname === '/reload') {
       options.scheduler.reloadAll();
@@ -1052,6 +1082,22 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       const body = await readJson(req);
       return bridge.withdrawCard(token, { id: required(body.id, 'id'), reason: str(body.reason) });
     }
+    if (req.method === 'POST' && parts[1] === 'reminder' && parts.length === 2) {
+      const body = await readJson(req);
+      return bridge.setReminder(token, {
+        text: str(body.text) ?? '',
+        cron: str(body.cron),
+        at: typeof body.at === 'number' ? body.at : str(body.at),
+        notify: body.notify === true,
+      });
+    }
+    if (req.method === 'GET' && parts[1] === 'reminders' && parts.length === 2) {
+      return { reminders: bridge.listReminders(token) };
+    }
+    if (req.method === 'POST' && parts[1] === 'reminder-cancel' && parts.length === 2) {
+      const body = await readJson(req);
+      return bridge.cancelReminder(token, required(body.id, 'id'));
+    }
     if (req.method === 'GET' && parts[1] === 'permission' && parts.length === 3) {
       const waitMs = Math.min(55, Math.max(0, Number(url.searchParams.get('wait')) || 0)) * 1000;
       return { decision: (await bridge.waitPermission(token, parts[2] as string, waitMs)) ?? null };
@@ -1081,6 +1127,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         .filter((j) => jobState(j) === 'failing').length,
       code: Boolean(options.code),
       browsers: Boolean(options.browsers),
+      reminders: Boolean(options.reminders),
       unhealthy: options.health ? redChecks().length : undefined,
     };
   };
@@ -1128,6 +1175,10 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     // `/?project=…` and `/?kind=…` were the sessions list before it moved to /sessions.
     const oldSessionsLink =
       parts.length === 0 && (url.searchParams.has('project') || url.searchParams.has('kind'));
+    if (parts[0] === 'reminders' && parts.length === 1 && options.reminders) {
+      const reminders = options.reminders;
+      return remindersPage(ctx, { reminders: (p) => reminders.list(p), now: now() });
+    }
     if ((parts[0] === 'sessions' && parts.length === 1) || oldSessionsLink) {
       const project = url.searchParams.get('project') ?? undefined;
       const runningThreads = new Set(
@@ -1625,6 +1676,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         err instanceof HttpError ||
         err instanceof BridgeError ||
         err instanceof ApprovalError ||
+        err instanceof ReminderError ||
         err instanceof CodeError
           ? err.status
           : 500;

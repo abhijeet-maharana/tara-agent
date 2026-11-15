@@ -18,9 +18,16 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { describe, expect, it } from 'vitest';
 import { Approvals } from '../src/approvals/approvals.js';
-import { Bridge, type RunContext, readChecked, wantsPermissionPrompts } from '../src/bridge/bridge.js';
+import {
+  Bridge,
+  BridgeError,
+  type RunContext,
+  readChecked,
+  wantsPermissionPrompts,
+} from '../src/bridge/bridge.js';
 import type { Project, ProjectConfig } from '../src/config/schema.js';
 import { startHttpServer } from '../src/http/server.js';
+import { Reminders } from '../src/reminders/reminders.js';
 import { buildClaudeArgs } from '../src/runner/args.js';
 import type { RunOptions, RunOutcome } from '../src/runner/run.js';
 import type { Scheduler } from '../src/scheduler/scheduler.js';
@@ -85,6 +92,29 @@ function openRun(bridge: Bridge, ctx: RunContext) {
   const config = JSON.parse(readFileSync(handle.mcpConfigPath, 'utf8'));
   return { handle, token: config.mcpServers.tara.env.TARA_RUN_TOKEN as string, config };
 }
+
+describe('Bridge reminders', () => {
+  it("sets, lists and cancels the run's own project reminders, and offers the tools only when reminders are on", () => {
+    const { bridge, ctx, store, chat, project: p } = setup();
+    expect(openRun(bridge, ctx).config.mcpServers.tara.env.TARA_REMINDER_TOOLS).toBe('0');
+    bridge.reminders = new Reminders({
+      store,
+      chat,
+      projects: [p],
+      timeZone: 'UTC',
+      log: silent,
+      now: () => Date.parse('2026-10-25T08:30:00Z'),
+    });
+    const { token, config } = openRun(bridge, { ...ctx, user: 'U9' });
+    expect(config.mcpServers.tara.env.TARA_REMINDER_TOOLS).toBe('1');
+    const r = bridge.setReminder(token, { text: 'Renew domain', at: '2026-11-01T09:00:00Z' });
+    expect(r).toMatchObject({ project: 'shop', createdBy: 'U9' });
+    expect(bridge.listReminders(token).map((x) => x.text)).toEqual(['Renew domain']);
+    expect(() => bridge.setReminder(token, { text: 'No time' })).toThrow(BridgeError);
+    expect(bridge.cancelReminder(token, r.id)).toEqual({ id: r.id, cancelled: true });
+    expect(() => bridge.cancelReminder(token, r.id)).toThrow(/No reminder/);
+  });
+});
 
 describe('Bridge runs', () => {
   it('writes a private MCP config with the run token and forgets it on dispose', () => {

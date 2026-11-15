@@ -29,6 +29,8 @@ export interface DashboardContext {
   code?: boolean;
   /** The Browsers page is on. */
   browsers?: boolean;
+  /** The Reminders page is on. */
+  reminders?: boolean;
   /** Red checks on the Health page, for its sidebar badge; undefined when the page is off. */
   unhealthy?: number;
 }
@@ -609,7 +611,17 @@ export const jobViewTabs = (view: JobsView, project?: string) => {
   return `<div class="toolbar"><div class="chips views">${tab('list', '/jobs', 'List')}${tab('ondemand', '/jobs', 'On demand')}${tab('timeline', '/schedule', 'Timeline')}</div></div>`;
 };
 
-export type Page = 'Home' | 'Approvals' | 'Queue' | 'Jobs' | 'Sessions' | 'Code' | 'Browsers' | 'Health' | '';
+export type Page =
+  | 'Home'
+  | 'Approvals'
+  | 'Queue'
+  | 'Jobs'
+  | 'Sessions'
+  | 'Reminders'
+  | 'Code'
+  | 'Browsers'
+  | 'Health'
+  | '';
 
 /** Projects whose app pages show here as tabs (`tabs` plus `dashboardUrl`). */
 export const tabbed = (projects: Project[]) =>
@@ -648,6 +660,7 @@ export function layout(
       ['/queue', 'Queue', '📤', 0, ''],
       ['/jobs', 'Jobs', '⏱️', failing, 'failing jobs'],
       ['/sessions', 'Sessions', '💬', 0, ''],
+      ...(ctx.reminders ? ([['/reminders', 'Reminders', '⏰', 0, '']] as const) : []),
       ...(ctx.code ? ([['/code', 'Code', '📝', 0, '']] as const) : []),
       ...(ctx.browsers ? ([['/browsers', 'Browsers', '🌐', 0, '']] as const) : []),
       ...(ctx.unhealthy !== undefined
@@ -719,6 +732,8 @@ const nameList = (names: string[], max = 4) =>
   names.length > max ? `${names.slice(0, max).join(', ')} +${names.length - max} more` : names.join(', ');
 const onHarness = (harness: string | undefined, model: string) =>
   harness === 'agy' ? `agy · ${model}` : model;
+/** A model with the job's own effort, e.g. `claude-opus-5-5 · max`; without one it runs at the host's. */
+const atEffort = (model: string, effort?: string) => (effort ? `${model} · ${effort}` : model);
 
 /** Which model does what: chat per project, jobs (and their steps and handoffs) per model, voice notes. */
 export function modelUses(projects: Project[], jobs: JobInfo[], host: HostModels = {}): ModelUse[] {
@@ -739,7 +754,7 @@ export function modelUses(projects: Project[], jobs: JobInfo[], host: HostModels
   );
   grouped(
     'Jobs',
-    jobs.map((j) => [onHarness(j.harness, j.model), j.name]),
+    jobs.map((j) => [atEffort(onHarness(j.harness, j.model), j.effort), j.name]),
     'job',
   );
   grouped(
@@ -781,7 +796,9 @@ function modelsSection(models: ModelUse[], effort?: string): string {
     )
     .join('');
   return section('Models', `<ul class="timeline models">${rows}</ul>`, {
-    sub: effort ? `effort ${effort}` : "each model's default effort",
+    sub: effort
+      ? `effort ${effort} unless a job sets its own`
+      : "each model's default effort unless a job sets its own",
   });
 }
 
@@ -1073,6 +1090,10 @@ export function jobsPage(
     )}">
 <div class="card-head"><div class="grow"><div class="title">${esc(j.name)}</div>
 <div class="meta"><span class="tag ${STATE[state].tone}">${STATE[state].label}</span>${projectTag(ctx, j.project)}${
+      j.effort
+        ? `<span class="tag dim" title="Runs at --effort ${esc(j.effort)}">effort ${esc(j.effort)}</span>`
+        : ''
+    }${
       onDemandView
         ? '' // the tab already says it
         : `<span>${esc(j.cron ? cronText(j.cron, j.tz, tz) : 'Runs when its queue has approved items')}</span>`
@@ -1098,6 +1119,8 @@ ${state === 'failing' && j.lastError ? `<div class="meta error">Last error: ${es
 <dt>Skills</dt><dd>${j.skills.length ? esc(j.skills.join(', ')) : '—'}</dd>
 <dt>Model</dt><dd>${j.harness === 'agy' ? 'agy (Antigravity CLI) · ' : ''}${esc(j.model)}${
       j.stepModels?.length ? ` · steps: ${esc(j.stepModels.join(', '))}` : ''
+    }${j.effort ? ` · effort ${esc(j.effort)}` : j.harness === 'agy' ? '' : ' · default effort'}${
+      j.stepEfforts?.length ? ` · step effort: ${esc(j.stepEfforts.join(', '))}` : ''
     }${j.handoff ? ` · after approval: ${esc(onHarness(j.handoff.harness, j.handoff.model))}` : ''}</dd>
 <dt>Length</dt><dd>${j.durationMinutes ? `${j.durationMinutes} min planned` : 'not planned'}${week?.typicalMinutes ? ` · ~${week.typicalMinutes} min in the last 7 days` : ''} <button type="button" class="btn quiet" data-length="${esc(j.project)}/${esc(j.id)}" data-name="${esc(j.name)}" data-minutes="${j.durationMinutes ?? week?.typicalMinutes ?? ''}" title="The planned length the Timeline uses for overlaps and free time">Change</button></dd>
 <dt>Schedule</dt><dd>${

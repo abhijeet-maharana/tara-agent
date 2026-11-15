@@ -1,10 +1,10 @@
 import type { Bridge, RunContext } from '../bridge/bridge.js';
-import type { HostConfig, Project, SelfImprove } from '../config/schema.js';
+import type { HostConfig, McpServer, Project, SelfImprove } from '../config/schema.js';
 import { buildClaudeArgs } from '../runner/args.js';
 import type { Runner, RunOutcome } from '../runner/run.js';
-import { isNoLesson, learnPrompt } from '../scheduler/prompt.js';
+import { isNoLesson, learnPrompt, type RunUse, type UsageNote } from '../scheduler/prompt.js';
 import { formatDuration, toSlackMrkdwn } from '../slack/format.js';
-import type { Store } from '../store/store.js';
+import type { Store, StoredRun } from '../store/store.js';
 import type { ChatPort, Logger } from './manager.js';
 
 /**
@@ -101,6 +101,64 @@ export interface LearnRequest {
   jobId?: string;
   /** Names the run in the Slack note, e.g. "*SLA Report*" or "This conversation". */
   label: string;
+  /** The run's `--effort` when it isn't the host's (a job's own `effort`). */
+  effort?: string;
+  /** The job's own MCP servers, as the run had them, so the turn sees the same tools (and cache). */
+  mcpServers?: Record<string, McpServer>;
+  /** What the run used, against the job's usual, so the turn can also make the next run cheaper. */
+  usage?: UsageNote;
+  /** The job step whose session this is: the turn changes only that step's part of the skill. */
+  step?: string;
+  /**
+   * The session's cost before this turn, when the store has no run of that session to subtract
+   * (a step's session is counted in its job's run, not stored as a run of its own).
+   */
+  priorCostUsd?: number;
+}
+
+/** Runs of a job that count towards its usual cost: this many days back, at least this many runs. */
+const TYPICAL_DAYS = 14;
+const TYPICAL_MIN_RUNS = 3;
+
+/**
+ * A job's usual whole run (median cost and length) from its stored runs, or undefined with too few.
+ * Only the first run in each thread counts: a later one continues after a card and is short.
+ */
+export function typicalRun(runs: StoredRun[], now: number): UsageNote['typical'] {
+  const firsts = new Map<string, StoredRun>();
+  for (const r of [...runs].sort((a, b) => a.startedAt - b.startedAt)) {
+    const thread = r.threadKey ?? `run:${r.id}`;
+    if (!firsts.has(thread)) firsts.set(thread, r);
+  }
+  const counted = [...firsts.values()].filter(
+    (r) =>
+      r.startedAt >= now - TYPICAL_DAYS * 86_400_000 &&
+      r.costUsd !== undefined &&
+      r.costUsd !== null &&
+      ['ok', 'failed', 'silent'].includes(r.status),
+  );
+  if (counted.length < TYPICAL_MIN_RUNS) return undefined;
+  const median = (xs: number[]) => {
+    const s = [...xs].sort((a, b) => a - b);
+    const mid = Math.floor(s.length / 2);
+    return s.length % 2 ? (s[mid] as number) : ((s[mid - 1] as number) + (s[mid] as number)) / 2;
+  };
+  return {
+    costUsd: median(counted.map((r) => r.costUsd as number)),
+    durationMs: median(counted.map((r) => r.endedAt - r.startedAt)),
+    runs: counted.length,
+  };
+}
+
+/** What one finished session used, in the shape a learning prompt shows. */
+export function runUse(o: Pick<RunOutcome, 'costUsd' | 'usage' | 'toolCalls' | 'durationMs'>): RunUse {
+  return {
+    costUsd: o.costUsd,
+    inputTokens: (o.usage?.input ?? 0) + (o.usage?.cacheRead ?? 0) + (o.usage?.cacheCreation ?? 0),
+    outputTokens: o.usage?.output ?? 0,
+    toolCalls: o.toolCalls,
+    durationMs: o.durationMs,
+  };
 }
 
 /** Runs one learning turn and reports a change in Slack. Never rejects. */
@@ -120,7 +178,7 @@ export async function learnFromRun(deps: LearnDeps, req: LearnRequest): Promise<
         resume: true,
         permissionMode: req.project.config.permissionMode,
         model: req.model,
-        effort: deps.host.claude.effort,
+        effort: req.effort ?? deps.host.claude.effort,
         allowedTools: req.allowedTools,
         mcpConfig: bridged?.mcpConfigPath,
         permissionPrompts: req.bridge?.permissionPrompts,
@@ -128,7 +186,8 @@ export async function learnFromRun(deps: LearnDeps, req: LearnRequest): Promise<
       cwd: req.project.dir,
       env: req.env,
       systemPrompt: req.appendSystemPrompt,
-      prompt: learnPrompt(req.reasons),
+      prompt: learnPrompt(req.reasons, { step: req.step, usage: req.usage }),
+      mcpServers: req.mcpServers,
       timeoutMs: LEARN_TIMEOUT_MS,
       onEvent: (event) => {
         if (event.kind === 'tool') calls.push({ name: event.name, file: event.file });
@@ -147,7 +206,10 @@ export async function learnFromRun(deps: LearnDeps, req: LearnRequest): Promise<
       startedAt,
       endedAt: now(),
       status: outcome.status,
-      costUsd: outcome.costUsd,
+      costUsd:
+        req.priorCostUsd !== undefined && outcome.costUsd !== undefined
+          ? Math.max(0, outcome.costUsd - req.priorCostUsd)
+          : outcome.costUsd,
       inputTokens: outcome.usage?.input,
       outputTokens: outcome.usage?.output,
       cacheReadTokens: outcome.usage?.cacheRead,

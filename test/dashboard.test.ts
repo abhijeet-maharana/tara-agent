@@ -622,6 +622,7 @@ describe('models section', () => {
     job('SLA', { stepModels: ['haiku'] }),
     job('Audit', { harness: 'agy', model: 'gemini-3-pro', handoff: { harness: 'claude', model: 'opus' } }),
     job('GA4'),
+    job('GST', { effort: 'max' }),
   ];
 
   it('lists each purpose with its model, most-used first', () => {
@@ -632,6 +633,8 @@ describe('models section', () => {
       { purpose: 'Chat', model: 'sonnet', used: 'Shop, blog' },
       { purpose: 'Jobs', model: 'sonnet', used: '2 jobs: SLA, GA4' },
       { purpose: 'Jobs', model: 'agy · gemini-3-pro', used: '1 job: Audit' },
+      // A job with its own effort is listed apart from those at the host's.
+      { purpose: 'Jobs', model: 'sonnet · max', used: '1 job: GST' },
       { purpose: 'Job steps', model: 'haiku', used: '1 job: SLA' },
       { purpose: 'After approval', model: 'opus', used: '1 job: Audit' },
       {
@@ -661,7 +664,8 @@ describe('models section', () => {
         effort: 'high',
       },
     );
-    expect(page).toContain('<h2>Models</h2><span>effort high</span>');
+    expect(page).toContain('<h2>Models</h2><span>effort high unless a job sets its own</span>');
+    expect(page).toContain('<code>sonnet · max</code>');
     expect(page).toContain('<span class="when">Job steps</span>');
     expect(page).toContain('<code>agy · gemini-3-pro</code>');
     expect(page).not.toContain('Voice notes');
@@ -1024,7 +1028,7 @@ describe('jobs page', () => {
   const page = jobsPage(
     ctx,
     [
-      job('review', { durationMinutes: 45 }),
+      job('review', { durationMinutes: 45, effort: 'max', stepEfforts: ['low'] }),
       job('watch', { cron: '*/10 * * * *' }),
       job('sender', { cron: undefined, queues: ['outbox'] }),
       job('filer', { cron: undefined }),
@@ -1050,6 +1054,15 @@ describe('jobs page', () => {
     expect(page).toContain('<details class="queue-jobs" data-group-box><summary>Run by a queue · 1 job');
     expect(page.indexOf('id="job-shop-sender"')).toBeGreaterThan(page.indexOf('class="queue-jobs"'));
     expect(page).toContain('none (executor of the outbox queue)');
+  });
+
+  it("shows a job's own effort on its card and in its details", () => {
+    const review = page.slice(page.indexOf('id="job-shop-review"'), page.indexOf('id="job-shop-watch"'));
+    expect(review).toContain('<span class="tag dim" title="Runs at --effort max">effort max</span>');
+    expect(review).toContain('opus · effort max · step effort: low');
+    const watch = page.slice(page.indexOf('id="job-shop-watch"'));
+    expect(watch).toContain('opus · default effort');
+    expect(watch.slice(0, watch.indexOf('</article>'))).not.toContain('>effort ');
   });
 
   it('keeps on-demand jobs out of List and shows them in the On demand view', () => {

@@ -34,6 +34,10 @@ export interface JobInfo {
   harness?: Harness;
   /** Models its steps run on where they differ from `model` (same harness). */
   stepModels?: string[];
+  /** Claude jobs: the job's own `effort`; unset runs at the host `claude.effort`. */
+  effort?: string;
+  /** Efforts its steps run at where they differ from the job's (steps with their own `effort`). */
+  stepEfforts?: string[];
   /** The harness and model an approved card continues on, when not the job's own. */
   handoff?: { harness: Harness; model: string };
   /** Typical run time from the jobs file. */
@@ -61,6 +65,8 @@ export interface JobControl {
   ): 'started' | 'unknown' | 'running';
   /** A job's `agyPermissions`, for a thread reply that continues its agy session. */
   agyPermissions?(project: string, id: string): AgyPermissions | undefined;
+  /** A job's own `effort`, for a thread reply that continues its session. */
+  effort?(project: string, id: string): string | undefined;
 }
 
 export interface SchedulerDeps {
@@ -167,6 +173,10 @@ export class Scheduler implements JobControl {
     return this.entries.get(jobKey(project, id))?.scheduled.job.agyPermissions;
   }
 
+  effort(project: string, id: string): string | undefined {
+    return this.entries.get(jobKey(project, id))?.scheduled.job.effort;
+  }
+
   list(project: string): JobInfo[] {
     return [...this.entries.values()]
       .filter((e) => e.scheduled.project.config.name === project)
@@ -185,6 +195,15 @@ export class Scheduler implements JobControl {
           stepModels: [
             ...new Set(job.steps.flatMap((s) => (s.model && s.model !== job.model ? [s.model] : []))),
           ],
+          effort: job.harness === 'claude' ? job.effort : undefined,
+          stepEfforts:
+            job.harness === 'claude'
+              ? [
+                  ...new Set(
+                    job.steps.flatMap((s) => (s.effort && s.effort !== job.effort ? [s.effort] : [])),
+                  ),
+                ]
+              : [],
           handoff: job.handoff,
           durationMinutes: job.durationMinutes,
           locks: job.locks,

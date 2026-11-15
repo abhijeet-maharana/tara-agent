@@ -195,6 +195,32 @@ describe('SessionManager', () => {
     expect(calls[0]?.args.join(' ')).toContain('--effort high');
   });
 
+  it("runs a reply in a job's thread at the job's own effort, else the host's", async () => {
+    const jobs: JobControl = {
+      list: () => [],
+      trigger: () => 'unknown',
+      effort: (_p, id) => (id === 'gst' ? 'max' : undefined),
+    };
+    const { store, calls, manager } = setup({
+      host: testHost({ claude: { bin: 'claude', chatTimeoutMinutes: 20, effort: 'high' } }),
+      jobs,
+    });
+    const now = Date.now();
+    store.recordRun({
+      kind: 'job',
+      project: 'shop',
+      jobId: 'gst',
+      threadKey: 'C1:100.1',
+      startedAt: now,
+      endedAt: now,
+      status: 'ok',
+    });
+    await manager.handle(msg('file it', { ts: '100.2', threadTs: '100.1' }));
+    await manager.handle(msg('hello', { ts: '300.1', threadTs: '300.1' }));
+    expect(calls[0]?.args.join(' ')).toContain('--effort max');
+    expect(calls[1]?.args.join(' ')).toContain('--effort high');
+  });
+
   it('keeps separate sessions per thread', async () => {
     const { calls, manager } = setup();
     await manager.handle(msg('a'));

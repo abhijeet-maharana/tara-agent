@@ -1,5 +1,5 @@
 import type { HealthStatus } from '../health/monitor.js';
-import type { DayRuns, JobTrend, LogGroup, Totals, Uptime } from '../health/trends.js';
+import type { CostRow, DayRuns, JobTrend, LogGroup, Totals, Uptime } from '../health/trends.js';
 import type { HostSample } from '../store/store.js';
 import { type DashboardContext, esc, layout, pageHead, relative, section } from './dashboard.js';
 
@@ -305,6 +305,8 @@ export interface TrendsData {
   previous: Totals;
   runs: DayRuns[];
   cost: Array<{ day: string; byProject: Record<string, number> }>;
+  /** Cost per job, per project's chats and learning turns, most expensive first. */
+  costRows: Array<CostRow & { name: string }>;
   projects: Array<{ name: string; title: string }>;
   usage: Array<{ at: number; share: number }>;
   jobs: Array<JobTrend & { name: string }>;
@@ -412,6 +414,45 @@ export function trendsPage(ctx: DashboardContext, d: TrendsData): string {
     series: costSeries,
     fmt: money,
   });
+
+  // Where the cost goes: the priciest rows up front, the long tail folded away.
+  const costTotal = d.costRows.reduce((t, r) => t + r.cost, 0);
+  const costChange = (r: CostRow) => {
+    if (r.cost === 0) return '<span class="dim">didn\'t run</span>';
+    if (r.previousCost === 0) return 'new';
+    const change = (r.cost - r.previousCost) / r.previousCost;
+    // A few cents either way is no news.
+    if (Math.abs(change) < 0.25 || Math.abs(r.cost - r.previousCost) < 0.5) return 'about the same';
+    return change > 0
+      ? `<span style="color:var(--amber)">▲ ${Math.round(change * 100)}%</span>`
+      : `<span style="color:var(--green)">▼ ${Math.round(-change * 100)}%</span>`;
+  };
+  const costRow = (r: CostRow & { name: string }) => {
+    const proj = d.projects.find((x) => x.name === r.project)?.title ?? r.project;
+    const name =
+      r.kind === 'job' && r.jobId
+        ? `<a href="/jobs#job-${esc(r.project)}-${esc(r.jobId)}">${esc(r.name)}</a>`
+        : `<b>${esc(r.name)}</b>`;
+    return `<tr><td class="name">${name}<small>${esc(proj)}</small></td><td>${r.runs}</td><td>${money(r.cost)}</td><td>${
+      r.runs ? money(r.cost / r.runs) : '–'
+    }</td><td>${costTotal ? pct(r.cost / costTotal) : '–'}</td><td>${costChange(r)}</td></tr>`;
+  };
+  const costHead =
+    '<thead><tr><th>What</th><th>Runs</th><th>Cost</th><th>Per run</th><th>Share</th><th>vs before</th></tr></thead>';
+  const TOP = 8;
+  const costTop = d.costRows.slice(0, TOP);
+  const costRest = d.costRows.slice(TOP);
+  const costPart = d.costRows.length
+    ? `<div class="tbl-wrap"><table class="tbl">${costHead}<tbody>${costTop.map(costRow).join('')}</tbody></table></div>${
+        costRest.length
+          ? `<details class="more" style="margin-top:8px"><summary>${costRest.length} more, ${money(
+              costRest.reduce((t, r) => t + r.cost, 0),
+            )} together</summary><div class="tbl-wrap"><table class="tbl">${costHead}<tbody>${costRest
+              .map(costRow)
+              .join('')}</tbody></table></div></details>`
+          : ''
+      }`
+    : '<div class="empty">No run reported a cost in this period.</div>';
 
   const dayTicks = (from: number, to: number) => {
     const ticks: Array<{ at: number; label: string }> = [];
@@ -568,7 +609,9 @@ export function trendsPage(ctx: DashboardContext, d: TrendsData): string {
   )}<div class="toolbar" style="margin-top:-6px">${rangeChips}</div>${kpis}${section(
     'Runs and cost',
     `<div class="grid2">${runsChart}${costChart}</div>`,
-  )}${section('Usage', usageChart, { sub: 'every run stops when the window is used up' })}${section(
+  )}${section('Where the cost goes', costPart, {
+    sub: 'per job, and per project for chats and learning; most expensive first',
+  })}${section('Usage', usageChart, { sub: 'every run stops when the window is used up' })}${section(
     'Jobs',
     jobsPart,
     {

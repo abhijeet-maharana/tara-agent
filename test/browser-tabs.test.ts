@@ -1,6 +1,12 @@
 import { createServer, type Server } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
-import { keptTabUrls, openTabs, type SweptBrowser, TabSweeper } from '../src/runner/browser-tabs.js';
+import {
+  Conversations,
+  keptTabUrls,
+  openTabs,
+  type SweptBrowser,
+  TabSweeper,
+} from '../src/runner/browser-tabs.js';
 import { fakeChrome } from './fakes.js';
 
 const servers: Server[] = [];
@@ -119,5 +125,69 @@ describe('keptTabUrls', () => {
     expect(await keptTabUrls(`${base}/0`)).toEqual(['https://a.example/f']);
     expect(await keptTabUrls(`${base}/1`)).toEqual(['https://b.example/g']);
     expect(await keptTabUrls('http://127.0.0.1:9/')).toBeUndefined();
+  });
+});
+
+describe('Conversations', () => {
+  const thread = { channel: 'C1', ts: '1.0' };
+  const run = (id: string, startedAt: number, endedAt?: number, t: typeof thread | null = thread) => ({
+    id,
+    project: 'shop',
+    thread: t ?? undefined,
+    startedAt,
+    endedAt,
+    status: endedAt === undefined ? 'running' : 'ok',
+  });
+
+  it('keeps a chat going from its first turn, across turns and between them', () => {
+    const c = new Conversations(30 * MIN);
+    c.update(run('t1', 0));
+    c.update(run('t1', 0, 5 * MIN));
+    expect(c.oldest(['shop'], 20 * MIN)).toBe(0); // between turns
+    c.update(run('t2', 25 * MIN));
+    expect(c.oldest(['shop'], 50 * MIN)).toBe(0); // turn 2 still owns turn 1's tabs
+    c.update(run('t2', 25 * MIN, 52 * MIN));
+    expect(c.oldest(['shop'], 81 * MIN)).toBe(0);
+    expect(c.oldest(['shop'], 82 * MIN)).toBeUndefined(); // idle for 30 minutes
+    expect(c.oldest(['other'], 10 * MIN)).toBeUndefined();
+  });
+
+  it('starts a chat over after it was idle, and forgets a job when it ends', () => {
+    const c = new Conversations(30 * MIN);
+    c.update(run('t1', 0, 5 * MIN));
+    c.update(run('t2', 60 * MIN));
+    expect(c.oldest(['shop'], 61 * MIN)).toBe(60 * MIN);
+    const job = new Conversations(30 * MIN);
+    job.update(run('j', 10 * MIN, undefined, null));
+    expect(job.oldest(['shop'], 20 * MIN)).toBe(10 * MIN);
+    job.update(run('j', 10 * MIN, 15 * MIN, null));
+    expect(job.oldest(['shop'], 16 * MIN)).toBeUndefined();
+  });
+
+  it('with the sweeper: a tab from turn 1 survives turn 3 an hour later', async () => {
+    const chrome = await fakeChrome({
+      a: 'chrome://new-tab-page/',
+      b: 'https://www.naukri.com/mnjuser/profile',
+    });
+    servers.push(chrome.server);
+    let now = 0;
+    const c = new Conversations(30 * MIN);
+    const sweeper = new TabSweeper({
+      browsers: () => [{ cdpUrl: chrome.url, staleMs: 30 * MIN, projects: ['shop'], keepUrls: [] }],
+      oldestRun: (p) => c.oldest(p, now),
+      now: () => now,
+      log: () => {},
+    });
+    c.update(run('t1', 0));
+    now = 1 * MIN;
+    await sweeper.sweep(); // tab b first seen during turn 1
+    c.update(run('t1', 0, 10 * MIN));
+    c.update(run('t2', 30 * MIN, 40 * MIN));
+    c.update(run('t3', 55 * MIN));
+    now = 60 * MIN;
+    expect(await sweeper.sweep()).toBe(0);
+    c.update(run('t3', 55 * MIN, 62 * MIN));
+    now = 95 * MIN;
+    expect(await sweeper.sweep()).toBe(1); // idle 33 minutes: now it is stale
   });
 });
