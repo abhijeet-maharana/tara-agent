@@ -52,12 +52,13 @@ server.registerTool(
       'one: a decision before you act (spending money, changing prices, listings, ads or data, publishing, ' +
       'sending messages to others), a suggestion worth acting on, or something only a person can do (a login, ' +
       'an OTP, a call, a failure you could not fix: say exactly what, with options like "Done, continue" / ' +
-      '"Skip"). Every button must let you carry on with no further message: never a button that only promises ' +
+      '"Skip"). Every button must let a session carry on with no further message: never a button that only promises ' +
       'a later reply ("I\'ll reply with the code", "I\'ll send it"), which makes the person tap and then type ' +
       '"done" as well. For a code, OTP or value only they have: buttons for each way they might finish ' +
       '("Done, I entered it" / "Skip"), and say in the details that they can instead reply in the thread ' +
-      'with the value for you to enter. After calling it, END YOUR TURN without doing the action: the answer arrives as your next ' +
-      'message, starting with "USER DECISION", or as a normal reply.',
+      'with the value for you to enter. After calling it, END YOUR TURN without doing the action. With `handoff` (the ' +
+      'usual case) the decision is acted on by a fresh session in a new thread, from the card, its handoff notes and ' +
+      'the project memory; without it, the answer arrives here as your next message, starting with "USER DECISION".',
     inputSchema: {
       title: z
         .string()
@@ -81,6 +82,16 @@ server.registerTool(
         .max(40)
         .optional()
         .describe('What sort of decision, so scripts can find it (e.g. "post-topic"). Default "decision".'),
+      handoff: z
+        .string()
+        .max(20_000)
+        .optional()
+        .describe(
+          'Notes for the fresh session that acts on the decision in a new thread, without this conversation: ' +
+            'what to do for each option, step by step, with every id, URL, file path, number and command it ' +
+            'needs, and anything you found that it should know. Shown folded on the Approvals page. Leave it out ' +
+            'only when the answer must come back to this very session (an OTP, a login in a browser you have open).',
+        ),
     },
   },
   async (args) => {
@@ -88,7 +99,10 @@ server.registerTool(
       const { options } = await api<{ options: string[] }>('/internal/approval', args);
       return text(
         `Approval request posted in the Slack thread (buttons: ${options.join(' / ')}). ` +
-          'Stop now: end your turn without doing the action. The decision arrives as your next message.',
+          'Stop now: end your turn without doing the action. ' +
+          (args.handoff?.trim()
+            ? 'A fresh session acts on the decision in a new thread, from the card and its handoff notes.'
+            : 'The decision arrives as your next message.'),
       );
     } catch (err) {
       return text(`Could not post the approval request: ${(err as Error).message}`, true);

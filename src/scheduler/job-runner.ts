@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Bridge, RunContext } from '../bridge/bridge.js';
 import type { HostConfig, ScheduledJob } from '../config/schema.js';
+import { memoryBlock } from '../memory/memory.js';
 import { buildAgyArgs } from '../runner/agy.js';
 import { buildClaudeArgs } from '../runner/args.js';
 import { buildChildEnv } from '../runner/env.js';
@@ -14,6 +15,7 @@ import { StreamReply } from '../slack/reply.js';
 import type { Item, RunRecord, Store } from '../store/store.js';
 import { type Locks, type Semaphore, Throttle } from '../util/concurrency.js';
 import {
+  buildDecisionPrompt,
   buildHandoffPrompt,
   buildJobPrompt,
   type DecidedCard,
@@ -36,6 +38,17 @@ export type JobTrigger =
   | { kind: 'manual'; by: string; thread?: { channel: string; ts: string } }
   /** A decision on the run's approval card: the same session continues in its thread. */
   | { kind: 'resume'; by: string; threadTs: string; text: string; card?: DecidedCard }
+  /**
+   * A decision on a card with handoff notes: a fresh session acts on it in a new `Run` thread, from the
+   * card, its notes and the project memory. `from` is the thread of the run that raised it.
+   */
+  | {
+      kind: 'decision';
+      by: string;
+      text: string;
+      card: DecidedCard;
+      from: { channel: string; threadTs: string };
+    }
   /** Approved items from one of the project's queues, handed to this (executor) job. */
   | { kind: 'queue'; queue: string; items: Item[] };
 
@@ -66,6 +79,8 @@ export interface JobRunnerDeps {
   env?: NodeJS.ProcessEnv;
   newSessionId?: () => string;
   now?: () => number;
+  /** A Slack thread's link, once Slack is connected. */
+  threadUrl?: (channel: string, ts: string) => string | undefined;
 }
 
 const SLACK_USER = /^[UW][A-Z0-9]+$/;
@@ -78,7 +93,10 @@ const sum = (a?: number, b?: number) => (a === undefined && !b ? a : (a ?? 0) + 
  * its steps into its thread: to whoever started or continued it in Slack, else the project owner.
  */
 export function streamRecipient(trigger: JobTrigger, owner: string | undefined): string | undefined {
-  const by = trigger.kind === 'manual' || trigger.kind === 'resume' ? trigger.by : undefined;
+  const by =
+    trigger.kind === 'manual' || trigger.kind === 'resume' || trigger.kind === 'decision'
+      ? trigger.by
+      : undefined;
   return by && SLACK_USER.test(by) ? by : owner;
 }
 
@@ -88,6 +106,7 @@ function triggerLabel(trigger: JobTrigger): string {
     return ` (run by ${/^[UW][A-Z0-9]+$/.test(trigger.by) ? `<@${trigger.by}>` : trigger.by})`;
   }
   if (trigger.kind === 'resume') return ' (continuing after your decision)';
+  if (trigger.kind === 'decision') return ' (acting on your decision)';
   if (trigger.kind === 'queue')
     return ` (${trigger.items.length} approved ${trigger.items.length === 1 ? 'item' : 'items'})`;
   return '';
@@ -190,15 +209,40 @@ export async function runJob(
       await chat.update(channel, statusTs, `❌ ${title}: the run's session is gone, so it can't continue`);
       return record('error', { error: 'no session to continue' });
     }
+    // Acting on a decision in a new thread: the run that raised the card, and where each thread points.
+    const from = trigger.kind === 'decision' ? trigger.from : undefined;
+    const origin = from && store.getSession(threadKey(from.channel, from.threadTs));
+    if (trigger.kind === 'decision' && from) {
+      const here = deps.threadUrl?.(channel, rootTs);
+      const there = deps.threadUrl?.(from.channel, from.threadTs);
+      await chat.post(
+        channel,
+        rootTs,
+        `📝 *${trigger.card.title}*${there ? ` · <${there}|earlier thread>` : ''}`,
+      );
+      await chat
+        .post(
+          from.channel,
+          from.threadTs,
+          `➡️ Your decision on "${trigger.card.title}" continues in ${here ? `<${here}|a new thread>` : 'a new thread'}`,
+        )
+        .catch((err: Error) =>
+          log.warn(`could not link the new thread from the earlier one: ${err.message}`),
+        );
+    }
+    // An approved card of a job with a handoff starts on the handoff's CLI, as a resumed one would.
+    const fresh =
+      trigger.kind === 'decision' && job.handoff && !trigger.card.declined ? job.handoff : undefined;
     const newId = (deps.newSessionId ?? randomUUID)();
     let session = earlier ?? {
       threadKey: key,
       project: project.config.name,
       sessionId: newId,
-      model: job.model,
+      model: fresh?.model ?? job.model,
       started: false,
-      harness: job.harness,
-      scratchId: newId,
+      harness: fresh?.harness ?? job.harness,
+      // Acting on a decision keeps the earlier run's scratch folder (its screenshots and downloads).
+      scratchId: origin?.scratchId ?? origin?.sessionId ?? newId,
     };
     // The run keeps its scratch folder (and the files in it, e.g. screenshots) across agy's own
     // conversation id and a handoff.
@@ -249,9 +293,19 @@ export async function runJob(
     };
 
     const mcpServers = expandMcpServers(job.mcpServers, env);
+    // A fresh session starts from the project memory; a resumed one has it already.
+    const withMemory = (prompt: string) => {
+      const memory = memoryBlock(project, store, { now: now(), timeZone: deps.host.timezone });
+      return memory ? `${memory}\n\n${prompt}` : prompt;
+    };
     // Steps run first (not when continuing after a decision or running queue items), each in its own session.
     let stepsDone: StepsResult | undefined;
-    if (job.steps.length && trigger.kind !== 'resume' && trigger.kind !== 'queue') {
+    if (
+      job.steps.length &&
+      trigger.kind !== 'resume' &&
+      trigger.kind !== 'decision' &&
+      trigger.kind !== 'queue'
+    ) {
       stepsDone = await runSteps({
         host: deps.host,
         run: deps.run,
@@ -325,16 +379,30 @@ export async function runJob(
         prompt:
           trigger.kind === 'resume'
             ? handoff && card
-              ? buildHandoffPrompt(job, ranOn, card, trigger.text, folders)
+              ? withMemory(buildHandoffPrompt(job, ranOn, card, trigger.text, folders))
               : job.handoff && card && harness === job.handoff.harness
                 ? decisionWithCard(card, trigger.text)
                 : trigger.text
-            : buildJobPrompt(
-                job,
-                folders,
-                trigger.kind === 'queue' ? trigger.items : undefined,
-                stepsDone?.section,
-              ),
+            : trigger.kind === 'decision'
+              ? withMemory(
+                  buildDecisionPrompt(trigger.card, trigger.text, {
+                    job,
+                    earlier: from && {
+                      url: deps.threadUrl?.(from.channel, from.threadTs),
+                      sessionId: origin?.sessionId,
+                      harness: origin?.harness,
+                    },
+                    folders,
+                  }),
+                )
+              : withMemory(
+                  buildJobPrompt(
+                    job,
+                    folders,
+                    trigger.kind === 'queue' ? trigger.items : undefined,
+                    stepsDone?.section,
+                  ),
+                ),
         timeoutMs,
         signal: stop,
         label: {
@@ -392,7 +460,7 @@ export async function runJob(
         durationMs: main.durationMs + stepsDone.durationMs,
       };
       const typical =
-        trigger.kind === 'resume' || trigger.kind === 'queue'
+        trigger.kind === 'resume' || trigger.kind === 'decision' || trigger.kind === 'queue'
           ? undefined
           : typicalRun(store.jobRuns(project.config.name, job.id, 60), now());
       const common = {

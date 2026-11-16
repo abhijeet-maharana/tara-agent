@@ -190,7 +190,7 @@ document.addEventListener('change', (e) => {
 `;
 
 const CSS = `<style>
-.item .body{margin-top:8px;font-size:14px;overflow-wrap:anywhere}.item .body.long:not(.open){max-height:260px;overflow:hidden;-webkit-mask-image:linear-gradient(#000 75%,transparent);mask-image:linear-gradient(#000 75%,transparent)}
+.item .handoff{margin-top:8px;font-size:13px}.item .handoff>summary{cursor:pointer;color:var(--text-dim)}.item .body{margin-top:8px;font-size:14px;overflow-wrap:anywhere}.item .body.long:not(.open){max-height:260px;overflow:hidden;-webkit-mask-image:linear-gradient(#000 75%,transparent);mask-image:linear-gradient(#000 75%,transparent)}
 .btn.expand{margin-top:6px}
 .media{display:flex;gap:8px;overflow-x:auto;margin-top:10px;align-items:flex-start}.media img,.media video{height:180px;border-radius:8px;border:1px solid var(--border);background:var(--bg)}.media video{height:min(62vh,520px);max-width:100%;aspect-ratio:9/16;background:#000;object-fit:contain}
 .fieldset{display:grid;gap:10px;margin-top:12px}.fieldset .field{position:relative}
@@ -319,6 +319,11 @@ function waitingCard(
   }</div>
 <div class="fold">
 ${item.body ? `<div class="body${long ? ' long' : ''}">${md(item.body)}</div>${long ? '<button type="button" class="btn quiet expand" data-expand>Show all</button>' : ''}` : ''}
+${
+  item.handoff
+    ? `<details class="handoff"><summary>Handoff notes · a decision is acted on in a new thread</summary><div class="body">${md(item.handoff)}</div></details>`
+    : ''
+}
 ${mediaHtml(item)}
 ${item.fields.length ? `<div class="fieldset">${item.fields.map((f) => fieldHtml(f, data.canDecide)).join('')}</div>` : ''}
 ${item.checks.length ? `<ul class="checks">${item.checks.map((c) => `<li class="${c.blocking ? 'bad' : 'warn'}">${esc(c.text)}</li>`).join('')}</ul>` : ''}

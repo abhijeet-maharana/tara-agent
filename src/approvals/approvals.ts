@@ -2,7 +2,7 @@ import { createHmac } from 'node:crypto';
 import { loadQueues } from '../config/load.js';
 import type { Project } from '../config/schema.js';
 import type { Privileged, PrivilegedResult } from '../privileged/privileged.js';
-import type { DecidedCard } from '../scheduler/prompt.js';
+import { buildDecisionPrompt, type DecidedCard } from '../scheduler/prompt.js';
 import { openRunThread } from '../scheduler/slack-trigger.js';
 import {
   type ChatPort,
@@ -17,8 +17,9 @@ import { sealItem } from './seal.js';
 
 /**
  * Approval items: the cards on the Approvals page (and, for a paused run, in its Slack thread).
- *   resume  a run stopped for a decision (`request_approval`); the answer continues that run. A
- *           project server can ask too (`ask`): the answer then starts the agent in the card's thread
+ *   resume  a run stopped for a decision (`request_approval`). With handoff notes, the answer starts a
+ *           fresh session in a new `Run` thread (the job's, or a chat's); without, it continues that
+ *           run. A project server can ask too (`ask`): the answer then starts the agent in the card's thread
  *   queue   a draft (`propose_item`) that, once approved, runs later through one of the project's
  *           queues (scheduler/queues.ts)
  * Decisions come from Slack taps and from the dashboard (human-only, see http/server.ts) and both
@@ -107,6 +108,8 @@ export interface ApprovalsDeps {
   newId?: () => string;
   /** How long a message posted as the person may wait for Slack to deliver it before it goes directly. */
   pickupTimeoutMs?: number;
+  /** A Slack thread's link, once Slack is connected. */
+  threadUrl?: (channel: string, ts: string) => string | undefined;
 }
 
 /** A message `toThread` posted as the person, until Slack delivers it (`delivered`). */
@@ -127,6 +130,12 @@ export class Approvals {
     project: string,
     jobId: string,
     r: { threadTs: string; text: string; by: string; card?: DecidedCard },
+  ) => Promise<unknown>;
+  /** Acts on a decision in a fresh session of the job, in a new `Run` thread (Scheduler.decided). */
+  onJobDecision?: (
+    project: string,
+    jobId: string,
+    r: { by: string; text: string; card: DecidedCard; from: { channel: string; threadTs: string } },
   ) => Promise<unknown>;
 
   private readonly now: () => number;
@@ -162,6 +171,8 @@ export class Approvals {
       kind?: string;
       key?: string;
       fields?: ItemField[];
+      /** Notes for the fresh session that acts on the decision in a new thread. */
+      handoff?: string;
     },
   ): Promise<{ id: string; options: string[] }> {
     const title = input.title.trim().slice(0, 150);
@@ -175,6 +186,7 @@ export class Approvals {
       mode: 'resume',
       title,
       body: input.details.trim(),
+      handoff: input.handoff,
       fields: input.fields?.map(cleanField),
       options,
       source: ctx.jobId,
@@ -209,7 +221,14 @@ export class Approvals {
       },
       {
         type: 'context',
-        elements: [{ type: 'mrkdwn', text: 'Or decide on the Approvals page, or reply in this thread.' }],
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: item.handoff
+              ? 'Or decide on the Approvals page. A decision is acted on in a new thread; a reply here goes to this run.'
+              : 'Or decide on the Approvals page, or reply in this thread.',
+          },
+        ],
       },
     ];
     if (refresh) {
@@ -577,15 +596,31 @@ export class Approvals {
         d.fields && Object.keys(d.fields).length ? `\nEdited values: ${JSON.stringify(d.fields)}` : '';
       const note = d.reply?.trim() ? `\nNote: ${d.reply.trim()}` : '';
       const text = `USER DECISION on "${decided.title}": ${d.option}${note}${edits} (${d.via === 'slack' ? 'tapped' : 'chosen on the Approvals page'} at ${when})${ran}`;
-      this.handOff(
-        decided,
-        this.continueConversation(project, decided, d.by, text, {
-          card: { title: decided.title, body: decided.body ?? '', declined: negative },
-          fromPage: d.via !== 'slack',
-          visible: (who) =>
-            `*From ${who} on the Approvals page:* ${negative ? '❌' : '✅'} ${d.option} on "${decided.title}"${d.reply?.trim() ? `\n${d.reply.trim()}` : ''}`,
-        }),
-      );
+      const card = {
+        title: decided.title,
+        body: decided.body ?? '',
+        declined: negative,
+        handoff: decided.handoff,
+      };
+      const visible = (who: string) =>
+        `*From ${who} on the Approvals page:* ${negative ? '❌' : '✅'} ${d.option} on "${decided.title}"${d.reply?.trim() ? `\n${d.reply.trim()}` : ''}`;
+      // With handoff notes a fresh session acts on it in a new thread. A plain "no" needs no run: the
+      // card shows it, and later runs see it in the project memory's recent decisions.
+      if (decided.handoff && !action) {
+        if (!negative || d.reply?.trim())
+          this.handOff(
+            decided,
+            this.actInNewThread(project, decided, d.by, text, card, { fromPage: d.via !== 'slack', visible }),
+          );
+      } else
+        this.handOff(
+          decided,
+          this.continueConversation(project, decided, d.by, text, {
+            card,
+            fromPage: d.via !== 'slack',
+            visible,
+          }),
+        );
     }
     const final = action ? (store.getItem(id) as Item) : decided;
     this.notify(final, 'decided');
@@ -879,6 +914,56 @@ export class Approvals {
       fromPage: opts.fromPage,
       visible: opts.visible,
     });
+  }
+
+  /**
+   * A decision on a card with handoff notes: a fresh session acts on it in a new `Run` thread, from the
+   * card, its notes and the project memory, instead of resuming the run that raised it. A job's card
+   * runs as that job (its slot, locks and timeout); a chat's card, or one whose job is gone, as a chat.
+   * Each thread links to the other.
+   */
+  private async actInNewThread(
+    project: Project,
+    item: Item,
+    by: string,
+    text: string,
+    card: DecidedCard,
+    opts: { fromPage?: boolean; visible?: (who: string) => string },
+  ): Promise<void> {
+    const user = /^[UW][A-Z0-9]+$/.test(by) ? by : (project.config.owner ?? by);
+    const from =
+      item.channel && item.threadTs ? { channel: item.channel, threadTs: item.threadTs } : undefined;
+    if (item.jobId && from && this.onJobDecision) {
+      const status = await this.onJobDecision(project.config.name, item.jobId, {
+        by: user,
+        text,
+        card,
+        from,
+      });
+      if (status !== 'unknown') return;
+      this.deps.log.warn(
+        `[${project.config.name}] item ${item.id}: job ${item.jobId} no longer exists, acting on it as a chat`,
+      );
+    }
+    const { chat, store, threadUrl } = this.deps;
+    const channel = project.config.slackChannel;
+    const threadTs = await openRunThread(chat, channel, item.kind, project.config.words);
+    const here = threadUrl?.(channel, threadTs);
+    const there = from && threadUrl?.(from.channel, from.threadTs);
+    await chat.post(channel, threadTs, `📝 *${item.title}*${there ? ` · <${there}|earlier thread>` : ''}`);
+    if (from)
+      await chat
+        .post(
+          from.channel,
+          from.threadTs,
+          `➡️ Your decision on "${item.title}" continues in ${here ? `<${here}|a new thread>` : 'a new thread'}`,
+        )
+        .catch((err: Error) => this.deps.log.warn(`could not link the new thread: ${err.message}`));
+    const earlier = from && store.getSession(threadKey(from.channel, from.threadTs));
+    const prompt = buildDecisionPrompt(card, text, {
+      earlier: from && { url: there, sessionId: earlier?.sessionId, harness: earlier?.harness },
+    });
+    await this.toThread({ channel, threadTs, ts: threadTs, user }, prompt, opts);
   }
 
   /**

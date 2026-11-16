@@ -211,7 +211,7 @@ async function readJson(req: IncomingMessage, limit = 10_000): Promise<Record<st
  *   GET  /code?q=, /code/<repo>?q=     search file names and text (every repo, or one)
  *   POST /code/<repo>/ask              {path, question} asks in Slack; needs the unlocked browser
  * and, for tara's own MCP server (header `x-tara-run: <run token>`):
- *   POST /internal/approval            {title, details, options?}
+ *   POST /internal/approval            {title, details, options?, kind?, handoff?}
  *   POST /internal/file                {path, comment?}
  *   POST /internal/privileged          {action, args?, reason} | {command, reason} → {ran, ok, result} | {id}
  *   POST /internal/permission          {tool_name, input}  → {id}
@@ -997,6 +997,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         details: required(body.details, 'details'),
         options,
         kind: str(body.kind)?.slice(0, 40),
+        handoff: str(body.handoff)?.slice(0, 20_000),
       });
     }
     if (req.method === 'POST' && parts[1] === 'privileged' && parts.length === 2) {

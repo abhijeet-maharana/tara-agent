@@ -1,4 +1,6 @@
-import { readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { HostConfig, Project, ProjectConfig } from '../src/config/schema.js';
 import type { RunOptions, RunOutcome } from '../src/runner/run.js';
@@ -138,6 +140,19 @@ describe('SessionManager', () => {
     expect(calls[1]?.agy?.settings).toEqual({
       permissions: { allow: ['mcp(tara_tara/*)'], deny: [], ask: [] },
     });
+  });
+
+  it('gives a new conversation the project memory, and a continued one nothing more', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'tara-mgr-mem-'));
+    mkdirSync(path.join(dir, '.tara'));
+    writeFileSync(path.join(dir, '.tara', 'memory.md'), '## Shop\n- Prices change only on Mondays');
+    const { calls, manager } = setup({ project: { ...project(), dir } });
+    await manager.handle(msg('hello'));
+    await manager.handle(msg('and then?', { ts: '100.2' }));
+    expect(calls[0]?.prompt).toMatch(
+      /^## Project memory\n[\s\S]*- Prices change only on Mondays\n\n<@U1>: hello/,
+    );
+    expect(calls[1]?.prompt).toBe('<@U1>: and then?');
   });
 
   it('starts a session, then resumes it on a thread reply', async () => {

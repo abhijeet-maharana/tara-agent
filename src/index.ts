@@ -169,6 +169,7 @@ async function serve(configFlag: string | undefined) {
     sealKey: process.env.APPROVAL_SEAL_KEY || undefined,
     privileged,
     autoApprove: host.autoApprove,
+    threadUrl,
   });
   if (!process.env.APPROVAL_SEAL_KEY) log.warn('APPROVAL_SEAL_KEY is not set: approved items are not sealed');
   // Pull requests: the token stays here, runs only get the tools.
@@ -219,6 +220,7 @@ async function serve(configFlag: string | undefined) {
     bridge,
     threads,
     log,
+    threadUrl,
   });
   manager = new SessionManager({
     projects,
@@ -247,6 +249,7 @@ async function serve(configFlag: string | undefined) {
   }
   approvals.onChat = (msg) => (manager as SessionManager).handle(msg);
   approvals.onJob = (project, jobId, r) => scheduler.resume(project, jobId, r);
+  approvals.onJobDecision = (project, jobId, r) => scheduler.decided(project, jobId, r);
   const queues = new QueueWorker({
     projects,
     store,

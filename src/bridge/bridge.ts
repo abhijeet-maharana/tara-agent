@@ -99,11 +99,12 @@ export const JOB_TOOLS_PROMPT = `- To run one of this channel's scheduled jobs n
 
 /** Appended to the system prompt of every run that has tara's MCP tools. */
 export const BRIDGE_PROMPT = `Slack tools (tara MCP server):
-- Everything that needs a person goes through \`request_approval\`: a card on the Approvals page and in this thread. The answer arrives as your next message, starting with "USER DECISION", and you continue from there. There is no other task list. Raise a card for:
+- Everything that needs a person goes through \`request_approval\`: a card on the Approvals page and in this thread. There is no other task list. Raise a card for:
   - a decision, before you act (spending money; changing prices, listings, ads, orders or data; publishing; sending messages to other people): the exact proposal and numbers. End your turn without acting.
   - a suggestion worth acting on: approving it means you do it.
   - something only a person can do (a login, an OTP, a captcha, a call, a failure you could not fix): say exactly what, with options like "Done, continue" / "Skip".
   No card for OK or FYI news: that stays in your reply.
+  Give every card \`handoff\` notes: the decision is then acted on by a fresh session in a new thread, which has only the card, those notes and the project memory, not this conversation. Write them for someone who wasn't here: what to do on each option, with every id, URL, file path, number and command it needs. Leave \`handoff\` out only when the answer must come back to this very session (an OTP or a login in a browser you have open): it then arrives here as your next message, starting with "USER DECISION".
 - Drafts that should go out later (messages, emails, applications, posts) go through \`propose_item\` with the queue that sends them: one card each, approved or edited on the Approvals page, then run at the queue's time. Never send them yourself.
 - Close a waiting card yourself with \`withdraw_card\` (its id from \`list_items\`, and why) whenever it no longer needs the person: they did it themselves, the role or post is gone, it is a duplicate, or a newer card replaces it. No approval is needed to close a card. Never ask them to tap a button just to clear it, and never leave a card they cannot act on.
 - To share a screenshot, PDF, CSV or image, save it inside the project (e.g. .scratch/) and call \`send_file\`.`;
@@ -231,7 +232,7 @@ export class Bridge {
 
   async requestApproval(
     token: string | undefined,
-    input: { title: string; details: string; options?: string[]; kind?: string },
+    input: { title: string; details: string; options?: string[]; kind?: string; handoff?: string },
   ): Promise<{ id: string; options: string[] }> {
     const ctx = this.run(token);
     return this.deps.approvals.requestDecision(ctx, input).catch(asBridgeError);

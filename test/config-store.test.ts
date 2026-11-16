@@ -242,11 +242,11 @@ describe('Store', () => {
     const db = new DatabaseSync(file);
     const { user_version: v } = db.prepare('PRAGMA user_version').get() as { user_version: number };
     // The database as it was before the upgrade: totals in cost_usd, no session_cost_usd.
-    // (seven migrations back: the cost one, day_threads, the health tables, samples and logs, item priority, reminders,
-    // reminder tasks; dropping the reminders table undoes the last two)
+    // (eight migrations back: the cost one, day_threads, the health tables, samples and logs, item priority, reminders,
+    // reminder tasks, item handoff notes; dropping the reminders table undoes reminders and reminder tasks)
     db.exec(
-      `DROP TABLE reminders; ALTER TABLE items DROP COLUMN priority; DROP TABLE log_events; DROP TABLE host_samples; DROP TABLE health_events;
-       DROP TABLE health_state; DROP TABLE day_threads; ALTER TABLE runs DROP COLUMN session_cost_usd; PRAGMA user_version = ${v - 7};`,
+      `ALTER TABLE items DROP COLUMN handoff; DROP TABLE reminders; ALTER TABLE items DROP COLUMN priority; DROP TABLE log_events; DROP TABLE host_samples; DROP TABLE health_events;
+       DROP TABLE health_state; DROP TABLE day_threads; ALTER TABLE runs DROP COLUMN session_cost_usd; PRAGMA user_version = ${v - 8};`,
     );
     const add = db.prepare(
       `INSERT INTO runs (kind, project, session_id, started_at, ended_at, status, cost_usd) VALUES ('chat', 'p', ?, ?, ?, 'ok', ?)`,

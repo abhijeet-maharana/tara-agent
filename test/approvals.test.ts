@@ -1602,3 +1602,171 @@ describe('Approvals page messages go through Slack (as the person)', () => {
     expect(chats[0]?.mentionWhenDone).toBe('U1');
   });
 });
+
+describe('a decision on a card with handoff notes acts in a new thread', () => {
+  it('hands a job card to a fresh run of the job with the notes, never resuming; a plain no runs nothing', async () => {
+    const { project, store, approvals, jobs } = setup();
+    const fresh: Array<{ jobId: string; text: string; handoff?: string; from: object; declined: boolean }> =
+      [];
+    approvals.onJobDecision = async (_p, jobId, r) =>
+      void fresh.push({
+        jobId,
+        text: r.text,
+        handoff: r.card.handoff,
+        from: r.from,
+        declined: r.card.declined,
+      });
+    const ask = (title: string) =>
+      approvals.requestDecision(
+        { project, channel: 'C1', threadTs: '90.1', jobId: 'sender' },
+        { title, details: 'Cut bids', handoff: 'Campaign 123: set bids to 0.40 with scripts/bids.sh' },
+      );
+    const a = await ask('Cut bids');
+    expect(store.getItem(a.id)?.handoff).toContain('Campaign 123');
+    await approvals.decide(a.id, { option: 'Approve', by: 'U1', via: 'slack' });
+    const b = await ask('Pause ads');
+    await approvals.decide(b.id, { option: 'Reject', by: 'U1', via: 'slack' });
+    const c = await ask('Stop campaign');
+    await approvals.decide(c.id, {
+      option: 'Reject',
+      by: 'U1',
+      via: 'dashboard',
+      reply: 'Lower it to 0.30 instead',
+    });
+    await approvals.settled();
+    expect(jobs).toHaveLength(0);
+    expect(fresh).toEqual([
+      expect.objectContaining({
+        jobId: 'sender',
+        handoff: expect.stringContaining('Campaign 123'),
+        from: { channel: 'C1', threadTs: '90.1' },
+        declined: false,
+      }),
+      expect.objectContaining({ declined: true, text: expect.stringContaining('Lower it to 0.30') }),
+    ]);
+  });
+
+  it('says on the Slack card that the decision continues in a new thread', async () => {
+    const { project, chat, approvals } = setup();
+    await approvals.requestDecision(
+      { project, channel: 'C1', threadTs: '91.1' },
+      { title: 'T', details: 'D', handoff: 'notes' },
+    );
+    expect(JSON.stringify(chat.blockPosts[0]?.blocks)).toContain('acted on in a new thread');
+  });
+
+  it('acts on a chat card (or one whose job is gone) as a chat in a new Run thread, linking both threads', async () => {
+    const { project, store, chat, approvals, chats } = setup();
+    store.saveSession({
+      threadKey: 'C1:92.1',
+      project: 'shop',
+      sessionId: 'old-sid',
+      model: 'opus',
+      started: true,
+    });
+    const ask = await approvals.requestDecision(
+      { project, channel: 'C1', threadTs: '92.1' },
+      {
+        title: 'Send the invoice',
+        details: 'Invoice #7 to Acme',
+        handoff: 'PDF at .scratch/inv7.pdf, email ap@acme.test',
+      },
+    );
+    await approvals.decide(ask.id, { option: 'Approve', by: 'U1', via: 'slack' });
+    await approvals.settled();
+    const run = chat.posts.find((p) => p.thread === '' && p.text === 'Run Decision');
+    expect(run).toBeDefined();
+    expect(chat.posts).toContainEqual(
+      expect.objectContaining({ thread: run?.ts, text: '📝 *Send the invoice*' }),
+    );
+    expect(chat.posts).toContainEqual(
+      expect.objectContaining({ thread: '92.1', text: expect.stringContaining('continues in a new thread') }),
+    );
+    expect(chats).toHaveLength(1);
+    expect(chats[0]).toMatchObject({ channel: 'C1', threadTs: run?.ts });
+    expect(chats[0]?.text).toContain('PDF at .scratch/inv7.pdf');
+    expect(chats[0]?.text).toContain('USER DECISION on "Send the invoice": Approve');
+    expect(chats[0]?.text).toContain('old-sid');
+  });
+
+  it('keeps a card without notes on its run, as before', async () => {
+    const { project, approvals, jobs } = setup();
+    approvals.onJobDecision = async () => {
+      throw new Error('not for cards without notes');
+    };
+    const ask = await approvals.requestDecision(
+      { project, channel: 'C1', threadTs: '93.1', jobId: 'sender' },
+      { title: 'Enter the OTP', details: 'D', options: ['Done, I entered it', 'Skip'] },
+    );
+    await approvals.decide(ask.id, { option: 'Done, I entered it', by: 'U1', via: 'slack' });
+    await approvals.settled();
+    expect(jobs).toEqual([{ jobId: 'sender', text: expect.stringContaining('Done, I entered it') }]);
+  });
+});
+
+describe('acting on a decision as the job', () => {
+  it('starts a fresh session in a new Run thread with the memory, the card and its notes, keeping the scratch folder', async () => {
+    const project = makeProject();
+    writeFileSync(path.join(project.dir, '.tara', 'memory.md'), '## Ads\n- Bids never above 0.50 (10 Nov)');
+    const store = new Store(':memory:');
+    const chat = new FakeChat('ts');
+    const calls: RunOptions[] = [];
+    let id = 0;
+    const scheduler = new Scheduler({
+      projects: [project],
+      host: testHost(),
+      store,
+      chat,
+      log: silent,
+      env: {},
+      newSessionId: () => `sid${++id}`,
+      threadUrl: (c, ts) => `https://slack.test/archives/${c}/p${ts}`,
+      run: async (o) => {
+        calls.push(o);
+        const sid = o.args[o.args.indexOf('--session-id') + 1] ?? 'x';
+        o.onEvent?.({ kind: 'init', sessionId: sid, model: 'm' });
+        return {
+          status: 'ok',
+          text: 'Done.',
+          sessionId: sid,
+          durationMs: 1,
+          toolCalls: 0,
+          permissionDenials: [],
+        };
+      },
+    });
+    scheduler.start();
+    scheduler.trigger('shop', 'sender', 'api');
+    await scheduler.idle();
+    const first = chat.posts[0]?.ts as string;
+    const status = await scheduler.decided('shop', 'sender', {
+      by: 'U1',
+      text: 'USER DECISION on "Cut bids": Approve',
+      card: { title: 'Cut bids', body: 'Cut 4 bids', declined: false, handoff: 'Campaign 123 → 0.40' },
+      from: { channel: 'C1', threadTs: first },
+    });
+    await scheduler.stop();
+    expect(status).toBe('ok');
+    expect(calls).toHaveLength(2);
+    const second = calls[1] as RunOptions;
+    expect(second.args).not.toContain('--resume');
+    expect(second.args).toEqual(expect.arrayContaining(['--session-id', 'sid2']));
+    expect(second.prompt).toContain('Bids never above 0.50');
+    expect(second.prompt).toContain('Campaign 123 → 0.40');
+    expect(second.prompt).toContain('USER DECISION on "Cut bids": Approve');
+    expect(second.prompt).toContain(`https://slack.test/archives/C1/p${first}`);
+    expect(second.prompt).toContain('`sid1`');
+    // The earlier run's scratch folder (named after its first session id) carries over.
+    expect(second.env?.TARA_SCRATCH).toBe(calls[0]?.env?.TARA_SCRATCH);
+    const runs = chat.posts.filter((p) => p.thread === '' && p.text === 'Run Sender');
+    expect(runs).toHaveLength(2);
+    const newThread = runs[1]?.ts as string;
+    expect(store.getSession(`C1:${newThread}`)).toMatchObject({ sessionId: 'sid2', started: true });
+    expect(chat.posts).toContainEqual(
+      expect.objectContaining({ thread: first, text: expect.stringContaining(`p${newThread}|a new thread`) }),
+    );
+    expect(chat.posts).toContainEqual(
+      expect.objectContaining({ thread: newThread, text: expect.stringContaining('*Cut bids*') }),
+    );
+  });
+});

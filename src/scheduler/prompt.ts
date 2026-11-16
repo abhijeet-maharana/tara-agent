@@ -1,10 +1,11 @@
 import type { Harness, JobConfig } from '../config/schema.js';
+import { MEMORY_LEARN_NOTE } from '../memory/memory.js';
 import { hasTable } from '../slack/format.js';
 import type { Item } from '../store/store.js';
 
 export const JOB_SYSTEM_PROMPT = `You are running a scheduled job unattended, through tara-agent. Nobody is watching live.
 - Do the whole job now. Never wait for input mid-turn.
-- Finish first, ask at the end: do every part that needs no decision, all the way through, and never stop midway for an approval you can do without. Then raise one \`request_approval\` card per thing that needs a person (a decision, a suggestion, a login or a failure you could not fix) and end your turn; each decision continues this run later. Drafts that go out later go through \`propose_item\`.
+- Finish first, ask at the end: do every part that needs no decision, all the way through, and never stop midway for an approval you can do without. Then raise one \`request_approval\` card per thing that needs a person (a decision, a suggestion, a login or a failure you could not fix) and end your turn. Give each card its \`handoff\` notes: its decision is acted on later by a fresh session in a new thread, which has only the card, those notes and the project memory. Drafts that go out later go through \`propose_item\`.
 - Nothing worth reporting: reply with one ✅ line saying so, e.g. "✅ No new notices".
 - If the job itself could not be done (a login, a page or a script broke), start the reply with ❌ and the reason, then the evidence: a first line starting with ❌ marks the run failed. Problems the job found are ⚠️, never ❌.
 - Reply format: a headline of 1–6 lines (shown next to the run's status line, at the top of its thread), then a line containing only ---, then the full details (posted below it). Write normal markdown (it is converted for Slack) and use a markdown table whenever the content fits one.
@@ -100,9 +101,11 @@ Only if writing that down would make the next run faster, cheaper or more reliab
   const where = step
     ? `That means only this step's part of the skill (its "### Step: ${step}" part, or "### Every step" when it applies to every step), or a script in the skill's folder that this step runs.`
     : 'That means the skill this run used (its SKILL.md, or a script in its folder that the skill runs) or another instruction (.md) file it used.';
+  // Steps only feed their job's main session, whose own turn keeps the memory.
+  const memory = step ? '' : `\n\n${MEMORY_LEARN_NOTE}`;
   return `${opening}${usage ? `\n\n${usageParagraph(usage, step)}` : ''}
 
-${where} Keep it small and specific: a corrected selector or URL, a missing step, a known trap and how to get past it, a fixed bug in a script, a cheaper way to do the same work. A new script goes in the skill's \`scripts/\` folder, with SKILL.md saying when and how to run it. If the skill has a version in its front matter, bump it.
+${where} Keep it small and specific: a corrected selector or URL, a missing step, a known trap and how to get past it, a fixed bug in a script, a cheaper way to do the same work. A new script goes in the skill's \`scripts/\` folder, with SKILL.md saying when and how to run it. If the skill has a version in its front matter, bump it.${memory}
 
 Do not repeat the task, open the browser or call other services. Do not create new skills.
 
@@ -139,10 +142,67 @@ export interface DecidedCard {
   body: string;
   /** Rejected, skipped or otherwise not approved. */
   declined: boolean;
+  /** The run's handoff notes for whoever acts on the decision (`request_approval` `handoff`). */
+  handoff?: string;
 }
 
 const cardSection = (card: DecidedCard) =>
-  `## The card\n### ${card.title}\n${card.body.trim() || '(no details)'}`;
+  `## The card\n### ${card.title}\n${card.body.trim() || '(no details)'}${
+    card.handoff?.trim() ? `\n\n## Handoff notes from the run that raised it\n${card.handoff.trim()}` : ''
+  }`;
+
+/** The run that raised a card, for a session acting on its decision in a new thread. */
+export interface EarlierRun {
+  /** Its Slack thread. */
+  url?: string;
+  sessionId?: string;
+  harness?: Harness;
+}
+
+/**
+ * The first prompt of the fresh session that acts on a decision in a new `Run` thread: the card, its
+ * handoff notes and the decision, and where the earlier run is in case the notes leave something out.
+ * For a job, also its instructions and folders; a chat gets its folders and memory from the manager.
+ */
+export function buildDecisionPrompt(
+  card: DecidedCard,
+  decision: string,
+  opts: {
+    job?: Pick<JobConfig, 'id' | 'name' | 'skills' | 'steps'>;
+    earlier?: EarlierRun;
+    folders?: RunFolders;
+  } = {},
+): string {
+  const { job, earlier, folders } = opts;
+  const what = job ? `the job "${job.name}"` : 'a conversation';
+  const transcript =
+    earlier?.sessionId &&
+    (earlier.harness === 'agy'
+      ? `Its session was the agy conversation \`${earlier.sessionId}\`.`
+      : `Its session was \`${earlier.sessionId}\`: the Claude Code transcript \`${earlier.sessionId}.jsonl\` under \`~/.claude/projects/\` (the folder named after this project's path).`);
+  const where = [earlier?.url ? `The earlier thread: ${earlier.url}.` : '', transcript ?? '']
+    .filter(Boolean)
+    .join(' ');
+  const parts = [
+    `A person decided on an approval card raised by ${what}. You act on that decision here, in a new session and a new Slack thread: you don't have the earlier conversation. The card, its handoff notes and the project memory are what you have. Act on the decision only: everything else that run did is already done, so never redo it.${
+      card.declined
+        ? " The card was not approved: don't do what it proposed. Do only what the note asks, if anything, and say in one line what you did."
+        : ''
+    }`,
+    cardSection(card),
+    `## The decision\n${decision}`,
+  ];
+  if (where)
+    parts.push(
+      `## If something is missing\n${where} Read it only when the card and its notes leave out something you need (an id, a link, a file), and only the part you need.`,
+    );
+  if (job)
+    parts.push(
+      `## The job's instructions\nThe \`${job.skills[0]}\` skill says how ${what} works (the Skill tool, or its SKILL.md): load it for how to carry out the decision, not to run the whole job again.`,
+    );
+  if (folders) parts.push(foldersNote(folders));
+  return parts.join('\n\n');
+}
 
 /**
  * The first prompt of a session a decision hands the run over to (job `handoff`): it has none of the

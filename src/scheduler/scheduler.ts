@@ -86,6 +86,8 @@ export interface SchedulerDeps {
   reloadIntervalMs?: number;
   /** How long a posted trigger may wait for the bot before the scheduler starts it itself. */
   pickupTimeoutMs?: number;
+  /** A Slack thread's link, once Slack is connected. */
+  threadUrl?: (channel: string, ts: string) => string | undefined;
 }
 
 interface Entry {
@@ -467,6 +469,18 @@ export class Scheduler implements JobControl {
     return this.whenFree(project, id, { kind: 'resume', ...r });
   }
 
+  /**
+   * Acts on a decision on a card with handoff notes: a fresh session of the job, in a new `Run` thread,
+   * as that job (its slot, locks and timeout), once any run of it in progress has finished.
+   */
+  async decided(
+    project: string,
+    id: string,
+    r: { by: string; text: string; card: DecidedCard; from: { channel: string; threadTs: string } },
+  ): Promise<JobStatus | 'unknown'> {
+    return this.whenFree(project, id, { kind: 'decision', ...r });
+  }
+
   /** Runs a job with approved queue items in its prompt; resolves when the run has ended. */
   async runQueue(project: string, id: string, queue: string, items: Item[]): Promise<JobStatus | 'unknown'> {
     return this.whenFree(project, id, { kind: 'queue', queue, items });
@@ -517,6 +531,7 @@ export class Scheduler implements JobControl {
         bridge: this.deps.bridge,
         newSessionId: this.deps.newSessionId,
         now: this.deps.now,
+        threadUrl: this.deps.threadUrl,
       },
       named,
       trigger,

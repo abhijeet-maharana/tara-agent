@@ -3,6 +3,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { type Bridge, JOB_TOOLS_PROMPT, type RunContext, wantsPermissionPrompts } from '../bridge/bridge.js';
 import type { HostConfig, Project } from '../config/schema.js';
+import { memoryBlock } from '../memory/memory.js';
 import { buildAgyArgs } from '../runner/agy.js';
 import { buildClaudeArgs } from '../runner/args.js';
 import { buildChildEnv } from '../runner/env.js';
@@ -374,7 +375,11 @@ export class SessionManager {
       const files = await this.saveAttachments(scratch, msg);
       // The first message of a session says where the folder is (the Write tool needs absolute paths).
       const cards = session.started ? '' : threadCards(store, msg.channel, msg.threadTs);
-      const prompt = `${cards}<@${msg.user}>: ${msg.text}${files}${session.started ? '' : `\n\n${foldersNote({ scratch })}`}`;
+      // A new conversation starts from the project memory; a continued one has it already.
+      const memory = session.started
+        ? ''
+        : memoryBlock(project, store, { now: this.now(), timeZone: host.timezone });
+      const prompt = `${memory ? `${memory}\n\n` : ''}${cards}<@${msg.user}>: ${msg.text}${files}${session.started ? '' : `\n\n${foldersNote({ scratch })}`}`;
       // A reply in the thread of a job that ran on agy continues that agy conversation, under the job's
       // own rules. Without them (the job is gone or has none) only tara's tools are allowed: a reply must
       // never get more than the run had, so it never skips agy's checks.

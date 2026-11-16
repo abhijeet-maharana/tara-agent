@@ -334,6 +334,8 @@ const MIGRATIONS = [
   // Scheduled tasks: a one-time reminder that starts a run with its text as the note of what to do.
   `ALTER TABLE reminders ADD COLUMN task INTEGER NOT NULL DEFAULT 0;
    ALTER TABLE reminders ADD COLUMN title TEXT;`,
+  // A paused run's handoff notes: what a fresh session needs to act on the decision in a new thread.
+  `ALTER TABLE items ADD COLUMN handoff TEXT;`,
 ];
 
 /** A line posted in a project's channel at `nextAt`, then again at each `cron` time (none = once). */
@@ -406,6 +408,11 @@ export interface Item {
   mode: 'resume' | 'queue';
   title: string;
   body?: string;
+  /**
+   * A paused run's notes for whoever acts on the decision (`request_approval` `handoff`): everything a
+   * fresh session needs. With them, a decision starts a new `Run` thread instead of resuming the run.
+   */
+  handoff?: string;
   media: ItemMedia[];
   fields: ItemField[];
   checks: ItemCheck[];
@@ -451,6 +458,7 @@ export type ItemInput = Pick<Item, 'project' | 'kind' | 'mode' | 'title' | 'opti
       | 'id'
       | 'key'
       | 'body'
+      | 'handoff'
       | 'media'
       | 'fields'
       | 'checks'
@@ -481,6 +489,7 @@ function toItem(r: Record<string, unknown>): Item {
     mode: r.mode as Item['mode'],
     title: r.title as string,
     body: opt(r.body),
+    handoff: opt(r.handoff),
     media: JSON.parse(r.media as string) as ItemMedia[],
     fields: JSON.parse(r.fields as string) as ItemField[],
     checks: JSON.parse(r.checks as string) as ItemCheck[],
@@ -1036,6 +1045,7 @@ export class Store {
       mode: input.mode,
       title: input.title.trim(),
       body: input.body?.trim() || null,
+      handoff: input.handoff?.trim() || null,
       media: JSON.stringify(input.media ?? []),
       fields: JSON.stringify(input.fields ?? []),
       checks: JSON.stringify(input.checks ?? []),

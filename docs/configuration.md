@@ -212,7 +212,7 @@ Test the cart and checkout.
 
 ### Self-improvement
 
-After a job run or chat turn, tara-agent resumes the same session once and asks Claude to fix the instructions it followed: the skill's `SKILL.md` or another `.md` file it used. Never code, never a new skill.
+After a job run or chat turn, tara-agent resumes the same session once and asks Claude to fix the instructions it followed: the skill's `SKILL.md` or another `.md` file it used. Never code, never a new skill. The same turn keeps the [project memory](#project-memory) (`.tara/memory.md`); a step's turn doesn't.
 
 | `selfImprove` | When it runs |
 |---|---|
@@ -251,7 +251,7 @@ Every run gets tara-agent's own MCP server alongside the repo's `.mcp.json` serv
 
 | Tool | What it does |
 |---|---|
-| `request_approval` | Asks a person: a decision before acting, a suggestion, or something only a person can do (a login, an OTP). Posts buttons (default **Approve / Reject**, up to 5 options) and ends the turn. A tap resumes the session with the choice; replying in words works too. Each card can only be decided once |
+| `request_approval` | Asks a person: a decision before acting, a suggestion, or something only a person can do (a login, an OTP). Posts buttons (default **Approve / Reject**, up to 5 options) and ends the turn. With `handoff` notes (the usual case), the decision is acted on by a fresh session in a new `Run` thread ([decisions in a new thread](#decisions-in-a-new-thread)); without them (an OTP, a login in an open browser), a tap resumes the session with the choice. Replying in the card's thread in words always goes to the run that raised it. Each card can only be decided once |
 | `request_privileged` | Asks for an action that needs root, from an allowlist. `auto` actions run at once; others wait for approval. See [privileged actions](security.md#privileged-actions) |
 | `send_file` | Uploads a file (screenshot, PDF, CSV, image) into the thread. Only files inside the project or temp directory, up to 100 MB |
 | `permission` | In chat, when Claude wants a tool not in `allowedTools`, the thread gets **Allow / Deny** buttons (denied after 10 minutes). Scheduled jobs never wait on this |
@@ -264,6 +264,25 @@ Every run gets tara-agent's own MCP server alongside the repo's `.mcp.json` serv
 | `read_ci_job` | Only for host `github` projects, read-only: a GitHub Actions job (URL or id) of the project's repo: workflow, branch, commit, conclusion, failed steps, the lines around the first `##[error]` and the last 300 log lines. Other repos are refused. See [CI jobs](security.md#ci-jobs) |
 
 The tools reach tara-agent through the local API with a per-run token, so `http.enabled` must stay on.
+
+### Decisions in a new thread
+
+A card raised with `handoff` notes is a complete brief: the card says what is proposed, the notes say how to carry it out (every id, URL, file path, number and command), for a session that never saw the run.
+
+- **On a decision**, tara opens a new `Run <Job>` thread (a chat's card: `Run <Kind>`, e.g. `Run Decision`) and starts a **fresh session** there with the project memory, the card, its notes and the decision. A job's card runs as the job (its slot, locks, timeout, effort, and its [handoff](#handoff) harness when approved); a chat's card, or one whose job is gone, runs as a chat.
+- **Both threads link to each other**: the old one gets `➡️ Your decision on "<title>" continues in a new thread`, the new one starts with `📝 <title> · earlier thread`.
+- **If the notes leave something out**, the new session is told where the earlier thread and its session transcript are, to read only the part it needs. A job's new session keeps the earlier run's scratch folder, so screenshots and downloads are still at the paths in the notes.
+- **A plain no** (Reject, Skip, … with no note) starts nothing: the card shows it, and later runs see it under recent decisions in the project memory. A no with a note starts a run that does what the note asks.
+- **Cards without notes** work as before: the decision resumes the session that asked. Runs leave the notes out only when the answer must reach that very session (an OTP, a login in a browser it has open). Privileged cards always resume.
+- The Slack card says a decision continues in a new thread; the Approvals page shows the notes folded under the card.
+
+### Project memory
+
+`.tara/memory.md` in the project holds what runs need to know that no skill or file says: what was decided or done and when, the person's preferences, the state of work in progress. Commit it with the repo like the skills.
+
+- **Written by learning turns** ([self-improvement](#self-improvement)) after each run of a main session: one short line per fact under a `## ` heading per topic, dated when it changes, replaced when it is no longer true, under about 150 lines.
+- **Read by every fresh session** in its first prompt, as `## Project memory`: a job run, a run acting on a decision, a [handoff](#handoff) session, and the first message of a chat. Continued sessions already have it. Over 12,000 characters, the rest is left for the session to read.
+- **Recent decisions** come with it, straight from the store: what people chose on the project's cards in the last 14 days (up to 15, newest first, with their notes), without notices or auto-approvals. So a turned-down idea isn't raised again.
 
 ## Queues
 
