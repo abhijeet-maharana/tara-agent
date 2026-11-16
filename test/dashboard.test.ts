@@ -951,15 +951,23 @@ describe('queue page', () => {
       now: NOW,
     });
 
-  it('gives every row its slot, and a filling queue waits for the queue it fills', () => {
+  it('shows no send time on rows, only holds; a filling queue waits for the queue it fills', () => {
     const page = data(
-      [draft('a', 'content', 7), draft('b', 'content', 4), draft('c', 'channel', 10)],
+      [
+        draft('a', 'content', 7),
+        draft('b', 'content', 4),
+        draft('h', 'content', 4, { runAfter: NOW + 3 * 86_400_000 }),
+        draft('c', 'channel', 10),
+      ],
       [draft('old', 'content', 9, { status: 'done', finishedAt: NOW - 16 * 3_600_000 })],
     );
-    expect(page).toContain('goes out Tue 10 Nov, 6:30 pm');
-    expect(page).toContain('~ Wed 11 Nov, 6:30 pm');
-    expect(page).toContain("after content's 2 items");
-    expect(page).toContain('waits while content has 2');
+    // The section head has the next slot; rows don't guess theirs.
+    expect(page).toContain('next slot Tue 10 Nov, 6:30 pm');
+    expect(page).not.toContain('goes out Tue');
+    expect(page).not.toContain('~ Wed');
+    expect(page.match(/<span class="tag">not before /g)).toHaveLength(1);
+    expect(page).toContain("after content's 3 items");
+    expect(page).toContain('waits while content has 3');
     expect(page).toContain('<span>last out 16h ago</span>');
     // Waiting more than 3 days: amber.
     expect(page).toContain('<span class="tag warn">approved 7d ago</span>');

@@ -97,6 +97,7 @@ describe('Bridge reminders', () => {
   it("sets, lists and cancels the run's own project reminders, and offers the tools only when reminders are on", () => {
     const { bridge, ctx, store, chat, project: p } = setup();
     expect(openRun(bridge, ctx).config.mcpServers.tara.env.TARA_REMINDER_TOOLS).toBe('0');
+    expect(bridge.prompt()).not.toContain('schedule_task');
     bridge.reminders = new Reminders({
       store,
       chat,
@@ -107,6 +108,7 @@ describe('Bridge reminders', () => {
     });
     const { token, config } = openRun(bridge, { ...ctx, user: 'U9' });
     expect(config.mcpServers.tara.env.TARA_REMINDER_TOOLS).toBe('1');
+    expect(bridge.prompt()).toContain('`schedule_task`: you, later.');
     const r = bridge.setReminder(token, { text: 'Renew domain', at: '2026-11-01T09:00:00Z' });
     expect(r).toMatchObject({ project: 'shop', createdBy: 'U9' });
     expect(bridge.listReminders(token).map((x) => x.text)).toEqual(['Renew domain']);

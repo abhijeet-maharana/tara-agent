@@ -1,14 +1,16 @@
 import type { QueueConfig } from '../config/schema.js';
 import { nextRun } from '../scheduler/queues.js';
 import type { Item } from '../store/store.js';
-import { goesOut, kindLabel, mediaHtml } from './approvals.js';
+import { kindLabel, mediaHtml } from './approvals.js';
 import { type DashboardContext, esc, layout, md, pageHead, projectTag, relative, when } from './dashboard.js';
 
 /**
  * The Queue page: approved drafts waiting to run, one section per queue (per kind in a queue that
  * alternates kinds, since kinds take turns), in the order the queue runs them. In a queue with
  * `reorder`, a person drags a row (or uses Top / ↑ / ↓ / Bottom) to choose what goes out first;
- * those queues show even when empty. Other queues sit read-only under "Other queues".
+ * those queues show even when empty. Other queues sit read-only under "Other queues". Rows carry no
+ * send time: each slot takes the first due row, and the section head says when the next slot is. A
+ * row only says what holds it back (a date it waits for, its window).
  */
 
 export interface QueueData {
@@ -92,19 +94,6 @@ const queueTitle = (name: string) => (name.charAt(0).toUpperCase() + name.slice(
 /** Approved this long ago and still in line: the row says so in amber, and "Other queues" opens. */
 const STALE_MS = 3 * 86_400_000;
 
-/** The queue's next `count` slot times (a queue with `slots`). */
-function slotTimes(cfg: QueueConfig, hostTz: string, now: number, count: number): number[] {
-  const out: number[] = [];
-  let t = now;
-  while (out.length < count) {
-    const next = nextRun({ runNow: false }, cfg, hostTz, t);
-    if (next === undefined) break;
-    out.push(next);
-    t = next + 60_000;
-  }
-  return out;
-}
-
 /** A row's draft as approved, shown when the row is opened: text, media and field values. */
 function draftHtml(item: Item): string {
   const fields = item.fields
@@ -172,18 +161,16 @@ function row(
     count?: number;
     kinds: boolean;
     reorder?: boolean;
-    /** When it goes out, worked out from the queue's slots (or what it waits for). */
-    eta?: string;
+    /** What it waits for in a queue that fills another ("after content's 2 items"). */
+    after?: string;
   },
 ): string {
   const running = item.status === 'running';
   const movable = !running && opts.reorder && data.canDecide && (opts.count ?? 0) > 1;
   const first = opts.pos === 0;
   const last = opts.pos === (opts.count ?? 0) - 1;
-  // Only the head of the line (the first batch), or an item with its own timing, has a "goes out".
-  const batch = data.queues(item.project)[item.queue ?? '']?.batch ?? 1;
-  const own = Boolean(item.window || item.runNow || (item.runAfter ?? 0) > data.now);
-  const timing = own || (opts.pos ?? 0) < batch;
+  // No send time: a slot takes the first due row. Only a hold is shown (a date it waits for, a window).
+  const held = !running && (item.runAfter ?? 0) > data.now;
   const draft = draftHtml(item);
   const stale = !running && data.now - (item.decidedAt ?? data.now) > STALE_MS;
   const approvedAt = `approved ${esc(relative(item.decidedAt, data.now))}`;
@@ -195,13 +182,9 @@ function row(
       : `<span class="title">${esc(item.title)}</span>`
   }
 <span class="meta">${opts.kinds ? `<span class="tag">${esc(kindLabel(item.kind))}</span>` : ''}${
-    running
-      ? '<span class="tag">running now</span>'
-      : !own && opts.eta
-        ? opts.eta
-        : timing
-          ? goesOut(ctx, item, data.queues, data.now, false)
-          : ''
+    running ? '<span class="tag">running now</span>' : (opts.after ?? '')
+  }${held ? `<span class="tag">not before ${esc(when(item.runAfter as number, ctx.timeZone))}</span>` : ''}${
+    item.window && !running ? `<span class="tag">${esc(item.window)}</span>` : ''
   }${item.runNow && !running ? '<span class="tag">run now</span>' : ''}${
     stale ? `<span class="tag warn">${approvedAt}</span>` : `<span>${approvedAt}</span>`
   }</span>${
@@ -250,31 +233,17 @@ export function queuePage(ctx: DashboardContext, data: QueueData): string {
     const kinds = new Set([...approved, ...running].map((i) => i.kind)).size > 1;
     // A queue that alternates kinds takes turns by kind: each kind is its own line.
     const alternate = cfg?.alternate ?? [];
-    // A queue that fills another's empty slots waits for that queue's items; otherwise each row gets
-    // the slot it will take (slots and batch, ignoring caps: "~" after the first batch).
+    // A queue that fills another's empty slots waits for that queue's items.
     const filled = cfg?.fills ? data.queues(project)[cfg.fills] : undefined;
     const inFilled = (list: Item[]) =>
       list.filter((i) => i.project === project && i.queue === cfg?.fills).length;
     const ahead = cfg?.fills ? inFilled(data.approved) + inFilled(data.running) : 0;
-    const slotCfg = filled ?? cfg;
-    const batch = Math.max(1, cfg?.batch ?? 1);
-    const times =
-      !ahead && slotCfg?.slots && !alternate.length && !('external' in (cfg?.executor ?? {}))
-        ? slotTimes(slotCfg, ctx.timeZone, data.now, Math.ceil(approved.length / batch))
-        : [];
-    const eta = (n: number): string | undefined => {
-      if (ahead)
-        return `<span>after ${esc(cfg?.fills ?? '')}'s ${ahead} ${ahead === 1 ? 'item' : 'items'}</span>`;
-      const at = times[Math.floor(n / batch)];
-      return at === undefined
-        ? undefined
-        : `<span>${n < batch ? 'goes out' : '~'} ${esc(when(at, ctx.timeZone))}</span>`;
-    };
+    const after = ahead
+      ? `<span>after ${esc(cfg?.fills ?? '')}'s ${ahead} ${ahead === 1 ? 'item' : 'items'}</span>`
+      : undefined;
     const list = (items: Item[]) =>
       `<div class="qlist">${items
-        .map((i, n) =>
-          row(ctx, i, data, { pos: n, count: items.length, kinds, reorder, eta: eta(approved.indexOf(i)) }),
-        )
+        .map((i, n) => row(ctx, i, data, { pos: n, count: items.length, kinds, reorder, after }))
         .join('')}</div>`;
     // When the queue last sent something.
     const last = mine(data.finished ?? []).sort((a, b) => (b.finishedAt ?? 0) - (a.finishedAt ?? 0))[0];

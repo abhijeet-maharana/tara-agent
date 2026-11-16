@@ -331,6 +331,9 @@ const MIGRATIONS = [
      cancelled_at INTEGER
    );
    CREATE INDEX reminders_next ON reminders (next_at);`,
+  // Scheduled tasks: a one-time reminder that starts a run with its text as the note of what to do.
+  `ALTER TABLE reminders ADD COLUMN task INTEGER NOT NULL DEFAULT 0;
+   ALTER TABLE reminders ADD COLUMN title TEXT;`,
 ];
 
 /** A line posted in a project's channel at `nextAt`, then again at each `cron` time (none = once). */
@@ -343,6 +346,10 @@ export interface Reminder {
   nextAt?: number;
   /** Also sent to the project's `reminders.hookUrl`. */
   notify: boolean;
+  /** A scheduled task: at `nextAt` it starts a run in a fresh thread, with `text` as the note of what to do. */
+  task?: boolean;
+  /** A task's short name, for its `Run <title>` message. */
+  title?: string;
   createdBy?: string;
   createdAt: number;
   lastAt?: number;
@@ -539,6 +546,8 @@ function toReminder(r: Record<string, unknown>): Reminder {
     cron: opt(r.cron),
     nextAt: opt(r.next_at),
     notify: r.notify === 1,
+    ...(r.task === 1 && { task: true }),
+    title: opt(r.title),
     createdBy: opt(r.created_by),
     createdAt: r.created_at as number,
     lastAt: opt(r.last_at),
@@ -793,8 +802,8 @@ export class Store {
   addReminder(r: Reminder): void {
     this.db
       .prepare(
-        `INSERT INTO reminders (id, project, text, cron, next_at, notify, created_by, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO reminders (id, project, text, cron, next_at, notify, task, title, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         r.id,
@@ -803,6 +812,8 @@ export class Store {
         r.cron ?? null,
         r.nextAt ?? null,
         r.notify ? 1 : 0,
+        r.task ? 1 : 0,
+        r.title ?? null,
         r.createdBy ?? null,
         r.createdAt,
       );

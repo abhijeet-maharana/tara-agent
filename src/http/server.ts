@@ -66,6 +66,7 @@ import {
 import { healthPage } from './health.js';
 import { logsPage, trendsPage } from './observe.js';
 import { queuePage } from './queue.js';
+import { loadQuotes, pickQuote } from './quotes.js';
 import { remindersPage } from './reminders-page.js';
 import { isDayKey, MAX_RUNS_PER_DAY, type PlanJob, planDay, schedulePage } from './schedule.js';
 import { firstPromptOf, readTranscript } from './transcript.js';
@@ -201,7 +202,7 @@ async function readJson(req: IncomingMessage, limit = 10_000): Promise<Record<st
  *                                      fixing a run, never for runs)
  *   POST /reload                       re-read every .tara/jobs.json now
  *   GET  /reminders?project=<name>     reminders still to come, soonest first
- *   POST /reminders/<project>          {text, cron? | at?, notify?, by?} → the reminder
+ *   POST /reminders/<project>          {text, cron? | at?, notify?, task?, title?, by?} → the reminder
  *   POST /reminders/<project>/<id>/cancel
  *   GET  /schedule?day=YYYY-MM-DD&project=<name>   one day's planned runs, overlaps and free windows
  *   GET  /schedule/conflicts?days=7    overlapping and back-to-back jobs over the next days
@@ -217,7 +218,7 @@ async function readJson(req: IncomingMessage, limit = 10_000): Promise<Record<st
  *   GET  /internal/permission/<id>?wait=45                 → {decision | null}
  *   GET  /internal/jobs, POST /internal/run-job {id}        (chat turns only)
  *   POST /internal/withdraw            {id, reason?}  closes a waiting card of the run's project
- *   POST /internal/reminder            {text, cron? | at?, notify?}; GET /internal/reminders;
+ *   POST /internal/reminder            {text, cron? | at?, notify?, task?, title?}; GET /internal/reminders;
  *   POST /internal/reminder-cancel     {id}
  */
 /** Paths tara-agent serves itself; with a fallback, everything else is passed through. */
@@ -577,6 +578,8 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
           cron: str(body.cron),
           at: typeof body.at === 'number' ? body.at : str(body.at),
           notify: body.notify === true,
+          task: body.task === true,
+          title: str(body.title),
           by: str(body.by)?.slice(0, 60) ?? 'api',
         });
       }
@@ -1089,6 +1092,8 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         cron: str(body.cron),
         at: typeof body.at === 'number' ? body.at : str(body.at),
         notify: body.notify === true,
+        task: body.task === true,
+        title: str(body.title),
       });
     }
     if (req.method === 'GET' && parts[1] === 'reminders' && parts.length === 2) {
@@ -1232,6 +1237,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         }
       const views = jobViews();
       return homePage(ctx, {
+        quote: pickQuote(loadQuotes(ctx.projects.map((p) => p.dir))),
         models: modelUses(ctx.projects, views, options.dashboard?.models),
         effort: options.dashboard?.models?.effort,
         jobs: views.map((j) => ({

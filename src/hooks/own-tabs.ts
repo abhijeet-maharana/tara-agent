@@ -3,8 +3,10 @@
  * project's browser MCP server, added by runner/run.ts). Jobs and chats use the same Chrome at once and
  * hold no lock, and a fresh Chrome MCP server starts on whatever tab is selected, which may be another
  * run's. So a run must open its own tab (`new_page`) before any other page tool, and may select or close
- * only tabs it opened. A later turn of the same session (a new CLI process, so new page numbers) gets
- * its tabs back by address: `list_pages`, then `select_page` on one at an address it had.
+ * only tabs it opened. A page tool that names a page (`pageId`) may use only the run's own tabs too. A later
+ * turn of the same session (a new CLI process, so new page numbers: e.g. resumed after an approval card)
+ * gets its tabs back by address: `list_pages`, then `select_page` or any page tool with the `pageId` of a
+ * page at an address it had.
  *
  * State: one file per session in the temp folder; `TARA_RUN_NONCE` (one per CLI process) tells this
  * process's page numbers from an earlier one's.
@@ -105,18 +107,29 @@ export function pagesIn(response: unknown): { id: number; url: string; selected:
   return pages;
 }
 
+/** Whether a page number is this run's: opened by it, or at an address one of the session's tabs had. */
+function isOwn(state: OwnTabsState, id: number): boolean {
+  if (state.own.includes(id)) return true;
+  const url = state.urls[String(id)];
+  return Boolean(url && state.ownUrls.includes(urlKey(url)));
+}
+
+const RESUME_HINT =
+  'After a card or in a later turn your tabs have new page numbers: call list_pages, then use (or select_page) the page at an address you had.';
+
 /** PreToolUse: why this call is refused, or undefined to let it run. */
 export function refusal(state: OwnTabsState, input: HookInput): string | undefined {
   const tool = toolOf(input.tool_name);
-  if (PICK_TOOLS.has(tool)) {
-    const id = pageOf(input.tool_input);
-    if (id === undefined || state.own.includes(id)) return undefined;
-    const url = state.urls[String(id)];
-    if (url && state.ownUrls.includes(urlKey(url))) return undefined;
-    return `Page ${id} is not a tab this session opened: other jobs and chats share this Chrome. Open your own with new_page${tool === 'close_page' ? ', and close only your own tabs' : ''}.`;
+  const id = pageOf(input.tool_input);
+  // select_page/close_page, or a page tool aimed at one page by number.
+  if (PICK_TOOLS.has(tool) || (PAGE_TOOLS.has(tool) && id !== undefined)) {
+    if (id === undefined || isOwn(state, id)) return undefined;
+    if (Object.keys(state.urls).length === 0)
+      return `Call list_pages first: page numbers change when a session resumes (e.g. after a card), and your earlier tabs are found by address. Then use page ${id} again if it is yours.`;
+    return `Page ${id} is not a tab this session opened: other jobs and chats share this Chrome. Open your own with new_page${tool === 'close_page' ? ', and close only your own tabs' : ''}. ${RESUME_HINT}`;
   }
   if (PAGE_TOOLS.has(tool) && state.own.length === 0)
-    return 'Open your own tab with new_page first: other jobs and chats share this Chrome, and the selected tab may be theirs. Never use, navigate or close a tab you did not open.';
+    return `Open your own tab with new_page first: other jobs and chats share this Chrome, and the selected tab may be theirs. Never use, navigate or close a tab you did not open. ${RESUME_HINT}`;
   return undefined;
 }
 
@@ -133,7 +146,7 @@ export function record(state: OwnTabsState, input: HookInput): OwnTabsState {
   if (pages.length) next.urls = Object.fromEntries(pages.map((p) => [String(p.id), p.url]));
   const selected = pages.find((p) => p.selected);
   if (tool === 'new_page' && selected && !next.own.includes(selected.id)) next.own.push(selected.id);
-  if (tool === 'select_page') {
+  if (tool === 'select_page' || PAGE_TOOLS.has(tool)) {
     const id = pageOf(input.tool_input);
     if (id !== undefined && !next.own.includes(id)) next.own.push(id); // refusal() let it through: it is ours
   }

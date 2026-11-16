@@ -78,6 +78,46 @@ describe('own-tabs hook', () => {
     expect(refusal(later, call('fill', { uid: 'a', value: 'b' }))).toBeUndefined();
   });
 
+  it('lets a run resumed after a card use its old tab by pageId (Sulekha sign-up, 2026-11-16)', () => {
+    let first = emptyState('n1');
+    first = record(
+      first,
+      call(
+        'new_page',
+        { url: 'https://www.sulekha.com/list-your-business' },
+        pages(4, { 1: 'https://chatgpt.com/business-hub', 4: 'https://www.sulekha.com/list-your-business' }),
+      ),
+    );
+    // Same run: page tools with its own pageId pass, another run's tab does not.
+    expect(refusal(first, call('evaluate_script', { pageId: 4, function: '() => 1' }))).toBeUndefined();
+    expect(refusal(first, call('evaluate_script', { pageId: 1, function: '() => 1' }))).toMatch(
+      /Page 1 is not a tab this session opened/,
+    );
+    // Resumed after the card: new process, renumbered pages, the form moved on to #chooseCategory.
+    let later = { ...emptyState('n2'), ownUrls: first.ownUrls };
+    expect(refusal(later, call('evaluate_script', { pageId: 2, function: '() => 1' }))).toMatch(
+      /Call list_pages first/,
+    );
+    later = record(
+      later,
+      call(
+        'list_pages',
+        {},
+        pages(1, {
+          1: 'https://chatgpt.com/business-hub',
+          2: 'https://www.sulekha.com/list-your-business#chooseCategory',
+        }),
+      ),
+    );
+    expect(refusal(later, call('evaluate_script', { pageId: 2, function: '() => 1' }))).toBeUndefined();
+    expect(refusal(later, call('evaluate_script', { pageId: 1, function: '() => 1' }))).toMatch(
+      /not a tab this session opened.*list_pages/,
+    );
+    later = record(later, call('evaluate_script', { pageId: 2, function: '() => 1' }));
+    expect(later.own).toEqual([2]);
+    expect(refusal(later, call('close_page', { pageId: 2 }))).toBeUndefined();
+  });
+
   it('hooks the repo browser MCP servers into a run, and nothing for a repo without one', () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'tara-tabs-'));
     expect(ownTabsSettings(dir)).toBeUndefined();

@@ -231,7 +231,15 @@ async function serve(configFlag: string | undefined) {
     bridge,
     log,
   });
-  const reminders = new Reminders({ store, chat: slack.chat, projects, timeZone: host.timezone, log });
+  const reminders = new Reminders({
+    store,
+    chat: slack.chat,
+    projects,
+    timeZone: host.timezone,
+    log,
+    startRun: (msg) => (manager as SessionManager).handle(msg),
+    catchUpMs: host.catchUpHours * 3_600_000,
+  });
   if (bridge) {
     bridge.onDecision = (msg) => (manager as SessionManager).handle(msg);
     bridge.jobs = scheduler;

@@ -5,6 +5,7 @@ import { repeatText } from '../src/http/reminders-page.js';
 import { startHttpServer } from '../src/http/server.js';
 import { Reminders } from '../src/reminders/reminders.js';
 import type { Scheduler } from '../src/scheduler/scheduler.js';
+import type { IncomingMessage } from '../src/sessions/manager.js';
 import { Store } from '../src/store/store.js';
 import { FakeChat } from './fakes.js';
 
@@ -37,7 +38,11 @@ function setup(p = project(), hook?: (body: unknown) => Response) {
   let clock = START;
   let n = 0;
   const hooked: unknown[] = [];
+  const runs: IncomingMessage[] = [];
   const reminders = new Reminders({
+    startRun: async (msg) => {
+      runs.push(msg);
+    },
     store,
     chat,
     projects: [p],
@@ -54,7 +59,7 @@ function setup(p = project(), hook?: (body: unknown) => Response) {
   const at = (ms: number) => {
     clock = ms;
   };
-  return { chat, store, reminders, hooked, at };
+  return { chat, store, reminders, hooked, runs, at };
 }
 
 describe('Reminders', () => {
@@ -160,6 +165,81 @@ describe('Reminders', () => {
   });
 });
 
+describe('Scheduled tasks', () => {
+  it('starts one run at its time, in a fresh Run <title> thread holding the note, then is gone', async () => {
+    const { chat, reminders, runs, at } = setup();
+    const note = 'Check CI of PR 142 in acme/shop; if green, tell <@U7> it can be merged.';
+    reminders.add('shop', {
+      text: note,
+      at: START + 30 * MIN,
+      task: true,
+      title: 'Check PR 142 CI',
+      by: 'U7',
+    });
+    expect(reminders.list('shop')).toMatchObject([{ task: true, title: 'Check PR 142 CI' }]);
+    await reminders.tick();
+    expect(runs).toEqual([]);
+    at(START + 30 * MIN);
+    await reminders.tick();
+    await reminders.tick();
+    expect(chat.log).toEqual([
+      'post top ts1: Run Check PR 142 CI',
+      `post ts1 ts2: 📝 Scheduled task, set by <@U7> Sat 14 Nov, 09:30 for Sat 14 Nov, 10:00:\n${note}`,
+    ]);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({ channel: 'C1', threadTs: 'ts1', ts: 'ts2', user: 'U7' });
+    expect(runs[0]?.text).toContain(note);
+    expect(reminders.list('shop')).toEqual([]);
+  });
+
+  it('runs as the project owner when a job set it, and says when it is late', async () => {
+    const { chat, reminders, runs, at } = setup();
+    reminders.add('shop', { text: 'Recheck stock', at: START + MIN, task: true, by: 'stock-audit' });
+    at(START + MIN + 60 * MIN);
+    await reminders.tick();
+    expect(chat.texts()[0]).toBe('Run Scheduled Task');
+    expect(chat.texts()[1]).toContain('set by stock-audit');
+    expect(chat.texts()[1]).toContain('(late: was due Sat 14 Nov, 09:31)');
+    expect(runs[0]?.user).toBe('U1');
+  });
+
+  it('skips a task missed by more than the catch-up window instead of running it stale', async () => {
+    const { chat, reminders, runs, at } = setup();
+    reminders.add('shop', { text: 'Post the 9am update', at: START + MIN, task: true });
+    at(START + 7 * 3_600_000);
+    await reminders.tick();
+    expect(runs).toEqual([]);
+    expect(chat.texts().at(-1)).toBe(
+      '⏭ Skipped: tara-agent was down at its time. Ask here if it is still needed.',
+    );
+    expect(chat.reactions).toEqual(['+double_vertical_bar@ts1']);
+    expect(reminders.list('shop')).toEqual([]);
+  });
+
+  it('refuses tasks it could not keep', () => {
+    const { reminders } = setup(project({ reminders: { hookUrl: 'http://127.0.0.1:4001/hook' } }));
+    expect(() => reminders.add('shop', { text: 'x', cron: '0 9 * * *', task: true })).toThrow(/runs once/);
+    expect(() => reminders.add('shop', { text: 'x', task: true })).toThrow(/runs once/);
+    expect(() => reminders.add('shop', { text: ' ', at: START + MIN, task: true })).toThrow(/note/);
+    expect(() => reminders.add('shop', { text: 'x', at: START + MIN, task: true, notify: true })).toThrow(
+      /notify/,
+    );
+    expect(() =>
+      reminders.add('shop', { text: 'x', at: START + MIN, task: true, title: 'T'.repeat(81) }),
+    ).toThrow(/title/);
+    expect(reminders.add('shop', { text: 'y'.repeat(3000), at: START + MIN, task: true }).task).toBe(true);
+    const off = new Reminders({
+      store: new Store(':memory:'),
+      chat: new FakeChat('ts'),
+      projects: [project()],
+      timeZone: 'Asia/Kolkata',
+      log: silent,
+      now: () => START,
+    });
+    expect(() => off.add('shop', { text: 'x', at: START + MIN, task: true })).toThrow(/off/);
+  });
+});
+
 describe('Reminders API', () => {
   it('adds, lists and cancels through the local API', async () => {
     const { store, reminders } = setup();
@@ -228,6 +308,18 @@ describe('Reminders page', () => {
       expect(html).toContain('Next: <span class="when">Thu 19 Nov, 9:30 am</span>');
       expect(html).toContain('+ Ops WhatsApp');
       expect(html).toContain('data-cancel="shop/r1"');
+      reminders.add('shop', {
+        text: 'Check CI of PR 142',
+        at: START + MIN,
+        task: true,
+        title: 'Check PR 142',
+      });
+      const withTask = await fetch(`${base}/reminders`, { headers: { accept: 'text/html' } }).then((r) =>
+        r.text(),
+      );
+      expect(withTask).toContain('<span class="title">Check PR 142</span>');
+      expect(withTask).toContain('▶️ Task: starts a run');
+      expect(withTask).toContain('Check CI of PR 142');
       const home = await fetch(`${base}/`, { headers: { accept: 'text/html' } }).then((r) => r.text());
       expect(home).toContain('href="/reminders"');
     } finally {

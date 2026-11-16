@@ -88,6 +88,13 @@ export class BridgeError extends Error {
 /** An item reported `later` without a time is tried again after this long (as for a URL executor). */
 const LATER_MS = 3_600_000;
 
+/** Appended (with BRIDGE_PROMPT) when the reminder tools are on, in chat turns and job runs alike. */
+export const REMINDER_TOOLS_PROMPT = `Later and on a schedule (tara MCP server):
+- \`schedule_task\`: you, later. At the given time tara-agent opens a fresh "Run <title>" thread in this channel and starts a new run of you there, with your note as the only instructions. Use it whenever something should be done at a later time ("check the PR at 5pm", "tomorrow at 9 post the summary", "follow up on Friday if they haven't replied") or when you must come back to something yourself (a deploy, a reply, a price change). It runs once and is then gone; repeating work belongs in a job. The future run remembers nothing of this conversation: write the note so it stands alone (what to do, links, ids, file paths, names, what counts as done, who to tell). Tell the person when it will run.
+- \`set_reminder\`: a line posted for a person at a time or on a schedule; no run. Use it when they want to be reminded, not when work needs doing.
+- \`list_reminders\` shows both (tasks have \`task: true\`); check it first so you don't add the same one twice. \`cancel_reminder\` stops either.
+- Times are ISO with their offset (e.g. 2026-11-19T09:30:00+05:30); run \`date\` first if you need the current time.`;
+
 export const JOB_TOOLS_PROMPT = `- To run one of this channel's scheduled jobs now, call \`run_job\` (\`list_jobs\` shows them). The job runs in its own message in the channel; tell the person it started, don't wait for it.`;
 
 /** Appended to the system prompt of every run that has tara's MCP tools. */
@@ -206,7 +213,13 @@ export class Bridge {
 
   /** The system prompt part for runs with tara's MCP tools. */
   prompt(): string {
-    return [BRIDGE_PROMPT, this.deps.privileged?.prompt() || PRIVILEGED_MANUAL_PROMPT].join('\n\n');
+    return [
+      BRIDGE_PROMPT,
+      this.reminders && REMINDER_TOOLS_PROMPT,
+      this.deps.privileged?.prompt() || PRIVILEGED_MANUAL_PROMPT,
+    ]
+      .filter(Boolean)
+      .join('\n\n');
   }
 
   /** The run a token belongs to; throws 401 for unknown or finished runs. */

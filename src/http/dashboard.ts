@@ -131,6 +131,8 @@ export interface HomeData {
   effort?: string;
   /** Red Health checks other than jobs (Home lists failing jobs itself); undefined when the page is off. */
   health?: { problems: Array<{ name: string; where: string }>; watch: number };
+  /** One line from the projects' `.tara/quotes.txt`, picked at random for this visit (see quotes.ts). */
+  quote?: string;
 }
 
 /** Host-level model settings the dashboard shows: effort and voice notes (`voice`). */
@@ -387,6 +389,7 @@ ${SWITCHER_CSS}
 .sec-head .more{margin-left:auto;font-size:13px}
 .nowbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;background:var(--card-bg);border:1px solid var(--border);border-left:3px solid var(--text-dim);border-radius:var(--radius);padding:10px 14px;margin-bottom:22px}
 .nowbar.live{border-left-color:var(--green)}.nowbar b{color:var(--text-heading)}
+.quote{margin:-6px 0 16px;color:var(--text-heading);font-size:15px;font-style:italic;overflow-wrap:anywhere}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:24px}
 .stat{background:var(--card-bg);border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px;color:inherit;text-decoration:none}
 a.stat:hover{border-color:var(--border-light);background:var(--card-hover)}
@@ -526,8 +529,18 @@ document.querySelector('.menu-btn')?.addEventListener('click', (e) => {
   const open = document.querySelector('.sidebar').classList.toggle('open');
   e.currentTarget.setAttribute('aria-expanded', open);
 });
+// The Home quote changes when the page is opened or refreshed by hand, not on the auto-refresh.
+const quote = document.querySelector('.quote-text');
+try {
+  const kept = sessionStorage.getItem('tara-quote');
+  if (quote && kept && sessionStorage.getItem('tara-auto-reload')) quote.textContent = kept;
+  sessionStorage.removeItem('tara-auto-reload');
+  if (quote) sessionStorage.setItem('tara-quote', quote.textContent);
+} catch {}
 if (document.body.dataset.refresh) setInterval(() => {
-  if (!document.hidden && !document.querySelector('.overlay, details[open], .input:focus, .toast, .dragging')) location.reload();
+  if (document.hidden || document.querySelector('.overlay, details[open], .input:focus, .toast, .dragging')) return;
+  try { sessionStorage.setItem('tara-auto-reload', '1'); } catch {}
+  location.reload();
 }, 60000);
 `;
 
@@ -978,7 +991,11 @@ export function homePage(ctx: DashboardContext, data: HomeData): string {
     ctx,
     'Home',
     'Home',
-    `${pageHead(ctx.agentName, `${esc(when(now, tz))} · times in ${esc(tz)}`)}${nowbar}${stats}
+    `${pageHead(ctx.agentName, `${esc(when(now, tz))} · times in ${esc(tz)}`)}${
+      data.quote
+        ? `<p class="quote"><span aria-hidden="true">✨</span> <span class="quote-text">${esc(data.quote)}</span></p>`
+        : ''
+    }${nowbar}${stats}
 ${section(
   'Needs attention',
   attention ? `<div class="todo">${attention}</div>` : '<div class="clear">✓ Nothing needs attention.</div>',

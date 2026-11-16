@@ -52,7 +52,11 @@ server.registerTool(
       'one: a decision before you act (spending money, changing prices, listings, ads or data, publishing, ' +
       'sending messages to others), a suggestion worth acting on, or something only a person can do (a login, ' +
       'an OTP, a call, a failure you could not fix: say exactly what, with options like "Done, continue" / ' +
-      '"Skip"). After calling it, END YOUR TURN without doing the action: the answer arrives as your next ' +
+      '"Skip"). Every button must let you carry on with no further message: never a button that only promises ' +
+      'a later reply ("I\'ll reply with the code", "I\'ll send it"), which makes the person tap and then type ' +
+      '"done" as well. For a code, OTP or value only they have: buttons for each way they might finish ' +
+      '("Done, I entered it" / "Skip"), and say in the details that they can instead reply in the thread ' +
+      'with the value for you to enter. After calling it, END YOUR TURN without doing the action: the answer arrives as your next ' +
       'message, starting with "USER DECISION", or as a normal reply.',
     inputSchema: {
       title: z
@@ -320,7 +324,8 @@ if (process.env.TARA_REMINDER_TOOLS === '1') {
       description:
         'Post a reminder in this channel at a time (`at`) or on a schedule (`cron`). Posting it starts no run: ' +
         'tara-agent posts the text itself and mentions the owner. Use it whenever the person asks to be ' +
-        "reminded; check list_reminders first so you don't add the same one twice. Set `notify` only when they " +
+        "reminded; check list_reminders first so you don't add the same one twice. For work to be done later, " +
+        'use schedule_task instead. Set `notify` only when they ' +
         "ask for it to go out beyond Slack too (the project's reminder hook, e.g. its WhatsApp group).",
       inputSchema: {
         text: z.string().min(1).max(1000).describe('What to remind about, as it should read'),
@@ -345,10 +350,47 @@ if (process.env.TARA_REMINDER_TOOLS === '1') {
   );
 
   server.registerTool(
+    'schedule_task',
+    {
+      title: 'Schedule a task for later',
+      description:
+        'Do something later, once: at `at`, tara-agent opens a fresh "Run <title>" thread in this channel and ' +
+        'starts a new run of you with `note` as its only instructions, then the task is gone. Use it for anything ' +
+        'that should happen at a later time ("check the PR at 5pm", "post the summary tomorrow at 9") or to come ' +
+        'back to something yourself. The run remembers nothing of this conversation, so the note must stand alone: ' +
+        'what to do, links, ids, paths, what counts as done, who to tell. Check list_reminders first; ' +
+        'cancel_reminder stops it. Repeating work belongs in a job, not here.',
+      inputSchema: {
+        note: z.string().min(1).max(4000).describe('Self-contained instructions for the future run'),
+        at: z.string().describe('When: ISO time with its offset, e.g. 2026-11-19T09:30:00+05:30'),
+        title: z
+          .string()
+          .max(80)
+          .optional()
+          .describe('Short name for the thread, e.g. "Check PR 142 CI" (shown as "Run <title>")'),
+      },
+    },
+    async ({ note, at, title }) => {
+      try {
+        const r = await api<{ id: string; nextAt: number }>('/internal/reminder', {
+          text: note,
+          at,
+          title,
+          task: true,
+        });
+        return text(`Task ${r.id} scheduled for ${new Date(r.nextAt).toISOString()}.`);
+      } catch (err) {
+        return text(`Could not schedule the task: ${(err as Error).message}`, true);
+      }
+    },
+  );
+
+  server.registerTool(
     'list_reminders',
     {
-      title: "List this channel's reminders",
-      description: 'Reminders still to come in this channel, soonest first (nextAt in epoch ms).',
+      title: "List this channel's reminders and scheduled tasks",
+      description:
+        'Reminders and scheduled tasks (`task: true`) still to come in this channel, soonest first (nextAt in epoch ms).',
       inputSchema: {},
     },
     async () => {
@@ -364,8 +406,8 @@ if (process.env.TARA_REMINDER_TOOLS === '1') {
   server.registerTool(
     'cancel_reminder',
     {
-      title: 'Cancel a reminder',
-      description: 'Stop a reminder (its id from list_reminders). No approval needed.',
+      title: 'Cancel a reminder or scheduled task',
+      description: 'Stop a reminder or scheduled task (its id from list_reminders). No approval needed.',
       inputSchema: { id: z.string().min(1) },
     },
     async (args) => {

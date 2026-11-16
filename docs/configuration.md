@@ -243,7 +243,7 @@ Each session gets its own folders, passed as environment variables and as absolu
 
 ## Shared browsers
 
-Jobs and chats use a project's Chrome (its `.mcp.json` `--browserUrl`) at the same time, with no locks. Each Claude run there gets a hook on that MCP server (`src/hooks/own-tabs.ts`, through `--settings`): page tools are refused until the run opens its own tab with `new_page`, and `select_page`/`close_page` work only on tabs it opened. A later turn of the same session gets its tabs back by address (`list_pages`, then `select_page`). Runs close their own tabs; tara closes stale ones (host `browsers`), but not a chat thread's tabs while that chat is still going. A page a person must finish, such as a form stopped at a captcha, is listed by the project's `keepTabsUrl` and never closed. Scripts that drive the same Chrome over CDP should follow the same rules: open their own tab, never reuse another, close only theirs.
+Jobs and chats use a project's Chrome (its `.mcp.json` `--browserUrl`) at the same time, with no locks. Each Claude run there gets a hook on that MCP server (`src/hooks/own-tabs.ts`, through `--settings`): page tools are refused until the run opens its own tab with `new_page`, and `select_page`/`close_page`, or a page tool given a `pageId`, work only on tabs it opened. A later turn of the same session (e.g. resumed after an approval card, with new page numbers) gets its tabs back by address: `list_pages`, then `select_page` or any page tool with the `pageId` of a page at an address it had (query and `#hash` ignored), so a sign-up can go on in its tab after a captcha or OTP card. Runs close their own tabs; tara closes stale ones (host `browsers`), but not a chat thread's tabs while that chat is still going. A page a person must finish, such as a form stopped at a captcha, is listed by the project's `keepTabsUrl` and never closed. Scripts that drive the same Chrome over CDP should follow the same rules: open their own tab, never reuse another, close only theirs.
 
 ## Approval tools
 
@@ -258,6 +258,7 @@ Every run gets tara-agent's own MCP server alongside the repo's `.mcp.json` serv
 | `propose_item`, `list_items`, `finish_item` | Drafts that go out later (a message, email, post): each becomes a card on the Approvals page and, once approved, runs through a [queue](#queues) |
 | `withdraw_card` | Closes any waiting card of the run's project, no approval needed (the person did it themselves, it no longer applies, a duplicate, or a newer card replaces it). It ends as cancelled with the reason; another project's cards are refused |
 | `set_reminder`, `list_reminders`, `cancel_reminder` | A reminder in the channel at a time (`at`, ISO with offset) or on a schedule (`cron`, host timezone). tara-agent posts it itself, no run: a `Run Reminder` thread mentioning the project `owner`, late ones marked late, a missed repeat posted once. `notify` also sends it to the project's `reminders.hookUrl`, only when the person asks |
+| `schedule_task` | Do something later, once: at `at` (ISO with offset) tara-agent opens a fresh `Run <title>` thread, posts the `note` and starts a chat run on it as whoever set it (the project `owner` if a job did), then the task is gone. The note is all the run knows, so it must stand alone. Missed by more than host `catchUpHours`: skipped with a note instead. Listed by `list_reminders` (`task: true`), stopped by `cancel_reminder`. Runs and chats with tara's tools get a short prompt section on when to use it vs `set_reminder` |
 | `list_jobs`, `run_job` | Chat turns only: lists the channel's jobs (id, next run, last status), or starts one now in its own `Run` thread |
 | `start_pull_request`, `open_pull_request` | Only for host `github` projects: a workspace copy of the base branch (or of the PR's branch), then a commit pushed to `<agentName>/<name>` and the PR opened or updated. See [pull requests](security.md#pull-requests) |
 | `read_ci_job` | Only for host `github` projects, read-only: a GitHub Actions job (URL or id) of the project's repo: workflow, branch, commit, conclusion, failed steps, the lines around the first `##[error]` and the last 300 log lines. Other repos are refused. See [CI jobs](security.md#ci-jobs) |
@@ -309,7 +310,7 @@ An item that is never reported ends as failed and is not retried, so nothing goe
 
 Open the HTTP address in a browser. Every page also answers JSON to tools.
 
-- **Home** (`/`): what's running, what needs attention (waiting approvals, failing or paused jobs), upcoming and recent runs.
+- **Home** (`/`): what's running, what needs attention (waiting approvals, failing or paused jobs), upcoming and recent runs. If a project has a `.tara/quotes.txt` (one line each; blank lines, `#` comments and a leading `- ` or `- [ ] ` are ignored), one line from all of them shows under the title, picked at random each time the page is opened or refreshed by hand (the 60 s auto-refresh keeps it). The file is read on every visit, so edits need no restart.
 - **Approvals** (`/approvals`): cards waiting for a person, and decisions from the last 30 days. Deciding needs the browser unlocked once on `/unlock` with `TARA_ADMIN_TOKEN`, from a device other than the server.
 - **Queue** (`/queue`): approved drafts waiting to run, in run order with the next slot or window. Each queue with `"reorder": true` has its own section (per kind with `alternate`), shown even when empty, with how many cards wait for approval. Drag a row (mouse or touch) or use **Top** / **↑** / **↓** / **Bottom** to choose what goes out first; **Cancel** drops one. Reordering needs the unlocked browser. Other queues are listed read-only under **Other queues**.
 - **Jobs** (`/jobs`): every job, failing first, with schedule, recent results, **Run now**, **Pause** / **Resume**, and run history.
@@ -364,7 +365,7 @@ For scripts and dashboards on the same host (`127.0.0.1:4100` by default).
 | `GET /runs/<id>` | One run, with reply and script output |
 | `POST /reload` | Re-read every `jobs.json` now |
 | `GET /reminders?project=<name>` | Reminders still to come, soonest first |
-| `POST /reminders/<project>` | Add one: `{text, cron? \| at?, notify?, by?}` |
+| `POST /reminders/<project>` | Add one: `{text, cron? \| at?, notify?, by?}`; a scheduled task: `{text: <note>, at, task: true, title?, by?}` |
 | `POST /reminders/<project>/<id>/cancel` | Stop one |
 | `GET /schedule?day=YYYY-MM-DD&project=<name>` | One day's runs, overlaps and free windows |
 | `GET /schedule/conflicts?days=7` | Overlapping and back-to-back jobs |

@@ -35,7 +35,7 @@ tara-agent is one Node process per host. It never calls the Anthropic API: every
 | `src/health/`, `src/http/health.ts`, `src/http/observe.ts` | The Health page. Now: checks of tara-agent, each project's jobs and each project's `healthUrl`, with red-twice-in-a-row alerts and recoveries in the day's `Run Health Alert` thread. Trends: runs, cost, usage, job lengths, uptime and machine samples over days. Logs: tara-agent's own warnings and errors plus `logUnits` from the journal, grouped. `GET /metrics` for Prometheus |
 | `src/http/dashboard.ts` | Server-rendered dashboard (home, jobs, runs, sessions); `cron-text.ts` turns schedules into plain English |
 | `src/slack/` | Bolt app, mrkdwn conversion, message splitting |
-| `src/reminders/reminders.ts` | Reminders: stored in SQLite, checked every 30 s, posted with no Claude run (`Run Reminder` thread), optionally sent to the project's `reminders.hookUrl`; `src/http/reminders-page.ts` is the dashboard page |
+| `src/reminders/reminders.ts` | Reminders: stored in SQLite, checked every 30 s, posted with no Claude run (`Run Reminder` thread), optionally sent to the project's `reminders.hookUrl`. Scheduled tasks (`schedule_task`) live in the same table: at their time they open a `Run <title>` thread and start a chat run on their note through the session manager; `src/http/reminders-page.ts` is the dashboard page |
 | `src/store/store.ts` | `node:sqlite` with numbered migrations |
 
 ## A chat turn
