@@ -33,6 +33,8 @@ export interface DashboardContext {
   reminders?: boolean;
   /** Red checks on the Health page, for its sidebar badge; undefined when the page is off. */
   unhealthy?: number;
+  /** The Phone page (desk phone pairing) is on: HTTPS is set up, or a phone is paired. */
+  phone?: boolean;
 }
 
 /** A job with its project and latest runs (newest first), as the home and jobs pages show it. */
@@ -634,6 +636,7 @@ export type Page =
   | 'Code'
   | 'Browsers'
   | 'Health'
+  | 'Phone'
   | '';
 
 /** Projects whose app pages show here as tabs (`tabs` plus `dashboardUrl`). */
@@ -679,6 +682,7 @@ export function layout(
       ...(ctx.unhealthy !== undefined
         ? ([['/health', 'Health', '❤️', ctx.unhealthy, 'health problems']] as const)
         : []),
+      ...(ctx.phone ? ([['/phone/pair', 'Phone', '📱', 0, '']] as const) : []),
     ] as const
   )
     .map(

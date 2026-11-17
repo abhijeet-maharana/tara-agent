@@ -23,6 +23,22 @@ jobs:
       - run: npm test
       - run: npm run build
 
+  # The desk phone shell (android/, docs/jarvis-phone.md): unit tests, lint, and a release build.
+  # Release signing keys stay on the build machine, so CI signs with the debug key.
+  android:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      - run: ./gradlew --no-daemon testDebugUnitTest lintRelease assembleRelease
+
   secrets:
     runs-on: ubuntu-latest
     steps:

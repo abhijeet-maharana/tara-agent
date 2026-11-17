@@ -336,7 +336,27 @@ const MIGRATIONS = [
    ALTER TABLE reminders ADD COLUMN title TEXT;`,
   // A paused run's handoff notes: what a fresh session needs to act on the decision in a new thread.
   `ALTER TABLE items ADD COLUMN handoff TEXT;`,
+  // Paired desk phones (http/phone.ts): the shell app's key is kept only as its SHA-256.
+  `CREATE TABLE phone_devices (
+     id           TEXT PRIMARY KEY,
+     name         TEXT NOT NULL,
+     key_hash     TEXT NOT NULL,
+     created_at   INTEGER NOT NULL,
+     last_seen_at INTEGER,
+     app_version  TEXT
+   );`,
 ];
+
+/** A paired phone (the shell app in android/). */
+export interface PhoneDevice {
+  id: string;
+  name: string;
+  /** SHA-256 (hex) of the key the phone holds. */
+  keyHash: string;
+  createdAt: number;
+  lastSeenAt?: number;
+  appVersion?: string;
+}
 
 /** A line posted in a project's channel at `nextAt`, then again at each `cron` time (none = once). */
 export interface Reminder {
@@ -560,6 +580,17 @@ function toReminder(r: Record<string, unknown>): Reminder {
     createdBy: opt(r.created_by),
     createdAt: r.created_at as number,
     lastAt: opt(r.last_at),
+  };
+}
+
+function toPhoneDevice(r: Record<string, unknown>): PhoneDevice {
+  return {
+    id: r.id as string,
+    name: r.name as string,
+    keyHash: r.key_hash as string,
+    createdAt: r.created_at as number,
+    lastSeenAt: (r.last_seen_at ?? undefined) as number | undefined,
+    appVersion: (r.app_version ?? undefined) as string | undefined,
   };
 }
 
@@ -860,6 +891,37 @@ export class Store {
       )
       .run(now, id, project);
     return Number(changes) === 1;
+  }
+
+  addPhoneDevice(d: PhoneDevice): void {
+    this.db
+      .prepare('INSERT INTO phone_devices (id, name, key_hash, created_at) VALUES (?, ?, ?, ?)')
+      .run(d.id, d.name, d.keyHash, d.createdAt);
+  }
+
+  phoneDevices(): PhoneDevice[] {
+    return (
+      this.db.prepare('SELECT * FROM phone_devices ORDER BY created_at').all() as Record<string, unknown>[]
+    ).map(toPhoneDevice);
+  }
+
+  phoneDevice(id: string): PhoneDevice | undefined {
+    const row = this.db.prepare('SELECT * FROM phone_devices WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
+    return row && toPhoneDevice(row);
+  }
+
+  seePhoneDevice(id: string, at: number, appVersion?: string): void {
+    this.db
+      .prepare(
+        'UPDATE phone_devices SET last_seen_at = ?, app_version = COALESCE(?, app_version) WHERE id = ?',
+      )
+      .run(at, appVersion ?? null, id);
+  }
+
+  forgetPhoneDevice(id: string): boolean {
+    return Number(this.db.prepare('DELETE FROM phone_devices WHERE id = ?').run(id).changes) === 1;
   }
 
   addHostSample(s: HostSample): void {

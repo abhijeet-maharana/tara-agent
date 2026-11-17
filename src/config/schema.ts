@@ -216,6 +216,23 @@ export const hostConfigSchema = z.object({
           key: z.string().min(1),
         })
         .optional(),
+      /**
+       * The desk phone's alerts (docs/jarvis-phone.md). Quiet hours hold them (Night page, one summary
+       * after); outside them at most one is spoken per `alertGapMinutes`. Defaults: 23:00–07:00, 30.
+       */
+      phone: z
+        .object({
+          quietHours: z
+            .object({
+              from: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Use HH:MM'),
+              to: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Use HH:MM'),
+            })
+            .optional(),
+          alertGapMinutes: z.number().int().min(0).max(1440).optional(),
+          /** false: alerts light the screen and buzz once, never spoken. Default true. */
+          speakAlerts: z.boolean().optional(),
+        })
+        .optional(),
     })
     .default({ enabled: true, bind: '127.0.0.1', port: 4100, allowFrom: ['127.0.0.0/8', '::1/128'] }),
   /**

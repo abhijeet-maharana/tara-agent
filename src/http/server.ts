@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { readFileSync, unwatchFile, watchFile } from 'node:fs';
+import { createReadStream, readFileSync, unwatchFile, watchFile } from 'node:fs';
 import {
   createServer,
   request as httpRequest,
@@ -65,6 +65,9 @@ import {
 } from './dashboard.js';
 import { healthPage } from './health.js';
 import { logsPage, trendsPage } from './observe.js';
+import { PHONE_COOKIE, Phone, PhoneError, pairPage } from './phone.js';
+import { type NextRun, PhoneHub, type QuietHours } from './phone-events.js';
+import { phoneScreen } from './phone-screen.js';
 import { queuePage } from './queue.js';
 import { loadQuotes, pickQuote } from './quotes.js';
 import { remindersPage } from './reminders-page.js';
@@ -122,9 +125,13 @@ export interface HttpOptions {
    * Live Claude runs: a running session's steps (and Stop) on its page, links to a running job's
    * transcript, and the usage figure on the home page.
    */
-  activity?: Pick<Activity, 'tasks' | 'usage' | 'stop'>;
+  activity?: Pick<Activity, 'tasks' | 'usage' | 'stop'> & Partial<Pick<Activity, 'subscribe'>>;
   /** A second, HTTPS listener on the same address. The certificate is re-read when its file changes. */
   tls?: { port: number; cert: string; key: string };
+  /** The desk phone shell's APK, served for its updates (default: android/apk/tara-phone.apk). */
+  phoneApk?: string;
+  /** The desk phone's alerts: quiet hours (default 23:00–07:00) and the gap between spoken ones (30 min). */
+  phone?: { quietHours?: QuietHours; alertGapMinutes?: number; speakAlerts?: boolean };
   /** The Health page (`/health` in a browser) and `GET /health/checks`, `POST /health/check`. */
   health?: Pick<HealthMonitor, 'snapshot' | 'check' | 'history' | 'label'>;
   /** The Health page's Trends and Logs views, and `GET /metrics` (Prometheus text). */
@@ -220,10 +227,22 @@ async function readJson(req: IncomingMessage, limit = 10_000): Promise<Record<st
  *   POST /internal/withdraw            {id, reason?}  closes a waiting card of the run's project
  *   POST /internal/reminder            {text, cron? | at?, notify?, task?, title?}; GET /internal/reminders;
  *   POST /internal/reminder-cancel     {id}
+ * and for the desk phone (http/phone.ts, docs/jarvis-phone.md):
+ *   GET  /phone/pair                   the dashboard's Phone page: pairing QR and paired phones (token)
+ *   POST /phone/pair                   {code, name} → {id, key}  (the QR's one-time code is the proof)
+ *   POST /phone/pin                    {id, nonce} → {spki, proof}  lets a phone move its pin after renewal
+ *   POST /phone/session                header `Authorization: Device <id>:<key>` → {session, expiresAt, cookie}
+ *   GET  /phone, /phone/ping           the phone's glance screen (session cookie, or the token)
+ *   GET  /phone/events                 SSE: state (the glance, on change), run (started/ended), alert
+ *                                      (session cookie, the token, or the shell's device key)
+ *   GET  /phone/state                  the glance as JSON; GET /phone/run/<task id> one run's live steps
+ *   GET  /phone/app.json, /phone/app.apk   the shell APK for updates (device key, or the token)
+ *   POST /phone/devices/<id>/forget    (token)
+ * A phone's session cookie also allows GET requests elsewhere (it shows what the dashboard shows).
  */
 /** Paths tara-agent serves itself; with a fallback, everything else is passed through. */
 const OWN_PATH =
-  /^\/(?:$|(?:health|metrics|reload|attention|jobs|runs|sessions|schedule|approvals|queue|items|reminders|unlock|code|internal|p|app)(?:\/|$))/;
+  /^\/(?:$|(?:health|metrics|reload|attention|jobs|runs|sessions|schedule|approvals|queue|items|reminders|unlock|code|internal|p|app|phone)(?:\/|$))/;
 const TOKEN_COOKIE = 'tara_token';
 const ADMIN_COOKIE = 'tara_admin';
 /** Finished items shown on the Done tab. */
@@ -339,6 +358,7 @@ export function crossSite(req: IncomingMessage, bind: string): string | undefine
 
 export async function startHttpServer(options: HttpOptions): Promise<Server> {
   const now = options.now ?? Date.now;
+  const phone = new Phone({ store: options.store, tls: options.tls, apk: options.phoneApk, now });
   const started = now();
   /**
    * How much of Claude's usage window is used: what the CLI reported last in this process, else the
@@ -357,6 +377,38 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     return last ? { share: last.rateLimitUtilization as number, asOf: last.endedAt } : undefined;
   };
   const timeZone = options.dashboard?.timeZone ?? 'UTC';
+  const projectTitle = (name: string) =>
+    options.dashboard?.projects.find((p) => p.config.name === name)?.config.title ?? name;
+  /** The next few scheduled runs today, leaving out jobs that start every half hour or more often. */
+  const nextUp = (at: number): NextRun[] =>
+    options.projects
+      .flatMap((p) => {
+        const jobs = new Map(options.scheduler.list(p).map((j) => [j.id, j]));
+        return options.scheduler.plannedRuns(p, at, at + DAY_MS, 2).flatMap(({ id, starts }) => {
+          const [first, second = Number.POSITIVE_INFINITY] = starts;
+          const job = jobs.get(id);
+          if (first === undefined || !job || second - first <= FREQUENT_MS) return [];
+          return [{ project: projectTitle(p), name: job.name, at: first }];
+        });
+      })
+      .sort((a, b) => a.at - b.at)
+      .slice(0, 3);
+  // The desk phone's glance and alerts (/phone/events).
+  const phoneHub = new PhoneHub({
+    attention: options.attention,
+    pending: () => (options.approvals ? options.store.items({ statuses: ['pending'], limit: 200 }) : []),
+    activity: options.activity,
+    next: nextUp,
+    usage: usageNow,
+    projectTitle,
+    timeZone,
+    quietHours: options.phone?.quietHours,
+    alertGapMinutes: options.phone?.alertGapMinutes,
+    speakAlerts: options.phone?.speakAlerts,
+    build: String(started),
+    now,
+    log: options.log,
+  });
   const knownProject = (name: string | null) => {
     if (!name || !options.projects.includes(name))
       throw new HttpError(404, `Unknown project "${name ?? ''}"`);
@@ -1135,6 +1187,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       browsers: Boolean(options.browsers),
       reminders: Boolean(options.reminders),
       unhealthy: options.health ? redChecks().length : undefined,
+      phone: Boolean(options.tls) || phone.devices().length > 0,
     };
   };
 
@@ -1463,6 +1516,11 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     return undefined;
   };
 
+  const sendHtml = (res: ServerResponse, status: number, html: string) => {
+    res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(html);
+  };
+
   const fallback = options.fallback ? new URL(options.fallback) : undefined;
   /**
    * Streams a request to another service (the fallback, or a project's app) and its answer back. `path`
@@ -1522,16 +1580,155 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
   };
 
   /** Bearer header, or (for browsers) the cookie set by opening any page once with `?token=…`. */
-  const authorized = (req: IncomingMessage) => {
+  const tokenHolder = (req: IncomingMessage) => {
     if (!options.token) return true;
     if (req.headers.authorization === `Bearer ${options.token}`) return true;
     const cookie = (req.headers.cookie ?? '').split(/;\s*/).find((c) => c.startsWith(`${TOKEN_COOKIE}=`));
     return cookie?.slice(TOKEN_COOKIE.length + 1) === options.token;
   };
+  /** The paired phone whose WebView sent this request (its session cookie), if any. */
+  const phoneOf = (req: IncomingMessage) => phone.deviceFromSession(cookie(req, PHONE_COOKIE));
+  /**
+   * The token holder, or a paired phone for reads: the phone shows what the dashboard shows, but it
+   * changes nothing outside `/phone/*` (actions there decide for themselves what a phone may do).
+   */
+  const authorized = (req: IncomingMessage) =>
+    tokenHolder(req) || (['GET', 'HEAD'].includes(req.method ?? 'GET') && Boolean(phoneOf(req)));
 
-  const sendHtml = (res: ServerResponse, status: number, html: string) => {
-    res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-    res.end(html);
+  const sendJson = (res: ServerResponse, status: number, body: unknown) => {
+    res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+    res.end(JSON.stringify(body));
+  };
+
+  /**
+   * The desk phone (`/phone/*`, see http/phone.ts). Pairing and the pin proof need no token (the
+   * one-time code and the device key are the proof); the shell's native calls send its device key.
+   * Returns false for paths it doesn't serve.
+   */
+  const phoneRoute = async (req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> => {
+    const p = url.pathname.replace(/\/$/, '') || '/';
+    if (p !== '/phone' && !p.startsWith('/phone/')) return false;
+    const method = req.method ?? 'GET';
+    const ctx = pageContext();
+    try {
+      if (method === 'POST' && p === '/phone/pair') {
+        const body = await readJson(req, 2_000);
+        sendJson(res, 200, phone.pair(String(body.code ?? ''), String(body.name ?? 'Phone')));
+        return true;
+      }
+      if (method === 'POST' && p === '/phone/pin') {
+        const body = await readJson(req, 2_000);
+        sendJson(res, 200, phone.pinProof(String(body.id ?? ''), String(body.nonce ?? '')));
+        return true;
+      }
+      const device = phone.deviceFromHeader(req.headers.authorization);
+      if (method === 'POST' && p === '/phone/session') {
+        if (!device) throw new PhoneError(401, 'Unknown phone or wrong key: pair it again');
+        const body = await readJson(req, 2_000).catch(() => ({}) as Record<string, unknown>);
+        const version = typeof body.version === 'string' ? body.version : undefined;
+        sendJson(res, 200, { ...phone.session(device, version), name: device.name, cookie: PHONE_COOKIE });
+        return true;
+      }
+      if (method === 'GET' && (p === '/phone/app.json' || p === '/phone/app.apk')) {
+        if (!device && !authorized(req)) throw new PhoneError(401, 'Missing or wrong key');
+        const apk = phone.apk();
+        if (!apk) throw new PhoneError(404, 'No APK has been built');
+        if (p === '/phone/app.json') {
+          const { file: _file, ...info } = apk;
+          sendJson(res, 200, info);
+          return true;
+        }
+        res.writeHead(200, {
+          'content-type': 'application/vnd.android.package-archive',
+          'content-length': apk.size,
+          'content-disposition': 'attachment; filename="tara-phone.apk"',
+          'cache-control': 'no-store',
+        });
+        createReadStream(apk.file).pipe(res);
+        return true;
+      }
+      if (method === 'GET' && p === '/phone/ping') {
+        const who = phoneOf(req);
+        if (!who && !tokenHolder(req)) throw new PhoneError(401, 'Signed out');
+        sendJson(res, 200, { ok: true, device: who?.name });
+        return true;
+      }
+      if (
+        method === 'GET' &&
+        (p === '/phone/events' || p === '/phone/state' || p.startsWith('/phone/run/'))
+      ) {
+        // The shell listens to /phone/events itself (for alerts while the screen is off) with its device key.
+        const native = p === '/phone/events' && phone.deviceFromHeader(req.headers.authorization);
+        if (!native && !phoneOf(req) && !tokenHolder(req)) throw new PhoneError(401, 'Signed out');
+        if (p === '/phone/events') {
+          if (!phoneHub.connect(res)) throw new PhoneError(429, 'Too many open event streams');
+          return true;
+        }
+        if (p === '/phone/state') {
+          if (!phoneHub.state().ready) await phoneHub.check();
+          sendJson(res, 200, phoneHub.state());
+          return true;
+        }
+        const id = p.slice('/phone/run/'.length);
+        const task = /^[\w-]{1,80}$/.test(id) ? phoneHub.task(id) : undefined;
+        if (!task) throw new PhoneError(404, 'That run is no longer in memory');
+        sendJson(res, 200, { task });
+        return true;
+      }
+      if (method === 'GET' && p === '/phone') {
+        const who = phoneOf(req);
+        if (!who && !tokenHolder(req)) {
+          sendHtml(
+            res,
+            401,
+            '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Signed out</title><body style="background:#090d16;color:#cbd5e1;font:18px sans-serif;padding:24px">This phone is not paired, or its session ended. Pair it on the dashboard\'s Phone page.',
+          );
+          return true;
+        }
+        sendHtml(
+          res,
+          200,
+          phoneScreen({
+            agentName: options.dashboard?.agentName ?? 'tara',
+            timeZone,
+            build: String(started),
+          }),
+        );
+        return true;
+      }
+      // The dashboard side: pairing codes and forgetting a phone need the dashboard's own token.
+      if (!tokenHolder(req)) throw new PhoneError(401, 'Missing or wrong bearer token');
+      if (method === 'GET' && p === '/phone/pair' && ctx) {
+        sendHtml(
+          res,
+          200,
+          pairPage(ctx, {
+            cert: phone.cert(),
+            code: options.tls ? phone.newCode() : undefined,
+            devices: phone.devices(),
+            apk: phone.apk(),
+            now: now(),
+          }),
+        );
+        return true;
+      }
+      const forget = /^\/phone\/devices\/([\w-]+)\/forget$/.exec(p);
+      if (method === 'POST' && forget) {
+        if (!phone.forget(forget[1] as string)) throw new PhoneError(404, 'Unknown phone');
+        options.log.info(`phone ${forget[1]} forgotten`);
+        res.writeHead(303, { location: '/phone/pair' });
+        res.end();
+        return true;
+      }
+      throw new PhoneError(404, 'Not found');
+    } catch (err) {
+      const status = err instanceof PhoneError || err instanceof HttpError ? err.status : 500;
+      if (status === 500) options.log.error(`http ${method} ${req.url}: ${(err as Error).stack ?? err}`);
+      if (status === 403 && p === '/phone/pair')
+        options.log.warn(`phone pairing refused from ${req.socket.remoteAddress}`);
+      sendJson(res, status, { error: (err as Error).message });
+      return true;
+    }
   };
 
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
@@ -1562,6 +1759,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       res.end();
       return;
     }
+    if (await phoneRoute(req, res, url)) return;
     // A project's app, shown in a tab: `/app/<name>/<rest>` is proxied to `<dashboardUrl>/<rest>`, and
     // `/p/<name>/<rest>` is the dashboard page that frames it.
     const tab = /^\/(app|p)\/([a-z0-9][a-z0-9-]*)(\/.*)?$/.exec(url.pathname);
@@ -1737,5 +1935,11 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       secure.close();
     });
   }
+  // Event streams never end on their own, so closing the server ends them first.
+  const close = server.close.bind(server);
+  server.close = (callback) => {
+    phoneHub.close();
+    return close(callback);
+  };
   return server;
 }

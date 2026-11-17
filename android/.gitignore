@@ -1,0 +1,6 @@
+.gradle/
+.kotlin/
+build/
+local.properties
+# The release APK tara-agent serves (./gradlew publishApk); synced to the host, never committed.
+apk/

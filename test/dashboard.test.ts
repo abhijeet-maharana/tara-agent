@@ -73,7 +73,7 @@ describe('access and rendering', () => {
   it('allows only the listed networks, including IPv4-mapped addresses', () => {
     const ok = allowList(['127.0.0.0/8', '100.64.0.0/10', 'fd7a:115c:a1e0::/48']);
     expect(ok('127.0.0.1')).toBe(true);
-    expect(ok('::ffff:100.126.35.115')).toBe(true);
+    expect(ok('::ffff:100.100.1.2')).toBe(true);
     expect(ok('fd7a:115c:a1e0::1')).toBe(true);
     expect(ok('192.168.1.20')).toBe(false);
     expect(ok(undefined)).toBe(false);
