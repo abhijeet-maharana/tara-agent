@@ -11,6 +11,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Push to talk (Phase 4): Android's speech recognizer listens for the app on screen. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Voice v2: the voice-call audio mode (echo cancellation) on the loudspeaker. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
     <!-- Apps are only visible to apps that ask for them (API 30+): text to speech engines, the
          phone's own launcher (the "Phone apps" button), Tailscale and RustDesk. -->
@@ -21,6 +25,10 @@
         <package android:name="com.carriez.flutter_hbb" />
         <intent>
             <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+        <!-- Speech recognizers (SpeechRecognizer.isRecognitionAvailable sees none without it). -->
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
         </intent>
         <intent>
             <action android:name="android.intent.action.MAIN" />

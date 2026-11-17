@@ -16,12 +16,18 @@ import { HealthMonitor } from './health/monitor.js';
 import { Observability } from './health/observability.js';
 import { gatherAttention, githubPullRequests } from './http/attention.js';
 import { probeBrowser, projectBrowser } from './http/browser-usage.js';
+import { chatModel } from './http/phone-voice.js';
 import { startHttpServer } from './http/server.js';
+import { ClaudeLane } from './live/claude-lane.js';
+import { GEMINI_LIVE_URL } from './live/gemini.js';
+import { Music } from './live/music.js';
+import { mergeKits } from './live/phone-live.js';
 import { Privileged } from './privileged/privileged.js';
 import { Reminders } from './reminders/reminders.js';
 import { Activity, redact } from './runner/activity.js';
 import { runAgy } from './runner/agy.js';
 import { resolveRunAs } from './runner/as-user.js';
+import { askProject } from './runner/ask.js';
 import { Conversations, TabSweeper } from './runner/browser-tabs.js';
 import { type Runner, runClaude } from './runner/run.js';
 import { sweepScratch } from './runner/workspace.js';
@@ -392,6 +398,89 @@ async function serve(configFlag: string | undefined) {
         activity,
         health,
         observe,
+        // The desk phone's voice: Gemini (host `voice`) for free-form questions, Claude for code questions.
+        phoneVoice: {
+          model: host.voice
+            ? chatModel({
+                url: host.voice.url,
+                models: host.http.phone?.voiceModels ?? host.voice.models,
+                apiKey: process.env.TARA_VOICE_API_KEY || undefined,
+              })
+            : undefined,
+          ask: (name, question) => {
+            const project = projects.find((p) => p.config.name === name);
+            if (!project) return Promise.reject(new Error(`no project ${name}`));
+            return askProject(
+              {
+                run,
+                bin: host.claude.bin,
+                agentName: host.agentName,
+                model: host.http.phone?.askModel ?? 'haiku',
+                timeoutMs: 120_000,
+                store,
+              },
+              project,
+              question,
+            );
+          },
+          dispatch: (name, task) => startThread(name, 'voice-request', `🎙 ${task.slice(0, 200)}`, task),
+        },
+        // Voice v2: Gemini Live as the voice (needs host http.phone.live and TARA_LIVE_API_KEY).
+        phoneLive:
+          host.http.phone?.live && process.env.TARA_LIVE_API_KEY
+            ? {
+                config: {
+                  ...host.http.phone.live,
+                  url: host.http.phone.live.url ?? GEMINI_LIVE_URL,
+                  apiKey: process.env.TARA_LIVE_API_KEY,
+                },
+                // The Claude lanes (ask_claude, claude_code, posters) need TARA_ANTHROPIC_API_KEY;
+                // music goes to the Cast speaker.
+                kit: mergeKits(
+                  host.http.phone.live.music
+                    ? new Music({
+                        speaker: host.http.phone.live.speaker,
+                        host: host.http.phone.live.speakerHost,
+                        log,
+                      })
+                        .warm()
+                        .kit()
+                    : undefined,
+                  process.env.TARA_ANTHROPIC_API_KEY
+                    ? new ClaudeLane({
+                        apiKey: process.env.TARA_ANTHROPIC_API_KEY,
+                        model: host.http.phone.live.claudeModel,
+                        hardModel: host.http.phone.live.claudeHardModel,
+                        projects: projects.map((p) => ({
+                          name: p.config.name,
+                          title: p.config.title ?? p.config.name,
+                        })),
+                        jobs: () =>
+                          projects.flatMap(({ config: { name, title } }) =>
+                            scheduler.list(name).map((j) => ({
+                              project: name,
+                              projectTitle: title ?? name,
+                              id: j.id,
+                              name: j.name,
+                              enabled: j.enabled,
+                              running: j.running,
+                              ...(j.nextRun && { nextRun: j.nextRun.getTime() }),
+                              ...(j.lastStatus && { lastStatus: j.lastStatus }),
+                              ...(j.lastRunAt && { lastRunAt: j.lastRunAt.getTime() }),
+                              ...(j.lastError && { lastError: j.lastError }),
+                            })),
+                          ),
+                        jobRuns: (project, id, limit) => store.jobRuns(project, id, limit),
+                        tasks: () => activity.tasks(),
+                        dispatch: (name, task) =>
+                          startThread(name, 'voice-request', `🎙 ${task.slice(0, 200)}`, task),
+                        timeZone: host.timezone,
+                        log,
+                      }).kit()
+                    : undefined,
+                ),
+              }
+            : undefined,
         code: readers.length
           ? {
               readers,

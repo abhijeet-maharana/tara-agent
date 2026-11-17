@@ -40,6 +40,14 @@ class Bridge(private val context: Context, private val host: Host) {
     private var ttsReady = false
     private val pending = mutableListOf<String>()
 
+    /** Push to talk (Phase 4); set by the activity. */
+    @Volatile var voice: Voice? = null
+
+    /** Voice v2 (Gemini Live through tara-agent), used instead of [voice] when the host has it. */
+    @Volatile var live: LiveVoice? = null
+
+    private fun liveUp() = live?.available() == true
+
     private fun ok(given: String?) = given != null && MessageDigest.isEqual(given.toByteArray(), key.toByteArray())
 
     @JavascriptInterface
@@ -125,6 +133,50 @@ class Bridge(private val context: Context, private val host: Host) {
         if (ok(key)) host.openRemote()
     }
 
+    /** True when the phone can listen (a speech recognizer is installed), so the page shows 🎙. */
+    @JavascriptInterface
+    fun hasVoice(key: String?): Boolean = ok(key) && (liveUp() || voice?.available() == true)
+
+    /** "Hey Jarvis" on or off (the page turns it off in quiet mode). */
+    @JavascriptInterface
+    fun setWake(key: String?, on: Boolean) {
+        if (ok(key)) live?.setWake(on)
+    }
+
+    /** True while Voice v2 is connected: the page shows its live view (steps, cards). */
+    @JavascriptInterface
+    fun hasLive(key: String?): Boolean = ok(key) && liveUp()
+
+    /** Push to talk: listen, or stop when listening. Replies come to `window.taraVoice`. */
+    @JavascriptInterface
+    fun listen(key: String?) {
+        if (!ok(key)) return
+        if (liveUp()) live?.toggle() else voice?.toggle()
+    }
+
+    /** Stops listening and speaking. */
+    @JavascriptInterface
+    fun cancelVoice(key: String?) {
+        if (!ok(key)) return
+        live?.stop()
+        voice?.cancel()
+    }
+
+    /** Words from the page (its Yes / No buttons), sent as if spoken. */
+    @JavascriptInterface
+    fun voiceText(key: String?, text: String?) {
+        if (!ok(key) || text.isNullOrBlank()) return
+        val l = live
+        if (l != null && l.available() && (text == "yes" || text == "no")) l.confirm(text == "yes")
+        else voice?.say(text.take(500))
+    }
+
+    /** Says an answer that came later (`voice` event), at answer volume. */
+    @JavascriptInterface
+    fun answer(key: String?, text: String?) {
+        if (ok(key) && !text.isNullOrBlank()) voice?.answer(text.take(600))
+    }
+
     fun close() {
         synchronized(this) {
             tts?.shutdown()
@@ -148,6 +200,13 @@ class Bridge(private val context: Context, private val host: Host) {
             openSetup: function () { a.openSetup(k); },
             hasRemote: function () { return a.hasRemote(k); },
             openRemote: function () { a.openRemote(k); },
+            hasVoice: function () { return a.hasVoice(k); },
+            hasLive: function () { return a.hasLive(k); },
+            setWake: function (on) { a.setWake(k, Boolean(on)); },
+            listen: function () { a.listen(k); },
+            cancelVoice: function () { a.cancelVoice(k); },
+            voiceText: function (t) { a.voiceText(k, String(t)); },
+            answer: function (t) { a.answer(k, String(t)); },
             // The shell itself wakes, vibrates and speaks for alerts (AlertStream), screen off or on.
             nativeAlerts: true
           });

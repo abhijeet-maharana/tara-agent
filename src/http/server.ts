@@ -11,6 +11,7 @@ import { createServer as createHttpsServer, type Server as HttpsServer } from 'n
 import { networkInterfaces } from 'node:os';
 import path from 'node:path';
 import { Cron } from 'croner';
+import { WebSocketServer } from 'ws';
 import { ApprovalError, type Approvals, type ProposeInput } from '../approvals/approvals.js';
 import { type Bridge, BridgeError } from '../bridge/bridge.js';
 import { CodeError, type CodeRepo, MIN_QUERY, type RepoReader } from '../code/repo.js';
@@ -18,6 +19,7 @@ import { loadQueues } from '../config/load.js';
 import type { HostConfig, Project, QueueConfig } from '../config/schema.js';
 import type { HealthMonitor } from '../health/monitor.js';
 import type { Observability } from '../health/observability.js';
+import { type LiveToolKit, PhoneLive, type PhoneLiveConfig } from '../live/phone-live.js';
 import { ReminderError, type Reminders } from '../reminders/reminders.js';
 import type { Activity } from '../runner/activity.js';
 import type { Scheduler } from '../scheduler/scheduler.js';
@@ -68,6 +70,7 @@ import { logsPage, trendsPage } from './observe.js';
 import { PHONE_COOKIE, Phone, PhoneError, pairPage } from './phone.js';
 import { type NextRun, PhoneHub, type QuietHours } from './phone-events.js';
 import { phoneScreen } from './phone-screen.js';
+import { PhoneVoice, type VoicePanel } from './phone-voice.js';
 import { queuePage } from './queue.js';
 import { loadQuotes, pickQuote } from './quotes.js';
 import { remindersPage } from './reminders-page.js';
@@ -132,6 +135,20 @@ export interface HttpOptions {
   phoneApk?: string;
   /** The desk phone's alerts: quiet hours (default 23:00–07:00) and the gap between spoken ones (30 min). */
   phone?: { quietHours?: QuietHours; alertGapMinutes?: number; speakAlerts?: boolean };
+  /**
+   * The desk phone's voice (http/phone-voice.ts): a fast text model for what the rules don't know, a
+   * read-only Claude question in a project, and handing work to a project's Slack channel.
+   */
+  phoneVoice?: {
+    model?: (system: string, user: string) => Promise<string>;
+    ask?: (project: string, question: string) => Promise<string>;
+    dispatch?: (project: string, task: string) => Promise<{ url?: string }>;
+  };
+  /**
+   * Voice v2 (live/phone-live.ts): Gemini Live over `/phone/live` (a WebSocket, device key), with
+   * extra tools (the Claude lanes, music). Unset: the phone keeps Phase 4's `/phone/voice`.
+   */
+  phoneLive?: { config: PhoneLiveConfig; kit?: LiveToolKit };
   /** The Health page (`/health` in a browser) and `GET /health/checks`, `POST /health/check`. */
   health?: Pick<HealthMonitor, 'snapshot' | 'check' | 'history' | 'label'>;
   /** The Health page's Trends and Logs views, and `GET /metrics` (Prometheus text). */
@@ -237,6 +254,8 @@ async function readJson(req: IncomingMessage, limit = 10_000): Promise<Record<st
  *   GET  /phone/events                 SSE: state (the glance, on change), run (started/ended), alert
  *                                      (session cookie, the token, or the shell's device key)
  *   GET  /phone/state                  the glance as JSON; GET /phone/run/<task id> one run's live steps
+ *   POST /phone/voice                  {text, locked} (device key) → what to say and show (http/phone-voice.ts)
+ *   POST /phone/quiet                  {minutes} quiet mode on (0: off); the page's 🔕 (session cookie too)
  *   GET  /phone/app.json, /phone/app.apk   the shell APK for updates (device key, or the token)
  *   POST /phone/devices/<id>/forget    (token)
  * A phone's session cookie also allows GET requests elsewhere (it shows what the dashboard shows).
@@ -407,6 +426,46 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     alertGapMinutes: options.phone?.alertGapMinutes,
     speakAlerts: options.phone?.speakAlerts,
     build: String(started),
+    now,
+    log: options.log,
+  });
+  /** Every project's jobs, as the phone's voice names them. */
+  const voiceJobs = () =>
+    options.projects.flatMap((project) =>
+      options.scheduler.list(project).map((j) => ({
+        project,
+        projectTitle: projectTitle(project),
+        id: j.id,
+        name: j.name,
+        enabled: j.enabled,
+        running: j.running,
+        ...(j.nextRun && { nextRun: j.nextRun.getTime() }),
+        ...(j.lastStatus && { lastStatus: j.lastStatus }),
+        ...(j.lastRunAt && { lastRunAt: j.lastRunAt.getTime() }),
+        ...(j.lastError && { lastError: j.lastError }),
+      })),
+    );
+  // The desk phone's voice: rules for the everyday questions, a model for the rest (/phone/voice).
+  const phoneVoice = new PhoneVoice({
+    agentName: options.dashboard?.agentName ?? 'tara',
+    projects: options.projects.map((name) => ({ name, title: projectTitle(name) })),
+    timeZone,
+    // The hub rebuilds the glance every 5 s while a phone listens; building it reads every job's schedule.
+    glance: () => phoneHub.recentState(6_000) ?? phoneHub.state(),
+    // The hub reads /attention every minute while a phone listens; a fresh read takes ~0.4 s.
+    attention: async () =>
+      phoneHub.recentAttention(90_000) ??
+      (options.attention ? options.attention() : { items: [], notes: [] }),
+    jobs: voiceJobs,
+    tasks: () => options.activity?.tasks() ?? [],
+    runJob: (project, id) => options.scheduler.trigger(project, id, 'phone'),
+    setJobEnabled: (project, id, enabled) => options.scheduler.setEnabled(project, id, enabled),
+    stopTask: (id) => options.activity?.stop(id) ?? false,
+    quiet: { until: () => phoneHub.quietMode(), set: (until) => phoneHub.setQuietMode(until) },
+    model: options.phoneVoice?.model,
+    ask: options.phoneVoice?.ask,
+    dispatch: options.phoneVoice?.dispatch,
+    announce: (data: { id: string; say: string; panel?: VoicePanel }) => phoneHub.announce(data),
     now,
     log: options.log,
   });
@@ -1627,7 +1686,12 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         if (!device) throw new PhoneError(401, 'Unknown phone or wrong key: pair it again');
         const body = await readJson(req, 2_000).catch(() => ({}) as Record<string, unknown>);
         const version = typeof body.version === 'string' ? body.version : undefined;
-        sendJson(res, 200, { ...phone.session(device, version), name: device.name, cookie: PHONE_COOKIE });
+        sendJson(res, 200, {
+          ...phone.session(device, version),
+          name: device.name,
+          cookie: PHONE_COOKIE,
+          live: Boolean(options.phoneLive),
+        });
         return true;
       }
       if (method === 'POST' && p === '/phone/telemetry') {
@@ -1647,6 +1711,34 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         });
         options.store.seePhoneDevice(device.id, at);
         sendJson(res, 200, { ok: true });
+        return true;
+      }
+      if (method === 'POST' && p === '/phone/voice') {
+        // The shell sends what was heard with its device key and the phone's lock state; actions need
+        // it unlocked. A token (when one is set) stands for an unlocked phone, for testing.
+        const who = device ? device.id : options.token && tokenHolder(req) ? 'token' : undefined;
+        if (!who) throw new PhoneError(401, 'Missing or wrong key');
+        const body = await readJson(req, 4_000);
+        const text = typeof body.text === 'string' ? body.text.trim().slice(0, 500) : '';
+        if (!text) throw new PhoneError(400, 'text is required');
+        const locked = device ? body.locked !== false : false;
+        const started = now();
+        const reply = await phoneVoice.turn(who, text, locked);
+        options.log.info(
+          `phone voice (${reply.via}, ${now() - started} ms${locked ? ', locked' : ''}): "${text.slice(0, 80)}" → "${reply.say.slice(0, 100)}"`,
+        );
+        if (device) options.store.seePhoneDevice(device.id, now());
+        sendJson(res, 200, reply);
+        return true;
+      }
+      if (method === 'POST' && p === '/phone/quiet') {
+        // Harmless (it only holds alerts), so the page's own session may set it too.
+        if (!device && !phoneOf(req) && !tokenHolder(req)) throw new PhoneError(401, 'Signed out');
+        const minutes = Number((await readJson(req, 1_000)).minutes);
+        if (!Number.isFinite(minutes) || minutes < 0 || minutes > 1440)
+          throw new PhoneError(400, 'minutes must be 0–1440');
+        phoneHub.setQuietMode(minutes ? now() + minutes * 60_000 : undefined);
+        sendJson(res, 200, { until: phoneHub.quietMode() ?? null });
         return true;
       }
       if (method === 'GET' && (p === '/phone/app.json' || p === '/phone/app.apk')) {
@@ -1925,11 +2017,50 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       });
     });
 
+  /**
+   * `GET /phone/live` (WebSocket): the shell's voice line (Voice v2), with its device key. Same network
+   * rules as every request; nothing else upgrades.
+   */
+  const liveWss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 });
+  const upgrade = (req: IncomingMessage, socket: import('node:stream').Duplex, head: Buffer) => {
+    const refuse = (status: number, text: string) => {
+      socket.end(`HTTP/1.1 ${status} ${text}\r\nConnection: close\r\n\r\n`);
+    };
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    if (!allowed(req.socket.remoteAddress)) return refuse(403, 'Forbidden');
+    if (url.pathname !== '/phone/live' || !options.phoneLive) return refuse(404, 'Not Found');
+    const device = phone.deviceFromHeader(req.headers.authorization);
+    if (!device) return refuse(401, 'Unauthorized');
+    const live = options.phoneLive;
+    liveWss.handleUpgrade(req, socket, head, (ws) => {
+      options.log.info(`phone live: ${device.name} connected`);
+      options.store.seePhoneDevice(device.id, now());
+      const session = new PhoneLive(ws, live.config, {
+        agentName: options.dashboard?.agentName ?? 'tara',
+        voice: phoneVoice,
+        jobs: voiceJobs,
+        tasks: () => options.activity?.tasks() ?? [],
+        runJob: (project, id) => options.scheduler.trigger(project, id, 'phone'),
+        setJobEnabled: (project, id, enabled) => options.scheduler.setEnabled(project, id, enabled),
+        stopTask: (id) => options.activity?.stop(id) ?? false,
+        subscribe: options.activity?.subscribe?.bind(options.activity),
+        kit: live.kit,
+        log: options.log,
+        now,
+      });
+      ws.on('close', () => {
+        session.end();
+        options.log.info(`phone live: ${device.name} disconnected`);
+      });
+    });
+  };
+
   const server = await listen(
     createServer((req, res) => void handle(req, res)),
     options.port,
     'HTTP API',
   );
+  server.on('upgrade', upgrade);
   const tls = options.tls;
   if (tls) {
     const read = () => ({ cert: readFileSync(tls.cert), key: readFileSync(tls.key) });
@@ -1944,6 +2075,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       server.close();
       throw err;
     }
+    secure.on('upgrade', upgrade);
     // Certificates are renewed in place (`tailscale cert` every month or two): pick up the new one.
     watchFile(tls.cert, { interval: 60_000 }, () => {
       try {
@@ -1962,6 +2094,8 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
   const close = server.close.bind(server);
   server.close = (callback) => {
     phoneHub.close();
+    for (const ws of liveWss.clients) ws.terminate();
+    liveWss.close();
     return close(callback);
   };
   return server;

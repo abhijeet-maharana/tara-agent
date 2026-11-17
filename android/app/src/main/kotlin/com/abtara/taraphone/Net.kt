@@ -50,6 +50,16 @@ class Net(private val host: String, private val port: Int, private val pin: Stri
         override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
     }
 
+    /** TLS for other clients (the voice WebSocket): the same pin rule as [call]. */
+    fun tls(): Pair<javax.net.ssl.SSLSocketFactory, X509TrustManager> {
+        val trust = Trust()
+        val ssl = SSLContext.getInstance("TLS").apply { init(null, arrayOf(trust), null) }
+        return ssl.socketFactory to trust
+    }
+
+    /** With a pin, the key identifies the server, not the host name. */
+    val pinned get() = pin != null
+
     private fun open(path: String, method: String, headers: Map<String, String>): Pair<HttpsURLConnection, Trust> {
         val trust = Trust()
         val ssl = SSLContext.getInstance("TLS").apply { init(null, arrayOf(trust), null) }

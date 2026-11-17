@@ -1,3 +1,5 @@
+import java.net.URI
+import java.security.MessageDigest
 import java.time.Duration
 import java.time.Instant
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
@@ -29,7 +31,12 @@ android {
         targetSdk = 35
         versionCode = System.getenv("TARA_PHONE_VERSION_CODE")?.toInt() ?: buildMinutes
         versionName = "0.1.0"
+        // Only the phone's ABI: ONNX Runtime (the wake word) ships native code for four.
+        ndk { abiFilters += "arm64-v8a" }
     }
+
+    // The wake word's models, downloaded at build time (see `wakeWordModels` below).
+    sourceSets["main"].assets.srcDir(layout.buildDirectory.dir("generated/wakeword"))
 
     signingConfigs {
         if (releaseStore != null) {
@@ -71,8 +78,38 @@ kotlin {
 dependencies {
     implementation("androidx.webkit:webkit:1.14.0")
     implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
+    // Voice v2: the WebSocket to tara-agent (pinned TLS, like Net).
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // "Hey Jarvis": openWakeWord's models on the phone.
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
     testImplementation("junit:junit:4.13.2")
 }
+
+// "Hey Jarvis" (Voice v2 step 4): openWakeWord's ONNX models (github.com/dscripka/openWakeWord, release
+// v0.5.1). They are licensed CC BY-NC-SA 4.0, so they are fetched at build time into build/ (checked by
+// SHA-256) and never committed to this repo.
+val wakeWordModels by tasks.registering {
+    val dir = layout.buildDirectory.dir("generated/wakeword/oww")
+    val models = mapOf(
+        "melspectrogram.onnx" to "ba2b0e0f8b7b875369a2c89cb13360ff53bac436f2895cced9f479fa65eb176f",
+        "embedding_model.onnx" to "70d164290c1d095d1d4ee149bc5e00543250a7316b59f31d056cff7bd3075c1f",
+        "hey_jarvis_v0.1.onnx" to "94a13cfe60075b132f6a472e7e462e8123ee70861bc3fb58434a73712ee0d2cb",
+    )
+    outputs.dir(dir)
+    doLast {
+        val out = dir.get().asFile.apply { mkdirs() }
+        for ((name, sha) in models) {
+            val f = File(out, name)
+            fun hash() = MessageDigest.getInstance("SHA-256").digest(f.readBytes())
+                .joinToString("") { "%02x".format(it) }
+            if (f.exists() && hash() == sha) continue
+            URI("https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/$name").toURL()
+                .openStream().use { input -> f.outputStream().use { input.copyTo(it) } }
+            check(hash() == sha) { "$name: checksum differs" }
+        }
+    }
+}
+tasks.named("preBuild") { dependsOn(wakeWordModels) }
 
 // `./gradlew publishApk`: the release APK and its version into android/apk/, where tara-agent serves
 // them (GET /phone/app.json, /phone/app.apk). Mutagen carries the folder to the host.

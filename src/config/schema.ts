@@ -231,6 +231,39 @@ export const hostConfigSchema = z.object({
           alertGapMinutes: z.number().int().min(0).max(1440).optional(),
           /** false: alerts light the screen and buzz once, never spoken. Default true. */
           speakAlerts: z.boolean().optional(),
+          /**
+           * Voice (Phase 4): models for what the rules don't answer, on the host `voice` endpoint
+           * (default: `voice.models`), and the Claude model for questions about a project's code.
+           */
+          voiceModels: z.array(z.string().min(1)).min(1).optional(),
+          askModel: z.string().min(1).default('haiku'),
+          /**
+           * Voice v2: Gemini Live as the voice (key in TARA_LIVE_API_KEY). Without it, or without the
+           * key, the phone keeps Phase 4's Android speech. `idleSeconds`: quiet time before the voice
+           * session closes (it costs per minute while open). `language`: how to speak, in plain words.
+           */
+          live: z
+            .object({
+              model: z.string().min(1),
+              voice: z.string().min(1).default('Charon'),
+              idleSeconds: z.number().int().min(5).max(600).default(20),
+              language: z.string().min(1).optional(),
+              /** Silence that ends the user's turn (ms); Google's default when unset. */
+              silenceMs: z.number().int().min(100).max(5_000).optional(),
+              googleSearch: z.boolean().default(true),
+              /** The model stays silent for speech not meant for it (TV, other people). */
+              proactiveAudio: z.boolean().default(true),
+              url: z.string().url().optional(),
+              /** ask_claude's models (key in TARA_ANTHROPIC_API_KEY); defaults Sonnet 5.5 and Opus 5.5. */
+              claudeModel: z.string().min(1).optional(),
+              claudeHardModel: z.string().min(1).optional(),
+              /** play_music: the Cast speaker by its name (or `host`); default the first one found. */
+              speaker: z.string().min(1).optional(),
+              speakerHost: z.string().min(1).optional(),
+              /** Off: no music tools. */
+              music: z.boolean().default(true),
+            })
+            .optional(),
         })
         .optional(),
     })

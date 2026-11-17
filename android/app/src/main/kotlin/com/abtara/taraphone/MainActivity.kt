@@ -59,6 +59,8 @@ class MainActivity : Activity(), Bridge.Host {
     private lateinit var settings: Settings
     private lateinit var web: WebView
     private lateinit var bridge: Bridge
+    private lateinit var voice: Voice
+    private lateinit var live: LiveVoice
     private lateinit var panel: View
     private lateinit var statusText: TextView
     private lateinit var backButton: Button
@@ -117,6 +119,16 @@ class MainActivity : Activity(), Bridge.Host {
                 }
             }
         }
+        // Push to talk: what it hears and answers goes to the page (window.taraVoice).
+        voice = Voice(this) { event ->
+            main.post { web.evaluateJavascript("window.taraVoice&&window.taraVoice($event)", null) }
+        }
+        bridge.voice = voice
+        // Voice v2: Gemini Live through tara-agent; its events go to the page (window.taraLive).
+        live = LiveVoice(this) { event ->
+            main.post { web.evaluateJavascript("window.taraLive&&window.taraLive($event)", null) }
+        }
+        bridge.live = live
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
         CookieManager.getInstance().setAcceptCookie(true)
 
@@ -143,6 +155,7 @@ class MainActivity : Activity(), Bridge.Host {
     override fun onResume() {
         super.onResume()
         immersive()
+        live.resume()
         // Back from a long sleep or from Settings: make sure the page and its session are fresh.
         if (paired != null && !pageLoaded) connect()
     }
@@ -161,8 +174,26 @@ class MainActivity : Activity(), Bridge.Host {
         if (panel.visibility == View.VISIBLE && pageLoaded) hidePanel()
     }
 
+    override fun onStop() {
+        // Leaving the screen (Home pressed, another app): stop listening.
+        voice.leave()
+        live.leave()
+        super.onStop()
+    }
+
+    @Deprecated("Activity's own permission result")
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        val granted = grantResults.firstOrNull() == android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (requestCode == Voice.REQUEST_MIC) {
+            if (live.available()) { if (granted) live.talk() } else voice.onPermission(granted)
+        }
+    }
+
     override fun onDestroy() {
         main.removeCallbacksAndMessages(null)
+        voice.close()
+        live.close()
         alerts.stop()
         telemetry.stop()
         io.shutdownNow()
@@ -292,6 +323,9 @@ class MainActivity : Activity(), Bridge.Host {
         main.postDelayed(renew, RENEW_MS)
         alerts.start(p)
         telemetry.start(p)
+        voice.paired = p
+        voice.warm()
+        if (s.optBoolean("live")) live.start(p)
         LinkService.start(this)
         main.removeCallbacks(updateCheck)
         main.postDelayed(updateCheck, 5_000)

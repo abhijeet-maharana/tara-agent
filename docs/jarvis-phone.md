@@ -1,6 +1,6 @@
 # Desk phone (plan)
 
-Status: **Phase 3 closed** (2026-11-17): the desk phone shows the glance screen (Home, Run, Night) live from jarvis, a failing job turns its screen on with the alert, and 🖥 opens RustDesk to see the host's screen (the planned live Chrome view was dropped). **Phase 6 (battery) built** the same day, done before Phase 4: the phone reports its battery and the Health page watches it; waiting to see the level settle near 80 %. See [Phase 1: as built](#phase-1-as-built), [Phase 2: as built](#phase-2-as-built), [Phase 3: as decided](#phase-3-as-decided) and [Phase 6: as built](#phase-6-as-built). A living document: update it as decisions are made and phases land.
+Status: **Voice v2 built** (2026-11-17): "Hey Jarvis" on the phone, Gemini Live as the voice (~1.1–1.5 s from the end of speech to the first word), Phase 4's rules as its tools, Claude (API, or a full Claude Code run in Slack) for anything to check or do, music on the Google Home Mini, every tool call live on the screen. See [Voice v2, step 1](#voice-v2-step-1-as-built) to [step 4](#voice-v2-step-4-hey-jarvis-as-built) and [latency per lane](#voice-v2-latency-and-cost). **Phase 6 (battery) built**, waiting to see the level settle near 80 %. See also [Phase 1: as built](#phase-1-as-built), [Phase 2: as built](#phase-2-as-built), [Phase 3: as decided](#phase-3-as-decided), [Phase 4: as built](#phase-4-as-built) (now the fallback when the host has no Live voice) and [Phase 6: as built](#phase-6-as-built). A living document: update it as decisions are made and phases land.
 
 A spare Android phone sits on the desk, always on, and keeps you up to date while you do other things (work, a film, another job): what needs you, approval cards waiting, what is running, and (through RustDesk) the host's screen with the shared Chromes. You talk to it ("Hey Jarvis, what's running?", "play some lo-fi") and it answers out loud; music plays on a Cast speaker. When you are away it is locked: it still shows and tells, but it does nothing until unlocked.
 
@@ -48,7 +48,7 @@ tara-agent had **Command** (`/command`), a voice control room on Gemini Live, fr
 
 Still in the tree: `GET /attention` (`src/http/attention.ts`, tiers urgent / waiting / later, titles "fit to be read aloud") and the run activity bus (`src/runner/activity.ts`, behind `/sessions/<id>/live`).
 
-Command's non-goals were a phone UI and a wake word. Those are this plan's main goals, so we restore its voice session and tools and give them a phone front end. **Open:** why it stayed off (voice quality, cost, or a desktop tab being the wrong place). The answer decides whether Phase 4 keeps Gemini Live.
+Command's non-goals were a phone UI and a wake word. Those are this plan's main goals. Why it stayed off: jarvis's config says it was turned off on 2026-11-10 because live tasks and Stop moved onto each running session's page, so the tab had little left to do. **Phase 4 did not bring Gemini Live back** (decided 2026-11-17): Android's built-in recognizer and voice are free and answered in about a second; Command's tools and their matching rules (`matchJob`, `matchTask`, the read-only `ask`) were reused. Gemini Live stays the option if on-phone speech turns out too slow or too poor.
 
 ## Shape
 
@@ -57,10 +57,10 @@ Desk phone: tara phone app (Kotlin shell)
   WebView ── https://<host>:<tls port>/phone ── tara-agent
   │  glance tiles, voice UI, RustDesk button      │
   │                                               ├─ /attention, /runs, /items, /sessions/<id>/live   (existing)
-  │  bridge: vibrate · speak · wake screen ·      ├─ /phone/events   SSE: attention changed, run started/ended, urgent alert
-  │          lock state · battery · RustDesk      │
-  │                                               ├─ /phone/voice    WebSocket: mic PCM in, voice out (restored Command session)
-  └─ foreground service: mic → wake word          └─ tools: attention · approvals · decide · jobs · play_music · …
+  │  bridge: vibrate · speak · wake screen ·      ├─ /phone/events   SSE: attention changed, run started/ended, urgent alert, late voice answers
+  │          lock state · battery · RustDesk ·    │
+  │          listen (Android speech → text)       ├─ /phone/voice    POST {text, locked} → {say, panel, expect, unlock} (rules, then a text model)
+  └─ foreground service: mic → wake word          └─ tools: needs · running · approvals (read) · jobs · stop · ask · dispatch · quiet · play_music · …
                                                          │
                                                          └─ Cast ──► speaker (Google Home Mini)
 ```
@@ -93,8 +93,8 @@ Design: big type, one idea per tile, dark theme, colours from the dashboard (red
 
 ## Voice
 
-1. **Phase 4: push to talk.** Tap the core or press a volume key. The mic streams to `/phone/voice`; the restored Command session (realtime voice model + tara tools) answers out loud.
-2. **Phase 5: wake word "Hey Jarvis".** [openWakeWord](https://github.com/dscripka/openWakeWord) has a ready-made `hey_jarvis` model. **Open:** run it on the phone (ONNX Runtime in the shell; audio never leaves the phone until the wake word) or on the host (the phone streams 16 kHz PCM all day; simpler app). Leaning to the phone.
+1. **Phase 4: push to talk** (built, see [Phase 4: as built](#phase-4-as-built)). Tap 🎙 or the clock. Android's speech recognizer turns it into words on the phone, `/phone/voice` decides the answer, Android's text to speech says it. (The volume-key trigger was left out: the volume keys are needed for the volume.)
+2. **Wake word "Hey Jarvis"**: [openWakeWord](https://github.com/dscripka/openWakeWord)'s `hey_jarvis` model **on the phone** (decided and built 2026-11-17, Voice v2 step 4): ONNX Runtime in the shell; audio never leaves the phone until the wake word.
 3. **Quiet mode** for films and calls: "Jarvis, quiet mode" (or a tile) pauses listening and spoken alerts for a set time.
 4. **Short spoken answers, details on screen:** a tool's result also arrives as a panel, as Command did.
 
@@ -103,16 +103,18 @@ Tools, from Command plus new ones:
 | Tool | Does | Allowed while locked |
 |---|---|---|
 | `attention`, `projects`, `jobs`, `approvals`, `repo`, `status`, `brief` | Read | ✅ |
-| `show(page)`, `watch(run)` | Switch the screen | ✅ |
-| `play_music(query)`, `music(pause\|resume\|stop\|volume)` | Cast speaker | ✅ (harmless) |
-| `decide(card, option)`, `job(run\|pause\|resume)`, `dispatch` (start work in Slack) | Act | ❌ needs unlock |
+| `show(page)`, `watch(run)`, quiet mode | Switch the screen, hold alerts | ✅ |
+| `ask` (read-only Claude question about a project) | Read | ✅ |
+| `play_music(query)`, `music(pause\|resume\|stop\|volume)` | Cast speaker (Phase 5) | ✅ (harmless) |
+| `job(run\|pause\|resume)`, `stop`, `dispatch` (start work in Slack) | Act | ❌ needs unlock, then a spoken yes |
+| `decide(card, option)` | Act | ❌ not by voice yet (needs the admin key in the Keystore, see below) |
 
 ## Music on a Cast speaker
 
 - `play_music("…")` finds the track (`yt-dlp "ytsearch1:…"` for YouTube / YouTube Music; Spotify Connect instead if that is the service) and casts the audio stream to the speaker with the default media receiver (`pychromecast` or `catt`).
 - The speaker must be on the same network as the host; discovery is mDNS (`_googlecast._tcp`).
-- **To test first:** casting a YouTube audio URL to an audio-only Google Home Mini, and how long a stream URL stays valid.
-- **Open:** which music service.
+- **Tested 2026-11-17** (Voice v2 step 3): a YouTube audio URL (m4a from `yt-dlp`) plays on the Google Home Mini through the Default Media Receiver, with our own Cast client (`src/live/cast.ts`, no `pychromecast`/`catt`). Stream URLs carry an `expire` about 6 h out; a track is cast right after it is found, so that's enough.
+- **Music service:** YouTube (search through `yt-dlp`), decided 2026-11-17. Spotify Connect stays an option.
 
 ## Locked vs unlocked
 
@@ -140,8 +142,8 @@ From `/attention`'s `urgent` tier (and `attention.urgent` rules), pushed over `/
 | Part | Does |
 |---|---|
 | Activity | Full-screen WebView on `/phone`, immersive, keep screen on, show when locked, turn screen on for alerts |
-| Bridge (`window.Android`, keyed) | `vibrate`, `speak` (Android TTS for alerts when no voice session is open), `lockState`, `battery`, `wakeScreen` |
-| Foreground service | `LinkService` (`specialUse`, since Phase 2) keeps the network up with the screen off, for alerts. Phase 4 adds the microphone type: mic for push-to-talk and the wake word; Android allows it because the app is on screen |
+| Bridge (`window.Android`, keyed) | `vibrate`, `speak` (Android TTS for alerts), `lockState`, `battery`, `wakeScreen`; Phase 4: `hasVoice`, `listen`, `cancelVoice`, `voiceText`, `answer` |
+| Foreground service | `LinkService` (`specialUse`, since Phase 2) keeps the network up with the screen off, for alerts. Push to talk (Phase 4) didn't need the microphone type: Google's recognizer listens for the app on screen. Phase 5 adds it for the wake word |
 | Kiosk | Home app (`CATEGORY_HOME`), start after reboot; optional lock-task mode as device owner (`dpm set-device-owner`, needs a phone with no accounts) |
 | Pairing | Scan a QR on the dashboard: host, TLS fingerprint, a one-time code → device key; admin key added separately with a fingerprint-protected unlock |
 | Updates | tara-agent serves the APK and its version; the app shows an **Update** prompt (one tap, `REQUEST_INSTALL_PACKAGES`). The desk phone is on a plain charger, not on the host's USB (the host sits by the router), so no adb from the host. While developing, builds go on from the Mac (USB or wireless debugging) |
@@ -177,8 +179,9 @@ Read over adb on 2026-11-16.
 | 1 ✅ | **Shell app**: WebView, immersive, keep awake, show when locked, pairing + pinned TLS, bridge, APK served by tara-agent | The phone opens a placeholder `/phone` full screen, over Tailscale, and stays on after a reboot. **Done 2026-11-17** |
 | 2 ✅ | **Glance screen + events**: Home, Run, Night pages; `/phone/events`; urgent alerts that wake the screen | You can see needs-you, approvals and running from across the room, and a failing job lights the phone up. **Done 2026-11-17** |
 | 3 ✅ | ~~**Live Chrome**: CDP screencast, profile tiles, full view~~ → **RustDesk button** | 🖥 on the desk screen opens RustDesk (after the phone's unlock). **Closed 2026-11-17**: live view dropped, see [Phase 3: as decided](#phase-3-as-decided) |
-| 4 | **Voice**: restore Command's session and tools, phone front end, push to talk, lock rules, quiet mode | "What's running?" gets a spoken answer in under a second |
-| 5 | **Wake word + music**: "Hey Jarvis", `play_music` to the Cast speaker | Hands-free from across the room; music plays on the speaker |
+| 4 ✅ | **Voice**: ~~restore Command's session~~ Android's own speech in and out, Command's tools as rules + a text model, phone front end, push to talk, lock rules, quiet mode | "What's running?" gets a spoken answer in under a second. **Built 2026-11-17**: 0.95 s end of speech → voice for a rule answer (see [Phase 4: as built](#phase-4-as-built)) |
+| 5 ✅ | **Wake word + music**: "Hey Jarvis", `play_music` to the Cast speaker | Hands-free from across the room; music plays on the speaker. **Built 2026-11-17 as part of Voice v2** (steps 3 and 4) |
+| V2 ✅ | **Voice v2**: Gemini Live + Claude, live steps and cards | **Built 2026-11-17**, see the step sections below |
 | 6 🔶 | **Battery**: telemetry, Health check (red when hot or stuck at 100 %); Moto Overcharge protection, root only if it doesn't hold | Battery stays at or under ~80 %. **Built 2026-11-17** (done before 4 and 5: small, and the phone sat at 97–100 %); open until the level is seen holding near 80 %. See [Phase 6: as built](#phase-6-as-built) |
 | Later | A text-only tab list per Chrome on the screen (no images, no cost) if RustDesk is too slow for a glance; more PhoneBox ideas from `phonebox-watch` | |
 
@@ -338,7 +341,7 @@ The throwaway job (`personal/phone-alert-test` and its skill) was removed after 
 - **Night dimming** is colour only; the backlight stays as set. A bridge `brightness(f)` would lower it (shell change).
 - A spoken alert counts toward the 30-min gap even if no phone heard it (e.g. the shell was offline).
 - The foreground service's notification is hidden (no notification permission asked); grant `POST_NOTIFICATIONS` to see "Listening for alerts".
-- **Alerts are spoken on the media stream**, so a muted phone speaks silently (seen 2026-11-17). Matters again in Phase 4: spoken answers need the volume up while answering (or their own stream).
+- **Alerts are spoken on the media stream**, so a muted phone speaks silently (seen 2026-11-17). Phase 4's answers raise the media volume to half while they speak, then put it back.
 
 ## Phase 3: as decided
 
@@ -384,6 +387,308 @@ Home on the phone comes back to the desk screen from RustDesk (the shell is the 
 | Tap while locked → Android's unlock prompt | ✅ |
 | Desk screen stays landscape after the rotation setting is reset to portrait (shell 461274) | ✅ |
 | After unlocking, RustDesk opens and connects to jarvis | Not checked (needs the owner's unlock) |
+
+## Phase 4: as built
+
+Built 2026-11-17 and checked on the moto g34 against jarvis, with real speech (the Mac's `say` voice next to the phone).
+
+### How the pieces fit
+
+```
+Tap 🎙 or the clock
+  │
+Shell: Voice.kt ── Android SpeechRecognizer (Google's, en-IN, partial results) ──► words
+  │                                                          │
+  │   POST /phone/voice {text, locked}   (device key; locked = KeyguardManager.isDeviceLocked)
+  ▼                                                          ▼
+tara-agent: PhoneVoice (src/http/phone-voice.ts)
+  1. a pending yes/no? → act or drop
+  2. rules: what's running, what needs me, approvals, next up, brief, usage, time, quiet mode,
+     run / pause / resume <job>, stop <run>, watch <run>, home / night            ~0–100 ms
+  3. else: Gemini 3 Flash (host `voice` endpoint) with the glance as context → {say, panel, action}   1.5–3 s
+       action ask      → Claude (haiku, read-only) in the project; answer later as a `voice` event
+       action dispatch → a new thread in the project's Slack channel (after unlock + yes)
+  │  ← {say, panel?, expect?: confirm, unlock?, watch?, show?, pending?}
+  ▼
+Shell: says it (Android text to speech, media volume raised to ≥ 50 % while it speaks, then put back)
+       expect: confirm → listens again at once;  unlock → Android's unlock prompt, then the same words again
+Page:  overlay with what was heard, the answer, its panel, Yes / No
+```
+
+| Part | Where | Notes |
+|---|---|---|
+| Voice turns | `src/http/phone-voice.ts` (`PhoneVoice`) | Rules first, then the model. Per-phone pending question (90 s). Job and run matching from Command's `matchJob` / `matchTask` |
+| Route | `POST /phone/voice` in `src/http/server.ts` | Device key only (a token, when one is set, counts as an unlocked phone, for testing). Logs each turn: path, ms, words, answer |
+| Quiet mode | `PhoneHub.setQuietMode` (`src/http/phone-events.ts`), `POST /phone/quiet` | Holds alerts like quiet hours (no wake, no buzz), without the Night page; ending it gives one "While you were quiet: …" summary. 🔔 in the bar = one hour; voice takes any length up to 24 h. Not kept across a tara-agent restart |
+| Claude questions | `src/runner/ask.ts` (restored from Command) | `claude -p`, `--tools Read Grep Glob`, model `http.phone.askModel` (default haiku), 2 min timeout. The project's jobs (last status and error) go with the question: Claude sees the repo, not run history |
+| Model | `chatModel` in `phone-voice.ts`, host `voice` (OmniRoute) | `http.phone.voiceModels` picks models (default `voice.models`); 8 s each, JSON answers |
+| Shell | `Voice.kt`, `Bridge` (`hasVoice`, `listen`, `cancelVoice`, `voiceText`, `answer`) | `RECORD_AUDIO`; `<queries>` for `android.speech.RecognitionService` (without it the recognizer is invisible on API 30+). Logs `voice timing: …` per turn |
+| Page | `src/http/phone-screen.ts` | 🎙 and a tap on the clock talk; the overlay shows the state (blue listening, amber thinking, green speaking, with the mic level), "Tap to stop" / "Tap to talk again", ✕ closes. Late answers come over `/phone/events` (`voice`) and are said through the shell |
+| Config | host `http.phone.voiceModels`, `http.phone.askModel` | jarvis: `voiceModels: [agy/gemini-3-flash, agy/gemini-3.5-flash-lite]` |
+
+### Lock rules, as built
+
+| Request | Locked phone | Unlocked phone |
+|---|---|---|
+| Questions, screen switching, quiet mode, Claude questions | ✅ | ✅ |
+| Run / pause / resume a job, stop a run, hand work to Slack | "Unlock the phone first": unlock prompt, then the question | "Run Blog writer, in Abtara, now?" → **yes** (spoken, or the Yes button) |
+| Decide an approval card | ❌ "I can't decide cards by voice" | ❌ same |
+
+The lock state comes from the shell with the device key, never from the page's cookie: a locked phone's page can't claim to be unlocked. A yes is checked again at the moment it arrives (the phone may have locked in between).
+
+### Decisions made while building
+
+- **Android's own speech, not Gemini Live** (owner's call: free first, Gemini Live only if too slow). It wasn't: the recognizer gives the words 80–150 ms after you stop talking.
+- **Rules before a model.** Every model tried took 1.5 s or more, so the everyday questions never reach one. The model gets what the rules don't know, and its actions go through the same yes and unlock as the rules'.
+- **Gemini 3 Flash, not Flash Lite**, for the model: with the glance as context, Flash Lite (the Slack voice-note models) took 3.7–5.7 s; Gemini 3 Flash 1.5–2.2 s, and its answers were better. Other fast models on OmniRoute weren't available (`agy/gemini-3.6-flash-low`, `dva/*`) or failed (`glm-4.7-flash`).
+- **Answers are louder than the phone.** Media volume on the desk phone is 0, so answers raise it to half for as long as they speak, then put it back (unless someone changed it meanwhile). Alerts stay silent (`speakAlerts: false`).
+- **No volume-key trigger:** the volume keys are needed for the volume. The wake word (Phase 5) is the hands-free way.
+- **Approvals aren't decided by voice** yet: a desk phone that sits unlocked is the wrong place for it, and the plan's admin key in the Keystore behind the unlock isn't built.
+- **The text to speech engine starts when the shell connects**: its cold start made the first answer 1.8 s late.
+
+### Checked on the phone (2026-11-17)
+
+Spoken by the Mac's `say -v Rishi` next to the phone; 🎙 tapped over adb. Times are from the end of speech to the first word of the answer (`voice timing` in logcat).
+
+| Said | Heard as | Path | Answer | Time |
+|---|---|---|---|---|
+| What's running? | ✅ | rule | "Nothing is running." | **0.6 s** (first try 2.2 s: text to speech cold start, since fixed) |
+| What needs me? | "what need me" | rule | "73 approval cards." (now "Nothing urgent. 73 approval cards waiting.") | 0.95 s |
+| Quiet for ten minutes | "client for 10 minutes" | model | "Quiet until 14:06. Alerts will wait." | 3.0 s |
+| Why did the last job fail? | ✅ | model → Claude | "Checking…" at 2.7 s; Claude's answer 31 s later, shown and said | 2.7 s |
+| Run the approvals cleanup job | "run the approval screen of job" | rule | ⚠️ answered about approvals (fixed: verb-led sentences act first) | 0.6 s |
+
+After the fixes (shell 461328+): "What needs me?" → rule, **0.43 s** ("Nothing urgent. 74 approval cards waiting."); "Why did the GST prep job stop?" → model, 3.9 s, answered from the job's history ("GSTR-1 Prep was stopped on November tenth").
+
+⚠️ **Open: the recognizer often hears nothing.** In the later tests many sentences came back empty (`ERROR_NO_MATCH`; Google's log: speech detected for ~2 s, then `NO_SPEECH_DETECTED`, no partial results), for example "Any approvals waiting?", and once even "What needs me?", which had worked earlier. Others were cut to their last words ("run the approvals cleanup job" → "job"). Turning the Mac up didn't help. The US Mac voice (Samantha) failed on every sentence; the Indian one (Rishi) mostly worked (the last check: "What needs me?" → "what need me", 0.48 s; "What's running?" → "what's your name"). So the test voice matters, which is why a real voice decides it. The phone's only recognizer is Google's **on-device** one (Speech Services, `com.google.android.tts`, the en-IN pack, `ONDEVICE_MEDIUM_SHORT`); the Google app's online recognizer isn't offered as a service here. Not yet tried with a real voice next to the phone (the owner is checking by hand). If it fails for a real voice too, options: `en-US` instead of `en-IN`, Google's recognizer through `RecognizerIntent` (its own dialog), or Gemini transcription of recorded audio on jarvis (the Slack voice-note path), or Gemini Live after all. The shell logs `partial:` and `final:` lines (`adb logcat -s TaraPhone`) to see what it heard.
+
+### Not done yet
+
+- **Spoken yes over a real job**: the confirm, unlock and run path is unit-tested and the question was asked on the phone, but no job was started by voice in the check (one answer was "no").
+- Quiet mode is in memory: a tara-agent restart ends it.
+- Hinglish: Google's en-IN recognizer writes Hindi words in Latin script ("kya chal raha hai" reached the model, which answered in Hinglish in the bench); not tried by voice.
+- The recognizer is Google's (online when it wants); on-device recognition (`createOnDeviceSpeechRecognizer`) wasn't needed for speed.
+
+## Voice v2: Gemini Live + Claude (decided 2026-11-17)
+
+After Phase 4, the owner asked for "a real Jarvis": a real AI with full access that can do anything, starts on "Hey Jarvis", plays music on the Google Home Mini, finds a movie to watch, checks facts, runs jobs, reads logs and reports back, and shows its work live on the screen (tool calls, cards). Phase 4's Android recognizer hears too unreliably for that, and its rules only know a fixed set of questions.
+
+**Shape: Gemini Live is the voice, Claude is the brain and the hands.**
+
+```
+"Hey Jarvis" (openWakeWord on the phone; nothing leaves the phone before it)
+   ▼
+Phone mic (16 kHz PCM) ──WS──► tara-agent ──WS──► Gemini Live: listens, talks, can be interrupted
+   ▲  voice (24 kHz) + panel events      │ tool calls
+   │                                     ├─ instant (~1 s): Phase 4's rules as tools (running, needs me, approvals,
+   │                                     │    next, quiet, show/watch), play_music / music (Cast → Home Mini)
+   │                                     ├─ look up (1–3 s): Google Search grounding (movies, facts), or Claude + web search
+   │                                     └─ do (s–min): ask_claude → Claude API (Sonnet 5.5, tara tools + web_search),
+   │                                          or a full Claude Code run in tara (repos, logs, browsers, Slack);
+   │                                          "on it" now, the result spoken when it ends
+   └── every tool call is also a `panel` event: the screen shows it live
+```
+
+| Decision | Why |
+|---|---|
+| Gemini Live for listening and speaking | Natural voice, interruptible, ~1 s, hears Hinglish; fixes Phase 4's recognizer |
+| Claude for anything that does or checks something | Stronger at careful multi-step work; tara already runs it with full access |
+| Claude API (`claude-sonnet-5-5`, Opus 5.5 for hard ones) for the middle lane | Anthropic API credit (~$900 for 5 months); first words in ~1 s vs several seconds for a `claude -p` start. ~$0.01–0.02 a turn |
+| Full Claude Code runs (tara) for big jobs | Subscription, full tools; result spoken when done |
+| Every tool call also a `panel` event | Live screen: step strip, cards (needs you, approval cards, run steps, logs, posters, sources, now playing, confirm) |
+| Actions still need the phone unlocked + a spoken yes | A voice can't prove it's the owner (a guest, the TV). Questions, search, music, reading logs: no gate |
+
+**Build order:** (1) Gemini Live session restored from Command (`git show 591b2b5^:src/live/gemini.ts`, `session.ts`, `tools.ts`) + phone mic/voice streaming over a WebSocket; (2) the lanes: Phase 4 rules as tools, Google Search, `ask_claude`, Claude Code runs, with a `panel` event per tool call and the new cards; (3) `play_music` to the Home Mini; (4) "Hey Jarvis" on the phone.
+
+**Needs:** a Google AI Studio key (`TARA_LIVE_API_KEY`) and an Anthropic API key (`TARA_ANTHROPIC_API_KEY`) in `/etc/tara-agent.env`. **Both set on 2026-11-17** (the old Live key from Command, in a backup of that file, was no longer valid).
+
+## Voice v2, step 1: as built
+
+Built and checked 2026-11-17 on the moto g34 against jarvis: Gemini Live is the voice, Phase 4's rules are its tools, every tool call shows on the screen.
+
+### How the pieces fit
+
+```
+🎙 (or the clock)                                                   jarvis: tara-agent
+Shell: LiveVoice.kt ─── wss://<host>:<tls port>/phone/live (device key, pinned TLS) ──► PhoneLive (src/live/phone-live.ts)
+  mic: voice-call source + echo canceller, 16 kHz PCM, 40 ms frames  ──────────►          │ GeminiLive (src/live/gemini.ts)
+  speaker: AudioTrack 24 kHz, voice-call mode on the loudspeaker  ◄──────────            ├──► Gemini Live (gemini-3.8-live)
+  JSON events → page window.taraLive: state, words, steps, cards ◄──────────            └── tools: Phase 4's rules (PhoneVoice), job/stop behind the gate
+```
+
+| Part | Where | Notes |
+|---|---|---|
+| Gemini client | `src/live/gemini.ts` | Restored from Command (`591b2b5^`), plus Google Search grounding, end-of-speech silence (`silenceMs`) and token usage (`usageMetadata`) |
+| Session | `src/live/phone-live.ts` (`PhoneLive`) | One per connected shell. Opens Gemini on `start`, closes after `idleSeconds` quiet (nothing pending) or `end_conversation`. Logs each turn (lane, end of speech → first word, tools) and each session (seconds heard and spoken, tokens, ~$) |
+| Tools | `RULE_TOOLS` | `running`, `needs_me`, `approvals` (read only), `next_up`, `brief`, `usage`, `jobs`, `quiet`, `show`, `watch`, `job` and `stop` (gated), `confirm`, `end_conversation`. The answers are Phase 4's rule answers (`PhoneVoice`, now public methods) |
+| Route | `GET /phone/live` upgrade in `src/http/server.ts` | Same `allowFrom` as every request, device key required, both HTTP and HTTPS listeners. `/phone/session` now says `live: true` so the shell knows |
+| Shell | `LiveVoice.kt` (OkHttp WebSocket, pinned like `Net`), `Bridge` (`hasLive`; `listen`, `cancelVoice`, Yes/No go to Live when it is up) | Falls back to Phase 4 (Android speech, `/phone/voice`) when the host has no Live voice |
+| Page | `src/http/phone-screen.ts`: `window.taraLive` | Orb, your words, the answer, up to 2 cards (list, confirm Yes/No, sources, posters, Claude, log, run, music), the **step strip** (last 6 tool calls: ● running, ✓, ✗) |
+| Config | host `http.phone.live` | jarvis: `model: gemini-3.8-live`, `voice: Charon`, `idleSeconds: 20`, `silenceMs: 400`, `googleSearch: false`, `language: Indian English…Hinglish`. Key `TARA_LIVE_API_KEY` in `/etc/tara-agent.env` |
+
+### The gate for actions
+
+| Situation | What happens |
+|---|---|
+| `job` / `stop` on a locked phone | Refused to the model; the shell shows Android's unlock prompt; once unlocked the model is told and calls again |
+| Unlocked | Nothing runs yet: a **Confirm** card ("Run Content Creator, in Abtara, now?") with Yes / No, and the model asks the same question |
+| The model calls `confirm(yes)` | Acts only if **the user's own words since the question** hold a yes (yes, haan, ji, chalao, go ahead…) and no no (no, nahi, mat, leave it…). The model can't say yes for the user |
+| Yes / No tapped | Acts (or not) and tells the model what happened |
+| 90 s with no answer | The question expires |
+
+### Decisions made while building
+
+- **gemini-3.8-live**, from a bench on jarvis with Rishi's recorded voice (tool call included, end of audio → first audio): 3.8-live **1.7 s** with Google's default end-of-speech wait, **1.25–1.5 s** with 300–500 ms; 3.1-flash-live-preview 2.2–2.4 s; 2.5-flash-native-audio 3.6–3.8 s. 3.8-live also wrote Hinglish correctly ("Jarvis, kya chal raha hai abhi?"); 2.5 heard it as Devanagari noise.
+- **`silenceMs: 400`**: 300 was fastest but more likely to cut a sentence at a pause.
+- ⚠️ **Google Search is off**: on 3.8-live and 3.1 the search tool closed the session with "You exceeded your current quota" (the key's project has no search-grounding quota; probably needs billing). It worked on 2.5 native audio but took 8 s. Lookups go to Claude with web search (step 2) unless billing is turned on.
+- **Echo cancellation through the voice-call path**: mic source `VOICE_COMMUNICATION` with `AcousticEchoCanceler` (available on this phone), playback as `USAGE_VOICE_COMMUNICATION` in `MODE_IN_COMMUNICATION` on the loudspeaker; call volume raised to 70 % while talking, put back after. The model didn't hear itself in any test.
+- **Latency is measured on the phone**: last loud mic frame (noise floor learned only while nothing plays) → first frame of the answer, sent to tara-agent and logged per turn with its lane. A turn runs from the user's words to their next words (a tool call splits Gemini's side in two).
+- **Hinglish answers in Latin script** after the `language` line was set (the first try answered in Devanagari).
+
+### Checked on the phone (2026-11-17)
+
+Spoken by `say -v Rishi` next to the phone; 🎙 tapped over adb; phone unlocked.
+
+| Said | Heard as | Tool | Answer | End of speech → first word |
+|---|---|---|---|---|
+| What's running right now? | ✅ | `running` | "Nothing is running right now." | 1.34 s, 1.36 s |
+| What needs me? | ✅ | `needs_me` | "Nothing urgent, but there are 75 approval cards waiting." + card | ~1.3 s |
+| What's next up? | "What's next" | `next_up` | Next three jobs + card | 1.34 s |
+| Jarvis, kya chal raha hai abhi? | "John Lewis, kya chal raha hai abhi?" | `running` | "Abhi kuch nahi chal raha hai." | 1.22 s |
+| Jarvis, brief me please | ✅ | `brief` | Briefing | 1.35 s |
+| Pause the content creator job | ⚠️ "the content creator job" (said while the briefing was still playing) | `job` → gate | Confirm card "Run Content Creator, in Abtara, now?" | 1.42 s |
+| No, leave it | "leave it" | `confirm(no)` | Nothing ran ✅ | 1.29 s |
+| Thanks, that's all | ✅ | `end_conversation` | Goodbye, session closed | 1.18 s |
+
+"Brief me" alone (half a second) was not taken as a turn once. The model now asks when it didn't hear the verb instead of assuming "run".
+
+### Cost
+
+Measured from `usageMetadata` (gemini-3.8-live list prices: audio $3 in / $12 out, text $0.75 in / $4.50 out per million tokens):
+
+| Session | Length | Tokens in (text / audio) | Tokens out (audio) | Cost |
+|---|---|---|---|---|
+| 4 questions | 45 s | 7,425 / 1,966 | 245 | ~$0.014 |
+| Briefing + action + bye | 38 s | 10,263 / 3,442 | 348 | ~$0.022 |
+
+**About $0.02–0.04 a minute of conversation (₹2–3).** Text input (instructions, tool list and tool results, re-read on every turn) is the largest part and grows with a longer conversation, which is one more reason the session closes after 20 s of quiet. Nothing is spent while no conversation is open. Ten minutes a day would be roughly $6–12 a month.
+
+## Voice v2, step 2: the lanes, as built
+
+Built and checked 2026-11-17. Gemini answers the quick things itself (step 1's rule tools); everything that needs checking or doing goes to Claude.
+
+| Lane | Tool (Gemini) | Where | What happens |
+|---|---|---|---|
+| Quick | `running`, `needs_me`, `approvals`, `next_up`, `brief`, `usage`, `jobs`, `quiet`, `show`, `watch`, `job`/`stop` (gated) | `src/live/phone-live.ts` | Phase 4's rule answers, a list card |
+| Look up / check | `ask_claude(question, hard?)` | `src/live/claude-lane.ts` (`ClaudeLane`) | Gemini says "on it" at once; Claude (`claude-sonnet-5-5`, effort low; `hard: true` → `claude-opus-5-5`, effort high) works with read-only tara tools and web search; the spoken part is said when it comes, the details go on a **Claude card** |
+| Do | `claude_code(project, task)` (gated) | same | A Slack thread in the project, like any tara run (`startThread`, all tools). Its end is told to Gemini (`TASK DONE`), which says how it went; a **run card** opens the Run view |
+| Posters | `show_titles` (Gemini or Claude) | same | Poster cards with Wikipedia thumbnails (`/api/rest_v1/page/summary`, "Title (YEAR film)" first) |
+| Google Search | built-in grounding | `gemini.ts` | Wired (step and **sources card** from `groundingMetadata`) but **off on jarvis**: the key's project has no quota for it on 3.x Live models |
+
+Claude's own tools (`READ_TOOLS`): `jobs`, `job_runs` (latest runs: status, error, start of output), `run_output` (one run's stored output, script output and error; also a **log card**), `running` (runs in memory with their last steps), `service_log` (tara-agent's own journal, secrets blanked; also a log card), `show_titles`, and `web_search_20260209` (up to 5 searches). Each call is a step on the strip; web searches show as "Web: <query>". Claude answers in two parts: one or two sentences to speak, then `---` and the details for the screen (markdown stripped).
+
+### Decisions made while building
+
+- **The official SDK** (`@anthropic-ai/sdk`), a manual tool loop rather than the SDK's tool runner, so each tool call becomes a step on the screen as it happens. `fallbacks: "default"` (server-side refusal fallback) is on.
+- **Long work doesn't block the voice.** `ask_claude` answers Gemini at once (`working`); the result comes as a text turn starting `RESULT` and is spoken 0.5–0.7 s after it arrives. Its step stays ● until then.
+- **Prompt caching** on Claude's requests: each round re-sends the logs read so far. The same log question cost **$0.11 before, $0.043 after** (35k of 50k input tokens read from the cache).
+- **Gemini goes straight to `ask_claude`** for checking work; when it called `jobs` first, "on it" came at 3.3 s instead of ~1 s.
+- **Language follows the user**: an English question once got a Hinglish answer; the instructions now say to answer in the language of the user's last words.
+- **`claude_code` is an action**: unlock + a spoken yes, like `job` (the question: "Start Claude in Personal to check how much free disk space is available?").
+- Key `TARA_ANTHROPIC_API_KEY` in `/etc/tara-agent.env` (not `ANTHROPIC_API_KEY`, which would change how tara's own `claude` runs are billed). Without it, the Claude lanes are left out.
+
+### Checked on the phone (2026-11-17)
+
+| Said | Lane | What happened | First word | Answer |
+|---|---|---|---|---|
+| Which job failed most recently, and why? Check the logs. | Claude | 5 steps on the strip (jobs, runs, log, run output, log); "Job Application Submitter was aborted on 16 Nov…", details and two log cards on screen | 2.4 s ("On it, checking the logs") | Sonnet 12.9 s, spoken 0.55 s later |
+| Suggest a good comedy movie to watch tonight. | Claude + web | Andaz Apna Apna, Hera Pheri, Chup Chup Ke with posters (Hera Pheri had none on Wikipedia) | 0.96 s | Sonnet 8.2 s, spoken 0.62 s later |
+| Who won the cricket world cup in 2023? | Claude | "Australia, beating India in the final", details card | 0.85 s | Sonnet 1.7 s, spoken 0.72 s later |
+| Start a Claude Code run in the personal project to check how much free disk space jarvis has | Claude Code | Confirm card → "Yes, go ahead" → thread in Personal's Slack → "There is 167 GB of free disk space available." | 1.64 s (the question) | Run took 7 s; spoken 0.5 s after it ended |
+| Which jobs failed this week, and why? (after caching) | Claude | 4 rounds, ~$0.043 | 1.1 s | Sonnet 8.3 s |
+
+## Voice v2, step 3: music, as built
+
+Built and checked 2026-11-17.
+
+| Part | Where | Notes |
+|---|---|---|
+| Cast client | `src/live/cast.ts` | mDNS discovery (`_googlecast._tcp`, name from the TXT record), Cast v2 over TLS :8009 with hand-encoded `CastMessage` frames, Default Media Receiver (`CC1AD845`): launch, `LOAD`, pause/resume/stop, volume |
+| Tools | `src/live/music.ts` (`Music`) | `play_music(query)`: `yt-dlp -j -f bestaudio[ext=m4a]/bestaudio "ytsearch1:<query>"` → cast, a **now-playing card** with the thumbnail. `music(pause\|resume\|stop\|volume\|status)`. Not gated (harmless) |
+| Config | host `http.phone.live.speaker` (or `speakerHost`), `music: true` | jarvis: the Home Mini's name as the Google Home app shows it (on the same LAN as jarvis) |
+
+### Decisions made while building
+
+- **Our own Cast client** (~200 lines) rather than Python's `pychromecast`: the protocol needs six protobuf fields; no new runtime on jarvis.
+- **Never send a Cast `CLOSE`** when disconnecting: a `CLOSE` to the media app ended playback on the Home Mini (first test: "idle" 8 s after `LOAD`). The connection is just dropped; music goes on.
+- **The speaker is found at startup** (`Music.warm()`): mDNS takes ~2.5 s, which made the first "pause" take 3.7 s.
+- **The conversation closes once the music is announced** (`endAfter`): otherwise the microphone hears the song and Gemini answers the lyrics.
+
+### Checked (2026-11-17)
+
+| Check | Result |
+|---|---|
+| jarvis sees the speaker (mDNS) | ✅ the Google Home Mini, by its name |
+| Play, pause, stop from a script on jarvis | ✅ (yt-dlp 3.8 s, cast 1.7 s) |
+| "Jarvis, play some lofi music on the speaker" | ✅ "1 A.M Study Session [lofi hip hop]": "putting it on" at 1.53 s, found in 4.4 s, cast in 0.55 s, announced 0.64 s later (**music ~6.5 s after the request**), then the conversation closed |
+| "Pause the music", "Stop the music" | ✅ 1.72 s, 1.44 s to the spoken answer |
+
+## Voice v2, step 4: "Hey Jarvis", as built
+
+Built and checked 2026-11-17.
+
+```
+LiveVoice.kt: one microphone (VOICE_COMMUNICATION, echo canceller) while the screen shows and quiet mode is off
+  idle:     40 ms frames → last 1 s kept → WakeWord.kt every 80 ms → score ≥ 0.5 → a conversation opens
+  talking:  frames → tara-agent (the kept second first, so "Hey Jarvis, what's running?" arrives whole)
+```
+
+| Part | Where | Notes |
+|---|---|---|
+| Detector | `WakeWord.kt` | openWakeWord's three models (mel spectrogram → embedding → `hey_jarvis_v0.1`) on ONNX Runtime (`onnxruntime-android` 1.20.0, one thread). Port checked against a Python run of the same steps: "Hey Jarvis, what's running right now?" 0.997, a sentence without it 0.001 |
+| Models | `wakeWordModels` task in `android/app/build.gradle.kts` | Downloaded at build time from openWakeWord's v0.5.1 release into `build/`, SHA-256 checked. **Not committed**: they are CC BY-NC-SA 4.0 (non-commercial) |
+| Shell | `LiveVoice.kt` | Mic on while the shell is on screen and quiet mode is off; 👂 in the bar shows it. A detection buzzes, opens a conversation and sends the last second first. Detections at least 2 s apart; the detector resets after each conversation |
+| Page | `phone-screen.ts` | Quiet mode (🔕 or by voice) turns the wake word off (`taraPhone.setWake`) |
+| APK | | 6 MB → 28 MB (ONNX Runtime's native library for arm64 only, plus 3.7 MB of models) |
+
+### Decisions made while building
+
+- **One microphone for both**, so nothing said after "Hey Jarvis" is lost to a second recorder starting.
+- **The microphone restarts when Jarvis first answers.** Android sets up the echo canceller for the audio mode an input starts in; the wake word's mic starts in normal mode, so in the first version Jarvis heard its own voice and answered it (gibberish transcripts in several languages, and once it started a song). Restarting the mic when the conversation opened garbled the user's sentence ("brief me please" → "inglés"); restarting at the first sound of the answer (the user has finished) works. It restarts again in normal mode after the conversation.
+- **A bare "Hey Jarvis" is told apart**: the kept second carries the wake words (heard as "jueves", "John Lewis"); the instructions say to answer "Yes?" and call no tool when that is all. Before that, a bare "Hey Jarvis" started a briefing.
+- **Proactive audio** (`proactivity.proactiveAudio`, accepted by 3.8-live, same latency) and an instruction to ignore speech not meant for it: the room's TV and talk reach the microphone.
+- The wake word runs in the activity (the shell is the home app and keeps the screen on), not yet in a microphone foreground service: with the screen off it doesn't listen.
+
+### Checked on the phone (2026-11-17)
+
+| Said (`say -v Rishi`, no tap) | Detection | Heard | Result | First word |
+|---|---|---|---|---|
+| Hey there, what's the weather like today in Mumbai? | none ✅ | | | |
+| Hey Jarvis, what's running right now? | 0.88 | ⚠️ "What's playing right now?" | `music` status | 1.47 s |
+| Hey Jarvis. … What needs me today? | 0.59 | ✅ (after "Yes?") | `needs_me` | 1.33 s |
+| Hey Jarvis, kya chal raha hai abhi? | 0.94 | "Luis, क्या रहा है अभी?" | `running` | 1.23 s |
+| Hey Jarvis, what's running right now? (×2) | 0.82, 0.84 | "Hey Jarvis, running right now." | `running` | 1.18 s, 1.29 s |
+| Hey Jarvis, brief me please. | 0.98 | "please" | `brief` | — |
+
+## Voice v2: latency and cost
+
+End of speech → first word of the answer, measured on the phone (last loud mic frame → first sound), 2026-11-17, Rishi's voice from the Mac:
+
+| Lane | First word | Full answer |
+|---|---|---|
+| Quick (rule tools) | **1.07–1.47 s** (typical 1.2–1.35 s) | same |
+| Chat (no tool) | ~1.0–1.5 s | same |
+| Wake word, one breath ("Hey Jarvis, what's running?") | 1.18–1.47 s | same |
+| Claude: a fact | ~0.9 s ("on it") | +1.7 s Claude +0.7 s ≈ **3.5 s** |
+| Claude: web + posters | ~1.0 s | +8.2 s +0.6 s ≈ **10 s** |
+| Claude: read runs and logs | 1.1–2.4 s | +8–13 s +0.5 s ≈ **10–16 s** |
+| Claude Code run | 1.6 s (the question), 1.9 s after "yes" | run time + 0.5 s |
+| Music | 1.5 s ("putting it on") | music plays ~6.5 s after the request; pause/stop 1.4–1.7 s |
+| (Phase 4, for comparison) | 0.43–0.95 s rules, 2–4 s model | |
+
+The floor is Gemini's end-of-speech wait (`silenceMs: 400`) plus ~0.8 s to the first audio; a session opens in ~0.7 s, during which the mic is buffered on the server.
+
+**Cost.** Gemini Live (gemini-3.8-live list prices: audio $3 in / $12 out, text $0.75 / $4.50 per million tokens), from `usageMetadata`: sessions of 16–56 s cost $0.008–0.03, **about $0.02–0.04 per minute of conversation (₹2–3)**, nothing while no conversation is open. Text input (instructions, tool list and results, re-read every turn) is the largest part, so a long conversation costs more per minute; sessions close after 20 s of quiet. **Not significant**: ten minutes a day is about $6–12 a month. Claude through the API: a fact ~$0.01, a log investigation ~$0.04 with caching (Sonnet 5.5; Opus 5.5 for `hard` is about twice that). The Claude Code lane runs on the subscription like every tara run.
 
 ## Phase 6: as built
 
@@ -434,11 +739,14 @@ One report under 95 % in the span counts as protection working. Detail line exam
 
 | Question | Decides |
 |---|---|
-| Why did Command stay off? | Whether Phase 4 keeps Gemini Live or tries another realtime model |
+| ~~Why did Command stay off?~~ | Answered: its tab had little left once live tasks moved to session pages. Phase 4 uses Android's own speech instead of Gemini Live |
+| Decide approval cards by voice? | Needs the admin key sealed in the Keystore behind the phone's unlock (see [Locked vs unlocked](#locked-vs-unlocked)); until then, cards are read out and decided on the Approvals page or in Slack |
 | ~~Phone model, Android version, OLED or LCD~~ | Answered: moto g34 5G, Android 15, LCD (see [The phone](#the-phone)). Shell targets API 35, min API 31 |
 | Does Overcharge protection hold ~80 % on a phone that is never unplugged? | Whether root is needed at all. The limiter is on (`mUpperLimit:80`, seen 2026-11-17); the Health page's battery check now shows whether it holds |
-| Music service (YouTube Music, Spotify, …) | How `play_music` finds and casts |
-| Wake word on the phone or on the host | Phase 5 design |
+| ~~Music service (YouTube Music, Spotify, …)~~ | Answered: YouTube through `yt-dlp`, cast to the Home Mini (Voice v2 step 3) |
+| ~~Wake word on the phone or on the host~~ | Answered: on the phone (Voice v2 step 4) |
 | ~~`android/` in this repo or its own repo~~ | Answered: `android/` in this repo |
-| Realtime voice cost per minute | Session idle timeout, wake-word strictness |
+| ~~Realtime voice cost per minute~~ | Answered: ~$0.02–0.04 per minute of conversation with gemini-3.8-live, nothing while closed (see [latency and cost](#voice-v2-latency-and-cost)) |
+| Google Search grounding on 3.x Live models | The key's project returns "exceeded your current quota" for it; probably needs billing on the project. Until then lookups go to Claude with web search |
+| Background speech (TV, other people) | Gemini sometimes answers speech not meant for it; once it started music from a German fragment. Proactive audio and an instruction reduce it; actions still need the unlock and a spoken yes, music doesn't |
 | ~~How the pin survives monthly certificate renewals~~ | Answered: the pin moves with an HMAC proof from tara-agent (see [Phase 1: as built](#phase-1-as-built)) |

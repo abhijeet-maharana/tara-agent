@@ -159,6 +159,40 @@ describe('PhoneHub alerts', () => {
   });
 });
 
+describe('PhoneHub quiet mode', () => {
+  it('holds alerts until it ends, then sums them up', async () => {
+    const { hub, res, clock, attention } = setup();
+    await hub.check();
+    hub.setQuietMode(NOON + 60 * MIN);
+    expect(hub.state().quiet).toMatchObject({ now: false, until: NOON + 60 * MIN });
+    attention.items = [failing('payments')];
+    await hub.check();
+    expect(res.events('alert').at(-1)).toMatchObject({ held: true, wake: false, speak: false });
+
+    // Ended by voice: the summary comes at once.
+    clock.now += 10 * MIN;
+    hub.setQuietMode(undefined);
+    await hub.check();
+    const summary = res.events('alert').at(-1) as PhoneAlert;
+    expect(summary).toMatchObject({ kind: 'summary', wake: true });
+    expect(summary.text).toBe('While you were quiet: payments failed.');
+    expect(hub.state().quiet.until).toBeUndefined();
+  });
+
+  it('runs out by itself', () => {
+    const { hub, clock } = setup();
+    hub.setQuietMode(NOON + 5 * MIN);
+    clock.now += 6 * MIN;
+    expect(hub.quietMode()).toBeUndefined();
+  });
+
+  it('sends late voice answers to every listener', () => {
+    const { hub, res } = setup();
+    hub.announce({ id: 'ask-1', say: 'It retries three times.' });
+    expect(res.events('voice')).toEqual([{ id: 'ask-1', say: 'It retries three times.' }]);
+  });
+});
+
 describe('PhoneHub glance', () => {
   it('builds needs, approvals per project, running and recent', async () => {
     const items = [

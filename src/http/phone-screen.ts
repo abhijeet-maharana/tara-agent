@@ -14,6 +14,11 @@ import { TOKENS } from './look.js';
  * (`window.taraPhone`) wakes the screen, vibrates and speaks; in a plain browser the page still works.
  * 🖥 in the bar opens RustDesk on the phone to see the host's screen (Phase 3, decided 2026-11-17: no
  * live Chrome view of our own; see the plan).
+ *
+ * Voice (Phase 4): 🎙 in the bar, or a tap on the clock, starts push to talk. The shell listens and
+ * speaks (Android's recognizer and text to speech) and reports to `window.taraVoice`; the overlay shows
+ * what was heard, the answer and its panel, and Yes / No when a question waits. 🔕 holds alerts for
+ * an hour (quiet mode; voice sets any length).
  */
 /** A value as a JS literal inside `<script>`: `<` escaped, so no text can close the script tag. */
 const inScript = (v: unknown) => JSON.stringify(v).replace(/</g, '\\u003c');
@@ -93,6 +98,50 @@ body.night{background:#000}body.night .bar{visibility:hidden}
 .toast{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:9;max-width:min(680px,92vw);padding:10px 18px;border-radius:12px;background:var(--panel);border:1px solid var(--border-light);font-size:16px;color:var(--text-heading);box-shadow:0 8px 30px rgba(0,0,0,.5)}
 .toast[hidden]{display:none}
 .offline{position:fixed;right:14px;bottom:12px;font-size:13px;color:var(--amber)}
+.gear.on{color:var(--amber)}#quiet{font-size:15px;white-space:nowrap}#mic{font-size:22px}#mic.on{color:var(--accent)}
+
+/* Voice */
+.voice{position:fixed;inset:0;z-index:8;display:flex;gap:30px;align-items:center;padding:22px 34px;background:rgba(5,8,15,.95)}
+.voice[hidden]{display:none}
+.orb{--l:0;width:150px;height:150px;flex:none;border-radius:50%;background:radial-gradient(circle at 50% 42%,#93c5fd,var(--accent) 45%,#1e3a8a 80%);box-shadow:0 0 calc(18px + var(--l)*70px) rgba(59,130,246,.55);transform:scale(calc(1 + var(--l)*.14));transition:transform .09s,box-shadow .09s}
+.voice[data-state=thinking] .orb{background:radial-gradient(circle at 50% 42%,#fde68a,var(--amber) 45%,#78350f 80%);box-shadow:0 0 34px rgba(245,158,11,.45)}
+.voice[data-state=speaking] .orb{background:radial-gradient(circle at 50% 42%,#bbf7d0,var(--green) 45%,#14532d 80%);box-shadow:0 0 34px rgba(34,197,94,.45)}
+.voice[data-state=idle] .orb,.voice[data-state=starting] .orb{opacity:.45;transform:none}
+.vcol{flex:1;min-width:0;display:flex;flex-direction:column;gap:10px;max-height:100%;overflow:hidden}
+.vstate{font-size:13px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim);min-height:16px}
+.vyou{font-size:19px;color:var(--text-dim)}.vyou.partial{opacity:.65}.vyou:empty{display:none}
+.vsay{font-size:clamp(22px,min(4.4vw,8vh),34px);font-weight:500;line-height:1.25;color:var(--text-heading);overflow:hidden;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical}
+.vsay.long{font-size:clamp(18px,min(3.2vw,6vh),25px);-webkit-line-clamp:7}.vsay.err{color:var(--amber)}.vsay:empty{display:none}
+.vpanel{background:var(--card-bg);border:1px solid var(--border);border-radius:14px;padding:10px 14px;min-height:0;overflow:hidden}.vpanel[hidden]{display:none}
+.vpanel h3{margin:0 0 6px;font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-dim)}
+.vpanel ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
+.vpanel li{min-width:0}.vpanel li .t{font-size:16px}.vpanel li .s{font-size:13px;color:var(--text-dim)}
+.vpanel li.red .t{color:var(--red)}.vpanel li.amber .t{color:var(--amber)}.vpanel li.blue .t{color:var(--accent)}
+.vbtns{display:flex;gap:12px;flex:none}.vbtns[hidden]{display:none}
+.vbtns button{height:54px;min-width:120px;border-radius:14px;border:1px solid var(--border-light);background:var(--panel);font-size:20px}
+.vbtns button.yes{background:#14532d;border-color:var(--green)}
+.vclose{position:absolute;top:10px;right:14px;width:48px;height:48px;border-radius:50%;border:1px solid var(--border-light);background:var(--panel);font-size:20px;color:var(--text-dim)}
+.vhint{font-size:14px;color:var(--text-dim);min-height:18px}
+.vtime{position:absolute;right:16px;bottom:10px;font-size:12px;color:var(--text-dim);font-variant-numeric:tabular-nums}
+.time.talk{cursor:pointer}
+/* Voice v2: the step strip and cards */
+.voice.live{align-items:stretch;padding-bottom:64px}.voice.live .orb{align-self:center}
+.vcards{display:flex;gap:10px;min-height:0;flex:1 1 auto;overflow:hidden}.vcards:empty{display:none}
+.card{flex:1 1 0;min-width:0;background:var(--card-bg);border:1px solid var(--border);border-radius:14px;padding:10px 14px;overflow:hidden;display:flex;flex-direction:column;gap:6px}
+.card h3{margin:0;font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text-dim)}
+.card ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:5px;min-height:0;overflow:hidden}
+.card li .t{font-size:15px}.card li .s{font-size:12.5px;color:var(--text-dim)}
+.card li.red .t{color:var(--red)}.card li.amber .t{color:var(--amber)}.card li.blue .t{color:var(--accent)}.card li.green .t{color:var(--green)}
+.card.confirm{border-color:var(--amber)}.card.confirm .q{font-size:20px;color:var(--text-heading)}.card.confirm .r{font-size:16px}
+.card .btns{display:flex;gap:10px;margin-top:auto}.card .btns button{flex:1;height:50px;border-radius:12px;border:1px solid var(--border-light);background:var(--panel);font-size:19px}.card .btns .yes{background:#14532d;border-color:var(--green)}
+.card .ans{font-size:15px;line-height:1.4;color:var(--text);overflow:hidden;display:-webkit-box;-webkit-line-clamp:6;-webkit-box-orient:vertical;white-space:pre-wrap}
+.card pre{margin:0;font:12px/1.35 ui-monospace,monospace;color:var(--text-dim);white-space:pre-wrap;overflow:hidden}
+.posters{display:flex;gap:10px;min-height:0;overflow:hidden}.poster{width:92px;flex:none;display:flex;flex-direction:column;gap:4px}
+.poster img,.poster i{width:92px;height:132px;border-radius:8px;object-fit:cover;background:var(--panel);display:block}
+.poster b{font-size:13px;font-weight:600;color:var(--text-heading)}.poster span{font-size:11.5px;color:var(--text-dim)}
+.strip{position:absolute;left:34px;right:76px;bottom:12px;height:40px;display:flex;gap:8px;align-items:center;overflow:hidden;justify-content:flex-end}.strip:empty{display:none}
+.step{flex:none;max-width:260px;display:flex;gap:6px;align-items:center;padding:6px 12px;border-radius:999px;background:var(--panel);border:1px solid var(--border-light);font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.step i{font-style:normal}.step.running i{color:var(--accent)}.step.ok i{color:var(--green)}.step.error i{color:var(--red)}.step.error{border-color:var(--red)}
 
 /* Portrait (411 × 914): time on top, tiles stacked with the count beside the list. */
 @media (orientation:portrait){
@@ -103,12 +152,15 @@ body.night{background:#000}body.night .bar{visibility:hidden}
  .tile{display:grid;grid-template-columns:auto 1fr;grid-template-rows:auto 1fr;column-gap:16px}
  .tile h2{grid-column:1/3}.tile .big{grid-row:2;align-self:start;min-width:64px}.tile ul,.tile .note{grid-row:2;grid-column:2;margin-top:8px}
  .rbody{flex-direction:column}.rtext{flex:0 1 auto;max-height:34%}
+ .voice{flex-direction:column;justify-content:center;gap:22px}.orb{width:120px;height:120px}.vcol{flex:0 1 auto;width:100%}
 }
 @media (prefers-reduced-motion:no-preference){.pulse{animation:p 1.6s ease-in-out infinite}@keyframes p{50%{opacity:.35}}}
 </style></head><body>
 <header class="bar"><span class="dot" id="dot"></span><b>${esc(opts.agentName)}</b><span id="barClock" hidden></span>
-<span class="sp"></span><span class="chip" id="lock"></span><span class="chip" id="battery"></span>
+<span class="sp"></span><span class="chip" id="wake" hidden title="Listening for “Hey ${esc(opts.agentName)}”">👂</span><span class="chip" id="lock"></span><span class="chip" id="battery"></span>
+<button class="gear" id="quiet" aria-label="Quiet mode: hold alerts for an hour">🔔</button>
 <button class="gear" id="remote" aria-label="See the host's screen (RustDesk)" hidden>🖥</button>
+<button class="gear" id="mic" aria-label="Talk to ${esc(opts.agentName)}" hidden>🎙</button>
 <button class="gear" id="gear" aria-label="Phone settings" hidden>⚙</button></header>
 
 <section class="page" id="home">
@@ -134,6 +186,12 @@ body.night{background:#000}body.night .bar{visibility:hidden}
  <div class="nurgent" id="nUrgent"></div><div class="nheld" id="nHeld"></div>
 </section>
 
+<div class="voice" id="voice" hidden data-state="idle"><div class="orb" id="vOrb"></div>
+ <div class="vcol"><div class="vstate" id="vState"></div><div class="vyou" id="vYou"></div><div class="vsay" id="vSay" aria-live="polite"></div>
+  <div class="vpanel" id="vPanel" hidden><h3 id="vPTitle"></h3><ul id="vPLines"></ul></div>
+  <div class="vbtns" id="vBtns" hidden><button class="yes" id="vYes">Yes</button><button id="vNo">No</button></div>
+  <div class="vcards" id="vCards"></div><div class="vhint" id="vHint"></div></div>
+ <div class="strip" id="vStrip"></div><div class="vtime" id="vTime"></div><button class="vclose" id="vClose" aria-label="Close">✕</button></div>
 <div class="alert" id="alert" hidden role="alert"><div class="akind" id="aKind">Urgent</div><div class="atext" id="aText"></div><div class="asub" id="aSub">Tap to dismiss</div></div>
 <div class="toast" id="toast" hidden></div>
 <div class="offline" id="offline" hidden></div>
@@ -180,7 +238,7 @@ function renderHome(){
  if(S.next.length){nx.append(el('h2',null,'Next up'));for(const j of S.next.slice(0,3)){const r=el('div','nx');const tm=el('time',null,until(j.at));tm.dataset.at=j.at;r.append(tm,el('span','ell',j.name+' · '+j.project));nx.append(r);}}
  const u=S.usage;$('usage').hidden=!u;
  if(u){const pc=Math.round(u.share*100);$('usageBar').style.width=Math.min(100,pc)+'%';$('usageN').textContent=pc+'%';$('usage').className='usage'+(u.share>=.9?' bad':u.share>=.7?' warn':'');}
- renderNight();ticks();
+ renderNight();renderQuiet();ticks();
 }
 function word(s){return s==='ok'?'done':s==='silent'?'nothing to do':s==='aborted'?'stopped':s;}
 function ticks(){
@@ -190,6 +248,17 @@ function ticks(){
  for(const t of document.querySelectorAll('#next time'))t.textContent=until(Number(t.dataset.at));
  if(view==='run'&&watchTask)runClock();
 }
+function renderQuiet(){
+ const u=S&&S.quiet.until,b=$('quiet');
+ // Quiet mode also stops "Hey Jarvis" listening (films, calls).
+ if(phone&&phone.setWake)phone.setWake(!u);b.classList.toggle('on',Boolean(u));
+ b.textContent=u?'🔕 '+hm.format(u):'🔔';b.setAttribute('aria-label',u?'Quiet until '+hm.format(u)+': tap to end':'Quiet mode: hold alerts for an hour');
+}
+$('quiet').onclick=async()=>{
+ const on=Boolean(S&&S.quiet.until);
+ try{const r=await fetch('/phone/quiet',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({minutes:on?0:60})});
+  if(r.ok){const j=await r.json();if(S){S.quiet.until=j.until||undefined;renderQuiet();}toast(j.until?'🔕 Quiet until '+hm.format(j.until)+': alerts wait':'🔔 Quiet mode off');}}catch{}
+};
 function renderNight(){
  if(!S)return;$('nUrgent').textContent=S.needs.urgent?S.needs.urgent+' urgent':'';
  $('nHeld').textContent=S.held?S.held+(S.held===1?' alert':' alerts')+' for the morning':'';
@@ -248,6 +317,99 @@ $('alert').onclick=()=>{$('alert').hidden=true;};
 let toastTimer;
 function toast(text){const t=$('toast');t.textContent=text;t.hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>{t.hidden=true;},8000);}
 
+/* Voice: the shell listens and speaks; this shows it (window.taraVoice). */
+let voiceHide;
+const VOICE_IDLE=12e3,VOICE_PANEL=30e3;
+function voiceOpen(){$('voice').hidden=false;clearTimeout(voiceHide);lastTouch=Date.now();if(view==='night')show('home');}
+function voiceClose(){$('voice').hidden=true;clearTimeout(voiceHide);}
+function voiceLater(){clearTimeout(voiceHide);voiceHide=setTimeout(voiceClose,$('vPanel').hidden?VOICE_IDLE:VOICE_PANEL);}
+function voicePanel(p){
+ const box=$('vPanel');box.hidden=!p||!p.lines||!p.lines.length;if(box.hidden)return;
+ $('vPTitle').textContent=p.title||'';const ul=$('vPLines');ul.replaceChildren();
+ for(const l of p.lines.slice(0,5)){const li=el('li',l.tone||'');li.append(el('div','t ell',l.text));if(l.sub)li.append(el('div','s ell',l.sub));ul.append(li);}
+}
+function voiceSay(text,err){const s=$('vSay');s.textContent=text||'';s.className='vsay'+(err?' err':'')+((text||'').length>140?' long':'');}
+const STATES={starting:'Wait…',listening:'Listening…',thinking:'Thinking…',speaking:'',idle:''};
+const HINTS={starting:'Tap to stop',listening:'Tap to stop',thinking:'Tap to stop',speaking:'Tap to stop',idle:'Tap to talk again'};
+window.taraVoice=function(e){
+ if(e.type==='state'){const st=e.state;$('voice').dataset.state=st;$('vState').textContent=STATES[st]||'';$('vHint').textContent=HINTS[st]||'';$('mic').classList.toggle('on',st!=='idle');
+  if(st==='starting'||st==='listening'){voiceOpen();if(st==='starting')$('vYou').textContent='';$('vOrb').style.setProperty('--l',0);}
+  if(st==='idle')voiceLater();else clearTimeout(voiceHide);
+  if(st!=='speaking'&&st!=='idle')$('vBtns').hidden=st!=='listening'||$('vBtns').dataset.on!=='1';}
+ else if(e.type==='level')$('vOrb').style.setProperty('--l',e.level);
+ else if(e.type==='partial'){voiceOpen();const y=$('vYou');y.textContent=e.text;y.className='vyou partial';}
+ else if(e.type==='heard'){voiceOpen();const y=$('vYou');y.textContent='“'+e.text+'”';y.className='vyou';voiceSay('');voicePanel(null);$('vBtns').hidden=true;$('vBtns').dataset.on='';$('vTime').textContent='';}
+ else if(e.type==='reply'){const r=e.reply;voiceOpen();voiceSay(r.say);voicePanel(r.panel);
+  const ask=r.expect==='confirm';$('vBtns').hidden=!ask;$('vBtns').dataset.on=ask?'1':'';
+  if(r.watch){openRun(r.watch);setTimeout(voiceClose,2500);}
+  else if(r.show){show(r.show);setTimeout(voiceClose,1500);}}
+ else if(e.type==='error'){voiceOpen();voiceSay(e.text,true);}
+ else if(e.type==='timing')$('vTime').textContent=(e.total/1e3).toFixed(1)+' s';
+};
+function talk(){if(phone&&phone.listen)phone.listen();}
+$('vYes').onclick=(ev)=>{ev.stopPropagation();phone&&phone.voiceText('yes');};
+$('vNo').onclick=(ev)=>{ev.stopPropagation();phone&&phone.voiceText('no');};
+// A tap on the overlay talks again when it is idle, and stops it otherwise; ✕ closes it.
+$('voice').onclick=(ev)=>{if(ev.target.closest('.vbtns,.vpanel'))return;lastTouch=Date.now();
+ if($('voice').dataset.state==='idle')talk();else if(phone&&phone.cancelVoice)phone.cancelVoice();};
+$('vClose').onclick=(ev)=>{ev.stopPropagation();if(phone&&phone.cancelVoice)phone.cancelVoice();voiceClose();};
+$('mic').onclick=talk;
+/** An answer that came later (a question for Claude). */
+function lateAnswer(v){voiceOpen();$('voice').dataset.state='speaking';$('vState').textContent='';$('vHint').textContent='';
+ const y=$('vYou');y.textContent=v.heard||'';y.className='vyou';voiceSay(v.say);voicePanel(v.panel||null);$('vBtns').hidden=true;
+ if(phone&&phone.answer)phone.answer(v.say);voiceLater();}
+
+/* Voice v2: Gemini Live through the shell (window.taraLive): state, words, steps, cards. */
+const LSTATES={connecting:'Connecting…',listening:'Listening…',thinking:'Working…',speaking:'',idle:''};
+const LHINTS={connecting:'Tap to stop',listening:'Tap to stop',thinking:'Tap to stop',speaking:'Tap to interrupt or stop',idle:'Tap to talk again'};
+let lSaid='',lHeard='',lLastWho='',lCards=new Map(),lSteps=new Map();
+function liveReset(){lSaid='';lHeard='';$('vYou').textContent='';voiceSay('');$('vCards').replaceChildren();$('vStrip').replaceChildren();lCards.clear();lSteps.clear();$('vTime').textContent='';voicePanel(null);$('vBtns').hidden=true;}
+function stepEl(st){const d=el('div','step '+st.status);d.append(el('i',st.status==='running'?'pulse':null,st.status==='ok'?'✓':st.status==='error'?'✗':'●'),el('span',null,st.label));d.title=st.detail||'';return d;}
+function renderSteps(){const box=$('vStrip');box.replaceChildren();for(const st of [...lSteps.values()].slice(-6))box.append(stepEl(st));}
+function cardEl(id,c){
+ const d=el('div','card '+c.kind);
+ if(c.kind==='list'){d.append(el('h3',null,c.title));const ul=el('ul');for(const l of (c.lines||[]).slice(0,6)){const li=el('li',l.tone||'');li.append(el('div','t ell',l.text));if(l.sub)li.append(el('div','s ell',l.sub));ul.append(li);}d.append(ul);}
+ else if(c.kind==='confirm'){d.append(el('h3',null,'Confirm'),el('div','q',c.question));
+  if(c.state==='asking'){const b=el('div','btns'),y=el('button','yes','Yes'),n=el('button',null,'No');y.onclick=(e)=>{e.stopPropagation();phone&&phone.voiceText('yes');};n.onclick=(e)=>{e.stopPropagation();phone&&phone.voiceText('no');};b.append(y,n);d.append(b);}
+  else d.append(el('div','r',c.state==='yes'?'✓ Yes':c.state==='no'?'✗ No':'Expired'));}
+ else if(c.kind==='sources'){d.append(el('h3',null,'Sources'+(c.queries&&c.queries[0]?' · '+c.queries[0]:'')));const ul=el('ul');for(const x of c.sources.slice(0,5)){const li=el('li');li.append(el('div','t ell',x.title),el('div','s ell',x.site||''));ul.append(li);}d.append(ul);}
+ else if(c.kind==='titles'){d.append(el('h3',null,c.title));const g=el('div','posters');for(const x of c.items.slice(0,6)){const p=el('div','poster');if(x.image){const im=el('img');im.src=x.image;im.alt='';im.onerror=()=>im.replaceWith(el('i'));p.append(im);}else p.append(el('i'));p.append(el('b','c2',x.title));if(x.sub||x.note)p.append(el('span','c2',[x.sub,x.note].filter(Boolean).join(' · ')));g.append(p);}d.append(g);}
+ else if(c.kind==='claude'){d.append(el('h3',null,'Claude · '+c.model+(c.status==='working'?' · working':c.status==='error'?' · failed':'')));
+  if(c.answer)d.append(el('div','ans',c.answer));else{const ul=el('ul');ul.append(el('li','t c2',c.question));for(const s of (c.steps||[]).slice(-4))ul.append(el('li','s ell','· '+s));d.append(ul);}}
+ else if(c.kind==='log'){d.append(el('h3',null,c.title),el('pre',null,(c.lines||[]).slice(-12).join('\\n')));}
+ else if(c.kind==='run'){d.append(el('h3',null,'Run · '+word(c.status)),el('div','q',c.title),el('div','s',c.project));d.onclick=(e)=>{e.stopPropagation();openRun(c.task);voiceClose();};}
+ else if(c.kind==='music'){d.append(el('h3',null,'♪ '+c.state));if(c.image){const im=el('img');im.src=c.image;im.style.cssText='width:100%;max-height:120px;object-fit:cover;border-radius:8px';d.append(im);}d.append(el('div','q c2',c.title));if(c.sub)d.append(el('div','s',c.sub));}
+ return d;
+}
+function renderCards(){const box=$('vCards');box.replaceChildren();const landscape=innerWidth>innerHeight;
+ // The confirm card first while it asks; then the newest.
+ const all=[...lCards.entries()];const ask=all.filter(([,c])=>c.kind==='confirm'&&c.state==='asking');const rest=all.filter((x)=>!ask.includes(x)).reverse();
+ for(const [id,c] of [...ask,...rest].slice(0,landscape?2:1))box.append(cardEl(id,c));}
+let lState='idle';
+/** Markers such as <no speech> can arrive split over two pieces: drop them and their halves. */
+function spoken(t){return t.replace(/<[^>]*>/g,'').replace(/^[^<>]*>/,'').replace(/<[^>]*$/,'').trim();}
+window.taraLive=function(e){
+ const v=$('voice');v.classList.add('live');
+ if(e.type==='state'){const st=e.state;
+  // A new answer starts: its words replace the last one's.
+  if(st==='speaking'&&lState!=='speaking')lLastWho='';lState=st;v.dataset.state=st==='connecting'?'starting':st==='thinking'?'thinking':st;$('vState').textContent=LSTATES[st]||'';$('vHint').textContent=LHINTS[st]||'';$('mic').classList.toggle('on',st!=='idle');
+  if(st==='connecting'){voiceOpen();liveReset();}else if(st!=='idle')voiceOpen();
+  if(st==='idle')voiceLater();else clearTimeout(voiceHide);}
+ else if(e.type==='level')$('vOrb').style.setProperty('--l',e.level);
+ else if(e.type==='wake')$('wake').hidden=!e.on;
+ else if(e.type==='transcript'){voiceOpen();
+  if(e.who==='user'){if(lLastWho!=='user'){lHeard='';}lHeard+=e.text;const y=$('vYou');y.textContent='“'+lHeard.trim()+'”';y.className='vyou';}
+  else{if(lLastWho!=='model')lSaid='';lSaid+=e.text;voiceSay(spoken(lSaid));}
+  lLastWho=e.who;}
+ else if(e.type==='interrupted'){lLastWho='';}
+ else if(e.type==='step'){const old=lSteps.get(e.id);lSteps.set(e.id,{label:e.label||(old&&old.label)||'',status:e.status,detail:e.detail});renderSteps();}
+ else if(e.type==='card'){voiceOpen();lCards.delete(e.id);lCards.set(e.id,e.card);renderCards();}
+ else if(e.type==='show'){show(e.page);setTimeout(voiceClose,1500);}
+ else if(e.type==='watch'){openRun(e.task);setTimeout(voiceClose,2500);}
+ else if(e.type==='error'){voiceOpen();voiceSay(e.message,true);}
+ else if(e.type==='timing')$('vTime').textContent=(e.total/1e3).toFixed(1)+' s';
+};
+
 /* Events */
 function onState(s){
  if(s.build!==BUILD){location.reload();return;}
@@ -267,6 +429,7 @@ function connect(){
   if(r.phase==='started')toast('▶ '+t.title+' · '+t.project);
   else toast((t.status==='ok'||t.status==='silent'?'✓ ':t.status==='aborted'?'■ ':'✗ ')+t.title+' · '+word(t.status));
   if(t.id===watch)fetchRun();});
+ es.addEventListener('voice',(e)=>{lastMsg=Date.now();lateAnswer(JSON.parse(e.data));});
  es.onerror=()=>{$('dot').className='dot';if(es.readyState===2){es=null;signedOut();}};
 }
 async function signedOut(){
@@ -287,7 +450,9 @@ function status(){
 }
 if(phone){$('gear').hidden=false;$('gear').onclick=()=>phone.openSetup();document.addEventListener('visibilitychange',status);
  // RustDesk, to see and use the host's screen (the shared Chromes): the shell asks for the unlock first.
- if(phone.hasRemote&&phone.hasRemote()){$('remote').hidden=false;$('remote').onclick=()=>phone.openRemote();}}
+ if(phone.hasRemote&&phone.hasRemote()){$('remote').hidden=false;$('remote').onclick=()=>phone.openRemote();}
+ // Push to talk: 🎙, or a tap anywhere on the clock column.
+ if(phone.hasVoice&&phone.hasVoice()){$('mic').hidden=false;const t=document.querySelector('.time');t.classList.add('talk');t.onclick=talk;}}
 
 try{const last=JSON.parse(localStorage.getItem('glance')||'null');if(last&&last.build===BUILD){S=last;for(const a of S.alerts)handled.add(a.id);renderHome();}}catch{}
 ticks();status();connect();

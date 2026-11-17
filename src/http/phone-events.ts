@@ -11,10 +11,12 @@ import type { Attention, AttentionItem } from './attention.js';
  *           sent on connect and whenever it changes ("attention changed")
  *   run     {phase: started | ended, task}: a run started or ended (the page shows a short toast)
  *   alert   an urgent item: wake the screen, vibrate, and say one line when `speak` is set
+ *   voice   {id, say, panel?}: an answer that came later (a voice `ask`, see phone-voice.ts)
  *
  * Alerts come from `/attention`'s urgent tier (host `attention.urgent` rules). At most one is spoken per
  * gap (30 min); later ones wake the screen but stay silent. In quiet hours (23:00–07:00) they are held:
  * no wake, no sound, just a count on the Night page, and one spoken summary when quiet hours end.
+ * Quiet mode ("Jarvis, quiet for two hours", Phase 4) holds them the same way, without the Night page.
  * Items already urgent when tara-agent starts aren't announced: they are on screen.
  */
 
@@ -80,7 +82,8 @@ export interface GlanceState {
   at: number;
   /** False until `/attention` has been read once. */
   ready: boolean;
-  quiet: QuietHours & { now: boolean };
+  /** `until`: quiet mode is on until then (alerts held as in quiet hours, no Night page). */
+  quiet: QuietHours & { now: boolean; until?: number };
   /** Urgent and waiting items other than approvals (those have their own tile). */
   needs: {
     urgent: number;
@@ -146,11 +149,15 @@ export function inQuietHours(at: number, timeZone: string, q: QuietHours): boole
   return from < to ? now >= from && now < to : now >= from || now < to;
 }
 
-export function alertText(kind: PhoneAlert['kind'], items: PhoneAlert['items']): string {
+export function alertText(
+  kind: PhoneAlert['kind'],
+  items: PhoneAlert['items'],
+  summaryLead = 'Overnight',
+): string {
   const first = items[0]?.title ?? '';
   const rest = items.length - 1;
   const list = rest ? `${first}, and ${rest} more` : first;
-  if (kind === 'summary') return `Overnight: ${list}.`;
+  if (kind === 'summary') return `${summaryLead}: ${list}.`;
   return rest ? `Heads up: ${items.length} urgent items. ${list}.` : `Heads up: ${first}.`;
 }
 
@@ -160,6 +167,8 @@ export class PhoneHub {
   private readonly quiet: QuietHours;
   private readonly gapMs: number;
   private attention?: Attention;
+  private last?: GlanceState;
+  private attentionAt = 0;
   private checking?: Promise<void>;
   private seen = new Set<string>();
   private primed = false;
@@ -169,6 +178,10 @@ export class PhoneHub {
   private count = 0;
   private lastSent = '';
   private wasQuiet?: boolean;
+  /** Quiet mode: alerts are held until then. */
+  private quietUntil?: number;
+  /** What held the alerts, for the summary's first words. */
+  private heldBy: 'night' | 'mode' = 'night';
   private readonly running = new Set<string>();
   private timers: NodeJS.Timeout[] = [];
   private poked?: NodeJS.Timeout;
@@ -191,6 +204,42 @@ export class PhoneHub {
 
   isQuiet(at = this.now()): boolean {
     return inQuietHours(at, this.opts.timeZone, this.quiet);
+  }
+
+  /** When quiet mode ends, if it is on. */
+  quietMode(at = this.now()): number | undefined {
+    return this.quietUntil !== undefined && this.quietUntil > at ? this.quietUntil : undefined;
+  }
+
+  /**
+   * Quiet mode on until `until` (alerts held: no wake, no buzz, no voice), or off with undefined.
+   * Ending it gives the summary of what was held, as the end of quiet hours does.
+   */
+  setQuietMode(until: number | undefined): void {
+    const was = this.quietMode() !== undefined;
+    this.quietUntil = until !== undefined && until > this.now() ? until : undefined;
+    if (was && this.quietUntil === undefined && this.held.length) void this.check();
+    this.refresh();
+  }
+
+  /** Alerts are held now: quiet hours or quiet mode. */
+  private holding(at = this.now()): boolean {
+    return this.isQuiet(at) || this.quietMode(at) !== undefined;
+  }
+
+  /** The glance last built, if at most `maxAgeMs` old (it is rebuilt every 5 s while a phone listens). */
+  recentState(maxAgeMs: number): GlanceState | undefined {
+    return this.last && this.now() - this.last.at <= maxAgeMs ? this.last : undefined;
+  }
+
+  /** The last `/attention` read, if it is at most `maxAgeMs` old (voice answers use it: a fresh read takes ~0.4 s). */
+  recentAttention(maxAgeMs: number): Attention | undefined {
+    return this.attention && this.now() - this.attentionAt <= maxAgeMs ? this.attention : undefined;
+  }
+
+  /** An answer that came later (a voice `ask`): the page shows it and the shell says it. */
+  announce(data: { id: string; say: string; heard?: string; panel?: unknown }): void {
+    this.broadcast('voice', data);
   }
 
   /** The glance as the screen shows it. */
@@ -229,11 +278,15 @@ export class PhoneHub {
       };
     };
     const usage = this.opts.usage(at);
-    return {
+    this.last = {
       build: this.opts.build,
       at,
       ready: Boolean(this.attention),
-      quiet: { ...this.quiet, now: this.isQuiet(at) },
+      quiet: {
+        ...this.quiet,
+        now: this.isQuiet(at),
+        ...(this.quietMode(at) && { until: this.quietMode(at) }),
+      },
       needs: {
         urgent: needs.filter((i) => i.tier === 'urgent').length,
         waiting: needs.filter((i) => i.tier === 'waiting').length,
@@ -259,6 +312,7 @@ export class PhoneHub {
       alerts: this.alerts.filter((a) => at - a.at < ALERT_KEEP_MS).slice(0, 5),
       held: this.held.length,
     };
+    return this.last;
   }
 
   /** A run's full live view (steps and text) for the Run page, while this process remembers it. */
@@ -324,7 +378,7 @@ export class PhoneHub {
   /** Sends the glance if it changed; reads `/attention` again when quiet hours have just ended. */
   refresh(): void {
     const state = this.state();
-    const quiet = state.quiet.now;
+    const quiet = this.holding(state.at);
     if (this.wasQuiet && !quiet && this.held.length) void this.check();
     this.wasQuiet = quiet;
     const { at: _at, ...rest } = state;
@@ -402,6 +456,7 @@ export class PhoneHub {
       return;
     }
     this.attention = attention;
+    this.attentionAt = this.now();
     const urgent = attention.items.filter((i) => i.tier === 'urgent');
     const keys = new Set(urgent.map((i) => i.key));
     // Gone items are forgotten, so coming back counts as new.
@@ -412,8 +467,9 @@ export class PhoneHub {
     } else {
       const fresh = urgent.filter((i) => !this.seen.has(i.key));
       for (const i of fresh) this.seen.add(i.key);
-      if (this.isQuiet()) {
+      if (this.holding()) {
         if (fresh.length) {
+          if (!this.held.length) this.heldBy = this.isQuiet() ? 'night' : 'mode';
           this.held.push(...fresh.filter((i) => !this.held.some((h) => h.key === i.key)));
           this.raise('urgent', fresh, true);
         }
@@ -437,7 +493,7 @@ export class PhoneHub {
     const alert: PhoneAlert = {
       id: `alert-${at}-${++this.count}`,
       kind,
-      text: alertText(kind, items),
+      text: alertText(kind, items, this.heldBy === 'mode' ? 'While you were quiet' : 'Overnight'),
       items,
       at,
       wake: !held,
