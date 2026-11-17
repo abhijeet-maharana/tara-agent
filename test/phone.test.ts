@@ -252,6 +252,31 @@ describe('/phone over HTTP', () => {
     native.abort();
   });
 
+  it('takes battery reports from a paired phone and shows the latest on the Phone page', async () => {
+    const phone = new Phone({ store });
+    const { id, key } = phone.pair(phone.newCode().code, 'Battery desk');
+    const auth = { authorization: `Device ${id}:${key}` };
+    expect((await post('/phone/telemetry', { battery: { level: 80 } })).status).toBe(401);
+    expect((await post('/phone/telemetry', { battery: { level: 'full' } }, auth)).status).toBe(400);
+    expect((await post('/phone/telemetry', { battery: { level: 140 } }, auth)).status).toBe(400);
+    const ok = await post(
+      '/phone/telemetry',
+      { battery: { level: 81, charging: false, plugged: true, temperature: 31.5 } },
+      auth,
+    );
+    expect(ok.status).toBe(200);
+    const [b] = store.phoneBattery(id, 0);
+    expect(b).toMatchObject({ level: 81, charging: false, plugged: true, temperature: 31.5 });
+    expect(store.phoneDevice(id)?.lastSeenAt).toBeGreaterThan(0);
+    const page = await (
+      await fetch(`${base}/phone/pair`, { headers: { authorization: `Bearer ${TOKEN}` } })
+    ).text();
+    expect(page).toContain('battery 81 %, 31.5 °C');
+    // Forgetting the phone drops its reports too.
+    store.forgetPhoneDevice(id);
+    expect(store.phoneBattery(id, 0)).toEqual([]);
+  });
+
   it('serves the APK and its version to a paired phone', async () => {
     const phone = new Phone({ store });
     const { id, key } = phone.pair(phone.newCode().code, 'Desk');

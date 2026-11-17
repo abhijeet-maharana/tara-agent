@@ -5,7 +5,7 @@ import type { BrowserStatus } from '../http/browser-usage.js';
 import type { Task } from '../runner/activity.js';
 import type { RateLimit } from '../runner/stream.js';
 import type { JobInfo } from '../scheduler/scheduler.js';
-import type { RunStat, StoredRun } from '../store/store.js';
+import type { PhoneBattery, PhoneDevice, RunStat, StoredRun } from '../store/store.js';
 import type { ClaudeLogin } from './claude-login.js';
 import { ago, type Check, type HealthSource, type HealthStatus, parseProjectChecks } from './monitor.js';
 
@@ -55,6 +55,8 @@ export interface AgentDeps {
   runsSince: (since: number) => RunStat[];
   dbFile?: string;
   probeBrowser?: (b: HostConfig['browsers'][number]) => Promise<BrowserStatus>;
+  /** Paired desk phones and their battery reports of the last few days (`PHONE_BATTERY_DAYS`). */
+  phones?: () => Array<{ device: PhoneDevice; battery: PhoneBattery[] }>;
   /** The runs' Claude login (src/health/claude-login.ts); undefined = nothing to watch. */
   claudeLogin?: () => Promise<ClaudeLogin | undefined>;
   timeZone: string;
@@ -230,6 +232,86 @@ export async function agentChecks(d: AgentDeps): Promise<Check[]> {
           ? `${b.version ?? 'Answers'}${b.tabs !== undefined ? ` · ${b.tabs} ${b.tabs === 1 ? 'tab' : 'tabs'} open` : ''}`
           : `Not answering on ${b.cdpUrl}`,
       });
+  if (d.phones) out.push(...phoneChecks(d.phones(), at));
+  return out;
+}
+
+/** Battery reports the phone checks look at. */
+export const PHONE_BATTERY_DAYS = 4;
+/** The shell reports every 10 min: silent this long is a warning, then a Slack alert. */
+const PHONE_WARN_MS = 30 * 60_000;
+const PHONE_BAD_MS = 2 * HOUR;
+/** Kept full (at or over this %) for a day is a warning, for 3 days an alert: charge protection isn't holding. */
+const FULL_LEVEL = 95;
+const HOT_WARN = 40;
+const HOT_BAD = 45;
+
+/**
+ * Each paired desk phone (docs/jarvis-phone.md, Phase 6): whether it still reports (Tailscale on, app
+ * running), and its battery: hot, held full for days (Moto's Overcharge protection should keep it near
+ * 80 %), or running down off the charger.
+ */
+export function phoneChecks(
+  phones: Array<{ device: PhoneDevice; battery: PhoneBattery[] }>,
+  at: number,
+): Check[] {
+  const out: Check[] = [];
+  for (const { device, battery } of phones) {
+    const group = 'Desk phone';
+    const key = `tara:phone:${device.id}`;
+    const last = battery.at(-1);
+    const seen = Math.max(device.lastSeenAt ?? 0, last?.at ?? 0);
+    const quiet = at - seen;
+    out.push({
+      key,
+      group,
+      name: `${device.name}: link`,
+      status: !seen ? 'warn' : quiet >= PHONE_BAD_MS ? 'bad' : quiet >= PHONE_WARN_MS ? 'warn' : 'ok',
+      detail: !seen
+        ? 'Never reported'
+        : quiet >= PHONE_WARN_MS
+          ? `Not heard from for ${ago(quiet)}: Tailscale off on the phone, the app closed, or the phone off`
+          : `Reported ${ago(quiet)} ago${device.appVersion ? ` · app ${device.appVersion}` : ''}`,
+    });
+    if (!last) {
+      out.push({
+        key: `${key}:battery`,
+        group,
+        name: `${device.name}: battery`,
+        status: 'warn',
+        detail: 'No battery report yet (needs the shell from 2026-11-17 or later)',
+      });
+      continue;
+    }
+    // Held full: every report over the span at or above FULL_LEVEL, and reports reaching back that far.
+    const fullFor = (ms: number) => {
+      const span = battery.filter((b) => b.at >= at - ms);
+      return (
+        battery[0] !== undefined &&
+        battery[0].at <= at - ms + HOUR &&
+        span.every((b) => b.level >= FULL_LEVEL)
+      );
+    };
+    const t = last.temperature;
+    const problems: Array<[HealthStatus, string]> = [];
+    if (t !== undefined && t >= HOT_BAD) problems.push(['bad', `Hot: ${t} °C`]);
+    else if (t !== undefined && t >= HOT_WARN) problems.push(['warn', `Warm: ${t} °C`]);
+    if (fullFor(3 * DAY))
+      problems.push(['bad', `At ${FULL_LEVEL}–100 % for 3 days: charge protection isn't holding`]);
+    else if (fullFor(DAY))
+      problems.push(['warn', `At ${FULL_LEVEL}–100 % for a day: is Overcharge protection on?`]);
+    if (!last.charging && last.level <= 10) problems.push(['bad', `${last.level} % and not charging`]);
+    else if (!last.charging && last.level <= 25)
+      problems.push(['warn', `${last.level} % and not charging: is the charger plugged in?`]);
+    const state = `${last.level} % · ${last.charging ? 'charging' : last.plugged ? 'on the charger, not charging' : 'on battery'}${t !== undefined ? ` · ${t} °C` : ''}`;
+    out.push({
+      key: `${key}:battery`,
+      group,
+      name: `${device.name}: battery`,
+      status: worst(...problems.map(([s]) => s)),
+      detail: problems.length ? `${problems.map(([, m]) => m).join(' · ')} (${state})` : state,
+    });
+  }
   return out;
 }
 

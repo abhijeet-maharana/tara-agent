@@ -232,6 +232,7 @@ async function readJson(req: IncomingMessage, limit = 10_000): Promise<Record<st
  *   POST /phone/pair                   {code, name} → {id, key}  (the QR's one-time code is the proof)
  *   POST /phone/pin                    {id, nonce} → {spki, proof}  lets a phone move its pin after renewal
  *   POST /phone/session                header `Authorization: Device <id>:<key>` → {session, expiresAt, cookie}
+ *   POST /phone/telemetry              {battery: {level, charging, plugged, temperature}} (device key), every 10 min
  *   GET  /phone, /phone/ping           the phone's glance screen (session cookie, or the token)
  *   GET  /phone/events                 SSE: state (the glance, on change), run (started/ended), alert
  *                                      (session cookie, the token, or the shell's device key)
@@ -1629,6 +1630,25 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         sendJson(res, 200, { ...phone.session(device, version), name: device.name, cookie: PHONE_COOKIE });
         return true;
       }
+      if (method === 'POST' && p === '/phone/telemetry') {
+        if (!device) throw new PhoneError(401, 'Unknown phone or wrong key: pair it again');
+        const body = await readJson(req, 4_000);
+        const b = (body.battery ?? {}) as Record<string, unknown>;
+        if (typeof b.level !== 'number' || !(b.level >= 0 && b.level <= 100))
+          throw new PhoneError(400, 'battery.level must be 0–100');
+        const t = b.temperature;
+        const at = now();
+        options.store.addPhoneBattery(device.id, {
+          at,
+          level: Math.round(b.level),
+          charging: b.charging === true,
+          plugged: b.plugged === true,
+          ...(typeof t === 'number' && t > -40 && t < 120 && { temperature: t }),
+        });
+        options.store.seePhoneDevice(device.id, at);
+        sendJson(res, 200, { ok: true });
+        return true;
+      }
       if (method === 'GET' && (p === '/phone/app.json' || p === '/phone/app.apk')) {
         if (!device && !authorized(req)) throw new PhoneError(401, 'Missing or wrong key');
         const apk = phone.apk();
@@ -1705,7 +1725,10 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
           pairPage(ctx, {
             cert: phone.cert(),
             code: options.tls ? phone.newCode() : undefined,
-            devices: phone.devices(),
+            devices: phone.devices().map((x) => {
+              const battery = options.store.phoneBattery(x.id, now() - DAY_MS).at(-1);
+              return battery ? { ...x, battery } : x;
+            }),
             apk: phone.apk(),
             now: now(),
           }),

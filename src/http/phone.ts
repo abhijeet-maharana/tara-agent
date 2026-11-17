@@ -3,7 +3,7 @@ import { readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import qrcode from 'qrcode-generator';
-import type { PhoneDevice, Store } from '../store/store.js';
+import type { PhoneBattery, PhoneDevice, Store } from '../store/store.js';
 import { type DashboardContext, esc, layout, pageHead, relative, section } from './dashboard.js';
 
 /**
@@ -228,7 +228,7 @@ const PAIR_STYLE = `<style>
 export interface PairPageData {
   cert?: CertInfo;
   code?: { code: string; expiresAt: number };
-  devices: PhoneDevice[];
+  devices: Array<PhoneDevice & { battery?: PhoneBattery }>;
   apk?: ApkInfo;
   now: number;
 }
@@ -255,7 +255,11 @@ export function pairPage(ctx: DashboardContext, d: PairPageData): string {
           ) => `<div class="row"><span class="dot ${x.lastSeenAt && d.now - x.lastSeenAt < 36 * 3_600_000 ? 'ok' : 'dim'}"></span>
 <span style="flex:1"><b>${esc(x.name)}</b><br><span class="dim">paired ${esc(relative(x.createdAt, d.now))} · last seen ${esc(
             relative(x.lastSeenAt, d.now),
-          )}${x.appVersion ? ` · app ${esc(x.appVersion)}` : ''}</span></span>
+          )}${x.appVersion ? ` · app ${esc(x.appVersion)}` : ''}${
+            x.battery
+              ? ` · battery ${x.battery.level} %${x.battery.charging ? ' ⚡' : ''}${x.battery.temperature !== undefined ? `, ${x.battery.temperature} °C` : ''}`
+              : ''
+          }</span></span>
 <form method="post" action="/phone/devices/${esc(x.id)}/forget"><button class="btn danger" type="submit">Forget</button></form></div>`,
         )
         .join('')

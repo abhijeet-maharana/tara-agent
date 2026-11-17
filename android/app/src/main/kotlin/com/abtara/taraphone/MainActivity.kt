@@ -87,6 +87,7 @@ class MainActivity : Activity(), Bridge.Host {
         },
         onFailure = { e -> Tailscale.reviveIfDown(applicationContext, e) },
     )
+    private val telemetry by lazy { Telemetry(applicationContext) }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -163,6 +164,7 @@ class MainActivity : Activity(), Bridge.Host {
     override fun onDestroy() {
         main.removeCallbacksAndMessages(null)
         alerts.stop()
+        telemetry.stop()
         io.shutdownNow()
         bridge.close()
         web.destroy()
@@ -289,6 +291,7 @@ class MainActivity : Activity(), Bridge.Host {
         }
         main.postDelayed(renew, RENEW_MS)
         alerts.start(p)
+        telemetry.start(p)
         LinkService.start(this)
         main.removeCallbacks(updateCheck)
         main.postDelayed(updateCheck, 5_000)
@@ -311,6 +314,7 @@ class MainActivity : Activity(), Bridge.Host {
             pageLoaded = false
             web.loadUrl("about:blank")
             alerts.stop()
+            telemetry.stop()
             return showPanel("tara-agent doesn't know this phone any more. Scan a new pairing QR.")
         }
         if (e is SecurityException) return showPanel(describe(e))

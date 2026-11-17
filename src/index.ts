@@ -10,7 +10,7 @@ import { codeReaders } from './code/repo.js';
 import { DEFAULT_HOST_CONFIG, expandHome, loadHostConfig, loadJobs, loadProjects } from './config/load.js';
 import { CiJobs } from './github/actions.js';
 import { PullRequests } from './github/pull-requests.js';
-import { agentChecks, healthSources, jobChecks, machine } from './health/checks.js';
+import { agentChecks, healthSources, jobChecks, machine, PHONE_BATTERY_DAYS } from './health/checks.js';
 import { claudeLoginReader } from './health/claude-login.js';
 import { HealthMonitor } from './health/monitor.js';
 import { Observability } from './health/observability.js';
@@ -314,6 +314,11 @@ async function serve(configFlag: string | undefined) {
                 runsSince: (since) => store.runStats(since),
                 dbFile,
                 probeBrowser,
+                phones: () =>
+                  store.phoneDevices().map((device) => ({
+                    device,
+                    battery: store.phoneBattery(device.id, Date.now() - PHONE_BATTERY_DAYS * 86_400_000),
+                  })),
                 claudeLogin,
                 timeZone: host.timezone,
                 now: Date.now,

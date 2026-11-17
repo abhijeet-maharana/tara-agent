@@ -1,6 +1,6 @@
 # Desk phone (plan)
 
-Status: **Phase 3 closed** (2026-11-17): the desk phone shows the glance screen (Home, Run, Night) live from jarvis, a failing job turns its screen on with the alert, and 🖥 opens RustDesk to see the host's screen (the planned live Chrome view was dropped). See [Phase 1: as built](#phase-1-as-built), [Phase 2: as built](#phase-2-as-built) and [Phase 3: as decided](#phase-3-as-decided). A living document: update it as decisions are made and phases land.
+Status: **Phase 3 closed** (2026-11-17): the desk phone shows the glance screen (Home, Run, Night) live from jarvis, a failing job turns its screen on with the alert, and 🖥 opens RustDesk to see the host's screen (the planned live Chrome view was dropped). **Phase 6 (battery) built** the same day, done before Phase 4: the phone reports its battery and the Health page watches it; waiting to see the level settle near 80 %. See [Phase 1: as built](#phase-1-as-built), [Phase 2: as built](#phase-2-as-built), [Phase 3: as decided](#phase-3-as-decided) and [Phase 6: as built](#phase-6-as-built). A living document: update it as decisions are made and phases land.
 
 A spare Android phone sits on the desk, always on, and keeps you up to date while you do other things (work, a film, another job): what needs you, approval cards waiting, what is running, and (through RustDesk) the host's screen with the shared Chromes. You talk to it ("Hey Jarvis, what's running?", "play some lo-fi") and it answers out loud; music plays on a Cast speaker. When you are away it is locked: it still shows and tells, but it does nothing until unlocked.
 
@@ -179,7 +179,7 @@ Read over adb on 2026-11-16.
 | 3 ✅ | ~~**Live Chrome**: CDP screencast, profile tiles, full view~~ → **RustDesk button** | 🖥 on the desk screen opens RustDesk (after the phone's unlock). **Closed 2026-11-17**: live view dropped, see [Phase 3: as decided](#phase-3-as-decided) |
 | 4 | **Voice**: restore Command's session and tools, phone front end, push to talk, lock rules, quiet mode | "What's running?" gets a spoken answer in under a second |
 | 5 | **Wake word + music**: "Hey Jarvis", `play_music` to the Cast speaker | Hands-free from across the room; music plays on the speaker |
-| 6 | **Battery**: telemetry, Health check (red when hot or stuck at 100 %); Moto Overcharge protection, root only if it doesn't hold | Battery stays at or under ~80 % |
+| 6 🔶 | **Battery**: telemetry, Health check (red when hot or stuck at 100 %); Moto Overcharge protection, root only if it doesn't hold | Battery stays at or under ~80 %. **Built 2026-11-17** (done before 4 and 5: small, and the phone sat at 97–100 %); open until the level is seen holding near 80 %. See [Phase 6: as built](#phase-6-as-built) |
 | Later | A text-only tab list per Chrome on the screen (no images, no cost) if RustDesk is too slow for a glance; more PhoneBox ideas from `phonebox-watch` | |
 
 ## Phase 1: as built
@@ -246,7 +246,7 @@ The shell's own panel (⚙ on the page, or shown when unpaired / offline) has **
 
 ### Notes for later phases
 
-- Tailscale on the phone can turn off (seen 2026-11-17, twice, cause unknown; always-on VPN was set). The shell then shows "Connecting…" and retries every ≤ 2 min, but can't turn Tailscale on itself. Phase 6's Health check should flag a phone not seen for a while. Over adb it comes back with `adb shell am broadcast -a com.tailscale.ipn.CONNECT_VPN -n com.tailscale.ipn/.IPNReceiver`. **Since 2026-11-17 the shell sends that itself** (`Tailscale.kt`) when a connection fails the way a missing tailnet does (name doesn't resolve, no route, timeout, link cut), at most every 2 min: Tailscale switched off by hand came back in 3 s.
+- Tailscale on the phone can turn off (seen 2026-11-17, twice, cause unknown; always-on VPN was set). The shell then shows "Connecting…" and retries every ≤ 2 min, but can't turn Tailscale on itself. Phase 6's Health check should flag a phone not seen for a while (**done 2026-11-17**: "link" check, warn after 30 min, alert after 2 h). Over adb it comes back with `adb shell am broadcast -a com.tailscale.ipn.CONNECT_VPN -n com.tailscale.ipn/.IPNReceiver`. **Since 2026-11-17 the shell sends that itself** (`Tailscale.kt`) when a connection fails the way a missing tailnet does (name doesn't resolve, no route, timeout, link cut), at most every 2 min: Tailscale switched off by hand came back in 3 s.
 - Landscape matters: the phone sits sideways, so pages must fit 914 × 411 CSS px (and 411 × 914 portrait) without scrolling. (Done in Phase 2: checked at both sizes, no scroll.) **Since 2026-11-17 the shell is fixed to landscape** (`screenOrientation="sensorLandscape"`: either way up by the sensor, even with auto-rotate off). Before, it followed Android's single rotation setting, which any portrait-only app (Tailscale, RustDesk, the installer) resets to portrait, so the desk screen kept coming back in portrait. Checked: rotation setting forced to portrait → the desk screen still shows landscape.
 - After a reboot of a PIN-locked phone, Android keeps app storage locked until the first unlock, so apps (Tailscale too) wait for it. In the test reboot the user was already unlocked within a minute; not checked whether someone unlocked it by hand. If the screen waits after a power cut, one unlock starts it.
 - Without `TARA_HTTP_TOKEN`, the dashboard (and so `/phone`, the Phone page, `app.json`) is open to every device `http.allowFrom` admits, e.g. the whole tailnet. Set the token when other people or devices share that network; the phone keeps working through its own session.
@@ -385,13 +385,58 @@ Home on the phone comes back to the desk screen from RustDesk (the shell is the 
 | Desk screen stays landscape after the rotation setting is reset to portrait (shell 461274) | ✅ |
 | After unlocking, RustDesk opens and connects to jarvis | Not checked (needs the owner's unlock) |
 
+## Phase 6: as built
+
+Built 2026-11-17, ahead of Phases 4 and 5, and checked on the moto g34 against jarvis.
+
+### How the pieces fit
+
+```
+Shell: Telemetry (every 10 min, device key) ── POST /phone/telemetry {battery: {level, charging, plugged, temperature}}
+                                                     │
+tara-agent: phone_battery table (14 days) ◄──────────┘
+            ├─ Health page, group "Desk phone": <phone>: link, <phone>: battery  (bad → Slack alert, as other checks)
+            └─ Dashboard › Phone: latest battery next to each paired phone
+```
+
+| Part | Where | Notes |
+|---|---|---|
+| Shell | `Telemetry.kt` (thread, started with the alert stream), `Bridge.batteryJson` | First report right after connecting, then every 10 min |
+| Route | `POST /phone/telemetry` in `src/http/server.ts` | Device key only; level 0–100 checked; also counts as "seen" |
+| Store | `phone_battery` (migration), `Store.addPhoneBattery` / `phoneBattery` | Rows older than 14 days dropped on insert; forgetting a phone drops its rows |
+| Health | `phoneChecks` in `src/health/checks.ts`, wired in `src/index.ts` | Reads the last 4 days (`PHONE_BATTERY_DAYS`) |
+
+### Health rules
+
+| Check | Warn | Bad (posted to Slack) |
+|---|---|---|
+| **link** | Not heard from for 30 min, or never reported | 2 h |
+| **battery**: heat | ≥ 40 °C | ≥ 45 °C |
+| **battery**: held full | Every report ≥ 95 % for a day | For 3 days ("charge protection isn't holding") |
+| **battery**: running down | ≤ 25 % and not charging ("is the charger plugged in?") | ≤ 10 % |
+
+One report under 95 % in the span counts as protection working. Detail line example: `80 % · on battery · 30.2 °C`.
+
+### Moto's charge limiter, as seen
+
+`dumpsys battery` on 2026-11-17 (13:30): `AdaptiveCharging … mUpperLimit:80, mChargingDisabled:true`, level 97 %, no power coming in (`usb/online 0`, `plug=none`), drawing ~0.2 A with the screen on. So the limiter is on (upper limit 80) and had stopped charging 41 min earlier. Android then reports the phone as **on battery**, not "plugged in, not charging", so the Health detail says "on battery" while Moto holds it. The charger **was** plugged in (owner, 2026-11-17), so this is Moto cutting the input to bring the battery down to 80 %: on this phone "on battery" at 80–100 % with the charger in is the limiter working. Still to see: the level holding near 80 % over the next hours.
+
+### Checked (2026-11-17)
+
+| Check | Result |
+|---|---|
+| Report reaches jarvis after install (shell 461281) | ✅ 97 %, not charging, 30.2 °C |
+| Health page: `moto g34 5G: link` and `: battery` | ✅ both ok |
+| jarvis database backed up before the migration | ✅ `tara.db.bak-2026-11-17-phone-battery` in the state folder |
+| Level settles near 80 % on the charger | Waiting |
+
 ## Open questions
 
 | Question | Decides |
 |---|---|
 | Why did Command stay off? | Whether Phase 4 keeps Gemini Live or tries another realtime model |
 | ~~Phone model, Android version, OLED or LCD~~ | Answered: moto g34 5G, Android 15, LCD (see [The phone](#the-phone)). Shell targets API 35, min API 31 |
-| Does Overcharge protection hold ~80 % on a phone that is never unplugged? | Whether root is needed at all |
+| Does Overcharge protection hold ~80 % on a phone that is never unplugged? | Whether root is needed at all. The limiter is on (`mUpperLimit:80`, seen 2026-11-17); the Health page's battery check now shows whether it holds |
 | Music service (YouTube Music, Spotify, …) | How `play_music` finds and casts |
 | Wake word on the phone or on the host | Phase 5 design |
 | ~~`android/` in this repo or its own repo~~ | Answered: `android/` in this repo |

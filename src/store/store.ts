@@ -345,6 +345,16 @@ const MIGRATIONS = [
      last_seen_at INTEGER,
      app_version  TEXT
    );`,
+  // The desk phone's battery, reported by its shell every 10 min (Health: hot, stuck full, running down).
+  `CREATE TABLE phone_battery (
+     device_id   TEXT NOT NULL,
+     at          INTEGER NOT NULL,
+     level       INTEGER NOT NULL,
+     charging    INTEGER NOT NULL,
+     plugged     INTEGER NOT NULL,
+     temperature REAL,
+     PRIMARY KEY (device_id, at)
+   );`,
 ];
 
 /** A paired phone (the shell app in android/). */
@@ -357,6 +367,20 @@ export interface PhoneDevice {
   lastSeenAt?: number;
   appVersion?: string;
 }
+
+/** One battery report from a paired phone. */
+export interface PhoneBattery {
+  at: number;
+  /** Percent. */
+  level: number;
+  charging: boolean;
+  plugged: boolean;
+  /** °C. */
+  temperature?: number;
+}
+
+/** Battery reports are kept this long. */
+const PHONE_BATTERY_KEEP_MS = 14 * 86_400_000;
 
 /** A line posted in a project's channel at `nextAt`, then again at each `cron` time (none = once). */
 export interface Reminder {
@@ -921,7 +945,33 @@ export class Store {
   }
 
   forgetPhoneDevice(id: string): boolean {
+    this.db.prepare('DELETE FROM phone_battery WHERE device_id = ?').run(id);
     return Number(this.db.prepare('DELETE FROM phone_devices WHERE id = ?').run(id).changes) === 1;
+  }
+
+  /** Records a battery report (and drops reports older than two weeks). */
+  addPhoneBattery(deviceId: string, b: PhoneBattery): void {
+    this.db
+      .prepare(
+        'INSERT OR REPLACE INTO phone_battery (device_id, at, level, charging, plugged, temperature) VALUES (?, ?, ?, ?, ?, ?)',
+      )
+      .run(deviceId, b.at, b.level, b.charging ? 1 : 0, b.plugged ? 1 : 0, b.temperature ?? null);
+    this.db.prepare('DELETE FROM phone_battery WHERE at < ?').run(b.at - PHONE_BATTERY_KEEP_MS);
+  }
+
+  /** A phone's battery reports since `since`, oldest first. */
+  phoneBattery(deviceId: string, since: number): PhoneBattery[] {
+    return (
+      this.db
+        .prepare('SELECT * FROM phone_battery WHERE device_id = ? AND at >= ? ORDER BY at')
+        .all(deviceId, since) as Record<string, unknown>[]
+    ).map((r) => ({
+      at: r.at as number,
+      level: r.level as number,
+      charging: r.charging === 1,
+      plugged: r.plugged === 1,
+      ...(r.temperature != null && { temperature: r.temperature as number }),
+    }));
   }
 
   addHostSample(s: HostSample): void {

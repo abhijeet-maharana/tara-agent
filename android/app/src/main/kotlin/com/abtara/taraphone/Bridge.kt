@@ -94,20 +94,7 @@ class Bridge(private val context: Context, private val host: Host) {
 
     /** JSON: {level, charging, plugged, temperature (°C), health}. */
     @JavascriptInterface
-    fun battery(key: String?): String {
-        if (!ok(key)) return ""
-        val i = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: return "{}"
-        val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
-        val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100).coerceAtLeast(1)
-        val status = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
-        return JSONObject()
-            .put("level", if (level < 0) null else level * 100 / scale)
-            .put("charging", status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL)
-            .put("plugged", i.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0)
-            .put("temperature", i.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) / 10.0)
-            .put("health", i.getIntExtra(BatteryManager.EXTRA_HEALTH, 0))
-            .toString()
-    }
+    fun battery(key: String?): String = if (ok(key)) batteryJson(context) else ""
 
     /** Turns the screen on (over the lock screen) for an alert. */
     @JavascriptInterface
@@ -168,6 +155,21 @@ class Bridge(private val context: Context, private val host: Host) {
         """.trimIndent()
 
     companion object {
+        /** JSON: {level, charging, plugged, temperature (°C), health} (the page and [Telemetry] use it). */
+        fun batteryJson(context: Context): String {
+            val i = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: return "{}"
+            val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+            val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100).coerceAtLeast(1)
+            val status = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+            return JSONObject()
+                .put("level", if (level < 0) null else level * 100 / scale)
+                .put("charging", status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL)
+                .put("plugged", i.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0)
+                .put("temperature", i.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) / 10.0)
+                .put("health", i.getIntExtra(BatteryManager.EXTRA_HEALTH, 0))
+                .toString()
+        }
+
         /** RustDesk's Android app. */
         const val REMOTE_PACKAGE = "com.carriez.flutter_hbb"
 
