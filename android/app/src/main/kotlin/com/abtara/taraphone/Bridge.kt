@@ -29,6 +29,7 @@ class Bridge(private val context: Context, private val host: Host) {
     interface Host {
         fun wakeScreen()
         fun openSetup()
+        fun openRemote()
     }
 
     val key: String = ByteArray(24).also { SecureRandom().nextBytes(it) }.let {
@@ -124,6 +125,19 @@ class Bridge(private val context: Context, private val host: Host) {
         if (ok(key)) host.openSetup()
     }
 
+    /** True when RustDesk is installed, so the page shows its button. */
+    @JavascriptInterface
+    fun hasRemote(key: String?): Boolean = ok(key) && remoteIntent(context) != null
+
+    /**
+     * Opens RustDesk to see and use the host's screen (the shared Chromes and the rest). Asks for the
+     * phone's unlock first: remote control is never one tap away on a locked phone.
+     */
+    @JavascriptInterface
+    fun openRemote(key: String?) {
+        if (ok(key)) host.openRemote()
+    }
+
     fun close() {
         synchronized(this) {
             tts?.shutdown()
@@ -145,6 +159,8 @@ class Bridge(private val context: Context, private val host: Host) {
             wakeScreen: function () { a.wakeScreen(k); },
             version: function () { return a.version(k); },
             openSetup: function () { a.openSetup(k); },
+            hasRemote: function () { return a.hasRemote(k); },
+            openRemote: function () { a.openRemote(k); },
             // The shell itself wakes, vibrates and speaks for alerts (AlertStream), screen off or on.
             nativeAlerts: true
           });
@@ -152,6 +168,12 @@ class Bridge(private val context: Context, private val host: Host) {
         """.trimIndent()
 
     companion object {
+        /** RustDesk's Android app. */
+        const val REMOTE_PACKAGE = "com.carriez.flutter_hbb"
+
+        fun remoteIntent(context: Context): Intent? =
+            context.packageManager.getLaunchIntentForPackage(REMOTE_PACKAGE)?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
         /** A screen wake lock that turns the display on, held briefly; the activity then keeps it on. */
         @Suppress("DEPRECATION")
         fun wake(context: Context) {

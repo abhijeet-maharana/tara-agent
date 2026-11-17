@@ -1,8 +1,8 @@
 # Desk phone (plan)
 
-Status: **Phase 2 done** (2026-11-17): the desk phone shows the glance screen (Home, Run, Night) live from jarvis, and a failing job turns its screen on with the alert. See [Phase 1: as built](#phase-1-as-built) and [Phase 2: as built](#phase-2-as-built). A living document: update it as decisions are made and phases land.
+Status: **Phase 3 closed** (2026-11-17): the desk phone shows the glance screen (Home, Run, Night) live from jarvis, a failing job turns its screen on with the alert, and 🖥 opens RustDesk to see the host's screen (the planned live Chrome view was dropped). See [Phase 1: as built](#phase-1-as-built), [Phase 2: as built](#phase-2-as-built) and [Phase 3: as decided](#phase-3-as-decided). A living document: update it as decisions are made and phases land.
 
-A spare Android phone sits on the desk, always on, and keeps you up to date while you do other things (work, a film, another job): what needs you, approval cards waiting, what is running, and a live view of the shared Chromes. You talk to it ("Hey Jarvis, what's running?", "play some lo-fi") and it answers out loud; music plays on a Cast speaker. When you are away it is locked: it still shows and tells, but it does nothing until unlocked.
+A spare Android phone sits on the desk, always on, and keeps you up to date while you do other things (work, a film, another job): what needs you, approval cards waiting, what is running, and (through RustDesk) the host's screen with the shared Chromes. You talk to it ("Hey Jarvis, what's running?", "play some lo-fi") and it answers out loud; music plays on a Cast speaker. When you are away it is locked: it still shows and tells, but it does nothing until unlocked.
 
 The name it answers to is the host's `agentName` (here "Jarvis").
 
@@ -48,19 +48,19 @@ tara-agent had **Command** (`/command`), a voice control room on Gemini Live, fr
 
 Still in the tree: `GET /attention` (`src/http/attention.ts`, tiers urgent / waiting / later, titles "fit to be read aloud") and the run activity bus (`src/runner/activity.ts`, behind `/sessions/<id>/live`).
 
-Command's non-goals were a phone UI and a wake word. Those are this plan's main goals, so we restore its voice session and tools and give them a phone front end. **Open:** why it stayed off (voice quality, cost, or a desktop tab being the wrong place). The answer decides whether Phase 3 keeps Gemini Live.
+Command's non-goals were a phone UI and a wake word. Those are this plan's main goals, so we restore its voice session and tools and give them a phone front end. **Open:** why it stayed off (voice quality, cost, or a desktop tab being the wrong place). The answer decides whether Phase 4 keeps Gemini Live.
 
 ## Shape
 
 ```
 Desk phone: tara phone app (Kotlin shell)
   WebView ── https://<host>:<tls port>/phone ── tara-agent
-  │  glance tiles, live Chrome, voice UI          │
+  │  glance tiles, voice UI, RustDesk button      │
   │                                               ├─ /attention, /runs, /items, /sessions/<id>/live   (existing)
   │  bridge: vibrate · speak · wake screen ·      ├─ /phone/events   SSE: attention changed, run started/ended, urgent alert
-  │          lock state · battery                 ├─ /phone/chrome/<lock>/live   MJPEG from CDP Page.startScreencast
+  │          lock state · battery · RustDesk      │
   │                                               ├─ /phone/voice    WebSocket: mic PCM in, voice out (restored Command session)
-  └─ foreground service: mic → wake word          └─ tools: attention · approvals · decide · jobs · chrome_view · play_music · …
+  └─ foreground service: mic → wake word          └─ tools: attention · approvals · decide · jobs · play_music · …
                                                          │
                                                          └─ Cast ──► speaker (Google Home Mini)
 ```
@@ -76,13 +76,15 @@ Pages, swiped or switched by voice and by the server. Returns to Home when idle.
 | Page | Shows |
 |---|---|
 | **Home** | Needs you (count + top 3 from `/attention`), approvals waiting (per project, oldest age), running now (job, project, running clock, latest step), next up, Claude usage, clock |
-| **Chrome** | One tile per shared Chrome (host `browsers`) with a thumbnail of its active tab; tap for the full live view; tab list per Chrome |
+| ~~**Chrome**~~ | Dropped: 🖥 in the bar opens RustDesk instead (Phase 3) |
 | **Run** | One running session's live steps (`/sessions/<id>/live`), opened from Home or by voice ("watch the blog job") |
 | **Night** | Large dim clock, urgent count only; after quiet hours begin or when the room is dark |
 
 Design: big type, one idea per tile, dark theme, colours from the dashboard (red: failing; amber: waiting; blue: running; green: quiet). Reduced motion respected.
 
 ## Live Chrome view
+
+> **Dropped on 2026-11-17** in favour of RustDesk (see [Phase 3: as decided](#phase-3-as-decided)). Kept as the design if it is ever wanted.
 
 - **How:** tara-agent opens a CDP WebSocket to the Chrome (`cdpUrl` from host `browsers`), attaches to the chosen page target and calls `Page.startScreencast` (JPEG, max width ~720, quality ~60, every frame acked). Frames go to the phone as MJPEG (`multipart/x-mixed-replace`) at `/phone/chrome/<lock>/live?target=<id>`, so the screen only needs an `<img>`. Node 22's built-in `WebSocket` is enough on the CDP side.
 - **Only while watched:** the screencast starts when a viewer connects and stops when the last one leaves.
@@ -91,8 +93,8 @@ Design: big type, one idea per tile, dark theme, colours from the dashboard (red
 
 ## Voice
 
-1. **Phase 3a: push to talk.** Tap the core or press a volume key. The mic streams to `/phone/voice`; the restored Command session (realtime voice model + tara tools) answers out loud.
-2. **Phase 3b: wake word "Hey Jarvis".** [openWakeWord](https://github.com/dscripka/openWakeWord) has a ready-made `hey_jarvis` model. **Open:** run it on the phone (ONNX Runtime in the shell; audio never leaves the phone until the wake word) or on the host (the phone streams 16 kHz PCM all day; simpler app). Leaning to the phone.
+1. **Phase 4: push to talk.** Tap the core or press a volume key. The mic streams to `/phone/voice`; the restored Command session (realtime voice model + tara tools) answers out loud.
+2. **Phase 5: wake word "Hey Jarvis".** [openWakeWord](https://github.com/dscripka/openWakeWord) has a ready-made `hey_jarvis` model. **Open:** run it on the phone (ONNX Runtime in the shell; audio never leaves the phone until the wake word) or on the host (the phone streams 16 kHz PCM all day; simpler app). Leaning to the phone.
 3. **Quiet mode** for films and calls: "Jarvis, quiet mode" (or a tile) pauses listening and spoken alerts for a set time.
 4. **Short spoken answers, details on screen:** a tool's result also arrives as a panel, as Command did.
 
@@ -101,7 +103,7 @@ Tools, from Command plus new ones:
 | Tool | Does | Allowed while locked |
 |---|---|---|
 | `attention`, `projects`, `jobs`, `approvals`, `repo`, `status`, `brief` | Read | ✅ |
-| `show(page)`, `chrome_view(lock, tab?)`, `watch(run)` | Switch the screen | ✅ |
+| `show(page)`, `watch(run)` | Switch the screen | ✅ |
 | `play_music(query)`, `music(pause\|resume\|stop\|volume)` | Cast speaker | ✅ (harmless) |
 | `decide(card, option)`, `job(run\|pause\|resume)`, `dispatch` (start work in Slack) | Act | ❌ needs unlock |
 
@@ -139,7 +141,7 @@ From `/attention`'s `urgent` tier (and `attention.urgent` rules), pushed over `/
 |---|---|
 | Activity | Full-screen WebView on `/phone`, immersive, keep screen on, show when locked, turn screen on for alerts |
 | Bridge (`window.Android`, keyed) | `vibrate`, `speak` (Android TTS for alerts when no voice session is open), `lockState`, `battery`, `wakeScreen` |
-| Foreground service | `LinkService` (`specialUse`, since Phase 2) keeps the network up with the screen off, for alerts. Phase 3 adds the microphone type: mic for push-to-talk and the wake word; Android allows it because the app is on screen |
+| Foreground service | `LinkService` (`specialUse`, since Phase 2) keeps the network up with the screen off, for alerts. Phase 4 adds the microphone type: mic for push-to-talk and the wake word; Android allows it because the app is on screen |
 | Kiosk | Home app (`CATEGORY_HOME`), start after reboot; optional lock-task mode as device owner (`dpm set-device-owner`, needs a phone with no accounts) |
 | Pairing | Scan a QR on the dashboard: host, TLS fingerprint, a one-time code → device key; admin key added separately with a fingerprint-protected unlock |
 | Updates | tara-agent serves the APK and its version; the app shows an **Update** prompt (one tap, `REQUEST_INSTALL_PACKAGES`). The desk phone is on a plain charger, not on the host's USB (the host sits by the router), so no adb from the host. While developing, builds go on from the Mac (USB or wireless debugging) |
@@ -174,11 +176,11 @@ Read over adb on 2026-11-16.
 |---|---|---|
 | 1 ✅ | **Shell app**: WebView, immersive, keep awake, show when locked, pairing + pinned TLS, bridge, APK served by tara-agent | The phone opens a placeholder `/phone` full screen, over Tailscale, and stays on after a reboot. **Done 2026-11-17** |
 | 2 ✅ | **Glance screen + events**: Home, Run, Night pages; `/phone/events`; urgent alerts that wake the screen | You can see needs-you, approvals and running from across the room, and a failing job lights the phone up. **Done 2026-11-17** |
-| 3 | **Live Chrome**: CDP screencast, profile tiles, full view | Both Chromes' active tabs are watchable live from the phone without touching runs |
+| 3 ✅ | ~~**Live Chrome**: CDP screencast, profile tiles, full view~~ → **RustDesk button** | 🖥 on the desk screen opens RustDesk (after the phone's unlock). **Closed 2026-11-17**: live view dropped, see [Phase 3: as decided](#phase-3-as-decided) |
 | 4 | **Voice**: restore Command's session and tools, phone front end, push to talk, lock rules, quiet mode | "What's running?" gets a spoken answer in under a second |
 | 5 | **Wake word + music**: "Hey Jarvis", `play_music` to the Cast speaker | Hands-free from across the room; music plays on the speaker |
 | 6 | **Battery**: telemetry, Health check (red when hot or stuck at 100 %); Moto Overcharge protection, root only if it doesn't hold | Battery stays at or under ~80 % |
-| Later | Chrome input when unlocked; more PhoneBox ideas from `phonebox-watch` | |
+| Later | A text-only tab list per Chrome on the screen (no images, no cost) if RustDesk is too slow for a glance; more PhoneBox ideas from `phonebox-watch` | |
 
 ## Phase 1: as built
 
@@ -245,7 +247,7 @@ The shell's own panel (⚙ on the page, or shown when unpaired / offline) has **
 ### Notes for later phases
 
 - Tailscale on the phone can turn off (seen 2026-11-17, twice, cause unknown; always-on VPN was set). The shell then shows "Connecting…" and retries every ≤ 2 min, but can't turn Tailscale on itself. Phase 6's Health check should flag a phone not seen for a while. Over adb it comes back with `adb shell am broadcast -a com.tailscale.ipn.CONNECT_VPN -n com.tailscale.ipn/.IPNReceiver`. **Since 2026-11-17 the shell sends that itself** (`Tailscale.kt`) when a connection fails the way a missing tailnet does (name doesn't resolve, no route, timeout, link cut), at most every 2 min: Tailscale switched off by hand came back in 3 s.
-- Landscape matters: the phone sits sideways, so pages must fit 914 × 411 CSS px (and 411 × 914 portrait) without scrolling. (Done in Phase 2: checked at both sizes, no scroll.)
+- Landscape matters: the phone sits sideways, so pages must fit 914 × 411 CSS px (and 411 × 914 portrait) without scrolling. (Done in Phase 2: checked at both sizes, no scroll.) **Since 2026-11-17 the shell is fixed to landscape** (`screenOrientation="sensorLandscape"`: either way up by the sensor, even with auto-rotate off). Before, it followed Android's single rotation setting, which any portrait-only app (Tailscale, RustDesk, the installer) resets to portrait, so the desk screen kept coming back in portrait. Checked: rotation setting forced to portrait → the desk screen still shows landscape.
 - After a reboot of a PIN-locked phone, Android keeps app storage locked until the first unlock, so apps (Tailscale too) wait for it. In the test reboot the user was already unlocked within a minute; not checked whether someone unlocked it by hand. If the screen waits after a power cut, one unlock starts it.
 - Without `TARA_HTTP_TOKEN`, the dashboard (and so `/phone`, the Phone page, `app.json`) is open to every device `http.allowFrom` admits, e.g. the whole tailnet. Set the token when other people or devices share that network; the phone keeps working through its own session.
 
@@ -337,6 +339,51 @@ The throwaway job (`personal/phone-alert-test` and its skill) was removed after 
 - A spoken alert counts toward the 30-min gap even if no phone heard it (e.g. the shell was offline).
 - The foreground service's notification is hidden (no notification permission asked); grant `POST_NOTIFICATIONS` to see "Listening for alerts".
 - **Alerts are spoken on the media stream**, so a muted phone speaks silently (seen 2026-11-17). Matters again in Phase 4: spoken answers need the volume up while answering (or their own stream).
+
+## Phase 3: as decided
+
+Decided 2026-11-17, before the phone page was built.
+
+### Why no live Chrome view
+
+| | Live Chrome view (planned) | RustDesk (chosen) |
+|---|---|---|
+| To look | Swipe on the desk screen | 🖥, unlock, connect |
+| Shows | Any tab, even one behind another window | jarvis's screen: the top window of the Chromes |
+| Click and type (finish a login, a captcha, 2FA) | ❌ (a later phase) | ✅ |
+| Cost while nobody watches | Zero | Zero |
+| Cost while watching | A few % of a core on jarvis and ~0.3–0.6 MB/s (estimate, not measured) | Similar, only while connected |
+| Work | A new server module, a phone page, tests | One button |
+
+When a browser run needs the owner it is nearly always for a login or a captcha, which needs input; watching a run is nice but rare. RustDesk already does both.
+
+### What was checked first
+
+On jarvis's Chromes (headed, Wayland, `--disable-backgrounding-occluded-windows`, `--disable-renderer-backgrounding`), `Page.startScreencast` on a tab opened in the background gave ~10 frames a second for an animated page without activating it, and every tab reported `visibilityState: visible`. So a read-only live view of any tab is possible. Two more findings, useful if the view comes back:
+
+- **CDP can't tell which tab is in front:** `document.hasFocus()` and visibility were true for both tabs, and `Target.getTargets` has no such field. `/json/list` order (most recently opened or active first) is the best guess.
+- `Page.captureScreenshot` on a background tab with a still page hung (no new frame to capture); the screencast sends the current frame at once, so use that.
+
+The test tabs were closed. The server code started for it (`src/http/phone-chrome.ts`, routes `/phone/chrome…`) was removed before commit.
+
+### As built
+
+| Part | Where | Notes |
+|---|---|---|
+| Button | `src/http/phone-screen.ts`, bar | 🖥, shown when the shell reports RustDesk installed (`taraPhone.hasRemote()`) |
+| Bridge | `Bridge.kt`: `hasRemote()`, `openRemote()` | Opens `com.carriez.flutter_hbb` (RustDesk). On a locked phone it asks for the unlock first (`requestDismissKeyguard`): remote control is never one tap away on a locked phone |
+| Manifest | `<queries>` adds RustDesk's package | Needed to see the app on API 30+ |
+
+Home on the phone comes back to the desk screen from RustDesk (the shell is the home app).
+
+### Checked on the phone (2026-11-17)
+
+| Check | Result |
+|---|---|
+| 🖥 shows in the bar (shell 461270) | ✅ |
+| Tap while locked → Android's unlock prompt | ✅ |
+| Desk screen stays landscape after the rotation setting is reset to portrait (shell 461274) | ✅ |
+| After unlocking, RustDesk opens and connects to jarvis | Not checked (needs the owner's unlock) |
 
 ## Open questions
 

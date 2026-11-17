@@ -13,10 +13,12 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- Apps are only visible to apps that ask for them (API 30+): text to speech engines, the
-         phone's own launcher (the "Phone apps" button), and Tailscale. -->
+         phone's own launcher (the "Phone apps" button), Tailscale and RustDesk. -->
     <queries>
         <!-- Tailscale: the shell asks it to connect when the tailnet is down (Tailscale.kt). -->
         <package android:name="com.tailscale.ipn" />
+        <!-- RustDesk: the desk screen's 🖥 button opens it to see and use jarvis's screen (Bridge.openRemote). -->
+        <package android:name="com.carriez.flutter_hbb" />
         <intent>
             <action android:name="android.intent.action.TTS_SERVICE" />
         </intent>
@@ -34,13 +36,16 @@
         android:theme="@style/Theme.TaraPhone"
         android:usesCleartextTraffic="false">
 
-        <!-- The one screen: launcher, home app (kiosk), and the pairing link from the QR. -->
+        <!-- The one screen: launcher, home app (kiosk), and the pairing link from the QR. Always landscape
+             (the phone stands sideways), either way up by the sensor even with auto-rotate off: Android's
+             one rotation setting is reset to portrait by any portrait-only app (Tailscale, RustDesk). -->
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density"
             android:excludeFromRecents="false"
             android:exported="true"
             android:launchMode="singleTask"
+            android:screenOrientation="sensorLandscape"
             android:showWhenLocked="true"
             android:turnScreenOn="true"
             android:windowSoftInputMode="adjustResize">

@@ -12,6 +12,8 @@ import { TOKENS } from './look.js';
  * `/phone/run/<id>`. It must fit 914 × 411 CSS px (landscape, how the phone sits) and 411 × 914
  * without scrolling: lists are capped and lines ellipsised, never scrolled. The shell's bridge
  * (`window.taraPhone`) wakes the screen, vibrates and speaks; in a plain browser the page still works.
+ * 🖥 in the bar opens RustDesk on the phone to see the host's screen (Phase 3, decided 2026-11-17: no
+ * live Chrome view of our own; see the plan).
  */
 /** A value as a JS literal inside `<script>`: `<` escaped, so no text can close the script tag. */
 const inScript = (v: unknown) => JSON.stringify(v).replace(/</g, '\\u003c');
@@ -106,6 +108,7 @@ body.night{background:#000}body.night .bar{visibility:hidden}
 </style></head><body>
 <header class="bar"><span class="dot" id="dot"></span><b>${esc(opts.agentName)}</b><span id="barClock" hidden></span>
 <span class="sp"></span><span class="chip" id="lock"></span><span class="chip" id="battery"></span>
+<button class="gear" id="remote" aria-label="See the host's screen (RustDesk)" hidden>🖥</button>
 <button class="gear" id="gear" aria-label="Phone settings" hidden>⚙</button></header>
 
 <section class="page" id="home">
@@ -282,7 +285,9 @@ function status(){
  try{const b=JSON.parse(phone.battery());$('battery').textContent=b.level+'%'+(b.charging?' ⚡':'');
   $('battery').className='chip'+(b.temperature>=42?' bad':b.level<20&&!b.charging?' warn':'');}catch{}
 }
-if(phone){$('gear').hidden=false;$('gear').onclick=()=>phone.openSetup();document.addEventListener('visibilitychange',status);}
+if(phone){$('gear').hidden=false;$('gear').onclick=()=>phone.openSetup();document.addEventListener('visibilitychange',status);
+ // RustDesk, to see and use the host's screen (the shared Chromes): the shell asks for the unlock first.
+ if(phone.hasRemote&&phone.hasRemote()){$('remote').hidden=false;$('remote').onclick=()=>phone.openRemote();}}
 
 try{const last=JSON.parse(localStorage.getItem('glance')||'null');if(last&&last.build===BUILD){S=last;for(const a of S.alerts)handled.add(a.id);renderHome();}}catch{}
 ticks();status();connect();

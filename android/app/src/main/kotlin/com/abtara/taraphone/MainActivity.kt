@@ -3,6 +3,7 @@ package com.abtara.taraphone
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.KeyguardManager
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
@@ -181,6 +182,23 @@ class MainActivity : Activity(), Bridge.Host {
         main.post {
             val p = paired
             showPanel(if (p == null) "Not paired." else "Paired with ${p.agentName} at ${p.host}:${p.port}.")
+        }
+    }
+
+    override fun openRemote() {
+        main.post {
+            val launch = {
+                val intent = Bridge.remoteIntent(this)
+                if (intent == null) showPanel("RustDesk isn't installed.")
+                else runCatching { startActivity(intent) }.onFailure { showPanel("Couldn't open RustDesk: ${it.message}") }
+            }
+            val km = getSystemService(KeyguardManager::class.java)
+            if (km?.isKeyguardLocked != true) launch()
+            else km.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
+                override fun onDismissSucceeded() {
+                    launch()
+                }
+            })
         }
     }
 
