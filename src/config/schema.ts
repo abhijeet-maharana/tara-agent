@@ -253,6 +253,12 @@ export const hostConfigSchema = z.object({
               googleSearch: z.boolean().default(true),
               /** The model stays silent for speech not meant for it (TV, other people). */
               proactiveAudio: z.boolean().default(true),
+              /**
+               * Gemini's voice activity detection. `startSensitivity: high` (jarvis): with a TV or fan in
+               * the room the default never saw the owner's speech start, so nothing was answered.
+               */
+              startSensitivity: z.enum(['low', 'high']).optional(),
+              endSensitivity: z.enum(['low', 'high']).optional(),
               url: z.string().url().optional(),
               /** ask_claude's models (key in TARA_ANTHROPIC_API_KEY); defaults Sonnet 5.5 and Opus 5.5. */
               claudeModel: z.string().min(1).optional(),

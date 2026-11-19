@@ -150,7 +150,7 @@ export class ClaudeLane {
     }).format(this.now());
     return `You are the brain behind Jarvis, a voice assistant on the user's desk phone. Jarvis's voice model passed you a request; your answer is read out by it and shown on the phone's screen.
 
-It is ${date} (${this.deps.timeZone}). The user is in India and speaks English and Hinglish.
+It is ${date} (${this.deps.timeZone}). The user is in India and speaks English, Hindi and Hinglish. Answer in English unless the request asks for another language (e.g. "Answer in Hindi."): then write both parts in that language.
 
 The user's software projects run on tara-agent (Claude runs, scheduled jobs, approval cards): ${this.deps.projects.map((p) => `${p.title} (${p.name})`).join(', ')}. Your tools read tara-agent: jobs, job_runs, run_output, running, service_log. Use them to find out why something failed: read the run's error and output, then the log around that time. You can't change anything; if a fix is needed, say what it is.
 
@@ -366,7 +366,7 @@ Answer in this shape: first one or two plain sentences to be spoken (no lists, n
             question: {
               type: 'STRING',
               description:
-                'The full request in English, with every detail the user gave and any context from this conversation.',
+                'The full request, with every detail the user gave and any context from this conversation. Write it in English, and end with "Answer in Hindi." when the user is speaking Hindi.',
             },
             hard: {
               type: 'BOOLEAN',
@@ -617,9 +617,16 @@ async function journal(sinceMinutes: number, grep: string | undefined, max: numb
     { timeout: 15_000, maxBuffer: 64 * 1024 * 1024, encoding: 'utf8' },
   );
   const g = grep?.toLowerCase();
-  return stdout
-    .split('\n')
-    .filter((l) => l.trim() && (!g || l.toLowerCase().includes(g)))
-    .map((l) => redact(l.replace(/^(\S+) \S+ [^:]+: /, '$1 ')).slice(0, 400))
-    .slice(-max);
+  return (
+    stdout
+      .split('\n')
+      // sudo and PAM lines (each Claude run starts through sudo) are noise for "why did it fail".
+      .filter((l) => l.trim() && !/ (sudo|systemd)\[\d+\]: | pam_unix\(/.test(l))
+      .filter((l) => !g || l.toLowerCase().includes(g))
+      .map((l) =>
+        // "2026-11-17T18:07:08+05:30 host node[123]: text" → "18:07:08 text" (the date fits no phone line).
+        redact(l.replace(/^\d{4}-\d\d-\d\dT(\d\d:\d\d:\d\d)\S* \S+ [^:]+: /, '$1 ')).slice(0, 400),
+      )
+      .slice(-max)
+  );
 }

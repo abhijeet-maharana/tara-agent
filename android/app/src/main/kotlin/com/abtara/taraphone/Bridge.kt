@@ -143,6 +143,30 @@ class Bridge(private val context: Context, private val host: Host) {
         if (ok(key)) live?.setWake(on)
     }
 
+    /** Records a wake word training sample ("wake" or "other", where: near/far/room) for [ms]. */
+    @JavascriptInterface
+    fun recordWakeSample(key: String?, label: String?, where: String?, ms: Int) {
+        if (ok(key) && (label == "wake" || label == "other") && where != null) live?.recordSample(label, where, ms)
+    }
+
+    /** The teach screen is open (true) or closed: the wake word doesn't fire meanwhile. */
+    @JavascriptInterface
+    fun setTraining(key: String?, on: Boolean) {
+        if (ok(key)) live?.training = on
+    }
+
+    /** Music is playing on the speaker (true) or not: the wake word is easier to trigger meanwhile. */
+    @JavascriptInterface
+    fun setMusic(key: String?, playing: Boolean) {
+        if (ok(key)) live?.musicPlaying = playing
+    }
+
+    /** Fetches the wake word verifier again (after training). */
+    @JavascriptInterface
+    fun reloadWake(key: String?) {
+        if (ok(key)) live?.loadWakeModel()
+    }
+
     /** True while Voice v2 is connected: the page shows its live view (steps, cards). */
     @JavascriptInterface
     fun hasLive(key: String?): Boolean = ok(key) && liveUp()
@@ -203,6 +227,10 @@ class Bridge(private val context: Context, private val host: Host) {
             hasVoice: function () { return a.hasVoice(k); },
             hasLive: function () { return a.hasLive(k); },
             setWake: function (on) { a.setWake(k, Boolean(on)); },
+            recordWakeSample: function (l, w, ms) { a.recordWakeSample(k, String(l), String(w), ms | 0); },
+            reloadWake: function () { a.reloadWake(k); },
+            setTraining: function (on) { a.setTraining(k, Boolean(on)); },
+            setMusic: function (on) { a.setMusic(k, Boolean(on)); },
             listen: function () { a.listen(k); },
             cancelVoice: function () { a.cancelVoice(k); },
             voiceText: function (t) { a.voiceText(k, String(t)); },

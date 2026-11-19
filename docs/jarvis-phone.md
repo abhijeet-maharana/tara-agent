@@ -523,8 +523,8 @@ Shell: LiveVoice.kt ─── wss://<host>:<tls port>/phone/live (device key, pi
 | Tools | `RULE_TOOLS` | `running`, `needs_me`, `approvals` (read only), `next_up`, `brief`, `usage`, `jobs`, `quiet`, `show`, `watch`, `job` and `stop` (gated), `confirm`, `end_conversation`. The answers are Phase 4's rule answers (`PhoneVoice`, now public methods) |
 | Route | `GET /phone/live` upgrade in `src/http/server.ts` | Same `allowFrom` as every request, device key required, both HTTP and HTTPS listeners. `/phone/session` now says `live: true` so the shell knows |
 | Shell | `LiveVoice.kt` (OkHttp WebSocket, pinned like `Net`), `Bridge` (`hasLive`; `listen`, `cancelVoice`, Yes/No go to Live when it is up) | Falls back to Phase 4 (Android speech, `/phone/voice`) when the host has no Live voice |
-| Page | `src/http/phone-screen.ts`: `window.taraLive` | Orb, your words, the answer, up to 2 cards (list, confirm Yes/No, sources, posters, Claude, log, run, music), the **step strip** (last 6 tool calls: ● running, ✓, ✗) |
-| Config | host `http.phone.live` | jarvis: `model: gemini-3.8-live`, `voice: Charon`, `idleSeconds: 20`, `silenceMs: 400`, `googleSearch: false`, `language: Indian English…Hinglish`. Key `TARA_LIVE_API_KEY` in `/etc/tara-agent.env` |
+| Page | `src/http/phone-screen.ts`: `window.taraLive` | Small orb (64 px) top left; state and hint on one line; your words on one line; the answer as a **subtitle** (latest words, 3 lines, 2 when cards show); up to 2 cards (list, confirm Yes/No, sources, posters, Claude, log, run, music) that **scroll** by touch instead of cutting off; the **step strip** (last 5 tool calls: ● running, ✓, ✗, fading at the left). Fitted to 914 × 411 after the owner found it overflowing (2026-11-17); log lines show only the time and drop sudo/PAM noise |
+| Config | host `http.phone.live` | jarvis: `model: gemini-3.8-live`, `voice: Charon`, `idleSeconds: 20`, `silenceMs: 800` (400 until the owner's sentences got cut), `googleSearch: false`, `language: Indian English…Hinglish`. Key `TARA_LIVE_API_KEY` in `/etc/tara-agent.env` |
 
 ### The gate for actions
 
@@ -624,6 +624,15 @@ Built and checked 2026-11-17.
 - **The speaker is found at startup** (`Music.warm()`): mDNS takes ~2.5 s, which made the first "pause" take 3.7 s.
 - **The conversation closes once the music is announced** (`endAfter`): otherwise the microphone hears the song and Gemini answers the lyrics.
 
+### Stopping the music (2026-11-17)
+
+The owner couldn't stop a song by voice and fell back on "Hey Google, stop". Over the music his "Hey Jarvis" scored 0.63–0.77 against 0.95. Now:
+- **Tap controls**: while something plays, the top bar shows **♪ title ⏸ ⏹** (also on the music card); `GET/POST /phone/music {action}` (page session or device key) goes straight to the speaker, no voice. Checked: ⏸ → `PAUSED`, ⏹ → `idle`.
+- **An easier wake word during music**: the page tells the shell (`taraPhone.setMusic`); the owner's model then needs 0.6 instead of 0.95 (the song alone scored ~0.2–0.3).
+- **Proactive audio off** (`proactiveAudio: false` on jarvis): it let Gemini ignore real requests twice (0 tokens, "speaker" heard of "Play some lofi music on the speaker"). Conversations only open on a tap or the wake word anyway. Checked after: the same request heard word for word and played, twice.
+
+- **Music pauses while the owner talks to Jarvis** (`PhoneLive.duck`) and resumes when the conversation closes, unless he played or stopped music in it. Checked: paused on opening, `PLAYING` again after closing.
+
 ### Checked (2026-11-17)
 
 | Check | Result |
@@ -645,7 +654,7 @@ LiveVoice.kt: one microphone (VOICE_COMMUNICATION, echo canceller) while the scr
 
 | Part | Where | Notes |
 |---|---|---|
-| Detector | `WakeWord.kt` | openWakeWord's three models (mel spectrogram → embedding → `hey_jarvis_v0.1`) on ONNX Runtime (`onnxruntime-android` 1.20.0, one thread). Port checked against a Python run of the same steps: "Hey Jarvis, what's running right now?" 0.997, a sentence without it 0.001 |
+| Detector | `WakeWord.kt` | openWakeWord's three models (mel spectrogram → embedding → `hey_jarvis_v0.1`) on ONNX Runtime (`onnxruntime-android` 1.20.0, one thread), threshold 0.3. Port checked against a Python run of the same steps: "Hey Jarvis, what's running right now?" 0.997, a sentence without it 0.001 |
 | Models | `wakeWordModels` task in `android/app/build.gradle.kts` | Downloaded at build time from openWakeWord's v0.5.1 release into `build/`, SHA-256 checked. **Not committed**: they are CC BY-NC-SA 4.0 (non-commercial) |
 | Shell | `LiveVoice.kt` | Mic on while the shell is on screen and quiet mode is off; 👂 in the bar shows it. A detection buzzes, opens a conversation and sends the last second first. Detections at least 2 s apart; the detector resets after each conversation |
 | Page | `phone-screen.ts` | Quiet mode (🔕 or by voice) turns the wake word off (`taraPhone.setWake`) |
@@ -658,6 +667,46 @@ LiveVoice.kt: one microphone (VOICE_COMMUNICATION, echo canceller) while the scr
 - **A bare "Hey Jarvis" is told apart**: the kept second carries the wake words (heard as "jueves", "John Lewis"); the instructions say to answer "Yes?" and call no tool when that is all. Before that, a bare "Hey Jarvis" started a briefing.
 - **Proactive audio** (`proactivity.proactiveAudio`, accepted by 3.8-live, same latency) and an instruction to ignore speech not meant for it: the room's TV and talk reach the microphone.
 - The wake word runs in the activity (the shell is the home app and keeps the screen on), not yet in a microphone foreground service: with the screen off it doesn't listen.
+- **Owner's voice, first try (2026-11-17): not recognised.** The phone logs near misses (`live: wake score best …` every 2 s above 0.05). His "Hey Jarvis" scored 0.15–0.50 against openWakeWord's 0.5, so the **threshold is 0.3**. Listening now uses the speech-recognition source without noise suppression (the call source with suppression is only for conversations). And a bug: after a conversation the mic restart could be skipped (the thread checked whether it was itself still alive), leaving the wake word deaf until the app restarted; fixed and checked with two wakes in a row (0.41, 0.72).
+
+### Far-field: teaching it the owner's voice (2026-11-17)
+
+The stock model woke only when the owner spoke close and loud (his far "Hey Jarvis" reached the mic at level ~180 and scored 0.06; near ones 0.36–0.61 at 1,800–11,000). Software gain on the detector's input (up to 12×, from a slow envelope) helped at medium distance but also lifted other speech towards the threshold (0.21).
+
+- **Porcupine was tried and dropped** the same day: Picovoice ended free AccessKeys on 2026-06-30 and plans no non-commercial tier; it would also check its key online at every start. The code was removed.
+- **First idea, a verifier on top of the stock model, didn't fit**: the owner's 31 clips all held clear speech (levels ~1,000–2,700, speech within 0.2–2.0 s), yet the stock model scored most of them 0.00–0.10, near ones too. It barely knows his pronunciation, so it can't pass the word on to a verifier.
+- **Chosen: his own model.** A small network (1536 → 64 → 1) over the same 16 × 96 features, trained on jarvis: positives are his clips, each varied 20 ways (gain 0.25–2×, room noise, start offset), using the windows that end just after the word; negatives are his other sentences, the quiet before each word, and ~250k windows of general speech from openWakeWord's ACAV100M feature set. It replaces the stock score. Never in the repo: the recordings and model stay in jarvis's state folder and go only to the paired phone.
+
+| Part | Where |
+|---|---|
+| Recording | 👂 in the bar opens **Teach Jarvis your voice**: 8 × "Hey Jarvis" close, 8 × from the usual seat, 6 other sentences, 20 s of the room; big countdowns, readable across the room. Recorded on the wake word's own microphone, uploaded with the device key (`POST /phone/wake-sample`) to `<stateDir>/wake/samples/{wake,other}/`. While the screen is open the wake word doesn't fire; it resumes at the first step jarvis lacks (`GET /phone/wake-samples`) |
+| Training | `deploy/wake/train_personal.py <stateDir>/wake ~/wakeword/data [--write]` on jarvis (venv `~/wakeword/venv`: numpy, onnxruntime, scikit-learn; features in `~/wakeword/data`, CC BY-NC-SA). ~2 min on jarvis's 4 cores. Keeps a quarter of the wake clips out to check on, measures false wakes per hour on openWakeWord's validation set (10.7 h of other audio), picks the lowest threshold with ≤ 0.5 an hour, then trains on everything and writes `personal.json` (2 MB) |
+| Phone | `GET /phone/wake-model` (device key) when the voice line connects; `PersonalModel` in `WakeWord.kt`. Without the file, the stock model alone (threshold 0.3) |
+
+**First model (2026-11-17, 31 wake clips, 6 other, no room clip yet):**
+
+| Threshold | Held-out wake clips caught (near and far) | False wakes per hour of other audio |
+|---|---|---|
+| 0.9 | 7/7 | 1.4 (0.5 with more general speech in the second run, which chose 0.9) |
+| 0.95 | 7/7 | 0.47 |
+| 0.98 | 6/7 | 0.09–0.19 |
+
+**Second model (same day, + the 20 s room clip, 250k windows sampled from 2.4M of general speech):** 7/7 held-out clips at every threshold up to 0.98; false wakes 0.47/h at 0.9, **0.19/h at 0.95 (in use)**. The threshold rule now prefers the most clips caught, then the fewest false wakes. **The owner confirmed it recognises his "Hey Jarvis"** (2026-11-17; scores 0.95–0.99 where the stock model gave 0.00–0.01).
+
+Fixed after his first use:
+- **The first answer after "Hey Jarvis" stuttered.** The listening mic (no echo canceller) was swapped for the call mic as the answer began, twice, because Android reports a new audio mode a moment late. Now it swaps once, 0.45 s after the user stops talking, before the answer arrives, and trusts the source it chose (checked: one swap, 0.86 s before the first sound).
+- **✕ didn't end it.** It now drops the audio already received, and the screen ignores that conversation's last events.
+
+**Then: "Hey Jarvis" works, but what follows was misheard** (owner, 2026-11-17). Two causes in the logs: his sentences were cut at natural pauses ("way to travel in" / "Can I travel in the…", each answered), and switching to the call mic mid-question (noise suppression on far speech, plus the switch itself) turned words into "el servicio de WhatsApp". Changed:
+- **One unprocessed mic for everything** (`VOICE_RECOGNITION`, no echo canceller or noise suppressor, no source switching), with gain (up to 6×, from a slow envelope) on what goes to Gemini.
+- **Half duplex instead of echo cancelling**: while Jarvis speaks, and 0.3 s after, the phone sends silence, so it never hears itself. **Interrupting is by tap or ✕, not by voice** (a trade-off). Answers play as media (`USAGE_ASSISTANT`), the media volume raised to 70 % for the conversation; no call audio mode any more.
+- **Owner, again: "not recognising well"**. His transcripts were mostly right but often began with a broken-off wake word ("service what to do now?", "reservis play…", "Jeeves play…", lone "voy", "llaves"), and the room (music) was raised with his voice. Now only the last 0.32 s before the wake word goes up (a one-breath question, not "Hey Jarvis" itself); the gain is gentler (≤ 3×, falling back over ~4 s instead of ~1 s); music on the speaker pauses during a conversation.
+- **Owner: "it's not recognising well" (and some questions got no answer at all).** A dump of one unanswered session held a clear "What needs me today?" over a TV voice and a fan hum; replayed to Gemini Live with Jarvis's exact setup it got no answer every time, not even a transcript: **Gemini's voice detection never decided speech had started.** Replays of that clip: `startOfSpeechSensitivity: HIGH` → answered 4/4 (with the phone's new noise gate, the whole question transcribed); `LOW` → never; `endOfSpeechSensitivity: HIGH` cut the question after one word. The clean clip that worked before still worked. Now: **`startSensitivity: high`** on jarvis, and a **noise gate** on the phone (frames below max(2.5 × the noise floor, ¼ of the recent peak) are turned down to a quarter before they go up). Checked live: three questions in a row answered, including the first after a restart (which had failed three times before).
+- **Language follows the user** (owner's request): Hindi → Hindi, English → English, Hinglish → Hinglish, in Gemini's instructions and the `language` line; `ask_claude` gets "Answer in Hindi." when he speaks Hindi, and Claude writes the screen details in that language. Checked with the Mac's Hindi voice: "आज मेरे लिए क्या ज़रूरी है?" → Hindi answer; English questions → English.
+- **`silenceMs: 800`** on jarvis (was 400): ~0.4 s slower to answer, but a pause inside a sentence no longer ends the turn.
+- Checked: "What's running right now?" heard exactly (1.64 s); "Can I travel to Pune by train tomorrow, [0.6 s pause] and how long does it take?" heard whole and word for word, answered through Claude. A dump of the uploaded audio (opt-in `TARA_LIVE_DUMP=<file>`) showed the speech raised to ~1,700 and pure silence while Jarvis spoke.
+
+On the phone: five other sentences in the Mac's voice scored 0.14–0.27, no wake. The Mac saying "Hey Jarvis" doesn't wake it either: it is the owner's wake word now (another person may need their own clips). Retrain after recording more (👂): `train_personal.py <stateDir>/wake ~/wakeword/data --write`, install `personal.json` as tara-agent, restart the shell.
 
 ### Checked on the phone (2026-11-17)
 

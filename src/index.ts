@@ -382,6 +382,15 @@ async function serve(configFlag: string | undefined) {
       })
     : undefined;
   // HTTP first: when tara-agent takes over a port, the hand-over gap is as short as possible.
+  // Music on the Cast speaker: the voice's play_music / music tools and the phone's tap controls.
+  const music =
+    host.http.phone?.live?.music && process.env.TARA_LIVE_API_KEY
+      ? new Music({
+          speaker: host.http.phone.live.speaker,
+          host: host.http.phone.live.speakerHost,
+          log,
+        }).warm()
+      : undefined;
   const http = host.http.enabled
     ? await startHttpServer({
         ...host.http,
@@ -434,18 +443,12 @@ async function serve(configFlag: string | undefined) {
                   url: host.http.phone.live.url ?? GEMINI_LIVE_URL,
                   apiKey: process.env.TARA_LIVE_API_KEY,
                 },
+                wakeDir: path.join(host.stateDir as string, 'wake'),
                 // The Claude lanes (ask_claude, claude_code, posters) need TARA_ANTHROPIC_API_KEY;
                 // music goes to the Cast speaker.
+                music,
                 kit: mergeKits(
-                  host.http.phone.live.music
-                    ? new Music({
-                        speaker: host.http.phone.live.speaker,
-                        host: host.http.phone.live.speakerHost,
-                        log,
-                      })
-                        .warm()
-                        .kit()
-                    : undefined,
+                  music?.kit(),
                   process.env.TARA_ANTHROPIC_API_KEY
                     ? new ClaudeLane({
                         apiKey: process.env.TARA_ANTHROPIC_API_KEY,

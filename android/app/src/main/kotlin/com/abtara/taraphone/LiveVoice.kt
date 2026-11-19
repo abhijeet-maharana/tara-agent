@@ -6,14 +6,11 @@ import android.app.Activity
 import android.app.KeyguardManager
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
-import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
-import android.media.audiofx.AcousticEchoCanceler
-import android.media.audiofx.NoiseSuppressor
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -38,10 +35,10 @@ import org.json.JSONObject
  * (24 kHz PCM), plus JSON events that the page shows ([emit] → `window.taraLive`): state, both
  * sides' words, a step per tool call, cards.
  *
- * Talking and listening at once needs echo cancellation, or the model hears itself and stops: the
- * microphone is the voice-call source with Android's echo canceller, and the voice plays as a call
- * on the loudspeaker (audio mode `IN_COMMUNICATION`) while a conversation is open. Its volume is the
- * call volume, raised to [CALL_VOLUME] for the conversation and put back after.
+ * One unprocessed microphone (the speech-recognition source) serves the wake word and the
+ * conversation; quiet speech is raised before it goes up. There is no echo canceller on it, so while
+ * Jarvis speaks the phone sends silence (half duplex): it never hears itself, and interrupting is by
+ * tap or ✕. Answers play at the media volume, raised to [CALL_VOLUME] for the conversation.
  *
  * Latency is measured here, where it is felt: from the last loud microphone frame to the first frame
  * of the answer, logged as `live timing` and sent to tara-agent, which logs it with the lane.
@@ -70,17 +67,29 @@ class LiveVoice(private val activity: Activity, private val emit: (JSONObject) -
     @Volatile private var wakeWanted = true
     @Volatile private var visible = true
     private var wakeShown = false
-    @Volatile private var detector: WakeWord? = null
-    @Volatile private var sendRing = false
-    /** The last second of audio before a wake word; kept across a microphone restart. */
-    private val ring = java.util.concurrent.LinkedBlockingDeque<ByteArray>()
+    @Volatile private var detector: WakeEngine? = null
+    /** The owner's own wake word model (trained on jarvis), when there is one. */
+    @Volatile private var personal: PersonalModel? = null
+    /** A recording for training the wake word, filled by the microphone thread. */
+    private class Capture(val label: String, val where: String, val bytes: Int) {
+        val out = java.io.ByteArrayOutputStream()
+    }
+    @Volatile private var capture: Capture? = null
     /**
-     * The microphone must start after the audio mode changes: Android sets up the echo canceller for
-     * the mode an input starts in. A recorder opened for the wake word (normal mode) lets Jarvis hear
-     * itself in a conversation (seen 2026-11-17: it answered its own words, transcribed as gibberish).
+     * Music plays on the speaker (the page says so): the owner's voice reaches the wake word partly
+     * drowned (0.63–0.77 against 0.95, 2026-11-17), so a lower threshold applies meanwhile.
      */
-    @Volatile private var restartMic = false
-    @Volatile private var micInCall = false
+    @Volatile var musicPlaying = false
+    /** The teach screen is open: the mic keeps running for recordings, but nothing wakes. */
+    @Volatile var training = false
+    private val uploads = java.util.concurrent.Executors.newSingleThreadExecutor()
+    @Volatile private var sendRing = false
+    /** The last second of audio before a wake word, sent first when it fires. */
+    private val ring = java.util.concurrent.LinkedBlockingDeque<ByteArray>()
+    /** The level of what was sent lately, for the gain in [toGemini]. */
+    @Volatile private var sendEnvelope = 0.0
+    @Volatile private var sendFloor = 300.0
+    @Volatile private var sendPeak = 0.0
     @Volatile private var resetWake = false
     @Volatile private var lastWake = 0L
 
@@ -95,7 +104,6 @@ class LiveVoice(private val activity: Activity, private val emit: (JSONObject) -
     @Volatile private var lastVoiceAt = 0L
     @Volatile private var waitingFirstAudio = false
 
-    private var savedMode = -1
     private var restoreVolume = -1
     private var boostedTo = -1
 
@@ -129,6 +137,7 @@ class LiveVoice(private val activity: Activity, private val emit: (JSONObject) -
             Log.i(TAG, "live: connected")
             connected = true
             retryMs = 2_000
+            loadWakeModel()
             main.post { ensureRecorder() }
         }
 
@@ -206,9 +215,54 @@ class LiveVoice(private val activity: Activity, private val emit: (JSONObject) -
     }
 
     fun stop() = main.post {
+        // ✕ means silence now: what was already received doesn't keep playing.
+        playQueue.clear()
+        flushPlayback = true
         if (!talking) return@post
         send(JSONObject().put("type", "stop"))
         stopTalking()
+    }
+
+    /** Records [ms] of the wake word's microphone for training; the page hears back through `sample` events. */
+    fun recordSample(label: String, where: String, ms: Int) = main.post {
+        if (talking || recorder?.isAlive != true) {
+            emit(JSONObject().put("type", "sample").put("state", "error").put("message", "The microphone isn't listening (quiet mode, or a conversation is open)"))
+            return@post
+        }
+        capture = Capture(label, where, ms.coerceIn(500, 20_000) * IN_RATE / 1000 * 2)
+        emit(JSONObject().put("type", "sample").put("state", "recording"))
+    }
+
+    private fun upload(c: Capture) {
+        val p = paired ?: return
+        val pcm = c.out.toByteArray()
+        uploads.execute {
+            val ev = JSONObject().put("type", "sample")
+            try {
+                val body = JSONObject().put("label", c.label).put("where", c.where)
+                    .put("pcm", android.util.Base64.encodeToString(pcm, android.util.Base64.NO_WRAP))
+                val r = p.net().ok("POST", "/phone/wake-sample", body, p.auth)
+                ev.put("state", "saved").put("counts", r.optJSONObject("counts") ?: JSONObject())
+                    .put("level", rms(pcm, pcm.size).roundToInt())
+            } catch (e: Exception) {
+                ev.put("state", "error").put("message", e.message ?: e.javaClass.simpleName)
+            }
+            main.post { emit(ev) }
+        }
+    }
+
+    /** Loads the owner's own wake word model from tara-agent (404: none trained yet, the stock model alone). */
+    fun loadWakeModel() {
+        val p = paired ?: return
+        uploads.execute {
+            try {
+                val r = p.net().call("GET", "/phone/wake-model", auth = p.auth)
+                personal = if (r.status == 200) PersonalModel(r.json()) else null
+                Log.i(TAG, "live: own wake word model ${if (personal != null) "loaded (threshold ${personal?.threshold})" else "none (${r.status})"}")
+            } catch (e: Exception) {
+                Log.w(TAG, "live: couldn't load the own wake word model: ${e.message}")
+            }
+        }
     }
 
     /** The Yes / No buttons on the screen. */
@@ -299,38 +353,50 @@ class LiveVoice(private val activity: Activity, private val emit: (JSONObject) -
     private fun startRecorder() {
         val t = Thread({
             val min = AudioRecord.getMinBufferSize(IN_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            // In a conversation: the call source (echo canceller). Listening for the wake word: the
+            // speech-recognition source, without noise suppression, closer to what the models learnt on.
+            // One microphone for everything (2026-11-17): the speech-recognition source, unprocessed. The
+            // call source's noise suppression mangled far-away speech, and swapping sources mid-question
+            // garbled it; echo is handled by sending silence while Jarvis speaks (see SEND_HOLD_MS).
+            val source = MediaRecorder.AudioSource.VOICE_RECOGNITION
             val rec = try {
-                AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, IN_RATE, AudioFormat.CHANNEL_IN_MONO,
+                AudioRecord(source, IN_RATE, AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT, max(min, FRAME_BYTES * 8))
             } catch (e: Exception) {
                 Log.w(TAG, "live: no microphone", e)
                 return@Thread
             }
-            val aec = if (AcousticEchoCanceler.isAvailable()) AcousticEchoCanceler.create(rec.audioSessionId)?.apply { enabled = true } else null
-            val ns = if (NoiseSuppressor.isAvailable()) NoiseSuppressor.create(rec.audioSessionId)?.apply { enabled = true } else null
-            Log.i(TAG, "live: microphone on (echo canceller ${aec?.enabled ?: "none"}, noise suppressor ${ns?.enabled ?: "none"})")
-            micInCall = audio?.mode == AudioManager.MODE_IN_COMMUNICATION
+            Log.i(TAG, "live: microphone on")
             val buf = ByteArray(FRAME_BYTES)
-            val chunk = ShortArray(WakeWord.CHUNK)
+            var chunk = ShortArray(0)
             var filled = 0
             var floor = 300.0
             var lastLevel = 0L
             var peak = 0.0
             var lastPeakLog = 0L
+            // Near misses, for tuning: the best score and the loudest frame every 2 s.
+            var bestScore = 0f
+            var wakePeak = 0.0
+            var lastScoreLog = 0L
             try {
                 rec.startRecording()
-                while (!Thread.currentThread().isInterrupted && !closed && micWanted() && !restartMic) {
+                while (!Thread.currentThread().isInterrupted && !closed && micWanted()) {
                     val n = rec.read(buf, 0, buf.size)
                     if (n <= 0) continue
                     val now = SystemClock.elapsedRealtime()
                     if (talking) {
                         if (sendRing) {
                             sendRing = false
-                            for (f in ring) socket?.send(f.toByteString())
+                            // Only the moment before the wake word fired (a question said in one breath),
+                            // not "Hey Jarvis" itself: its broken-off end was heard as "service", "voy".
+                            for (f in ring.toList().takeLast(WAKE_TAIL_FRAMES)) socket?.send(toGemini(f, f.size).toByteString())
                         }
                         ring.clear()
                         filled = 0
-                        socket?.send(buf.toByteString(0, n))
+                        // Half duplex: while Jarvis speaks (and a moment after), silence goes up, so the
+                        // model never hears itself. Interrupting is by tap (or ✕), not by voice.
+                        val speaking = now - lastPlayed < SEND_HOLD_MS || playQueue.isNotEmpty()
+                        socket?.send((if (speaking) ByteArray(n) else toGemini(buf, n)).toByteString(0, n))
                     } else {
                         // Listening for the wake word: the last second is kept for the question after it.
                         if (resetWake) {
@@ -338,18 +404,51 @@ class LiveVoice(private val activity: Activity, private val emit: (JSONObject) -
                             detector?.reset()
                             filled = 0
                         }
+                        wakePeak = max(wakePeak, rms(buf, n))
+                        if (now - lastScoreLog > 2_000) {
+                            if (bestScore > 0.05f) Log.i(TAG, "live: wake score best ${"%.2f".format(bestScore)}, mic peak ${wakePeak.roundToInt()}")
+                            bestScore = 0f
+                            wakePeak = 0.0
+                            lastScoreLog = now
+                        }
                         ring.addLast(buf.copyOf(n))
                         while (ring.size > RING_FRAMES) ring.removeFirst()
+                        // Recording a training sample: no detection meanwhile ("Hey Jarvis" is the point).
+                        val c = capture
+                        if (c != null) {
+                            c.out.write(buf, 0, n)
+                            if (c.out.size() >= c.bytes) {
+                                capture = null
+                                upload(c)
+                            }
+                            filled = 0
+                            continue
+                        }
+                        if (training) {
+                            filled = 0
+                            continue
+                        }
+                        val engine = wakeEngine() ?: continue
+                        if (chunk.size != engine.frameLength) {
+                            chunk = ShortArray(engine.frameLength)
+                            filled = 0
+                        }
                         var i = 0
                         while (i + 1 < n) {
                             chunk[filled++] = ((buf[i + 1].toInt() shl 8) or (buf[i].toInt() and 0xff)).toShort()
                             i += 2
                             if (filled == chunk.size) {
                                 filled = 0
-                                val score = wakeScore(chunk)
-                                if (score >= WakeWord.THRESHOLD && now - lastWake > WAKE_GAP_MS) {
+                                val base = engine.feed(chunk)
+                                val pm = personal
+                                // The owner's own model, when trained, decides instead of the stock one.
+                                val score = if (pm != null && engine is WakeWord) pm.score(engine.window()) else base
+                                val normal = if (pm != null && engine is WakeWord) pm.threshold else engine.threshold
+                                val threshold = if (musicPlaying && pm != null) minOf(normal, MUSIC_THRESHOLD) else normal
+                                if (score > bestScore) bestScore = score
+                                if (score >= threshold && now - lastWake > WAKE_GAP_MS) {
                                     lastWake = now
-                                    Log.i(TAG, "live: wake word heard (score ${"%.2f".format(score)})")
+                                    Log.i(TAG, "live: wake word heard (${if (pm != null) "own model" else engine.name}, stock ${"%.2f".format(base)}, score ${"%.2f".format(score)})")
                                     // The wake word counts as speech for the latency figure.
                                     lastVoiceAt = now
                                     talk(fromWake = true)
@@ -384,10 +483,9 @@ class LiveVoice(private val activity: Activity, private val emit: (JSONObject) -
             } finally {
                 runCatching { rec.stop() }
                 rec.release()
-                aec?.release()
-                ns?.release()
-                Log.i(TAG, "live: microphone off${if (restartMic) " (restarting for the audio mode)" else ""}")
-                restartMic = false
+                Log.i(TAG, "live: microphone off")
+                // Seen from here this thread is still alive: clear it, or the restart below never starts.
+                if (recorder === Thread.currentThread()) recorder = null
                 main.post { ensureRecorder() }
             }
         }, "live-mic")
@@ -395,13 +493,15 @@ class LiveVoice(private val activity: Activity, private val emit: (JSONObject) -
         t.start()
     }
 
-    /** The wake word's score for 80 ms of audio; the models load on first use. */
-    private fun wakeScore(chunk: ShortArray): Float {
-        val d = detector ?: runCatching { WakeWord(ctx) }.onFailure {
+    /** The wake word engine (openWakeWord), loaded on first use. */
+    private fun wakeEngine(): WakeEngine? {
+        detector?.let { return it }
+        val e = runCatching { WakeWord(ctx) }.onFailure {
             Log.w(TAG, "live: wake word unavailable", it)
             wakeWanted = false
-        }.getOrNull()?.also { detector = it } ?: return 0f
-        return d.feed(chunk)
+        }.getOrNull()
+        detector = e
+        return e
     }
 
     private fun rms(b: ByteArray, n: Int): Double {
@@ -429,9 +529,6 @@ class LiveVoice(private val activity: Activity, private val emit: (JSONObject) -
         }
         waitingFirstAudio = false
         if (!talking) main.post { callAudio(true) }
-        // The wake word's microphone started in normal mode, without the echo canceller: swap it for
-        // one in call mode now that Jarvis answers (the user has finished; mid-sentence it garbled).
-        if (talking && recorder?.isAlive == true && !micInCall) restartMic = true
         playQueue.offer(pcm)
         ensurePlayer()
     }
@@ -443,7 +540,7 @@ class LiveVoice(private val activity: Activity, private val emit: (JSONObject) -
             val min = AudioTrack.getMinBufferSize(OUT_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
             val tr = AudioTrack.Builder()
                 .setAudioAttributes(AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
                 .setAudioFormat(AudioFormat.Builder().setSampleRate(OUT_RATE)
                     .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
@@ -476,33 +573,51 @@ class LiveVoice(private val activity: Activity, private val emit: (JSONObject) -
         t.start()
     }
 
-    /** The voice-call audio mode on the loudspeaker (for the echo canceller), and its volume. */
-    @SuppressLint("WrongConstant") // savedMode is a mode AudioManager gave us
+    /** The answer's volume: the media volume (0 on the desk phone) raised for a conversation, put back after. */
     private fun callAudio(on: Boolean) {
         val a = audio ?: return
+        val stream = AudioManager.STREAM_MUSIC
         if (on) {
-            if (savedMode < 0) savedMode = a.mode
-            a.mode = AudioManager.MODE_IN_COMMUNICATION
-            a.availableCommunicationDevices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
-                ?.let { a.setCommunicationDevice(it) }
-            val want = (a.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL) * CALL_VOLUME).roundToInt()
-            val now = a.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
-            if (now < want) runCatching { a.setStreamVolume(AudioManager.STREAM_VOICE_CALL, want, 0) }.onSuccess {
+            val want = (a.getStreamMaxVolume(stream) * CALL_VOLUME).roundToInt()
+            val now = a.getStreamVolume(stream)
+            if (now < want) runCatching { a.setStreamVolume(stream, want, 0) }.onSuccess {
                 if (restoreVolume < 0) restoreVolume = now
                 boostedTo = want
             }
         } else {
             if (playQueue.isNotEmpty() || track != null && SystemClock.elapsedRealtime() - lastPlayed < 500) return
-            if (savedMode < 0) return
-            if (restoreVolume >= 0 && a.getStreamVolume(AudioManager.STREAM_VOICE_CALL) == boostedTo)
-                runCatching { a.setStreamVolume(AudioManager.STREAM_VOICE_CALL, restoreVolume, 0) }
+            if (restoreVolume >= 0 && a.getStreamVolume(stream) == boostedTo)
+                runCatching { a.setStreamVolume(stream, restoreVolume, 0) }
             restoreVolume = -1
             boostedTo = -1
-            a.clearCommunicationDevice()
-            a.mode = savedMode
-            savedMode = -1
-            if (recorder?.isAlive == true && micInCall && !talking) restartMic = true
         }
+    }
+
+    /**
+     * What goes to Gemini: quiet (far) speech brought up towards a speaking level, from a slow envelope
+     * so words keep their shape; at most [MAX_SEND_GAIN]x, none in a quiet room.
+     */
+    private fun toGemini(b: ByteArray, n: Int): ByteArray {
+        val r = rms(b, n)
+        // Falls back slowly (~4 s to halve), so the room between words isn't raised to speech level.
+        sendEnvelope = max(r, sendEnvelope * 0.993)
+        var gain = if (sendEnvelope > 60.0) (SEND_LEVEL / sendEnvelope).coerceIn(1.0, MAX_SEND_GAIN) else 1.0
+        // Noise gate: frames well below the speech level (a fan, a distant TV) are turned down, so the
+        // room doesn't blur the user's words (checked on a clip with a TV: the whole question heard).
+        sendFloor = if (r < sendFloor) sendFloor * 0.9 + r * 0.1 else sendFloor * 0.999 + r * 0.001
+        sendPeak = max(r, sendPeak * 0.995)
+        if (r < max(sendFloor * 2.5, sendPeak * 0.25)) gain *= GATE_LEVEL
+        if (gain in 0.99..1.01) return b
+        val out = ByteArray(n)
+        var i = 0
+        while (i + 1 < n) {
+            val v = ((b[i + 1].toInt() shl 8) or (b[i].toInt() and 0xff)).toShort()
+            val g = (v * gain).coerceIn(-32768.0, 32767.0).toInt()
+            out[i] = (g and 0xff).toByte()
+            out[i + 1] = (g shr 8).toByte()
+            i += 2
+        }
+        return out
     }
 
     private fun buzz() {
@@ -511,6 +626,7 @@ class LiveVoice(private val activity: Activity, private val emit: (JSONObject) -
     }
 
     fun close() {
+        uploads.shutdown()
         closed = true
         talking = false
         detector?.close()
@@ -536,5 +652,16 @@ class LiveVoice(private val activity: Activity, private val emit: (JSONObject) -
         const val RING_FRAMES = 25
         /** One detection per this long (the score stays high for a few chunks). */
         const val WAKE_GAP_MS = 2_000L
+        /** Silence goes up while Jarvis speaks and this long after (the room's echo dies away). */
+        const val SEND_HOLD_MS = 300L
+        /** The owner's model while music plays (the song alone scores ~0.2–0.3). */
+        const val MUSIC_THRESHOLD = 0.6f
+        const val SEND_LEVEL = 2_000.0
+        const val MAX_SEND_GAIN = 3.0
+        /** How far the noise gate turns the room down. */
+        const val GATE_LEVEL = 0.25
+        /** What is sent from before a wake word: 0.32 s. */
+        const val WAKE_TAIL_FRAMES = 8
+
     }
 }

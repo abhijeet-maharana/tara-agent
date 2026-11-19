@@ -1,3 +1,4 @@
+import { appendFileSync } from 'node:fs';
 import WebSocket from 'ws';
 import { findJob, findTask, type PhoneVoice, type VoiceJob, type VoiceReply } from '../http/phone-voice.js';
 import type { ActivityEvent, Task } from '../runner/activity.js';
@@ -158,6 +159,9 @@ export interface PhoneLiveConfig {
   googleSearch?: boolean;
   /** Ignore speech not meant for it (default on). */
   proactiveAudio?: boolean;
+  /** Gemini's voice activity detection; see the config schema. */
+  startSensitivity?: 'low' | 'high';
+  endSensitivity?: 'low' | 'high';
 }
 
 export interface PhoneLiveDeps {
@@ -170,6 +174,10 @@ export interface PhoneLiveDeps {
   stopTask(id: string): boolean;
   subscribe?(listener: (e: ActivityEvent) => void): () => void;
   kit?: LiveToolKit;
+  /** The room speaker: paused while the user talks to Jarvis (it drowns their voice), resumed after. */
+  music?: {
+    control(action: 'pause' | 'resume' | 'status'): Promise<{ state?: string }>;
+  };
   log: { info(msg: string): void; warn(msg: string): void };
   now?: () => number;
   connect?: (o: LiveConnectOptions) => Promise<GeminiLive>;
@@ -319,7 +327,7 @@ ${language ? `\nLanguage and accent: ${language}\n` : ''}
 - Actions (job, stop, and any tool that says it acts): only when the user clearly said what to do. If you didn't hear the verb (run, pause, resume, stop) or the target, ask; never assume "run". The server checks the phone is unlocked and returns a question: ask exactly that, wait for the answer, then call confirm with it. Never call confirm for the user.
 - Approval cards are never decided by voice: point to the Approvals page or Slack.
 - A message starting with "${RESULT}" or "${TASK_DONE}" is work that finished: tell the user the gist in one or two sentences.
-- Answer in the language of the user's last words: English to English, Hindi or Hinglish to casual Hinglish (Latin script). Results and tool answers are in English; that doesn't change the user's language.
+- Answer in the language of the user's last words: Hindi to Hindi, English to English, Hinglish to Hinglish. Switch whenever they switch. Results and tool answers come in English: say them in the user's language.
 - No small talk beyond one friendly line. When the user is done (bye, thanks, that's all), call end_conversation.${extra ? `\n${extra}` : ''}`;
 }
 
@@ -357,6 +365,8 @@ export class PhoneLive {
   private turnTimer?: NodeJS.Timeout;
   /** When a finished result was handed to the model, to log how soon it was spoken. */
   private resultSentAt?: number;
+  /** The speaker's music was paused for this conversation (resumed when it closes). */
+  private ducked = false;
   /** Close once the current answer is said (after music starts). */
   private closeAfterTurn = false;
   private stats = { opened: 0, micBytes: 0, speechBytes: 0, tools: 0, tokens: emptyUsage() };
@@ -418,6 +428,8 @@ export class PhoneLive {
 
   private audio(pcm: Buffer): void {
     if (!this.talking) return;
+    // Debugging: TARA_LIVE_DUMP=<file> appends what the phone sends (16 kHz 16-bit mono PCM).
+    if (process.env.TARA_LIVE_DUMP) appendFileSync(process.env.TARA_LIVE_DUMP, pcm);
     if (this.upstream) {
       this.stats.micBytes += pcm.length;
       this.upstream.sendAudio(pcm);
@@ -454,6 +466,8 @@ export class PhoneLive {
           googleSearch: this.cfg.googleSearch,
           silenceMs: this.cfg.silenceMs,
           proactiveAudio: this.cfg.proactiveAudio ?? true,
+          startSensitivity: this.cfg.startSensitivity,
+          endSensitivity: this.cfg.endSensitivity,
         },
         events: {
           onAudio: (pcm) => {
@@ -525,6 +539,7 @@ export class PhoneLive {
       for (const pcm of this.early.splice(0)) up.sendAudio(pcm);
       this.earlyBytes = 0;
       this.setState(this.talking ? 'listening' : 'thinking');
+      if (this.talking) void this.duck();
       this.armIdle();
       return up;
     } catch (err) {
@@ -539,7 +554,28 @@ export class PhoneLive {
     }
   }
 
+  /** Pauses the speaker's music for the conversation, when it plays. */
+  private async duck(): Promise<void> {
+    const music = this.deps.music;
+    if (!music) return;
+    try {
+      const { state } = await music.control('status');
+      if (String(state).toUpperCase() !== 'PLAYING' || !this.upstream) return;
+      await music.control('pause');
+      this.ducked = true;
+      this.deps.log.info('phone live: music paused for the conversation');
+    } catch (err) {
+      this.deps.log.warn(`phone live: couldn't pause the music: ${(err as Error).message}`);
+    }
+  }
+
   private upstreamClosed(reason?: string): void {
+    if (this.ducked) {
+      this.ducked = false;
+      void this.deps.music
+        ?.control('resume')
+        .catch((err: Error) => this.deps.log.warn(`phone live: couldn't resume the music: ${err.message}`));
+    }
     this.endTurn();
     this.upstream = undefined;
     this.modelTalking = false;
@@ -677,6 +713,8 @@ export class PhoneLive {
       ...(r.panel && { card: { kind: 'list', title: title ?? r.panel.title, lines: r.panel.lines } }),
     });
     if (GATED.has(call.name) || this.deps.kit?.gated?.includes(call.name)) return this.gate(call);
+    // The user handles the music themselves: it isn't resumed behind their back.
+    if (call.name === 'play_music' || call.name === 'music') this.ducked = false;
     switch (call.name) {
       case 'running':
         return reply(v.running());

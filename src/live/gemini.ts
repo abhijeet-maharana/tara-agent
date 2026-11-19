@@ -41,6 +41,9 @@ export interface LiveSetup {
   silenceMs?: number;
   /** Lets the model stay silent for speech not meant for it (a TV, other people, music). */
   proactiveAudio?: boolean;
+  /** Voice activity detection: how readily speech starts and ends a turn (Google's defaults unset). */
+  startSensitivity?: 'low' | 'high';
+  endSensitivity?: 'low' | 'high';
 }
 
 /** Where a grounded answer came from: the searches run and the pages used. */
@@ -97,8 +100,18 @@ export function setupMessage(setup: LiveSetup, handle?: string): Record<string, 
         ...(setup.tools.length ? [{ functionDeclarations: setup.tools }] : []),
         ...(setup.googleSearch ? [{ googleSearch: {} }] : []),
       ],
-      ...(setup.silenceMs && {
-        realtimeInputConfig: { automaticActivityDetection: { silenceDurationMs: setup.silenceMs } },
+      ...((setup.silenceMs || setup.startSensitivity || setup.endSensitivity) && {
+        realtimeInputConfig: {
+          automaticActivityDetection: {
+            ...(setup.silenceMs && { silenceDurationMs: setup.silenceMs }),
+            ...(setup.startSensitivity && {
+              startOfSpeechSensitivity: `START_SENSITIVITY_${setup.startSensitivity.toUpperCase()}`,
+            }),
+            ...(setup.endSensitivity && {
+              endOfSpeechSensitivity: `END_SENSITIVITY_${setup.endSensitivity.toUpperCase()}`,
+            }),
+          },
+        },
       }),
       ...(setup.proactiveAudio && { proactivity: { proactiveAudio: true } }),
       inputAudioTranscription: {},

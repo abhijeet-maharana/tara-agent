@@ -1,5 +1,14 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { createReadStream, readFileSync, unwatchFile, watchFile } from 'node:fs';
+import {
+  createReadStream,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  unwatchFile,
+  watchFile,
+  writeFileSync,
+} from 'node:fs';
 import {
   createServer,
   request as httpRequest,
@@ -148,7 +157,22 @@ export interface HttpOptions {
    * Voice v2 (live/phone-live.ts): Gemini Live over `/phone/live` (a WebSocket, device key), with
    * extra tools (the Claude lanes, music). Unset: the phone keeps Phase 4's `/phone/voice`.
    */
-  phoneLive?: { config: PhoneLiveConfig; kit?: LiveToolKit };
+  phoneLive?: {
+    config: PhoneLiveConfig;
+    kit?: LiveToolKit;
+    /**
+     * The wake word's own data: the owner's recorded samples (`samples/<label>/*.wav`) and the model
+     * trained on them (`personal.json`), which the shell loads. Kept in the state folder, never the repo.
+     */
+    wakeDir?: string;
+    /** The Cast speaker's music, for the phone's ⏸ / ⏹ (no voice needed). */
+    music?: {
+      control(
+        action: 'pause' | 'resume' | 'stop' | 'volume' | 'status',
+        level?: number,
+      ): Promise<{ playing?: string; state?: string; volume?: number }>;
+    };
+  };
   /** The Health page (`/health` in a browser) and `GET /health/checks`, `POST /health/check`. */
   health?: Pick<HealthMonitor, 'snapshot' | 'check' | 'history' | 'label'>;
   /** The Health page's Trends and Logs views, and `GET /metrics` (Prometheus text). */
@@ -1731,6 +1755,58 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         sendJson(res, 200, reply);
         return true;
       }
+      if (method === 'POST' && p === '/phone/wake-sample') {
+        // A recording for training the wake word (the shell, device key): 16 kHz 16-bit mono PCM.
+        const dir = options.phoneLive?.wakeDir;
+        if (!device) throw new PhoneError(401, 'Missing or wrong key');
+        if (!dir) throw new PhoneError(404, 'Wake word training is off');
+        // Up to 20 s of 16 kHz 16-bit audio, base64: ~850 KB.
+        const body = await readJson(req, 1_200_000);
+        const label = String(body.label ?? '');
+        const where = String(body.where ?? '');
+        if (!['wake', 'other'].includes(label) || !/^[a-z]{1,12}$/.test(where))
+          throw new PhoneError(400, 'label must be wake or other; where a short word');
+        const pcm = Buffer.from(String(body.pcm ?? ''), 'base64');
+        if (pcm.length < 3_200 || pcm.length > 16_000 * 2 * 20)
+          throw new PhoneError(400, 'pcm must be 0.1–20 s');
+        sendJson(res, 200, saveWakeSample(dir, label, where, pcm, now()));
+        return true;
+      }
+      if (method === 'GET' && p === '/phone/wake-samples') {
+        // How many recordings there are, so the teach screen resumes where it left off (page or shell).
+        if (!device && !phoneOf(req) && !tokenHolder(req)) throw new PhoneError(401, 'Signed out');
+        const dir = options.phoneLive?.wakeDir;
+        sendJson(res, 200, { counts: dir ? wakeSampleCounts(dir) : {} });
+        return true;
+      }
+      if (method === 'GET' && p === '/phone/wake-model') {
+        if (!device) throw new PhoneError(401, 'Missing or wrong key');
+        const file = options.phoneLive?.wakeDir && path.join(options.phoneLive.wakeDir, 'personal.json');
+        if (!file || !existsSync(file)) throw new PhoneError(404, 'No wake word model trained yet');
+        res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        createReadStream(file).pipe(res);
+        return true;
+      }
+      if ((method === 'POST' || method === 'GET') && p === '/phone/music') {
+        // The speaker's music by tap: harmless, so the page's own session may do it too.
+        if (!device && !phoneOf(req) && !tokenHolder(req)) throw new PhoneError(401, 'Signed out');
+        const music = options.phoneLive?.music;
+        if (!music) throw new PhoneError(404, 'No music speaker');
+        const body = method === 'POST' ? await readJson(req, 1_000) : {};
+        const action = method === 'GET' ? 'status' : String(body.action ?? '');
+        if (!['pause', 'resume', 'stop', 'volume', 'status'].includes(action))
+          throw new PhoneError(400, 'action must be pause, resume, stop, volume or status');
+        const level = Number(body.volume);
+        sendJson(
+          res,
+          200,
+          await music.control(
+            action as 'pause' | 'resume' | 'stop' | 'volume' | 'status',
+            Number.isFinite(level) ? Math.max(0, Math.min(100, level)) / 100 : undefined,
+          ),
+        );
+        return true;
+      }
       if (method === 'POST' && p === '/phone/quiet') {
         // Harmless (it only holds alerts), so the page's own session may set it too.
         if (!device && !phoneOf(req) && !tokenHolder(req)) throw new PhoneError(401, 'Signed out');
@@ -2045,6 +2121,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         stopTask: (id) => options.activity?.stop(id) ?? false,
         subscribe: options.activity?.subscribe?.bind(options.activity),
         kit: live.kit,
+        music: live.music,
         log: options.log,
         now,
       });
@@ -2099,4 +2176,44 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     return close(callback);
   };
   return server;
+}
+
+/** Saves one wake word recording as a WAV file; returns how many there are per label and place. */
+export function saveWakeSample(
+  dir: string,
+  label: string,
+  where: string,
+  pcm: Buffer,
+  at: number,
+): { counts: Record<string, number> } {
+  const folder = path.join(dir, 'samples', label);
+  mkdirSync(folder, { recursive: true });
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write('WAVEfmt ', 8);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(16_000, 24);
+  header.writeUInt32LE(32_000, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(pcm.length, 40);
+  writeFileSync(path.join(folder, `${where}-${at}.wav`), Buffer.concat([header, pcm]));
+  return { counts: wakeSampleCounts(dir) };
+}
+
+/** Recordings per label and place, e.g. {"wake-near": 8, "other-room": 1}. */
+export function wakeSampleCounts(dir: string): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const l of ['wake', 'other']) {
+    const f = path.join(dir, 'samples', l);
+    for (const name of existsSync(f) ? readdirSync(f) : []) {
+      const key = `${l}-${name.split('-')[0]}`;
+      counts[key] = (counts[key] ?? 0) + 1;
+    }
+  }
+  return counts;
 }

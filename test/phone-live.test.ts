@@ -286,6 +286,35 @@ describe('PhoneLive', () => {
   });
 });
 
+describe('music during a conversation', () => {
+  it('pauses the speaker while the user talks and resumes it after', async () => {
+    const control = vi.fn(async (a: string) => (a === 'status' ? { state: 'PLAYING' } : {}));
+    const { client, gemini } = setup({ music: { control } });
+    client.say({ type: 'start' });
+    await tick();
+    await tick();
+    expect(control).toHaveBeenCalledWith('pause');
+    gemini.ev().onClose();
+    expect(control).toHaveBeenLastCalledWith('resume');
+  });
+
+  it("doesn't resume music the user handled in the conversation", async () => {
+    const control = vi.fn(async (a: string) => (a === 'status' ? { state: 'PLAYING' } : {}));
+    const kit = {
+      declarations: [{ name: 'music', description: '' }],
+      run: async () => ({ response: { state: 'stopped' } }),
+    };
+    const { client, gemini } = setup({ music: { control }, kit });
+    client.say({ type: 'start' });
+    await tick();
+    await tick();
+    gemini.ev().onToolCalls([{ id: 'c1', name: 'music', args: { action: 'stop' } }]);
+    await tick();
+    gemini.ev().onClose();
+    expect(control).not.toHaveBeenCalledWith('resume');
+  });
+});
+
 describe('helpers', () => {
   it('names the lane of a turn', () => {
     expect(laneOf([])).toBe('chat');
