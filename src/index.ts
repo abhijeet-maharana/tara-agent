@@ -38,6 +38,7 @@ import { type Logger, SessionManager } from './sessions/manager.js';
 import { Threads } from './sessions/threads.js';
 import { createSlackGateway } from './slack/app.js';
 import { Store } from './store/store.js';
+import { deliveryOf, isWebChannel, RoutedChat, WebChat, webChannel, webProject } from './web/chat.js';
 
 /** Where warnings and errors are also kept (the Health page's Logs view), once the store is open. */
 let logSink: ((level: 'warn' | 'error', message: string) => void) | undefined;
@@ -127,10 +128,20 @@ async function serve(configFlag: string | undefined) {
   logSink = (level, message) => store.addLog({ at: Date.now(), level, message: redact(message) });
   const runAs = host.claude.runAs ? resolveRunAs(host.claude.runAs) : undefined;
   if (runAs) log.info(`Claude runs as ${runAs.user} (${runAs.home})`);
+  // The dashboard as you open it: host `dashboardUrl`, else this machine's name and port (e.g.
+  // http://jarvis:4000, which Tailscale's MagicDNS resolves on every device of the tailnet).
+  const dashboardUrl = (
+    host.dashboardUrl ?? (host.http.enabled ? `http://${hostname()}:${host.http.port}` : '')
+  ).replace(/\/$/, '');
+  // A thread's link: a dashboard thread's page, or the Slack thread.
   const threadUrl = (channel: string, ts: string) => {
+    if (isWebChannel(channel)) return dashboardUrl ? `${dashboardUrl}/t/${channel}/${ts}` : undefined;
     const base = slack.workspaceUrl();
     return base && `${base}archives/${channel}/p${ts.replace('.', '')}`;
   };
+  /** Where a project's unattended runs happen: its dashboard channel (`delivery: summary`) or Slack. */
+  const runChannel = (p: (typeof projects)[number]) =>
+    deliveryOf(host, p) === 'summary' ? webChannel(p.config.name) : p.config.slackChannel;
   // Every labelled run, live, for a running session's page (its steps and Stop).
   const activity = new Activity({ threadUrl });
   // Each run goes through the CLI it names (`harness`): Claude Code, or agy for agy jobs.
@@ -160,6 +171,16 @@ async function serve(configFlag: string | undefined) {
     streaming: host.streaming,
     voice: host.voice && { ...host.voice, apiKey: process.env.TARA_VOICE_API_KEY || undefined },
   });
+  // Everything posts through this: Slack channels to Slack, dashboard threads (`web-<project>`) to the
+  // dashboard, with cards copied to Slack (src/web/chat.ts).
+  const web = new WebChat(store, host.stateDir as string);
+  const chat = new RoutedChat(slack.chat, web, {
+    store,
+    log,
+    slackChannelFor: (channel) =>
+      projects.find((p) => p.config.name === webProject(channel))?.config.slackChannel,
+    link: threadUrl,
+  });
   // Root actions: the helper's allowlist is the source of truth; without it runs can only ask a person.
   const privileged = host.privileged ? new Privileged(host.privileged.command) : undefined;
   await privileged
@@ -168,7 +189,8 @@ async function serve(configFlag: string | undefined) {
     .catch((err: Error) => log.warn(`Root actions are unavailable: ${err.message}`));
   const approvals = new Approvals({
     store,
-    chat: slack.chat,
+    chat,
+    runChannel,
     log,
     projects,
     timeZone: host.timezone,
@@ -201,7 +223,7 @@ async function serve(configFlag: string | undefined) {
   if (host.http.enabled) {
     bridge = new Bridge({
       apiUrl: `http://${host.http.bind === '0.0.0.0' ? '127.0.0.1' : host.http.bind}:${host.http.port}`,
-      chat: slack.chat,
+      chat,
       store,
       approvals,
       privileged,
@@ -221,7 +243,7 @@ async function serve(configFlag: string | undefined) {
     projects,
     host,
     store,
-    chat: slack.chat,
+    chat,
     run,
     bridge,
     threads,
@@ -232,16 +254,18 @@ async function serve(configFlag: string | undefined) {
     projects,
     host,
     store,
-    chat: slack.chat,
+    chat,
     run,
     jobs: scheduler,
     threads,
     bridge,
     log,
+    threadUrl,
   });
   const reminders = new Reminders({
     store,
-    chat: slack.chat,
+    chat,
+    runChannel,
     projects,
     timeZone: host.timezone,
     log,
@@ -265,17 +289,25 @@ async function serve(configFlag: string | undefined) {
     onFinished: (item) => approvals.finished(item),
   });
   /**
-   * A new "Run <what>" thread in the project's channel, as if its owner had asked there; returns its
-   * link. The title is the thread's first reply.
+   * A new "Run <what>" thread, as if the project's owner had asked: on the dashboard with the answer
+   * posted in Slack (`delivery: summary`), or in the project's channel. Returns its link. The title is
+   * the thread's first reply.
    */
   const startThread = async (name: string | undefined, what: string, title: string, prompt: string) => {
     const project = projects.find((p) => p.config.name === name);
     if (!project) throw new Error(`No project "${name}" to ask in`);
-    const channel = project.config.slackChannel;
-    const ts = await openRunThread(slack.chat, channel, what, project.config.words);
-    await slack.chat.post(channel, ts, title);
+    const channel = runChannel(project);
+    const ts = await openRunThread(chat, channel, what, project.config.words);
+    await chat.post(channel, ts, title);
     const user = project.config.owner ?? project.config.allowedUsers[0] ?? 'dashboard';
-    void (manager as SessionManager).handle({ channel, threadTs: ts, ts, user, text: prompt });
+    void (manager as SessionManager).handle({
+      channel,
+      threadTs: ts,
+      ts,
+      user,
+      text: prompt,
+      summary: `*${title.slice(0, 120)}*`,
+    });
     return { url: threadUrl(channel, ts), thread: { channel, ts } };
   };
   const readers = codeReaders(host, projects);
@@ -403,6 +435,7 @@ async function serve(configFlag: string | undefined) {
         adminToken: process.env.TARA_ADMIN_TOKEN || undefined,
         readAs: runAs?.user,
         continueThread: (msg) => (manager as SessionManager).handle(msg),
+        web,
         attention,
         activity,
         health,
@@ -538,7 +571,9 @@ async function serve(configFlag: string | undefined) {
   // Run history and slot claims older than `retentionDays`, once at start and then daily.
   const prune = () => {
     try {
-      const { runs, claims, sessions } = store.prune(Date.now() - host.retentionDays * 86_400_000);
+      const before = Date.now() - host.retentionDays * 86_400_000;
+      const { runs, claims, sessions } = store.prune(before);
+      web.sweep(before);
       if (runs || claims || sessions)
         log.info(
           `Deleted ${runs} runs, ${claims} slot claims and ${sessions} sessions older than ${host.retentionDays} days`,

@@ -31,6 +31,8 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `streaming` | `true` | Stream replies as a live task card and text. Needs the Slack app's "Agents & AI Apps" feature and the `assistant:write` scope; without them, tara-agent falls back to one edited status message |
 | `browsers` | `[{lock: chrome, cdpUrl: http://127.0.0.1:9222, closeTabs: true, staleMinutes: 30}]` | The shared Chromes runs drive (e.g. one per signed-in identity: its own `--user-data-dir` and `--remote-debugging-port`). `lock` is its name on the Browsers page. Runs share a browser without locks ([shared browsers](#shared-browsers)); with `closeTabs`, tara closes stale tabs every 5 minutes: open over `staleMinutes` and since before every conversation still going in that browser began (a job run, or a chat thread: going while a turn runs and for `staleMinutes` after its last turn), never a kept tab (project `keepTabsUrl`) or the last tab. Point the project's Chrome MCP server (`--browserUrl`) at the same `cdpUrl` |
 | `voice` | unset | Speech-to-text for Slack voice notes that Slack didn't transcribe (it skips short clips and some languages): `url` (an OpenAI-compatible chat completions endpoint whose models take `input_audio`, e.g. Gemini) and `models` (tried in order). Key from `TARA_VOICE_API_KEY`. Unset = Slack's transcript only, and voice notes without one get a "please type it" reply |
+| `delivery` | `summary` | Where runs nobody started from Slack happen (scheduled, catch-up, Run now, queues, decisions, scheduled tasks, voice and Code-page requests). `summary`: on the dashboard (see [Dashboard runs](#dashboard-runs)), with one result message in Slack. `thread`: a `Run <name>` thread in Slack with every step. Projects and jobs override it with their own `delivery` |
+| `dashboardUrl` | `http://<host name>:<http.port>` | The dashboard's address as you open it, for the "Open the run" links in Slack summaries and card copies. The default (e.g. `http://jarvis:4000`) works over Tailscale MagicDNS; set it when you open the dashboard by another name |
 | `statusIntervalSeconds` | `5` | Min gap between status edits in the fallback mode |
 | `catchUpHours` | `6` | After downtime, run a job's latest missed slot if it is at most this old (`0` = never) |
 | `timezone` | host's | Default timezone for job schedules and times shown in Slack |
@@ -55,6 +57,7 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `permissionMode` | `default` | `default`, `acceptEdits`, `plan` or `bypassPermissions` |
 | `allowedTools` | `[]` | Tools allowed without asking, in `--allowedTools` syntax |
 | `allowedUsers` | `[]` (everyone in the channel) | Slack user IDs allowed to talk to the bot |
+| `delivery` | host `delivery` | `summary` or `thread` for this project's runs |
 | `chatModel` | `sonnet` | Model for new threads |
 | `systemPromptFile` | none | Extra instructions added to every session |
 | `owner` | none | Slack user ID that receives live progress of jobs started from the API or dashboard |
@@ -109,7 +112,8 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `timeoutMinutes` | `30` | Time limit for the run, and for any one command it runs (Claude's Bash timeout is set to it) |
 | `catchUp` | `true` | Run the latest missed slot after downtime |
 | `selfImprove` | project's | Overrides the project's `selfImprove` for this job, e.g. `"trouble"` for a monitor that runs every few minutes |
-| `channel` | project channel | Where the job posts |
+| `channel` | project channel | Where the job posts (its thread, or its summary) |
+| `delivery` | project `delivery` | `thread`: this job's whole run in a Slack thread; `summary`: on the dashboard, its result in Slack |
 | `env` | `{}` | Extra environment for Claude and the scripts it runs (`~/` expanded), merged over the file-level `env` |
 | `durationMinutes` | none | Typical run time: the Jobs Timeline plans with it (change it on the job's card in Jobs → List) |
 | `enabled` | `true` | `false` keeps the job listed but never scheduled |
@@ -136,6 +140,8 @@ Check yesterday's late orders in that output and summarise them. On STATUS: FAIL
 
 ### How a run goes
 
+> With `delivery: summary` (the default) the next paragraphs describe what happens **on the dashboard** instead of in Slack; see [Dashboard runs](#dashboard-runs). They apply as written to `delivery: thread` and to runs started from Slack.
+
 **A project channel holds only `Run <name>` messages.** Every run starts with one at the top level, and everything else (status, the answer, cards, notes, learning notes) goes in its thread. `Run` messages are never edited. The name is always in title case: a kebab-case id is never shown raw (`code-question` → `Run Code Question`; two jobs sharing a name → their ids, e.g. `Run Pnl 2`). Things that aren't job runs follow the same rule: a Code-page question opens a `Run Code Question` thread. An invalid jobs file posts nothing in Slack: it is in the logs and on the dashboard. A trigger that can't run (the job is paused or already running) says so inside its own thread and gets a ⏸ / 🔁 reaction. A card a project server raises **for a run** (the run called the server) goes in that run's thread too: the server passes the run's `TARA_THREAD` as `thread` to `POST /items` or `POST /items/ask`. Cards a project server raises on its own (drafts, `POST /items/ask` questions and notices, no `thread`) are not runs: they wait on the Approvals page only, with nothing posted in Slack. Once Jarvis has to act on one (a decision on a question, a revise, a note from the page), a `Run <Kind>` thread opens for it (e.g. `Run Decision`, `Run Replies`) with the card's title as its first reply; its outcome follows there. A chat started in a thread of cards is told which cards it holds.
 
 1. **Trigger message.** At cron time a `Run <job name>` message is posted (the skill's words capitalised, e.g. `Run Google Analytics`) in the project channel, as the `SLACK_USER_TOKEN` person if set (else, or when that person isn't in the channel, as the bot). The bot picks it up and runs the job in its thread; if Slack doesn't deliver it within 2 minutes, the scheduler starts it there itself.
@@ -149,6 +155,18 @@ Other rules:
 
 - **Every slot runs at most once**, even across restarts. A job added while tara-agent was down doesn't run for past slots.
 - **Watching live:** every run streams its steps and text into its Slack thread (the status line, its first reply, keeps the current step and, at the end, the headline). A run you start with `run <job name>` streams in your message's thread; scheduled, queue and dashboard/API runs stream in their `Run <job name>` thread, addressed to the project `owner` (Slack's streaming needs a recipient; without `owner` they post the status line and Claude's whole reply at the end). A run with no thread of its own (a queue, Run now) opens its `Run <job name>` thread. A run that replies nothing keeps its thread, with the steps it took, its session, a `🔇 … · nothing to report` status line and a line saying Claude wrote no reply.
+
+### Dashboard runs
+
+With `delivery: summary`, a run nobody started from Slack happens in a **dashboard thread** (`web-<project>`) instead of a `Run <name>` Slack thread. Nothing is posted in Slack while it runs.
+
+1. **Start.** A scheduled slot starts the run straight away (no trigger message). Run now, `run_job`, queues, decisions on cards, scheduled tasks and voice or Code-page requests open a dashboard thread too.
+2. **Watch.** The run's session page (Sessions, or the home page's running job) shows its steps and text live, then the whole transcript, the files it sent, and a **Reply** box (an unlocked browser) that continues the session.
+3. **Result in Slack.** When it ends, one top-level message: the reply's headline (the part before `---`; a table there is drawn as one), then the run's name, time and an **Open the run ↗** link (`dashboardUrl`). Files it sent are attached in that message's thread. A run with nothing to report (🔇) or one you stopped posts nothing; a failure, timeout or usage limit posts one line.
+4. **Cards.** A card with buttons (an approval, a permission prompt) is also copied to the channel as its own message, so it still notifies you; a tap there or on the Approvals page decides it, and the copy shows the decision.
+5. **Replies.** A reply in the thread of a summary or a card copy goes to the run's session: Jarvis answers in that Slack thread, with the run's whole context.
+
+A run asked for in a Slack thread (`run <job name>` there, a `slack` queue's cards) stays in that thread, as before.
 
 ### agy jobs
 
@@ -234,7 +252,7 @@ Each session gets its own folders, passed as environment variables and as absolu
 | Variable | What | Lifetime |
 |---|---|---|
 | `TARA_SCRATCH` | This session's scratch folder: helper scripts, downloads, temp files | Deleted `scratchDays` after its last use. An active chat thread keeps its folder |
-| `TARA_THREAD` | This run's or chat's Slack thread, `<channel>:<ts>` | Pass it to your project server, which sends it as `thread` to `POST /items` or `POST /items/ask`: the card then lands in this thread, not only on the Approvals page |
+| `TARA_THREAD` | This run's or chat's thread, `<channel>:<ts>` (a Slack thread, or a dashboard thread `web-<project>:<ts>`) | Pass it to your project server, which sends it as `thread` to `POST /items` or `POST /items/ask`: the card then lands in this thread, not only on the Approvals page |
 | `TARA_JOB_DATA` | The job's data folder: what the job needs on its next run. Scripts the run starts get it too | Never deleted |
 
 - A scratch folder is only made when Claude runs, so skipped runs leave nothing behind.

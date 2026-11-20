@@ -355,10 +355,11 @@ function runStrip(runs: StoredRun[], timeZone: string): string {
   return `<span class="strip" aria-label="${ok} of ${runs.length} recent runs OK">${cells}</span>`;
 }
 
-function threadLink(ctx: DashboardContext, threadKey: string): string {
+/** A Slack thread's link; a dashboard thread (`web-…`) has none (it is this page). */
+function threadLink(ctx: DashboardContext, threadKey: string, label = 'Slack thread ↗'): string {
   const [channel, ts] = threadKey.split(':');
-  if (!ctx.slackUrl || !channel || !ts) return '';
-  return `<a href="${esc(ctx.slackUrl)}archives/${esc(channel)}/p${esc(ts.replace('.', ''))}">Slack thread ↗</a>`;
+  if (!ctx.slackUrl || !channel || !ts || channel.startsWith('web-')) return '';
+  return `<a href="${esc(ctx.slackUrl)}archives/${esc(channel)}/p${esc(ts.replace('.', ''))}">${esc(label)}</a>`;
 }
 
 /** The first prompt of a session, read from the start of its transcript only (they can be large). */
@@ -506,7 +507,7 @@ const post = async (url, body) => {
 };
 const reload = () => setTimeout(() => location.reload(), 900);
 const TEXT = {
-  run: ['Run "%" now?', 'It starts within a few seconds and posts in the project\\'s Slack channel.', 'Run now'],
+  run: ['Run "%" now?', 'It starts within a few seconds. Follow it under Sessions; its result is posted in Slack.', 'Run now'],
   pause: ['Pause "%"?', 'It stops running on its schedule until you resume it.', 'Pause'],
   resume: ['Resume "%"?', 'It runs on its schedule again.', 'Resume'],
 };
@@ -1379,6 +1380,12 @@ export function sessionPage(
     running?: boolean;
     /** This browser may stop the run (unlocked, from another device). */
     canStop?: boolean;
+    /** This browser may write in the session (unlocked, from another device); undefined: no box. */
+    canSay?: boolean;
+    /** Files the run sent (`send_file`), for download links. */
+    files?: Array<{ id: number; name: string; comment?: string }>;
+    /** The Slack summary of a dashboard run (`<channel>:<ts>`), for a link to it. */
+    slackSummary?: string;
   } = {},
 ): string {
   const { run, running } = opts;
@@ -1391,7 +1398,9 @@ export function sessionPage(
     ? `<div class="meta">${projectTag(ctx, project)}${status}${
         session
           ? `<span>${esc(session.model)}</span>
-<span>${session.turns} ${session.turns === 1 ? 'turn' : 'turns'}</span>${threadLink(ctx, session.threadKey)}`
+<span>${session.turns} ${session.turns === 1 ? 'turn' : 'turns'}</span>${threadLink(ctx, session.threadKey)}${
+              opts.slackSummary ? threadLink(ctx, opts.slackSummary, 'Slack summary ↗') : ''
+            }`
           : ''
       }${
         run && !running ? `<a href="/runs/${run.id}">Run details</a>` : ''
@@ -1414,10 +1423,50 @@ export function sessionPage(
           : '<div class="actions"><a class="btn quiet" href="/unlock" title="Unlock this browser to stop runs from here">Unlock to stop</a></div>'
       }</div><ol class="steps" id="live-steps"></ol><pre class="live-text" id="live-text" hidden></pre></section>`
     : '';
-  return layout(ctx, title, 'Sessions', `${pageHead(title)}${head}${error}${live}${body}`, {
-    script: running ? LIVE_SCRIPT : undefined,
+  const files = opts.files?.length
+    ? `<article class="card spaced"><div class="title">Files</div><ul class="md">${opts.files
+        .map(
+          (f) =>
+            `<li><a href="/web-files/${f.id}" download>${esc(f.name)}</a>${f.comment && f.comment !== f.name ? ` <span class="dim">${esc(f.comment)}</span>` : ''}</li>`,
+        )
+        .join('')}</ul></article>`
+    : '';
+  // Write in the session: the next turn reads it (after the running one, if any) and answers here.
+  const say =
+    opts.canSay === undefined
+      ? ''
+      : opts.canSay
+        ? `<form class="card spaced say" id="say" data-session="${esc(sessionId)}"><label class="title" for="say-text">Reply</label>
+<textarea class="input" id="say-text" name="text" rows="3" placeholder="${running ? 'Read when the current turn ends. Type stop to stop it.' : 'Continue this conversation…'}" required></textarea>
+<div class="actions"><button type="submit" class="btn">Send</button></div></form>`
+        : '<div class="empty"><a href="/unlock">Unlock this browser</a> to reply in this session.</div>';
+  return layout(ctx, title, 'Sessions', `${pageHead(title)}${head}${error}${live}${body}${files}${say}`, {
+    script: [running ? LIVE_SCRIPT : '', opts.canSay ? SAY_SCRIPT : ''].join('') || undefined,
   });
 }
+
+/** The session page's reply box: posts `/sessions/<id>/say`, then reloads to show the turn running. */
+const SAY_SCRIPT = `
+(() => {
+  const form = document.getElementById('say');
+  if (!form) return;
+  const box = form.querySelector('textarea');
+  box.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) form.requestSubmit(); });
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const text = box.value.trim();
+    if (!text) return;
+    const button = form.querySelector('button');
+    button.disabled = true;
+    try {
+      await post('/sessions/' + encodeURIComponent(form.dataset.session) + '/say', { text });
+      box.value = '';
+      toast('Sent');
+      setTimeout(() => location.reload(), 1500);
+    } catch (err) { toast(err.message, { error: true }); button.disabled = false; }
+  });
+})();
+`;
 
 /** The running session's live card: polls `/sessions/<id>/live`, Stop posts `/sessions/<id>/stop`. */
 const LIVE_SCRIPT = `
@@ -1462,7 +1511,7 @@ const LIVE_SCRIPT = `
   poll();
   const stop = $('live-stop');
   stop?.addEventListener('click', async () => {
-    if (!(await ask('Stop this run?', 'The work so far stays, and its Slack thread says it stopped.', 'Stop', true))) return;
+    if (!(await ask('Stop this run?', 'The work so far stays, and its thread says it stopped.', 'Stop', true))) return;
     stop.disabled = true;
     try { await post(url + '/stop'); toast('Stopping…'); }
     catch (err) { toast(err.message, { error: true }); stop.disabled = false; }

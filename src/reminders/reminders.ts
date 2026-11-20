@@ -60,6 +60,11 @@ export interface RemindersDeps {
   startRun?: (msg: IncomingMessage) => Promise<void>;
   /** A task this late is skipped instead of run (host `catchUpHours`; default 6 h). */
   catchUpMs?: number;
+  /**
+   * The channel a project's task runs in: a dashboard thread's (host `delivery: summary`, with the
+   * result posted in Slack) or its Slack channel (unset).
+   */
+  runChannel?: (project: Project) => string;
 }
 
 export class Reminders {
@@ -183,13 +188,16 @@ export class Reminders {
     const project = this.deps.projects.find((p) => p.config.name === r.project);
     if (!project) return;
     const { chat } = this.deps;
-    const channel = project.config.slackChannel;
     const lateMs = now - due;
-    const ts = await openRunThread(chat, channel, r.title ?? 'Scheduled Task', project.config.words);
+    const skip = lateMs > (this.deps.catchUpMs ?? 6 * 3_600_000) || !this.deps.startRun;
+    // A skipped task needs a person, so it is said in Slack; a run may happen on the dashboard.
+    const channel = (!skip && this.deps.runChannel?.(project)) || project.config.slackChannel;
+    const name = r.title ?? 'Scheduled Task';
+    const ts = await openRunThread(chat, channel, name, project.config.words);
     const by = r.createdBy && SLACK_USER.test(r.createdBy) ? r.createdBy : undefined;
     const setBy = by ? `<@${by}>` : (r.createdBy ?? 'Claude');
     const header = `📝 Scheduled task, set by ${setBy} ${this.clock(r.createdAt)} for ${this.clock(due)}`;
-    if (lateMs > (this.deps.catchUpMs ?? 6 * 3_600_000) || !this.deps.startRun) {
+    if (skip || !this.deps.startRun) {
       await chat.post(channel, ts, `${header}:\n${r.text}`);
       await chat.post(
         channel,
@@ -208,6 +216,7 @@ export class Reminders {
         threadTs: ts,
         ts: noteTs,
         user,
+        summary: `*${name}*`,
         text: `Scheduled task (set ${this.clock(r.createdAt)} for ${this.clock(due)}, now due). Do what this note says:\n\n${r.text}`,
       })
       .catch((err: Error) => this.deps.log.warn(`Task ${r.id}: ${err.message}`));

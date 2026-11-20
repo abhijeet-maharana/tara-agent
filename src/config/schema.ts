@@ -184,6 +184,19 @@ export const hostConfigSchema = z.object({
       message: 'each browser needs its own lock',
     })
     .default([{ lock: 'chrome', cdpUrl: 'http://127.0.0.1:9222', closeTabs: true, staleMinutes: 30 }]),
+  /**
+   * Where runs that nobody started from Slack happen (scheduled jobs, catch-ups, Run now, queues,
+   * decisions, scheduled tasks, voice requests). `summary`: on the dashboard (live steps, the whole
+   * conversation, a box to reply), with one summary message in Slack when the run ends (nothing for a
+   * run with nothing to report). `thread`: a `Run <name>` thread in Slack, as before. Projects and jobs
+   * can override it (`delivery`).
+   */
+  delivery: z.enum(['summary', 'thread']).default('summary'),
+  /**
+   * The dashboard's address as the owner opens it, for the "Open the run" links in Slack summaries.
+   * Unset: `http://<this machine's name>:<http.port>` (e.g. http://jarvis:4000 over Tailscale).
+   */
+  dashboardUrl: z.string().url().optional(),
   /** Minimum gap between edits of the live status message. */
   statusIntervalSeconds: z.number().min(1).default(5),
   /** Max scheduled jobs running at once (separate from chat). */
@@ -394,6 +407,8 @@ export const projectConfigSchema = z.object({
     .optional(),
   /** Slack user IDs allowed to talk to the bot. Empty = every member of the channel. */
   allowedUsers: z.array(z.string()).default([]),
+  /** Overrides the host's `delivery` for this project's runs (`summary` or `thread`). */
+  delivery: z.enum(['summary', 'thread']).optional(),
   /** `api` runs the CLI with ANTHROPIC_API_KEY instead of the host's Claude login. */
   billing: z.enum(['subscription', 'api']).default('subscription'),
   /**
@@ -563,8 +578,13 @@ export const jobSchema = z
     catchUp: z.boolean().default(true),
     /** Overrides the project's `selfImprove` for this job, e.g. `trouble` for a job that runs every few minutes. */
     selfImprove: selfImproveSchema.optional(),
-    /** Slack channel for this job's threads. Defaults to the project channel. */
+    /** Slack channel for this job's threads (or summaries). Defaults to the project channel. */
     channel: z.string().optional(),
+    /**
+     * Overrides the project's `delivery` for this job: `thread` keeps its whole run in a Slack thread,
+     * `summary` runs it on the dashboard and posts only the result in Slack.
+     */
+    delivery: z.enum(['summary', 'thread']).optional(),
     /** Extra environment for the CLI (and the scripts it runs). `~/` is expanded. */
     env: z.record(z.string(), z.string()).default({}),
     allowedTools: z.array(z.string()).optional(),

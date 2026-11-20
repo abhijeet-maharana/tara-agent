@@ -17,6 +17,8 @@ import { formatDuration } from '../slack/format.js';
 import { EditReply, type StreamPort, StreamReply, type TurnReply } from '../slack/reply.js';
 import type { SessionRow, Store } from '../store/store.js';
 import { Semaphore } from '../util/concurrency.js';
+import { isWebChannel, streamFor, webChannel, webOf } from '../web/chat.js';
+import { postSummary } from '../web/summary.js';
 import { matchJob } from './job-match.js';
 import { learnFromRun, learnReasons } from './learn.js';
 import { Threads } from './threads.js';
@@ -49,6 +51,8 @@ export interface ChatPort {
   ): Promise<void>;
   /** Native message streaming, when the platform has it. */
   stream?: StreamPort;
+  /** The stream for one channel (the router: the dashboard always streams, Slack when it can). */
+  streamFor?(channel: string): StreamPort | undefined;
   react(channel: string, ts: string, emoji: string): Promise<void>;
   unreact(channel: string, ts: string, emoji: string): Promise<void>;
 }
@@ -73,6 +77,11 @@ export interface IncomingMessage {
    * Slack doesn't notify on a streamed or edited answer.
    */
   mentionWhenDone?: string;
+  /**
+   * A run nobody is watching (a scheduled task, a voice request, a card's decision) in a dashboard
+   * thread: its result is posted in Slack under this name (Slack mrkdwn) when the turn ends.
+   */
+  summary?: string;
 }
 
 export interface Attachment {
@@ -102,6 +111,8 @@ export interface ManagerDeps {
   log?: Logger;
   newSessionId?: () => string;
   now?: () => number;
+  /** A thread's link: a Slack thread's, or a dashboard thread's page (for chat summaries). */
+  threadUrl?: (channel: string, ts: string) => string | undefined;
 }
 
 const BASE_PROMPT = `You are running headless for a Slack thread, through tara-agent.
@@ -130,7 +141,13 @@ export class SessionManager {
   private readonly now: () => number;
 
   constructor(private readonly deps: ManagerDeps) {
-    this.byChannel = new Map(deps.projects.map((p) => [p.config.slackChannel, p]));
+    this.byChannel = new Map(
+      deps.projects.flatMap((p) => [
+        [p.config.slackChannel, p] as const,
+        // Dashboard threads: messages typed on a session page, and runs started there.
+        [webChannel(p.config.name), p] as const,
+      ]),
+    );
     this.threads = deps.threads ?? new Threads();
     this.slots = new Semaphore(deps.host.concurrency);
     this.env = deps.env ?? process.env;
@@ -147,8 +164,10 @@ export class SessionManager {
       await this.scheduledRun(project, msg);
       return;
     }
+    const onDashboard = isWebChannel(msg.channel);
     const { allowedUsers } = project.config;
-    if (allowedUsers.length > 0 && !allowedUsers.includes(msg.user)) {
+    // A dashboard message comes from someone who unlocked the dashboard, not a Slack member.
+    if (!onDashboard && allowedUsers.length > 0 && !allowedUsers.includes(msg.user)) {
       this.log.warn(`[${project.config.name}] ignored message from ${msg.user} (not in allowedUsers)`);
       return;
     }
@@ -157,7 +176,10 @@ export class SessionManager {
     // "Run <id>" at the top level: the scheduler's trigger when a slot of that job is waiting for it,
     // otherwise a person's own request, handled as "run <job name>" below.
     if (msg.threadTs === msg.ts && parseScheduledRun(text) && (await this.scheduledRun(project, msg))) return;
-    const key = threadKey(msg.channel, msg.threadTs);
+    // A reply under a dashboard run's Slack summary (or a copy of its card) continues that run's session:
+    // the answer comes in this Slack thread, the session and its lock are the dashboard thread's.
+    const own = threadKey(msg.channel, msg.threadTs);
+    const key = (!onDashboard && msg.threadTs !== msg.ts && this.deps.store.threadAlias(own)) || own;
     const reply = (text: string) => this.deps.chat.post(msg.channel, msg.threadTs, text);
 
     // "stop" stops whatever runs in this thread (a chat turn or a job) right away.
@@ -316,11 +338,11 @@ export class SessionManager {
     const { chat, store, host } = this.deps;
     const name = project.config.name;
     const intervalMs = host.statusIntervalSeconds * 1000;
-    const streaming = chat.stream && !chat.stream.disabled;
+    const streaming = streamFor(chat, msg.channel);
     const reply: TurnReply = streaming
       ? new StreamReply(
           chat,
-          chat.stream as StreamPort,
+          streaming,
           msg.channel,
           msg.threadTs,
           msg.user,
@@ -370,7 +392,7 @@ export class SessionManager {
       env = {
         ...buildChildEnv(this.env, project.config.billing),
         TARA_SCRATCH: scratch,
-        TARA_THREAD: threadKey(msg.channel, msg.threadTs),
+        TARA_THREAD: key,
       };
       const files = await this.saveAttachments(scratch, msg);
       // The first message of a session says where the folder is (the Write tool needs absolute paths).
@@ -574,7 +596,26 @@ export class SessionManager {
           ]
         : [];
     await reply.finish({ summary, ok: o.status === 'ok', answer: o.text, notes });
-    if (msg.mentionWhenDone)
+    // A run nobody watches, in a dashboard thread: its result goes to Slack. Stopped or silent: nothing.
+    const web = webOf(chat);
+    if (msg.summary && web && isWebChannel(msg.channel) && o.status !== 'aborted') {
+      const said = o.status === 'ok' ? o.text : summary;
+      if (said.trim())
+        await postSummary({
+          chat,
+          store,
+          web,
+          log: this.log,
+          slackChannel: project.config.slackChannel,
+          thread: { channel: msg.channel, ts: msg.threadTs },
+          title: msg.summary,
+          text: said,
+          meta: formatDuration(o.durationMs),
+          link: this.deps.threadUrl?.(msg.channel, msg.threadTs),
+          since: this.now() - o.durationMs - 60_000,
+        });
+    }
+    if (msg.mentionWhenDone && !isWebChannel(msg.channel))
       await chat
         .post(
           msg.channel,

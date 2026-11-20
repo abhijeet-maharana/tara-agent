@@ -355,7 +355,51 @@ const MIGRATIONS = [
      temperature REAL,
      PRIMARY KEY (device_id, at)
    );`,
+  // Dashboard threads (src/web/): runs that live on the dashboard instead of a Slack thread. Each row is
+  // one message of such a thread; `web_mirrors` are their Slack copies (cards with buttons), and
+  // `thread_aliases` send replies in a Slack thread (a run's summary, a card) to the dashboard thread's session.
+  `CREATE TABLE web_messages (
+     id         INTEGER PRIMARY KEY AUTOINCREMENT,
+     channel    TEXT NOT NULL,
+     thread_ts  TEXT NOT NULL,
+     ts         TEXT NOT NULL UNIQUE,
+     kind       TEXT NOT NULL,
+     user       TEXT,
+     text       TEXT NOT NULL DEFAULT '',
+     data       TEXT,
+     created_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL
+   );
+   CREATE INDEX web_messages_thread ON web_messages (channel, thread_ts, id);
+   CREATE TABLE web_mirrors (
+     web_ts        TEXT PRIMARY KEY,
+     slack_channel TEXT NOT NULL,
+     slack_ts      TEXT NOT NULL,
+     created_at    INTEGER NOT NULL
+   );
+   CREATE TABLE thread_aliases (
+     slack_key  TEXT PRIMARY KEY,
+     web_key    TEXT NOT NULL,
+     created_at INTEGER NOT NULL
+   );`,
 ];
+
+/** One message of a dashboard thread (src/web/). */
+export interface WebMessage {
+  id: number;
+  channel: string;
+  threadTs: string;
+  ts: string;
+  /** text: a plain message; blocks: a Block Kit card; file: an uploaded file; stream: a live reply. */
+  kind: 'text' | 'blocks' | 'file' | 'stream';
+  /** Who wrote it: a person's id for a message from the dashboard; unset for the agent. */
+  user?: string;
+  text: string;
+  /** blocks: the blocks; file: {name, path, comment}; stream: {title, tasks, done}. */
+  data?: unknown;
+  createdAt: number;
+  updatedAt: number;
+}
 
 /** A paired phone (the shell app in android/). */
 export interface PhoneDevice {
@@ -769,6 +813,10 @@ export class Store {
     const claims = this.db.prepare('DELETE FROM job_claims WHERE slot < ?').run(before).changes;
     const sessions = this.db.prepare('DELETE FROM sessions WHERE updated_at < ?').run(before).changes;
     this.db.prepare('DELETE FROM day_threads WHERE created_at < ?').run(before);
+    // Dashboard threads go with their sessions' history (their files are swept by web/chat.ts).
+    this.db.prepare('DELETE FROM web_messages WHERE updated_at < ?').run(before);
+    this.db.prepare('DELETE FROM web_mirrors WHERE created_at < ?').run(before);
+    this.db.prepare('DELETE FROM thread_aliases WHERE created_at < ?').run(before);
     this.db.prepare('DELETE FROM health_events WHERE at < ?').run(before);
     // Samples and log lines are only charted for weeks; a month is plenty.
     const month = Math.max(before, this.now() - 31 * 86_400_000);
@@ -1582,7 +1630,161 @@ export class Store {
       .run(project, queue, slot);
   }
 
+  addWebMessage(m: Omit<WebMessage, 'id' | 'createdAt' | 'updatedAt'>): number {
+    const t = this.now();
+    const r = this.db
+      .prepare(
+        `INSERT INTO web_messages (channel, thread_ts, ts, kind, user, text, data, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        m.channel,
+        m.threadTs,
+        m.ts,
+        m.kind,
+        m.user ?? null,
+        m.text,
+        m.data === undefined ? null : JSON.stringify(m.data),
+        t,
+        t,
+      );
+    return Number(r.lastInsertRowid);
+  }
+
+  /** Changes a dashboard message's text and/or data; false when there is no such message. */
+  updateWebMessage(
+    channel: string,
+    ts: string,
+    change: { text?: string; data?: unknown; kind?: string },
+  ): boolean {
+    const sets: string[] = ['updated_at = ?'];
+    const args: (string | number | null)[] = [this.now()];
+    if (change.text !== undefined) {
+      sets.push('text = ?');
+      args.push(change.text);
+    }
+    if (change.data !== undefined) {
+      sets.push('data = ?');
+      args.push(JSON.stringify(change.data));
+    }
+    if (change.kind !== undefined) {
+      sets.push('kind = ?');
+      args.push(change.kind);
+    }
+    const r = this.db
+      .prepare(`UPDATE web_messages SET ${sets.join(', ')} WHERE channel = ? AND ts = ?`)
+      .run(...args, channel, ts);
+    return Number(r.changes) > 0;
+  }
+
+  deleteWebMessage(channel: string, ts: string): void {
+    this.db.prepare('DELETE FROM web_messages WHERE channel = ? AND ts = ?').run(channel, ts);
+  }
+
+  getWebMessage(channel: string, ts: string): WebMessage | undefined {
+    const row = this.db.prepare('SELECT * FROM web_messages WHERE channel = ? AND ts = ?').get(channel, ts) as
+      | Record<string, unknown>
+      | undefined;
+    return row ? webMessageRow(row) : undefined;
+  }
+
+  webMessageById(id: number): WebMessage | undefined {
+    const row = this.db.prepare('SELECT * FROM web_messages WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
+    return row ? webMessageRow(row) : undefined;
+  }
+
+  /** A dashboard thread's messages, oldest first: its root and every reply (`afterId`: only newer ones). */
+  webThread(
+    channel: string,
+    threadTs: string,
+    opts: { afterId?: number; limit?: number } = {},
+  ): WebMessage[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM web_messages WHERE channel = ? AND (thread_ts = ? OR ts = ?) AND id > ?
+         ORDER BY id LIMIT ?`,
+      )
+      .all(channel, threadTs, threadTs, opts.afterId ?? 0, opts.limit ?? 500) as Record<string, unknown>[];
+    return rows.map(webMessageRow);
+  }
+
+  /** A dashboard message's Slack copy (a card with buttons). */
+  webMirror(webTs: string): { channel: string; ts: string } | undefined {
+    const row = this.db
+      .prepare('SELECT slack_channel, slack_ts FROM web_mirrors WHERE web_ts = ?')
+      .get(webTs) as { slack_channel: string; slack_ts: string } | undefined;
+    return row && { channel: row.slack_channel, ts: row.slack_ts };
+  }
+
+  saveWebMirror(webTs: string, channel: string, ts: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO web_mirrors (web_ts, slack_channel, slack_ts, created_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT (web_ts) DO UPDATE SET slack_channel = excluded.slack_channel, slack_ts = excluded.slack_ts`,
+      )
+      .run(webTs, channel, ts, this.now());
+  }
+
+  /** The dashboard thread a Slack thread stands for (a run's summary, a card's copy), if any. */
+  threadAlias(slackKey: string): string | undefined {
+    const row = this.db.prepare('SELECT web_key FROM thread_aliases WHERE slack_key = ?').get(slackKey) as
+      | { web_key: string }
+      | undefined;
+    return row?.web_key;
+  }
+
+  saveThreadAlias(slackKey: string, webKey: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO thread_aliases (slack_key, web_key, created_at) VALUES (?, ?, ?)
+         ON CONFLICT (slack_key) DO UPDATE SET web_key = excluded.web_key`,
+      )
+      .run(slackKey, webKey, this.now());
+  }
+
+  /** Whether a Slack message (`<channel>:<ts>`) is a copy of a dashboard card. */
+  isMirror(slackKey: string): boolean {
+    const at = slackKey.indexOf(':');
+    return Boolean(
+      this.db
+        .prepare('SELECT 1 FROM web_mirrors WHERE slack_channel = ? AND slack_ts = ?')
+        .get(slackKey.slice(0, at), slackKey.slice(at + 1)),
+    );
+  }
+
+  /** The Slack threads that stand for a dashboard thread (its summaries), oldest first. */
+  aliasesOf(webKey: string): string[] {
+    return (
+      this.db
+        .prepare('SELECT slack_key FROM thread_aliases WHERE web_key = ? ORDER BY created_at')
+        .all(webKey) as { slack_key: string }[]
+    ).map((r) => r.slack_key);
+  }
+
   close(): void {
     this.db.close();
   }
+}
+
+function webMessageRow(r: Record<string, unknown>): WebMessage {
+  let data: unknown;
+  try {
+    data = r.data ? JSON.parse(r.data as string) : undefined;
+  } catch {
+    data = undefined;
+  }
+  return {
+    id: r.id as number,
+    channel: r.channel as string,
+    threadTs: r.thread_ts as string,
+    ts: r.ts as string,
+    kind: r.kind as WebMessage['kind'],
+    user: (r.user as string | null) ?? undefined,
+    text: r.text as string,
+    data,
+    createdAt: r.created_at as number,
+    updatedAt: r.updated_at as number,
+  };
 }

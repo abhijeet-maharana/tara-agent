@@ -33,6 +33,7 @@ tara-agent is one Node process per host. It never calls the Anthropic API: every
 | `src/http/server.ts` | Local API for other tools, plus `/internal/*` for the MCP server |
 | `src/code/repo.ts`, `src/http/code.ts` | The Code page: read-only git status, diffs and files of each repo, through a private index copy ([code-view.md](code-view.md)) |
 | `src/health/`, `src/http/health.ts`, `src/http/observe.ts` | The Health page. Now: checks of tara-agent, each project's jobs and each project's `healthUrl`, with red-twice-in-a-row alerts and recoveries in the day's `Run Health Alert` thread. Trends: runs, cost, usage, job lengths, uptime and machine samples over days. Logs: tara-agent's own warnings and errors plus `logUnits` from the journal, grouped. `GET /metrics` for Prometheus |
+| `src/web/` | Dashboard threads (`WebChat`), the Slack/dashboard router (`RoutedChat`) and Slack result summaries ([Dashboard runs](#dashboard-runs)) |
 | `src/http/dashboard.ts` | Server-rendered dashboard (home, jobs, runs, sessions); `cron-text.ts` turns schedules into plain English |
 | `src/slack/` | Bolt app, mrkdwn conversion, message splitting |
 | `src/memory/memory.ts` | Project memory: `.tara/memory.md` (kept by learning turns) plus recent decisions on cards, given to every fresh session in its first prompt (`memoryBlock`) |
@@ -49,7 +50,7 @@ tara-agent is one Node process per host. It never calls the Anthropic API: every
 
 ## A scheduled job
 
-Scheduled runs go through Slack: the scheduler only posts a message, and the bot runs the job it names.
+With `delivery: summary` (the default), a scheduled run doesn't touch Slack until it ends: see [Dashboard runs](#dashboard-runs). The steps below are `delivery: thread`, where scheduled runs go through Slack: the scheduler only posts a message, and the bot runs the job it names.
 
 1. croner fires; the scheduler works out the slot time and **claims** it in SQLite. A claimed slot never runs again, even after a restart.
 2. It posts a trigger message in the project channel: `Run <job name>` (e.g. `Run Weekly GA4 Audit`; the id only when two jobs share a name), the words a person would type (`src/scheduler/slack-trigger.ts`). With `SLACK_USER_TOKEN` set it is posted as that person, otherwise as the bot. It starts the scheduled slot only while one is waiting for that job; a person typing `Run <name>` otherwise gets a normal run.
@@ -59,6 +60,23 @@ Scheduled runs go through Slack: the scheduler only posts a message, and the bot
 6. The job thread is saved as a session, so replying to it continues the job's conversation ("why didn't you check X?").
 
 On start, each enabled job posts its most recent missed slot once if it is younger than `catchUpHours` and after the job was first seen on this host (also `Run <job name>`). Runs started with `run <job name>` or a card decision run in that thread; a queue and Run now open their own `Run <job name>` thread (`openRunThread`).
+
+## Dashboard runs
+
+`src/web/chat.ts`: a **dashboard thread** looks like a Slack thread to the rest of tara-agent (a channel `web-<project>` and a thread ts, so sessions, `Threads` locks, cards, files and `TARA_THREAD` work unchanged) but lives in SQLite (`web_messages`).
+
+```
+ runJob / SessionManager ──► RoutedChat ──┬─► Slack          (Slack channels)
+                                          └─► WebChat        (web-<project>: SQLite, files on disk)
+                                                 │  cards with tara: buttons ──► copied to Slack (web_mirrors)
+ run ends ──► postSummary (src/web/summary.ts) ──► one top-level Slack message + files in its thread
+ Slack reply under a summary or card copy ──► thread_aliases ──► the dashboard thread's session
+```
+
+1. `deliveryOf(host, project, job)` picks `summary` or `thread`. With `summary`, `Scheduler.fire` launches the run directly (no trigger post), and `runJob` uses the project's dashboard channel for any run that wasn't asked for in a Slack thread.
+2. `RoutedChat` sends each call by channel. `streamFor(channel)`: the dashboard always streams (the live reply is one message whose text and task list grow).
+3. At the end, `postSummary` posts the headline (`splitAtSeparator`), a footer with the run's name and its `/t/<channel>/<ts>` link (host `dashboardUrl`), attaches the run's files, and saves an alias `<slack channel>:<summary ts> → web-<project>:<ts>`. Silent and stopped runs post nothing.
+4. `SessionManager.handle` resolves an aliased Slack thread to the dashboard thread's key: the session, lock and job are the run's, the answer goes to the Slack thread. A message typed on the session page (`POST /sessions/<id>/say`) is stored in the dashboard thread and handled like a Slack reply. Chats nobody watches (scheduled tasks, voice requests, card decisions) carry `IncomingMessage.summary` and post a Slack summary too.
 
 ## An approval
 

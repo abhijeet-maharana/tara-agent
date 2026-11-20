@@ -14,6 +14,8 @@ import { formatDuration, postMarkdown } from '../slack/format.js';
 import { StreamReply } from '../slack/reply.js';
 import type { Item, RunRecord, Store } from '../store/store.js';
 import { type Locks, type Semaphore, Throttle } from '../util/concurrency.js';
+import { deliveryOf, isWebChannel, streamFor, webChannel, webOf } from '../web/chat.js';
+import { postSummary } from '../web/summary.js';
 import {
   buildDecisionPrompt,
   buildHandoffPrompt,
@@ -36,8 +38,11 @@ export type JobTrigger =
   | { kind: 'catch-up'; thread?: { channel: string; ts: string }; byPerson?: boolean }
   /** `thread`: the chat message that asked for the run; the run then happens in its thread. */
   | { kind: 'manual'; by: string; thread?: { channel: string; ts: string } }
-  /** A decision on the run's approval card: the same session continues in its thread. */
-  | { kind: 'resume'; by: string; threadTs: string; text: string; card?: DecidedCard }
+  /**
+   * A decision on the run's approval card: the same session continues in its thread. `channel`: the
+   * thread's channel (a dashboard thread's, or a Slack one; unset: the job's Slack channel).
+   */
+  | { kind: 'resume'; by: string; channel?: string; threadTs: string; text: string; card?: DecidedCard }
   /**
    * A decision on a card with handoff notes: a fresh session acts on it in a new `Run` thread, from the
    * card, its notes and the project memory. `from` is the thread of the run that raised it.
@@ -79,7 +84,7 @@ export interface JobRunnerDeps {
   env?: NodeJS.ProcessEnv;
   newSessionId?: () => string;
   now?: () => number;
-  /** A Slack thread's link, once Slack is connected. */
+  /** A thread's link: a Slack thread's once Slack is connected, a dashboard thread's page. */
   threadUrl?: (channel: string, ts: string) => string | undefined;
 }
 
@@ -125,7 +130,7 @@ export async function runJob(
   const { project, job } = scheduled;
   const { chat, store, log } = deps;
   const now = deps.now ?? Date.now;
-  const channel = job.channel ?? project.config.slackChannel;
+  const slackChannel = job.channel ?? project.config.slackChannel;
   const title = `*${job.name}*${triggerLabel(trigger)}`;
   const timeoutMs = job.timeoutMinutes * 60_000;
   // Asked for in chat, or running cards that share a Slack thread (a `slack` queue): run inside that
@@ -133,7 +138,7 @@ export async function runJob(
   const cardThread =
     trigger.kind === 'queue' &&
     trigger.items.every(
-      (i) => i.channel === channel && i.messageTs && i.threadTs === trigger.items[0]?.threadTs,
+      (i) => i.channel === slackChannel && i.messageTs && i.threadTs === trigger.items[0]?.threadTs,
     )
       ? trigger.items[0]?.threadTs
       : undefined;
@@ -141,7 +146,17 @@ export async function runJob(
     trigger.kind === 'manual' || trigger.kind === 'schedule' || trigger.kind === 'catch-up'
       ? trigger.thread
       : undefined;
-  const requestTs = asked?.channel === channel ? asked.ts : cardThread;
+  const requestTs = asked?.channel === slackChannel ? asked.ts : cardThread;
+  // Where the run happens. Continuing: the thread it ran in. Asked for in a Slack thread: there. Else,
+  // with `delivery: summary`, a dashboard thread (Slack gets the result only); otherwise a new Slack thread.
+  const web = webOf(chat);
+  const channel =
+    trigger.kind === 'resume'
+      ? (trigger.channel ?? slackChannel)
+      : !requestTs && web && deliveryOf(deps.host, project, job) === 'summary'
+        ? webChannel(project.config.name)
+        : slackChannel;
+  const onDashboard = isWebChannel(channel);
   // The thread the run posts in: the trigger or requester's message, or (continuing) the job's earlier
   // thread. A run with none (a queue, Run now) opens its own with a top-level "Run <name>". The top
   // level of the channel only ever holds those "Run" messages; they are never edited.
@@ -194,6 +209,18 @@ export async function runJob(
       env.BASH_DEFAULT_TIMEOUT_MS = env.BASH_MAX_TIMEOUT_MS = String(timeoutMs);
     } catch (err) {
       await postMain(`❌ ${title} could not start: ${(err as Error).message}`);
+      if (web && inThread && onDashboard)
+        await postSummary({
+          chat,
+          store,
+          web,
+          log,
+          slackChannel,
+          thread: { channel, ts: inThread },
+          title,
+          text: `❌ Could not start: ${(err as Error).message}`,
+          link: deps.threadUrl?.(channel, inThread),
+        });
       return record('error', { error: (err as Error).message });
     }
 
@@ -277,11 +304,33 @@ export async function runJob(
     let toolErrors = 0;
     const intervalMs = deps.host.statusIntervalSeconds * 1000;
     const status = new Throttle<string>(intervalMs, (text) => chat.update(channel, statusTs, text));
-    const recipient = streamRecipient(trigger, project.config.owner);
+    // A dashboard thread streams to whoever opens it; Slack's stream needs a person to address.
+    const recipient = onDashboard ? 'dashboard' : streamRecipient(trigger, project.config.owner);
+    const port = streamFor(chat, channel);
     const live =
-      recipient && chat.stream && !chat.stream.disabled
-        ? new StreamReply(chat, chat.stream, channel, rootTs, recipient, false, Math.min(intervalMs, 1000))
+      recipient && port
+        ? new StreamReply(chat, port, channel, rootTs, recipient, false, Math.min(intervalMs, 1000))
         : undefined;
+    /**
+     * A dashboard run's result in Slack: one message with its headline (or why it didn't finish), its
+     * files in that message's thread. A run with nothing to report, or one a person stopped, posts nothing.
+     */
+    const summarize = async (text: string, meta?: string) => {
+      if (!onDashboard || !web) return;
+      await postSummary({
+        chat,
+        store,
+        web,
+        log,
+        slackChannel,
+        thread: { channel, ts: rootTs },
+        title,
+        text,
+        meta,
+        link: deps.threadUrl?.(channel, rootTs),
+        since: startedAt,
+      });
+    };
     // The latest text block reaches the thread once the next step starts; the final one when the run
     // ends, so the thread always holds Claude's whole reply.
     let block = '';
@@ -541,6 +590,12 @@ export async function runJob(
       await live?.finish({ summary: reason, ok: false, answer: '', notes: [] });
       // Not streamed: what Claude wrote before it stopped still goes in the thread, to debug the run.
       if (!live && outcome.text.trim()) await postMarkdown(chat, channel, rootTs, outcome.text);
+      // A run a person stopped needs no message; anything else that broke does ("⌛ Timed out after 30m").
+      if (outcome.status !== 'aborted')
+        await summarize(
+          reason.replace(/^(\S+ )(\p{Ll})/u, (_, icon: string, c: string) => icon + c.toUpperCase()),
+          formatDuration(outcome.durationMs),
+        );
       learnIf(undefined, rootTs);
       return record(outcome.status, { ...usage, error: outcome.error, output: outcome.text });
     }
@@ -581,6 +636,7 @@ export async function runJob(
     } else {
       await postMarkdown(chat, channel, rootTs, outcome.text);
     }
+    await summarize(outcome.text, meta);
     learnIf(failure, rootTs);
     return record(failure ? 'failed' : 'ok', { ...usage, error: failure, output: outcome.text });
   } catch (err) {

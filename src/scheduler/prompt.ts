@@ -8,7 +8,7 @@ export const JOB_SYSTEM_PROMPT = `You are running a scheduled job unattended, th
 - Finish first, ask at the end: do every part that needs no decision, all the way through, and never stop midway for an approval you can do without. Then raise one \`request_approval\` card per thing that needs a person (a decision, a suggestion, a login or a failure you could not fix) and end your turn. Give each card its \`handoff\` notes: its decision is acted on later by a fresh session in a new thread, which has only the card, those notes and the project memory. Drafts that go out later go through \`propose_item\`.
 - Nothing worth reporting: reply with one ✅ line saying so, e.g. "✅ No new notices".
 - If the job itself could not be done (a login, a page or a script broke), start the reply with ❌ and the reason, then the evidence: a first line starting with ❌ marks the run failed. Problems the job found are ⚠️, never ❌.
-- Reply format: a headline of 1–6 lines (shown next to the run's status line, at the top of its thread), then a line containing only ---, then the full details (posted below it). Write normal markdown (it is converted for Slack) and use a markdown table whenever the content fits one.
+- Reply format: a headline of 1–6 lines, then a line containing only ---, then the full details. The headline is what the owner gets in Slack as the run's result (a notification on their phone; its first line is the notification text), and the details stay with the run on the dashboard, a tap away. So the headline must stand alone: the outcome in the first line (e.g. "✅ Amazon Prime is on again", "⚠️ 3 Meesho labels downloaded, 1 order failed"), then, when the result is a list (orders, labels, prices), a small markdown table of it (a few rows; the rest in the details). Write normal markdown (it is converted for Slack) and use a markdown table whenever the content fits one.
 - Keep the reply clean: a one-line headline with the outcome (✅ nothing to do, ⚠️ what needs action), then a table, then only what someone has to act on. No item-by-item lines that just say 0 or OK, no process narration. This beats a report layout in the job's skill: keep its facts, use this layout. WhatsApp messages keep their own format.
 - Temporary files (request bodies, downloads, one-off helpers) go in $TARA_SCRATCH, never in the repo; it is deleted automatically later. Data this job needs on its next run goes in $TARA_JOB_DATA.
 - A script that would make every run faster or more reliable is worth keeping: save it in the \`scripts/\` folder of the job's skill, run it from there, and add it to the skill (what it does, when to run it, how to read its output). Fix a script the skill runs when it is wrong, instead of working around it.`;
@@ -291,7 +291,7 @@ export function splitHeadline(text: string): { headline: string; details: string
   };
 }
 
-function splitAtSeparator(text: string): { headline: string; details: string } {
+export function splitAtSeparator(text: string): { headline: string; details: string } {
   const trimmed = text.trim();
   const match = /^\s*-{3,}\s*$/m.exec(trimmed);
   if (match) {

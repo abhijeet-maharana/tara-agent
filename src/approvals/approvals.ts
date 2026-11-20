@@ -13,6 +13,7 @@ import {
 } from '../sessions/manager.js';
 import { hasTable, MARKDOWN_MAX, postMarkdown, textBlock, toSlackMrkdwn } from '../slack/format.js';
 import type { Item, ItemCheck, ItemField, ItemMedia, Store } from '../store/store.js';
+import { isWebChannel, webChannel } from '../web/chat.js';
 import { sealItem } from './seal.js';
 
 /**
@@ -108,8 +109,13 @@ export interface ApprovalsDeps {
   newId?: () => string;
   /** How long a message posted as the person may wait for Slack to deliver it before it goes directly. */
   pickupTimeoutMs?: number;
-  /** A Slack thread's link, once Slack is connected. */
+  /** A thread's link: a Slack thread's once Slack is connected, a dashboard thread's page. */
   threadUrl?: (channel: string, ts: string) => string | undefined;
+  /**
+   * Where a card's own `Run <Kind>` thread opens (a chat acting on it): a dashboard thread (host
+   * `delivery: summary`, its result posted in Slack) or the project's Slack channel (unset).
+   */
+  runChannel?: (project: Project) => string;
 }
 
 /** A message `toThread` posted as the person, until Slack delivers it (`delivered`). */
@@ -129,7 +135,7 @@ export class Approvals {
   onJob?: (
     project: string,
     jobId: string,
-    r: { threadTs: string; text: string; by: string; card?: DecidedCard },
+    r: { channel?: string; threadTs: string; text: string; by: string; card?: DecidedCard },
   ) => Promise<unknown>;
   /** Acts on a decision in a fresh session of the job, in a new `Run` thread (Scheduler.decided). */
   onJobDecision?: (
@@ -203,9 +209,12 @@ export class Approvals {
       // An update edits the one message: the full text stays on the Approvals page.
       details = `${details.slice(0, max - 200)}…\n_Full text on the Approvals page._`;
     } else if (details.length > max) {
-      // Too long for one block: post it in full first, then the buttons under it.
+      // Too long for one block: post it in full first, then the buttons under it. A dashboard run's card
+      // is also copied to Slack, where "above" would point at nothing.
       await postMarkdown(this.deps.chat, ctx.channel, ctx.threadTs, details);
-      details = '_Full proposal above._';
+      details = isWebChannel(ctx.channel)
+        ? `${details.slice(0, max - 200)}…\n_Full text on the Approvals page._`
+        : '_Full proposal above._';
     }
     const blocks: SlackBlock[] = [
       textBlock(`**🟡 Approval needed: ${title}**\n${details}`, SECTION_MAX + 200),
@@ -767,7 +776,7 @@ export class Approvals {
       ? { channel: item.channel ?? project.config.slackChannel, threadTs: item.threadTs }
       : await this.openCardThread(project, item);
     await this.toThread(
-      { channel, threadTs, ts: threadTs, user },
+      { channel, threadTs, ts: threadTs, user, summary: `*${item.title}*` },
       `About the waiting card "${item.title}" (item ${id}), sent from the Approvals page without a decision. The card is still waiting: answer in this thread, and change or withdraw the card only if the note asks for that.\n\n${text}`,
       {
         fromPage: true,
@@ -856,7 +865,12 @@ export class Approvals {
     const at = value.indexOf(':');
     const channel = value.slice(0, at);
     const threadTs = value.slice(at + 1);
-    if (at < 1 || !threadTs || channel !== project.config.slackChannel) return undefined;
+    if (
+      at < 1 ||
+      !threadTs ||
+      (channel !== project.config.slackChannel && channel !== webChannel(project.config.name))
+    )
+      return undefined;
     const session = this.deps.store.getSession(value);
     return session?.project === project.config.name ? { channel, threadTs } : undefined;
   }
@@ -870,7 +884,7 @@ export class Approvals {
     project: Project,
     item: Item,
   ): Promise<{ channel: string; threadTs: string; ts: string }> {
-    const channel = project.config.slackChannel;
+    const channel = this.deps.runChannel?.(project) ?? project.config.slackChannel;
     const threadTs = await openRunThread(
       this.deps.chat,
       channel,
@@ -893,6 +907,7 @@ export class Approvals {
     const user = /^[UW][A-Z0-9]+$/.test(by) ? by : (project.config.owner ?? by);
     if (item.jobId && item.threadTs && item.mode === 'resume' && this.onJob) {
       const status = await this.onJob(project.config.name, item.jobId, {
+        channel: item.channel,
         threadTs: item.threadTs,
         text,
         by: user,
@@ -910,10 +925,14 @@ export class Approvals {
       ? { channel: item.channel ?? project.config.slackChannel, threadTs: item.threadTs, ts: item.messageTs }
       : await this.openCardThread(project, item);
     const { channel, threadTs } = where;
-    await this.toThread({ channel, threadTs, ts: where.ts ?? threadTs, user }, text, {
-      fromPage: opts.fromPage,
-      visible: opts.visible,
-    });
+    await this.toThread(
+      { channel, threadTs, ts: where.ts ?? threadTs, user, summary: `*${item.title}*` },
+      text,
+      {
+        fromPage: opts.fromPage,
+        visible: opts.visible,
+      },
+    );
   }
 
   /**
@@ -946,7 +965,7 @@ export class Approvals {
       );
     }
     const { chat, store, threadUrl } = this.deps;
-    const channel = project.config.slackChannel;
+    const channel = this.deps.runChannel?.(project) ?? project.config.slackChannel;
     const threadTs = await openRunThread(chat, channel, item.kind, project.config.words);
     const here = threadUrl?.(channel, threadTs);
     const there = from && threadUrl?.(from.channel, from.threadTs);
@@ -963,7 +982,7 @@ export class Approvals {
     const prompt = buildDecisionPrompt(card, text, {
       earlier: from && { url: there, sessionId: earlier?.sessionId, harness: earlier?.harness },
     });
-    await this.toThread({ channel, threadTs, ts: threadTs, user }, prompt, opts);
+    await this.toThread({ channel, threadTs, ts: threadTs, user, summary: `*${item.title}*` }, prompt, opts);
   }
 
   /**
@@ -996,8 +1015,11 @@ export class Approvals {
     const { chat, store, log } = this.deps;
     const key = threadKey(msg.channel, msg.threadTs);
     const mention = opts.mention && /^[UW][A-Z0-9]+$/.test(msg.user) ? msg.user : undefined;
+    // A dashboard thread has no Slack delivery to wait for: it goes to Jarvis directly.
     const asPerson =
-      opts.fromPage && (opts.always || !store.getSession(key)) ? chat.postAsUser?.bind(chat) : undefined;
+      opts.fromPage && !isWebChannel(msg.channel) && (opts.always || !store.getSession(key))
+        ? chat.postAsUser?.bind(chat)
+        : undefined;
     if (asPerson) {
       // A mention, so the sender is notified at once (the post is the user token's account, not theirs).
       const who = /^[UW][A-Z0-9]+$/.test(msg.user) ? `<@${msg.user}>` : msg.user;
@@ -1031,9 +1053,17 @@ export class Approvals {
       }
     }
     if (opts.shown) await chat.post(msg.channel, msg.threadTs, opts.shown);
-    const turn = this.onChat?.({ ...msg, text, mentionWhenDone: mention });
+    // In a dashboard thread nobody watches the answer come in: it is posted in Slack when it ends.
+    const summary = isWebChannel(msg.channel) ? (msg.summary ?? this.cardTitle(msg)) : undefined;
+    const turn = this.onChat?.({ ...msg, text, mentionWhenDone: mention, summary });
     if (!opts.background) return turn;
     turn?.catch((err: Error) => log.error(`${key}: ${err.message}`));
+  }
+
+  /** The title of the card a dashboard thread is about (its first `📝` line), for its Slack summary. */
+  private cardTitle(msg: Pick<IncomingMessage, 'channel' | 'threadTs'>): string {
+    const card = this.deps.store.itemsInThread(msg.channel, msg.threadTs)[0];
+    return card ? `*${card.title.slice(0, 120)}*` : '*Card*';
   }
 
   /**

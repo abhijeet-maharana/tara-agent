@@ -9,6 +9,7 @@ import {
   watchFile,
   writeFileSync,
 } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import {
   createServer,
   request as httpRequest,
@@ -35,6 +36,7 @@ import type { Scheduler } from '../scheduler/scheduler.js';
 import { type IncomingMessage as ChatMessage, type Logger, threadKey } from '../sessions/manager.js';
 import { ITEM_STATUSES, type ItemStatus, type Store } from '../store/store.js';
 import { addDays, dayKey, midnight } from '../util/time.js';
+import { isWebChannel, type WebChat } from '../web/chat.js';
 import { allowList } from './access.js';
 import {
   type ApprovalsTab,
@@ -125,6 +127,8 @@ export interface HttpOptions {
   readAs?: string;
   /** Puts a message into a session's thread as if its owner had typed it (SessionManager.handle). */
   continueThread?: (msg: ChatMessage) => Promise<void>;
+  /** Dashboard threads (src/web/): what a session page shows of one, and where a reply typed there goes. */
+  web?: WebChat;
   /** The Code page: repos' uncommitted changes and files, read-only. */
   code?: {
     readers: RepoReader[];
@@ -815,6 +819,31 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         void options.continueThread({ channel, threadTs, ts: threadTs, user: owner ?? 'admin', text });
         return { ok: true, threadKey: session.threadKey };
       }
+      // The session page's reply box: as the project's owner, from an unlocked browser. In a dashboard
+      // thread it shows there and the answer comes there; in a Slack thread the answer comes in Slack.
+      if (method === 'POST' && parts.length === 3 && parts[2] === 'say') {
+        human(req);
+        if (!options.continueThread) throw new HttpError(404, 'Chat is not running');
+        const body = await readJson(req);
+        const text = str(body.text)?.trim().slice(0, 20_000);
+        if (!text) throw new HttpError(400, '"text" is required');
+        const session = options.store.sessionsOverview({ sessionId: id, limit: 1 })[0];
+        const at = session?.threadKey.indexOf(':') ?? -1;
+        if (!session || at < 1) throw new HttpError(404, 'No thread for this session');
+        const channel = session.threadKey.slice(0, at);
+        const threadTs = session.threadKey.slice(at + 1);
+        const owner = options.dashboard?.projects.find((p) => p.config.name === session.project)?.config
+          .owner;
+        const user = owner ?? 'dashboard';
+        const ts =
+          isWebChannel(channel) && options.web
+            ? await options.web.post(channel, threadTs, text, user)
+            : threadTs;
+        void options
+          .continueThread({ channel, threadTs, ts, user, text })
+          .catch((err: Error) => options.log.warn(`reply in ${session.threadKey}: ${err.message}`));
+        return { ok: true, threadKey: session.threadKey };
+      }
     }
     if (method === 'GET' && parts[0] === 'runs' && parts.length === 2) {
       const run = options.store.getRun(Number(parts[1]));
@@ -1301,6 +1330,46 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     });
   };
 
+  /** A session's page: its transcript, live steps while it runs, its files and a reply box. */
+  const sessionView = (req: IncomingMessage, ctx: DashboardContext, id: string): string => {
+    const jobNames = () =>
+      new Map(
+        ctx.projects.flatMap((p) =>
+          options.scheduler.list(p.config.name).map((j) => [`${p.config.name}:${j.id}`, j.name] as const),
+        ),
+      );
+    const session = options.store.sessionsOverview({ sessionId: id, limit: 1 })[0];
+    // Its latest run, even when the session's thread was cleared (a silent job run).
+    const run = options.store.latestSessionRun(id) ?? session?.lastRun;
+    const project = session?.project ?? run?.project;
+    const dir = ctx.projects.find((p) => p.config.name === project)?.dir;
+    // Sessions whose thread was cleared are still on disk: look in every project.
+    const entries = transcript(id, dir);
+    const jobName = run?.jobId ? jobNames().get(`${run.project}:${run.jobId}`) : undefined;
+    const running = liveTask(id)?.status === 'running';
+    const key = session?.threadKey;
+    const at = key?.indexOf(':') ?? -1;
+    const channel = key && at > 0 ? key.slice(0, at) : undefined;
+    const onDashboard = isWebChannel(channel);
+    const files =
+      key && onDashboard && options.web
+        ? options.web
+            .files(channel, key.slice(at + 1))
+            .map((f) => ({ id: f.id, name: f.name, comment: f.comment }))
+        : undefined;
+    const aliases = key && onDashboard ? options.store.aliasesOf(key) : [];
+    return sessionPage(ctx, session, id, entries, {
+      jobName,
+      run,
+      running,
+      canStop: running && canDecide(req),
+      canSay: session && options.continueThread ? canDecide(req) : undefined,
+      files,
+      // The newest summary that isn't a card's copy (the run's result).
+      slackSummary: aliases.filter((a) => !options.store.isMirror(a)).at(-1),
+    });
+  };
+
   const page = (
     req: IncomingMessage,
     ctx: DashboardContext,
@@ -1483,24 +1552,13 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         projectsWithJobs: names.filter((p) => options.scheduler.list(p).length > 0),
       });
     }
-    if (parts[0] === 'sessions' && parts.length === 2) {
-      const id = parts[1] as string;
-      const session = options.store.sessionsOverview({ sessionId: id, limit: 1 })[0];
-      // Its latest run, even when the session's thread was cleared (a silent job run).
-      const run = options.store.latestSessionRun(id) ?? session?.lastRun;
-      const project = session?.project ?? run?.project;
-      const dir = ctx.projects.find((p) => p.config.name === project)?.dir;
-      // Sessions whose thread was cleared are still on disk: look in every project.
-      const entries = transcript(id, dir);
-      const jobName = run?.jobId ? jobNames().get(`${run.project}:${run.jobId}`) : undefined;
-      const running = liveTask(id)?.status === 'running';
-      return sessionPage(ctx, session, id, entries, {
-        jobName,
-        run,
-        running,
-        canStop: running && canDecide(req),
-      });
+    // A dashboard thread's link (Slack summaries link here): its session's page.
+    if (parts[0] === 't' && parts.length === 3) {
+      const id = options.store.getSession(`${parts[1]}:${parts[2]}`)?.sessionId;
+      if (!id) return errorPage(ctx, 404, 'This run has no session yet, or it was cleared.');
+      return sessionView(req, ctx, id);
     }
+    if (parts[0] === 'sessions' && parts.length === 2) return sessionView(req, ctx, parts[1] as string);
     if (parts[0] === 'jobs' && parts.length === 1) {
       const at = now();
       const weeks = jobWeeks(options.store.runsSince(at - 7 * DAY_MS));
@@ -2047,6 +2105,30 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         options.log.error(`http page ${req.url}: ${(err as Error).stack ?? err}`);
         return sendHtml(res, 500, errorPage(ctx, 500));
       }
+    }
+    // A file a dashboard run sent (`send_file`), from its session page.
+    const fileId = /^\/web-files\/(\d+)$/.exec(url.pathname)?.[1];
+    if (req.method === 'GET' && fileId && options.web) {
+      const m = authorized(req) ? options.store.webMessageById(Number(fileId)) : undefined;
+      const file = m?.kind === 'file' ? (m.data as { name: string; path: string }) : undefined;
+      if (!file?.path?.startsWith(options.web.filesDir + path.sep)) {
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('No such file');
+        return;
+      }
+      try {
+        const data = await readFile(file.path);
+        res.writeHead(200, {
+          'content-type': 'application/octet-stream',
+          'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(file.name)}`,
+          'cache-control': 'no-store',
+        });
+        res.end(data);
+      } catch {
+        res.writeHead(410, { 'content-type': 'text/plain' });
+        res.end('The file is gone (deleted after the retention period)');
+      }
+      return;
     }
     if (req.method === 'GET' && url.pathname === '/metrics' && options.observe) {
       if (!authorized(req)) {

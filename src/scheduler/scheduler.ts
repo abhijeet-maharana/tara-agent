@@ -16,6 +16,7 @@ import type { ChatPort, Logger } from '../sessions/manager.js';
 import { Threads } from '../sessions/threads.js';
 import type { Item, Store } from '../store/store.js';
 import { Locks, Semaphore } from '../util/concurrency.js';
+import { deliveryOf, webOf } from '../web/chat.js';
 import { type JobStatus, type JobTrigger, runJob } from './job-runner.js';
 import type { DecidedCard } from './prompt.js';
 import { runName, SCHEDULE_BY, type ScheduledKind, scheduledRunText } from './slack-trigger.js';
@@ -405,6 +406,12 @@ export class Scheduler implements JobControl {
     }
     if (!this.deps.store.claimSlot(key, slot, this.startedAt)) return;
     const { chat } = this.deps;
+    // `delivery: summary`: no trigger message; the run starts here, on the dashboard, and Slack gets
+    // only its result.
+    if (webOf(chat) && deliveryOf(this.deps.host, project, job) === 'summary') {
+      this.launch(scheduled, { kind }, (status) => this.deps.store.finishSlot(key, slot, status));
+      return;
+    }
     const channel = project.config.slackChannel;
     const words = project.config.words;
     const text = scheduledRunText(runName(job, this.jobsOf(project.config.name), words), words);
@@ -461,7 +468,7 @@ export class Scheduler implements JobControl {
   async resume(
     project: string,
     id: string,
-    r: { threadTs: string; text: string; by: string; card?: DecidedCard },
+    r: { channel?: string; threadTs: string; text: string; by: string; card?: DecidedCard },
   ): Promise<JobStatus | 'unknown'> {
     // A job with a handoff runs no model for a declined card: the card and its Slack message already
     // show the decision, and a turn would only say "skipped" (on the paid harness, after a handoff).
