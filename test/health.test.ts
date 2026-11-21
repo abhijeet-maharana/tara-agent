@@ -10,7 +10,6 @@ import {
   healthSources,
   type JobsDeps,
   jobChecks,
-  phoneChecks,
   projectChecks,
 } from '../src/health/checks.js';
 import { type ClaudeLogin, claudeLoginReader, parseCredentials } from '../src/health/claude-login.js';
@@ -493,63 +492,6 @@ describe('agentChecks', () => {
       deps({ probeBrowser: async (b) => ({ lock: b.lock, cdpUrl: b.cdpUrl, up: false }) }),
     );
     expect(checks.at(-1)).toMatchObject({ key: 'tara:browser:chrome', group: 'Browsers', status: 'bad' });
-  });
-});
-
-describe('phoneChecks', () => {
-  const H = 3_600_000;
-  const at = 10 * 24 * H;
-  const device = { id: 'p1', name: 'Desk', keyHash: 'x', createdAt: 0, appVersion: '0.1.0 (1)' };
-  /** Reports every 10 min over `hours`, at `level`. */
-  const reports = (hours: number, level: number, extra: { charging?: boolean; temperature?: number } = {}) =>
-    Array.from({ length: hours * 6 + 1 }, (_, i) => ({
-      at: at - hours * H + i * 600_000,
-      level,
-      charging: extra.charging ?? false,
-      plugged: true,
-      temperature: extra.temperature ?? 30,
-    }));
-  const check = (battery: ReturnType<typeof reports>, lastSeenAt?: number) => {
-    const [link, bat] = phoneChecks([{ device: { ...device, lastSeenAt }, battery }], at);
-    return { link, bat };
-  };
-
-  it('is fine near 80 %, reporting', () => {
-    const { link, bat } = check(reports(30, 80));
-    expect(link).toMatchObject({ key: 'tara:phone:p1', group: 'Desk phone', status: 'ok' });
-    expect(link?.detail).toContain('app 0.1.0 (1)');
-    expect(bat).toMatchObject({
-      key: 'tara:phone:p1:battery',
-      status: 'ok',
-      detail: '80 % · on the charger, not charging · 30 °C',
-    });
-  });
-
-  it('warns when the phone goes quiet, and alerts after 2 hours', () => {
-    expect(check(reports(1, 80).map((b) => ({ ...b, at: b.at - 40 * 60_000 }))).link?.status).toBe('warn');
-    const { link } = check(reports(1, 80).map((b) => ({ ...b, at: b.at - 3 * H })));
-    expect(link?.status).toBe('bad');
-    expect(link?.detail).toMatch(/Not heard from for 3h/);
-    expect(check([]).link).toMatchObject({ status: 'warn', detail: 'Never reported' });
-  });
-
-  it('flags a battery held full for a day, then for 3 days', () => {
-    expect(check(reports(20, 100)).bat?.status).toBe('ok');
-    expect(check(reports(30, 100)).bat).toMatchObject({ status: 'warn' });
-    expect(check(reports(80, 99)).bat?.detail).toMatch(/for 3 days: charge protection isn't holding/);
-    expect(check(reports(80, 99)).bat?.status).toBe('bad');
-    // One dip under 95 % in the day means protection is working.
-    const dipped = reports(30, 100);
-    dipped[100] = { ...(dipped[100] as (typeof dipped)[number]), level: 80 };
-    expect(check(dipped).bat?.status).toBe('ok');
-  });
-
-  it('flags heat and a battery running down off the charger', () => {
-    expect(check(reports(1, 80, { temperature: 41 })).bat?.status).toBe('warn');
-    expect(check(reports(1, 80, { temperature: 46 })).bat).toMatchObject({ status: 'bad' });
-    expect(check(reports(1, 22)).bat?.detail).toMatch(/is the charger plugged in/);
-    expect(check(reports(1, 8)).bat?.status).toBe('bad');
-    expect(check(reports(1, 8, { charging: true })).bat?.status).toBe('ok');
   });
 });
 

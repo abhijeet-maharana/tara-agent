@@ -14,6 +14,8 @@ export interface RateLimit {
   /** 0–1 share of the current window already used, when the CLI reports it. */
   utilization?: number;
   resetsAt?: number;
+  /** Every window the CLI reported (e.g. `five_hour`, `seven_day`), with its share used and reset time. */
+  windows?: Record<string, { utilization?: number; resetsAt?: number; status?: string }>;
 }
 
 export type StreamEvent =
@@ -112,11 +114,17 @@ function parseRateLimit(info: unknown): RateLimit | undefined {
   const window = str(info.rateLimitType);
   const windows = isObject(info.unifiedWindows) ? info.unifiedWindows : {};
   const current = window && isObject(windows[window]) ? (windows[window] as Json) : {};
+  const all: NonNullable<RateLimit['windows']> = {};
+  for (const [name, w] of Object.entries(windows)) {
+    if (!isObject(w)) continue;
+    all[name] = { utilization: num(w.utilization), resetsAt: num(w.resetsAt), status: str(w.status) };
+  }
   return {
     status: str(info.status) ?? 'unknown',
     window,
     utilization: num(current.utilization),
     resetsAt: num(info.resetsAt),
+    ...(Object.keys(all).length && { windows: all }),
   };
 }
 

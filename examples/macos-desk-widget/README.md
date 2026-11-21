@@ -3,13 +3,15 @@
 Two glance panels on the Mac desktop, drawn by [Übersicht](https://tracesof.net/uebersicht/):
 
 - **Mac**: CPU temperature and thermal state, CPU use (performance / efficiency cores, 2-minute sparkline), RAM and swap, memory pressure, the virtual machine's share (if tara-agent runs in a VM on this Mac), the top 3 apps by CPU, power draw.
-- **Agent**: tara-agent's glance from `GET /phone/state`, the same data the desk phone's Home page shows: Claude usage, needs you with the failing jobs, approvals per project with the 3 oldest cards (`GET /attention`), running now with its latest step, next 3 jobs, alerts, and any extra tiles you add. Click a row to open its dashboard page.
+- **Agent**: tara-agent's glance from `GET /glance`: Claude usage (the 5-hour window, and the weekly one once a run since tara-agent's last restart has reported it), needs you with the failing jobs, approvals per project with the 3 oldest cards (`GET /attention`), running now with its latest step, next 3 jobs, and any extra tiles you add.
 
-When tara-agent can't be reached, the agent panel dims, keeps the last data and says `offline since hh:mm`; the Mac panel keeps updating. Both panels dim from 23:00 to 07:00 (full on hover).
+Both panels are look-only: clicks pass through to the desktop (`pointer-events: none`).
 
-**Notifications.** Each new urgent item (a job that starts failing, a check gone red) gives a macOS notification. None in tara-agent's quiet hours; what came then is told in one "overnight" notification when they end. The widget reads `/attention` itself, since tara-agent raises its own alerts only while a desk phone is connected. With `brew install terminal-notifier`, clicking one opens the dashboard; otherwise it opens Script Editor.
+When tara-agent can't be reached, the agent panel dims, keeps the last data and says `offline since hh:mm`; the Mac panel keeps updating. In tara-agent's quiet hours the agent panel says 🌙 quiet; neither panel dims.
 
-**Reporting the Mac to tara-agent** (`./install.sh --metrics`), for a Mac that runs tara-agent's VM: a LaunchAgent posts the Mac panel's numbers to `POST /vmhost/metrics` every 5 minutes, so the Health page (a VM host group and Trends charts) and the desk phone show the host's heat, memory and the VM's share too. To stop it: `launchctl bootout gui/$(id -u)/com.github.tara-agent.vmhost-metrics` (until the next login), and also delete `~/Library/LaunchAgents/com.github.tara-agent.vmhost-metrics.plist` to remove it for good. The Health rows then go amber after 15 minutes and red after an hour.
+**Notifications.** Each new urgent item (a job that starts failing, a check gone red) gives a macOS notification. None in tara-agent's quiet hours; what came then is told in one "overnight" notification when they end. The widget reads `/attention` itself and decides what is new. With `brew install terminal-notifier`, clicking one opens the dashboard; otherwise it opens Script Editor.
+
+**Reporting the Mac to tara-agent** (`./install.sh --metrics`), for a Mac that runs tara-agent's VM: a LaunchAgent posts the Mac panel's numbers to `POST /vmhost/metrics` every 5 minutes, so the Health page (a VM host group and Trends charts) shows the host's heat, memory and the VM's share too. To stop it: `launchctl bootout gui/$(id -u)/com.github.tara-agent.vmhost-metrics` (until the next login), and also delete `~/Library/LaunchAgents/com.github.tara-agent.vmhost-metrics.plist` to remove it for good. The Health rows then go amber after 15 minutes and red after an hour.
 
 ## Install
 
@@ -28,11 +30,11 @@ Then set `TARA_URL` in `config.local.sh` (git-ignored) to where the dashboard li
 | `TARA_KEYCHAIN_SERVICE` | empty | Only if the host sets `TARA_HTTP_TOKEN`: the login Keychain item holding it (`security add-generic-password -s tara-agent -a "$USER" -w`). Never put the token in a file |
 | `VM_LABEL` | `VM` | Name of the VM row (any Apple Virtualization, UTM, QEMU, Parallels or VMware process) |
 | `AGENT_NAME` | `tara` | Agent panel title |
-| `EXTRA_TILES_URL` | empty | A URL returning more tiles for the agent panel: `{"tiles": [{"label", "href"?, "items": [{"text", "level": "ok\|warn\|bad\|info", "title"?}]}]}`. Read every 30 s with a 5 s timeout; a failure just hides them |
+| `EXTRA_TILES_URL` | empty | A URL returning more tiles for the agent panel: `{"tiles": [{"label", "items": [{"text", "level": "ok\|warn\|bad\|info", "title"?}]}]}`. Read every 30 s with a 5 s timeout; a failure just hides them |
 | `NOTIFY` | `1` | `0` turns the notifications off |
 | `HOST_NAME` | `Mac` | How this Mac is named in tara-agent when it reports (`--metrics`) |
 
-Panel position and size: `className` at the top of `mac.jsx` and `agent.jsx`. Refresh: `refreshFrequency` (5 s Mac, 30 s agent). Night hours: `NIGHT` in `mac.jsx`; the agent panel follows tara-agent's `http.phone.quietHours`.
+Panel position and size: `className` at the top of `mac.jsx` and `agent.jsx`. Refresh: `refreshFrequency` (5 s Mac, 30 s agent). Quiet hours (🌙 and held notifications): tara-agent's `http.quietHours`.
 
 ## How it works
 
@@ -42,11 +44,11 @@ Panel position and size: `className` at the top of `mac.jsx` and `agent.jsx`. Re
 | `lib/mac-stats.sh` | Mac numbers as one JSON line: cached macmon sample, `ps` grouped by app bundle, `sysctl` memory pressure, thermal state |
 | `lib/macmon-feed.sh` | Keeps one `macmon pipe` running and its latest sample in `~/Library/Caches/tara-desk-widget/macmon.json`. Started by `mac-stats.sh`; stops itself a minute after the last read |
 | `lib/thermal.swift` | `ProcessInfo.thermalState` (nominal / fair / serious / critical), compiled by `install.sh` into the cache folder |
-| `lib/agent-state.sh` | `curl` of `/phone/state`, `/attention` and `EXTRA_TILES_URL` (5 s timeout each), as `{name, url, notify, state, attention, extra}` or `{name, url, error}` |
+| `lib/agent-state.sh` | `curl` of `/glance`, `/attention` and `EXTRA_TILES_URL` (5 s timeout each), as `{name, url, notify, state, attention, extra}` or `{name, url, error}` |
 | `lib/notify.sh` | One notification (`terminal-notifier`, else `osascript`); the text goes in as arguments, never as code |
 | `lib/post-metrics.sh` | `--metrics`: reshapes `mac-stats.sh` output (JavaScript for Automation, no installs) and posts it to `/vmhost/metrics`. LaunchAgent `com.github.tara-agent.vmhost-metrics`, errors in `~/Library/Logs/tara-desk-widget.log` |
 
-`/phone/state` needs no token when `TARA_HTTP_TOKEN` is unset; keep `http.allowFrom` to loopback and your tailnet in that case.
+`/glance` needs no token when `TARA_HTTP_TOKEN` is unset; keep `http.allowFrom` to loopback and your tailnet in that case.
 
 ## Cost
 

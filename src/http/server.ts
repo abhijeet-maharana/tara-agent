@@ -1,14 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
-import {
-  createReadStream,
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  unwatchFile,
-  watchFile,
-  writeFileSync,
-} from 'node:fs';
+import { readFileSync, unwatchFile, watchFile } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import {
   createServer,
@@ -21,7 +12,6 @@ import { createServer as createHttpsServer, type Server as HttpsServer } from 'n
 import { networkInterfaces } from 'node:os';
 import path from 'node:path';
 import { Cron } from 'croner';
-import { WebSocketServer } from 'ws';
 import { ApprovalError, type Approvals, type ProposeInput } from '../approvals/approvals.js';
 import { type Bridge, BridgeError } from '../bridge/bridge.js';
 import { CodeError, type CodeRepo, MIN_QUERY, type RepoReader } from '../code/repo.js';
@@ -30,7 +20,6 @@ import type { HostConfig, Project, QueueConfig } from '../config/schema.js';
 import type { HealthMonitor } from '../health/monitor.js';
 import type { Observability } from '../health/observability.js';
 import { parseVmHostSample, VMHOST_KEEP_DAYS, VmHostError } from '../health/vmhost.js';
-import { type LiveToolKit, PhoneLive, type PhoneLiveConfig } from '../live/phone-live.js';
 import { ReminderError, type Reminders } from '../reminders/reminders.js';
 import type { Activity } from '../runner/activity.js';
 import type { Scheduler } from '../scheduler/scheduler.js';
@@ -77,12 +66,9 @@ import {
   tabbed,
   tabPage,
 } from './dashboard.js';
+import { Glance, type NextRun, type QuietHours } from './glance.js';
 import { healthPage } from './health.js';
 import { logsPage, trendsPage } from './observe.js';
-import { PHONE_COOKIE, Phone, PhoneError, pairPage } from './phone.js';
-import { type NextRun, PhoneHub, type QuietHours } from './phone-events.js';
-import { phoneScreen } from './phone-screen.js';
-import { PhoneVoice, type VoicePanel } from './phone-voice.js';
 import { queuePage } from './queue.js';
 import { loadQuotes, pickQuote } from './quotes.js';
 import { remindersPage } from './reminders-page.js';
@@ -148,39 +134,8 @@ export interface HttpOptions {
   activity?: Pick<Activity, 'tasks' | 'usage' | 'stop'> & Partial<Pick<Activity, 'subscribe'>>;
   /** A second, HTTPS listener on the same address. The certificate is re-read when its file changes. */
   tls?: { port: number; cert: string; key: string };
-  /** The desk phone shell's APK, served for its updates (default: android/apk/tara-phone.apk). */
-  phoneApk?: string;
-  /** The desk phone's alerts: quiet hours (default 23:00–07:00) and the gap between spoken ones (30 min). */
-  phone?: { quietHours?: QuietHours; alertGapMinutes?: number; speakAlerts?: boolean };
-  /**
-   * The desk phone's voice (http/phone-voice.ts): a fast text model for what the rules don't know, a
-   * read-only Claude question in a project, and handing work to a project's Slack channel.
-   */
-  phoneVoice?: {
-    model?: (system: string, user: string) => Promise<string>;
-    ask?: (project: string, question: string) => Promise<string>;
-    dispatch?: (project: string, task: string) => Promise<{ url?: string }>;
-  };
-  /**
-   * Voice v2 (live/phone-live.ts): Gemini Live over `/phone/live` (a WebSocket, device key), with
-   * extra tools (the Claude lanes, music). Unset: the phone keeps Phase 4's `/phone/voice`.
-   */
-  phoneLive?: {
-    config: PhoneLiveConfig;
-    kit?: LiveToolKit;
-    /**
-     * The wake word's own data: the owner's recorded samples (`samples/<label>/*.wav`) and the model
-     * trained on them (`personal.json`), which the shell loads. Kept in the state folder, never the repo.
-     */
-    wakeDir?: string;
-    /** The Cast speaker's music, for the phone's ⏸ / ⏹ (no voice needed). */
-    music?: {
-      control(
-        action: 'pause' | 'resume' | 'stop' | 'volume' | 'status',
-        level?: number,
-      ): Promise<{ playing?: string; state?: string; volume?: number }>;
-    };
-  };
+  /** The glance's quiet hours (`GET /glance`, default 23:00–07:00): desk panels hold notifications then. */
+  quietHours?: QuietHours;
   /** The Health page (`/health` in a browser) and `GET /health/checks`, `POST /health/check`. */
   health?: Pick<HealthMonitor, 'snapshot' | 'check' | 'history' | 'label'>;
   /** The Health page's Trends and Logs views, and `GET /metrics` (Prometheus text). */
@@ -279,25 +234,10 @@ async function readJson(req: IncomingMessage, limit = 10_000): Promise<Record<st
  *   POST /internal/withdraw            {id, reason?}  closes a waiting card of the run's project
  *   POST /internal/reminder            {text, cron? | at?, notify?, task?, title?}; GET /internal/reminders;
  *   POST /internal/reminder-cancel     {id}
- * and for the desk phone (http/phone.ts, docs/jarvis-phone.md):
- *   GET  /phone/pair                   the dashboard's Phone page: pairing QR and paired phones (token)
- *   POST /phone/pair                   {code, name} → {id, key}  (the QR's one-time code is the proof)
- *   POST /phone/pin                    {id, nonce} → {spki, proof}  lets a phone move its pin after renewal
- *   POST /phone/session                header `Authorization: Device <id>:<key>` → {session, expiresAt, cookie}
- *   POST /phone/telemetry              {battery: {level, charging, plugged, temperature}} (device key), every 10 min
- *   GET  /phone, /phone/ping           the phone's glance screen (session cookie, or the token)
- *   GET  /phone/events                 SSE: state (the glance, on change), run (started/ended), alert
- *                                      (session cookie, the token, or the shell's device key)
- *   GET  /phone/state                  the glance as JSON; GET /phone/run/<task id> one run's live steps
- *   POST /phone/voice                  {text, locked} (device key) → what to say and show (http/phone-voice.ts)
- *   POST /phone/quiet                  {minutes} quiet mode on (0: off); the page's 🔕 (session cookie too)
- *   GET  /phone/app.json, /phone/app.apk   the shell APK for updates (device key, or the token)
- *   POST /phone/devices/<id>/forget    (token)
- * A phone's session cookie also allows GET requests elsewhere (it shows what the dashboard shows).
  */
 /** Paths tara-agent serves itself; with a fallback, everything else is passed through. */
 const OWN_PATH =
-  /^\/(?:$|(?:health|metrics|reload|attention|jobs|runs|sessions|schedule|approvals|queue|items|reminders|unlock|code|internal|p|app|phone)(?:\/|$))/;
+  /^\/(?:$|(?:health|metrics|reload|attention|jobs|runs|sessions|schedule|approvals|queue|items|reminders|unlock|code|internal|p|app|glance)(?:\/|$))/;
 const TOKEN_COOKIE = 'tara_token';
 const ADMIN_COOKIE = 'tara_admin';
 /** Finished items shown on the Done tab. */
@@ -413,23 +353,33 @@ export function crossSite(req: IncomingMessage, bind: string): string | undefine
 
 export async function startHttpServer(options: HttpOptions): Promise<Server> {
   const now = options.now ?? Date.now;
-  const phone = new Phone({ store: options.store, tls: options.tls, apk: options.phoneApk, now });
   const started = now();
   /**
    * How much of Claude's usage window is used: what the CLI reported last in this process, else the
-   * latest run's figure from the last 5 hours (one window), so a restart doesn't blank it.
+   * latest run's figure from the last 5 hours (one window), so a restart doesn't blank it. The 7-day
+   * window comes only from this process's reports (runs don't store it).
    */
   const usageNow = (at: number): HomeUsage | undefined => {
     const live = options.activity?.usage();
+    const ms = (t?: number) => (t ? t * (t < 1e12 ? 1000 : 1) : undefined);
+    const seven = live?.windows?.seven_day;
+    const weekResets = ms(seven?.resetsAt);
+    const week =
+      seven?.utilization !== undefined && (!weekResets || weekResets > at)
+        ? { share: seven.utilization, ...(weekResets && { resetsAt: weekResets }) }
+        : undefined;
     if (live?.utilization !== undefined) {
-      const resetsAt = live.resetsAt ? live.resetsAt * (live.resetsAt < 1e12 ? 1000 : 1) : undefined;
-      if (!resetsAt || resetsAt > at) return { share: live.utilization, window: live.window, resetsAt };
+      const resetsAt = ms(live.resetsAt);
+      if (!resetsAt || resetsAt > at)
+        return { share: live.utilization, window: live.window, resetsAt, ...(week && { week }) };
     }
     const last = options.store
       .runsSince(at - 5 * 3_600_000)
       .filter((r) => r.rateLimitUtilization !== undefined)
       .at(-1);
-    return last ? { share: last.rateLimitUtilization as number, asOf: last.endedAt } : undefined;
+    return last
+      ? { share: last.rateLimitUtilization as number, asOf: last.endedAt, ...(week && { week }) }
+      : undefined;
   };
   const timeZone = options.dashboard?.timeZone ?? 'UTC';
   const projectTitle = (name: string) =>
@@ -448,60 +398,16 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       })
       .sort((a, b) => a.at - b.at)
       .slice(0, 3);
-  // The desk phone's glance and alerts (/phone/events).
-  const phoneHub = new PhoneHub({
+  // The glance for desk panels (GET /glance).
+  const glance = new Glance({
     attention: options.attention,
     pending: () => (options.approvals ? options.store.items({ statuses: ['pending'], limit: 200 }) : []),
-    activity: options.activity,
+    tasks: options.activity && (() => options.activity?.tasks() ?? []),
     next: nextUp,
     usage: usageNow,
-    vmHost: () => options.store.lastVmHostSample(),
     projectTitle,
     timeZone,
-    quietHours: options.phone?.quietHours,
-    alertGapMinutes: options.phone?.alertGapMinutes,
-    speakAlerts: options.phone?.speakAlerts,
-    build: String(started),
-    now,
-    log: options.log,
-  });
-  /** Every project's jobs, as the phone's voice names them. */
-  const voiceJobs = () =>
-    options.projects.flatMap((project) =>
-      options.scheduler.list(project).map((j) => ({
-        project,
-        projectTitle: projectTitle(project),
-        id: j.id,
-        name: j.name,
-        enabled: j.enabled,
-        running: j.running,
-        ...(j.nextRun && { nextRun: j.nextRun.getTime() }),
-        ...(j.lastStatus && { lastStatus: j.lastStatus }),
-        ...(j.lastRunAt && { lastRunAt: j.lastRunAt.getTime() }),
-        ...(j.lastError && { lastError: j.lastError }),
-      })),
-    );
-  // The desk phone's voice: rules for the everyday questions, a model for the rest (/phone/voice).
-  const phoneVoice = new PhoneVoice({
-    agentName: options.dashboard?.agentName ?? 'tara',
-    projects: options.projects.map((name) => ({ name, title: projectTitle(name) })),
-    timeZone,
-    // The hub rebuilds the glance every 5 s while a phone listens; building it reads every job's schedule.
-    glance: () => phoneHub.recentState(6_000) ?? phoneHub.state(),
-    // The hub reads /attention every minute while a phone listens; a fresh read takes ~0.4 s.
-    attention: async () =>
-      phoneHub.recentAttention(90_000) ??
-      (options.attention ? options.attention() : { items: [], notes: [] }),
-    jobs: voiceJobs,
-    tasks: () => options.activity?.tasks() ?? [],
-    runJob: (project, id) => options.scheduler.trigger(project, id, 'phone'),
-    setJobEnabled: (project, id, enabled) => options.scheduler.setEnabled(project, id, enabled),
-    stopTask: (id) => options.activity?.stop(id) ?? false,
-    quiet: { until: () => phoneHub.quietMode(), set: (until) => phoneHub.setQuietMode(until) },
-    model: options.phoneVoice?.model,
-    ask: options.phoneVoice?.ask,
-    dispatch: options.phoneVoice?.dispatch,
-    announce: (data: { id: string; say: string; panel?: VoicePanel }) => phoneHub.announce(data),
+    quietHours: options.quietHours,
     now,
     log: options.log,
   });
@@ -1337,7 +1243,6 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       browsers: Boolean(options.browsers),
       reminders: Boolean(options.reminders),
       unhealthy: options.health ? redChecks().length : undefined,
-      phone: Boolean(options.tls) || phone.devices().length > 0,
     };
   };
 
@@ -1782,256 +1687,18 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     const cookie = (req.headers.cookie ?? '').split(/;\s*/).find((c) => c.startsWith(`${TOKEN_COOKIE}=`));
     return cookie?.slice(TOKEN_COOKIE.length + 1) === options.token;
   };
-  /** The paired phone whose WebView sent this request (its session cookie), if any. */
-  const phoneOf = (req: IncomingMessage) => phone.deviceFromSession(cookie(req, PHONE_COOKIE));
-  /**
-   * The token holder, or a paired phone for reads: the phone shows what the dashboard shows, but it
-   * changes nothing outside `/phone/*` (actions there decide for themselves what a phone may do).
-   */
-  const authorized = (req: IncomingMessage) =>
-    tokenHolder(req) || (['GET', 'HEAD'].includes(req.method ?? 'GET') && Boolean(phoneOf(req)));
-
   const sendJson = (res: ServerResponse, status: number, body: unknown) => {
     res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     res.end(JSON.stringify(body));
   };
 
-  /**
-   * The desk phone (`/phone/*`, see http/phone.ts). Pairing and the pin proof need no token (the
-   * one-time code and the device key are the proof); the shell's native calls send its device key.
-   * Returns false for paths it doesn't serve.
-   */
-  const phoneRoute = async (req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> => {
-    const p = url.pathname.replace(/\/$/, '') || '/';
-    if (p !== '/phone' && !p.startsWith('/phone/')) return false;
-    const method = req.method ?? 'GET';
-    const ctx = pageContext();
-    try {
-      if (method === 'POST' && p === '/phone/pair') {
-        const body = await readJson(req, 2_000);
-        sendJson(res, 200, phone.pair(String(body.code ?? ''), String(body.name ?? 'Phone')));
-        return true;
-      }
-      if (method === 'POST' && p === '/phone/pin') {
-        const body = await readJson(req, 2_000);
-        sendJson(res, 200, phone.pinProof(String(body.id ?? ''), String(body.nonce ?? '')));
-        return true;
-      }
-      const device = phone.deviceFromHeader(req.headers.authorization);
-      if (method === 'POST' && p === '/phone/session') {
-        if (!device) throw new PhoneError(401, 'Unknown phone or wrong key: pair it again');
-        const body = await readJson(req, 2_000).catch(() => ({}) as Record<string, unknown>);
-        const version = typeof body.version === 'string' ? body.version : undefined;
-        sendJson(res, 200, {
-          ...phone.session(device, version),
-          name: device.name,
-          cookie: PHONE_COOKIE,
-          live: Boolean(options.phoneLive),
-        });
-        return true;
-      }
-      if (method === 'POST' && p === '/phone/telemetry') {
-        if (!device) throw new PhoneError(401, 'Unknown phone or wrong key: pair it again');
-        const body = await readJson(req, 4_000);
-        const b = (body.battery ?? {}) as Record<string, unknown>;
-        if (typeof b.level !== 'number' || !(b.level >= 0 && b.level <= 100))
-          throw new PhoneError(400, 'battery.level must be 0–100');
-        const t = b.temperature;
-        const at = now();
-        options.store.addPhoneBattery(device.id, {
-          at,
-          level: Math.round(b.level),
-          charging: b.charging === true,
-          plugged: b.plugged === true,
-          ...(typeof t === 'number' && t > -40 && t < 120 && { temperature: t }),
-        });
-        options.store.seePhoneDevice(device.id, at);
-        sendJson(res, 200, { ok: true });
-        return true;
-      }
-      if (method === 'POST' && p === '/phone/voice') {
-        // The shell sends what was heard with its device key and the phone's lock state; actions need
-        // it unlocked. A token (when one is set) stands for an unlocked phone, for testing.
-        const who = device ? device.id : options.token && tokenHolder(req) ? 'token' : undefined;
-        if (!who) throw new PhoneError(401, 'Missing or wrong key');
-        const body = await readJson(req, 4_000);
-        const text = typeof body.text === 'string' ? body.text.trim().slice(0, 500) : '';
-        if (!text) throw new PhoneError(400, 'text is required');
-        const locked = device ? body.locked !== false : false;
-        const started = now();
-        const reply = await phoneVoice.turn(who, text, locked);
-        options.log.info(
-          `phone voice (${reply.via}, ${now() - started} ms${locked ? ', locked' : ''}): "${text.slice(0, 80)}" → "${reply.say.slice(0, 100)}"`,
-        );
-        if (device) options.store.seePhoneDevice(device.id, now());
-        sendJson(res, 200, reply);
-        return true;
-      }
-      if (method === 'POST' && p === '/phone/wake-sample') {
-        // A recording for training the wake word (the shell, device key): 16 kHz 16-bit mono PCM.
-        const dir = options.phoneLive?.wakeDir;
-        if (!device) throw new PhoneError(401, 'Missing or wrong key');
-        if (!dir) throw new PhoneError(404, 'Wake word training is off');
-        // Up to 20 s of 16 kHz 16-bit audio, base64: ~850 KB.
-        const body = await readJson(req, 1_200_000);
-        const label = String(body.label ?? '');
-        const where = String(body.where ?? '');
-        if (!['wake', 'other'].includes(label) || !/^[a-z]{1,12}$/.test(where))
-          throw new PhoneError(400, 'label must be wake or other; where a short word');
-        const pcm = Buffer.from(String(body.pcm ?? ''), 'base64');
-        if (pcm.length < 3_200 || pcm.length > 16_000 * 2 * 20)
-          throw new PhoneError(400, 'pcm must be 0.1–20 s');
-        sendJson(res, 200, saveWakeSample(dir, label, where, pcm, now()));
-        return true;
-      }
-      if (method === 'GET' && p === '/phone/wake-samples') {
-        // How many recordings there are, so the teach screen resumes where it left off (page or shell).
-        if (!device && !phoneOf(req) && !tokenHolder(req)) throw new PhoneError(401, 'Signed out');
-        const dir = options.phoneLive?.wakeDir;
-        sendJson(res, 200, { counts: dir ? wakeSampleCounts(dir) : {} });
-        return true;
-      }
-      if (method === 'GET' && p === '/phone/wake-model') {
-        if (!device) throw new PhoneError(401, 'Missing or wrong key');
-        const file = options.phoneLive?.wakeDir && path.join(options.phoneLive.wakeDir, 'personal.json');
-        if (!file || !existsSync(file)) throw new PhoneError(404, 'No wake word model trained yet');
-        res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-        createReadStream(file).pipe(res);
-        return true;
-      }
-      if ((method === 'POST' || method === 'GET') && p === '/phone/music') {
-        // The speaker's music by tap: harmless, so the page's own session may do it too.
-        if (!device && !phoneOf(req) && !tokenHolder(req)) throw new PhoneError(401, 'Signed out');
-        const music = options.phoneLive?.music;
-        if (!music) throw new PhoneError(404, 'No music speaker');
-        const body = method === 'POST' ? await readJson(req, 1_000) : {};
-        const action = method === 'GET' ? 'status' : String(body.action ?? '');
-        if (!['pause', 'resume', 'stop', 'volume', 'status'].includes(action))
-          throw new PhoneError(400, 'action must be pause, resume, stop, volume or status');
-        const level = Number(body.volume);
-        sendJson(
-          res,
-          200,
-          await music.control(
-            action as 'pause' | 'resume' | 'stop' | 'volume' | 'status',
-            Number.isFinite(level) ? Math.max(0, Math.min(100, level)) / 100 : undefined,
-          ),
-        );
-        return true;
-      }
-      if (method === 'POST' && p === '/phone/quiet') {
-        // Harmless (it only holds alerts), so the page's own session may set it too.
-        if (!device && !phoneOf(req) && !tokenHolder(req)) throw new PhoneError(401, 'Signed out');
-        const minutes = Number((await readJson(req, 1_000)).minutes);
-        if (!Number.isFinite(minutes) || minutes < 0 || minutes > 1440)
-          throw new PhoneError(400, 'minutes must be 0–1440');
-        phoneHub.setQuietMode(minutes ? now() + minutes * 60_000 : undefined);
-        sendJson(res, 200, { until: phoneHub.quietMode() ?? null });
-        return true;
-      }
-      if (method === 'GET' && (p === '/phone/app.json' || p === '/phone/app.apk')) {
-        if (!device && !authorized(req)) throw new PhoneError(401, 'Missing or wrong key');
-        const apk = phone.apk();
-        if (!apk) throw new PhoneError(404, 'No APK has been built');
-        if (p === '/phone/app.json') {
-          const { file: _file, ...info } = apk;
-          sendJson(res, 200, info);
-          return true;
-        }
-        res.writeHead(200, {
-          'content-type': 'application/vnd.android.package-archive',
-          'content-length': apk.size,
-          'content-disposition': 'attachment; filename="tara-phone.apk"',
-          'cache-control': 'no-store',
-        });
-        createReadStream(apk.file).pipe(res);
-        return true;
-      }
-      if (method === 'GET' && p === '/phone/ping') {
-        const who = phoneOf(req);
-        if (!who && !tokenHolder(req)) throw new PhoneError(401, 'Signed out');
-        sendJson(res, 200, { ok: true, device: who?.name });
-        return true;
-      }
-      if (
-        method === 'GET' &&
-        (p === '/phone/events' || p === '/phone/state' || p.startsWith('/phone/run/'))
-      ) {
-        // The shell listens to /phone/events itself (for alerts while the screen is off) with its device key.
-        const native = p === '/phone/events' && phone.deviceFromHeader(req.headers.authorization);
-        if (!native && !phoneOf(req) && !tokenHolder(req)) throw new PhoneError(401, 'Signed out');
-        if (p === '/phone/events') {
-          if (!phoneHub.connect(res)) throw new PhoneError(429, 'Too many open event streams');
-          return true;
-        }
-        if (p === '/phone/state') {
-          if (!phoneHub.state().ready) await phoneHub.check();
-          sendJson(res, 200, phoneHub.state());
-          return true;
-        }
-        const id = p.slice('/phone/run/'.length);
-        const task = /^[\w-]{1,80}$/.test(id) ? phoneHub.task(id) : undefined;
-        if (!task) throw new PhoneError(404, 'That run is no longer in memory');
-        sendJson(res, 200, { task });
-        return true;
-      }
-      if (method === 'GET' && p === '/phone') {
-        const who = phoneOf(req);
-        if (!who && !tokenHolder(req)) {
-          sendHtml(
-            res,
-            401,
-            '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Signed out</title><body style="background:#090d16;color:#cbd5e1;font:18px sans-serif;padding:24px">This phone is not paired, or its session ended. Pair it on the dashboard\'s Phone page.',
-          );
-          return true;
-        }
-        sendHtml(
-          res,
-          200,
-          phoneScreen({
-            agentName: options.dashboard?.agentName ?? 'tara',
-            timeZone,
-            build: String(started),
-          }),
-        );
-        return true;
-      }
-      // The dashboard side: pairing codes and forgetting a phone need the dashboard's own token.
-      if (!tokenHolder(req)) throw new PhoneError(401, 'Missing or wrong bearer token');
-      if (method === 'GET' && p === '/phone/pair' && ctx) {
-        sendHtml(
-          res,
-          200,
-          pairPage(ctx, {
-            cert: phone.cert(),
-            code: options.tls ? phone.newCode() : undefined,
-            devices: phone.devices().map((x) => {
-              const battery = options.store.phoneBattery(x.id, now() - DAY_MS).at(-1);
-              return battery ? { ...x, battery } : x;
-            }),
-            apk: phone.apk(),
-            now: now(),
-          }),
-        );
-        return true;
-      }
-      const forget = /^\/phone\/devices\/([\w-]+)\/forget$/.exec(p);
-      if (method === 'POST' && forget) {
-        if (!phone.forget(forget[1] as string)) throw new PhoneError(404, 'Unknown phone');
-        options.log.info(`phone ${forget[1]} forgotten`);
-        res.writeHead(303, { location: '/phone/pair' });
-        res.end();
-        return true;
-      }
-      throw new PhoneError(404, 'Not found');
-    } catch (err) {
-      const status = err instanceof PhoneError || err instanceof HttpError ? err.status : 500;
-      if (status === 500) options.log.error(`http ${method} ${req.url}: ${(err as Error).stack ?? err}`);
-      if (status === 403 && p === '/phone/pair')
-        options.log.warn(`phone pairing refused from ${req.socket.remoteAddress}`);
-      sendJson(res, status, { error: (err as Error).message });
-      return true;
-    }
+  /** `GET /glance` (http/glance.ts): JSON for desk panels; returns false for other paths. */
+  const glanceRoute = async (req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> => {
+    if (url.pathname.replace(/\/$/, '') !== '/glance') return false;
+    if (!tokenHolder(req)) sendJson(res, 401, { error: 'Missing or wrong bearer token' });
+    else if (req.method !== 'GET' && req.method !== 'HEAD') sendJson(res, 405, { error: 'Use GET' });
+    else sendJson(res, 200, await glance.read());
+    return true;
   };
 
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
@@ -2062,7 +1729,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       res.end();
       return;
     }
-    if (await phoneRoute(req, res, url)) return;
+    if (await glanceRoute(req, res, url)) return;
     // A project's app, shown in a tab: `/app/<name>/<rest>` is proxied to `<dashboardUrl>/<rest>`, and
     // `/p/<name>/<rest>` is the dashboard page that frames it.
     const tab = /^\/(app|p)\/([a-z0-9][a-z0-9-]*)(\/.*)?$/.exec(url.pathname);
@@ -2070,7 +1737,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     if (tab && tabProject) {
       const name = tabProject.config.name;
       const rest = tab[3] ?? '';
-      if (!authorized(req)) {
+      if (!tokenHolder(req)) {
         res.writeHead(401, { 'content-type': 'text/plain' });
         res.end('Open the dashboard once with ?token=<TARA_HTTP_TOKEN> added to the address.');
         return;
@@ -2092,7 +1759,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       if (req.method === 'GET' && ctxTab)
         return sendHtml(res, 200, tabPage(ctxTab, tabProject, rest + url.search));
     }
-    if (req.method === 'POST' && url.pathname === '/unlock' && options.dashboard && authorized(req)) {
+    if (req.method === 'POST' && url.pathname === '/unlock' && options.dashboard && tokenHolder(req)) {
       const ctxUnlock = pageContext() as DashboardContext;
       const form = new URLSearchParams(await readBody(req, 2_000).catch(() => ''));
       const given = form.get('token') ?? '';
@@ -2133,7 +1800,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     const ctx = pageContext();
     const wantsHtml =
       Boolean(ctx) && req.method === 'GET' && (req.headers.accept ?? '').includes('text/html');
-    if (wantsHtml && ctx && !authorized(req) && !internalPath)
+    if (wantsHtml && ctx && !tokenHolder(req) && !internalPath)
       return sendHtml(
         res,
         401,
@@ -2163,7 +1830,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     // A file a dashboard run sent (`send_file`), from its session page.
     const fileId = /^\/web-files\/(\d+)$/.exec(url.pathname)?.[1];
     if (req.method === 'GET' && fileId && options.web) {
-      const m = authorized(req) ? options.store.webMessageById(Number(fileId)) : undefined;
+      const m = tokenHolder(req) ? options.store.webMessageById(Number(fileId)) : undefined;
       const file = m?.kind === 'file' ? (m.data as { name: string; path: string }) : undefined;
       if (!file?.path?.startsWith(options.web.filesDir + path.sep)) {
         res.writeHead(404, { 'content-type': 'text/plain' });
@@ -2185,7 +1852,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       return;
     }
     if (req.method === 'GET' && url.pathname === '/metrics' && options.observe) {
-      if (!authorized(req)) {
+      if (!tokenHolder(req)) {
         res.writeHead(401, { 'content-type': 'text/plain' });
         res.end('Missing or wrong bearer token');
         return;
@@ -2200,7 +1867,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       if (internalPath) {
         payload = await internal(req);
       } else {
-        if (!authorized(req)) throw new HttpError(401, 'Missing or wrong bearer token');
+        if (!tokenHolder(req)) throw new HttpError(401, 'Missing or wrong bearer token');
         payload = await route(req);
       }
     } catch (err) {
@@ -2229,51 +1896,11 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       });
     });
 
-  /**
-   * `GET /phone/live` (WebSocket): the shell's voice line (Voice v2), with its device key. Same network
-   * rules as every request; nothing else upgrades.
-   */
-  const liveWss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 });
-  const upgrade = (req: IncomingMessage, socket: import('node:stream').Duplex, head: Buffer) => {
-    const refuse = (status: number, text: string) => {
-      socket.end(`HTTP/1.1 ${status} ${text}\r\nConnection: close\r\n\r\n`);
-    };
-    const url = new URL(req.url ?? '/', 'http://localhost');
-    if (!allowed(req.socket.remoteAddress)) return refuse(403, 'Forbidden');
-    if (url.pathname !== '/phone/live' || !options.phoneLive) return refuse(404, 'Not Found');
-    const device = phone.deviceFromHeader(req.headers.authorization);
-    if (!device) return refuse(401, 'Unauthorized');
-    const live = options.phoneLive;
-    liveWss.handleUpgrade(req, socket, head, (ws) => {
-      options.log.info(`phone live: ${device.name} connected`);
-      options.store.seePhoneDevice(device.id, now());
-      const session = new PhoneLive(ws, live.config, {
-        agentName: options.dashboard?.agentName ?? 'tara',
-        voice: phoneVoice,
-        jobs: voiceJobs,
-        tasks: () => options.activity?.tasks() ?? [],
-        runJob: (project, id) => options.scheduler.trigger(project, id, 'phone'),
-        setJobEnabled: (project, id, enabled) => options.scheduler.setEnabled(project, id, enabled),
-        stopTask: (id) => options.activity?.stop(id) ?? false,
-        subscribe: options.activity?.subscribe?.bind(options.activity),
-        kit: live.kit,
-        music: live.music,
-        log: options.log,
-        now,
-      });
-      ws.on('close', () => {
-        session.end();
-        options.log.info(`phone live: ${device.name} disconnected`);
-      });
-    });
-  };
-
   const server = await listen(
     createServer((req, res) => void handle(req, res)),
     options.port,
     'HTTP API',
   );
-  server.on('upgrade', upgrade);
   const tls = options.tls;
   if (tls) {
     const read = () => ({ cert: readFileSync(tls.cert), key: readFileSync(tls.key) });
@@ -2288,7 +1915,6 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       server.close();
       throw err;
     }
-    secure.on('upgrade', upgrade);
     // Certificates are renewed in place (`tailscale cert` every month or two): pick up the new one.
     watchFile(tls.cert, { interval: 60_000 }, () => {
       try {
@@ -2303,53 +1929,5 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       secure.close();
     });
   }
-  // Event streams never end on their own, so closing the server ends them first.
-  const close = server.close.bind(server);
-  server.close = (callback) => {
-    phoneHub.close();
-    for (const ws of liveWss.clients) ws.terminate();
-    liveWss.close();
-    return close(callback);
-  };
   return server;
-}
-
-/** Saves one wake word recording as a WAV file; returns how many there are per label and place. */
-export function saveWakeSample(
-  dir: string,
-  label: string,
-  where: string,
-  pcm: Buffer,
-  at: number,
-): { counts: Record<string, number> } {
-  const folder = path.join(dir, 'samples', label);
-  mkdirSync(folder, { recursive: true });
-  const header = Buffer.alloc(44);
-  header.write('RIFF', 0);
-  header.writeUInt32LE(36 + pcm.length, 4);
-  header.write('WAVEfmt ', 8);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(1, 22);
-  header.writeUInt32LE(16_000, 24);
-  header.writeUInt32LE(32_000, 28);
-  header.writeUInt16LE(2, 32);
-  header.writeUInt16LE(16, 34);
-  header.write('data', 36);
-  header.writeUInt32LE(pcm.length, 40);
-  writeFileSync(path.join(folder, `${where}-${at}.wav`), Buffer.concat([header, pcm]));
-  return { counts: wakeSampleCounts(dir) };
-}
-
-/** Recordings per label and place, e.g. {"wake-near": 8, "other-room": 1}. */
-export function wakeSampleCounts(dir: string): Record<string, number> {
-  const counts: Record<string, number> = {};
-  for (const l of ['wake', 'other']) {
-    const f = path.join(dir, 'samples', l);
-    for (const name of existsSync(f) ? readdirSync(f) : []) {
-      const key = `${l}-${name.split('-')[0]}`;
-      counts[key] = (counts[key] ?? 0) + 1;
-    }
-  }
-  return counts;
 }

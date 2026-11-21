@@ -1,13 +1,6 @@
 import type { AddressInfo } from 'node:net';
 import { describe, expect, it } from 'vitest';
-import {
-  parseVmHostSample,
-  type VmHostSample,
-  vmHostChecks,
-  vmHostLine,
-  vmHostStatus,
-} from '../src/health/vmhost.js';
-import { PhoneHub } from '../src/http/phone-events.js';
+import { parseVmHostSample, type VmHostSample, vmHostChecks, vmHostLine } from '../src/health/vmhost.js';
 import { startHttpServer } from '../src/http/server.js';
 import type { Scheduler } from '../src/scheduler/scheduler.js';
 import { Store } from '../src/store/store.js';
@@ -49,17 +42,10 @@ describe('parseVmHostSample', () => {
   });
 });
 
-describe('vmHostLine and vmHostStatus', () => {
+describe('vmHostLine', () => {
   it('reads as one line of figures', () => {
     expect(vmHostLine(mac)).toBe('58 °C · CPU 23 % · RAM 92 % · swap 0.8 GB · VM 31 % CPU, 5.9 GB · 6.1 W');
     expect(vmHostLine({ at: AT, cpuTemp: 50, swapBytes: 0 })).toBe('50 °C');
-  });
-
-  it('is the worst of heat and memory', () => {
-    expect(vmHostStatus(mac)).toBe('ok');
-    expect(vmHostStatus({ ...mac, thermal: 'serious' })).toBe('warn');
-    expect(vmHostStatus({ ...mac, swapBytes: 5 * GB })).toBe('warn');
-    expect(vmHostStatus({ ...mac, pressure: 'critical' })).toBe('bad');
   });
 });
 
@@ -115,8 +101,8 @@ describe('VM host store', () => {
   });
 });
 
-describe('VM host API and phone glance', () => {
-  it('stores a POSTed report, lists it, refuses bad ones and shows it on the phone while fresh', async () => {
+describe('VM host API', () => {
+  it('stores a POSTed report, lists it and refuses bad ones', async () => {
     const store = new Store(':memory:');
     const server = await startHttpServer({
       bind: '127.0.0.1',
@@ -146,26 +132,5 @@ describe('VM host API and phone glance', () => {
     } finally {
       server.close();
     }
-
-    const last = store.lastVmHostSample() as VmHostSample;
-    let now = last.at + MIN;
-    const hub = new PhoneHub({
-      pending: () => [],
-      next: () => [],
-      usage: () => undefined,
-      vmHost: () => store.lastVmHostSample(),
-      projectTitle: (n) => n,
-      timeZone: 'Asia/Kolkata',
-      build: '1',
-      now: () => now,
-    });
-    expect(hub.state().vmHost).toEqual({
-      name: 'MacBook Air',
-      line: vmHostLine(mac),
-      status: 'ok',
-      at: last.at,
-    });
-    now = last.at + 20 * MIN;
-    expect(hub.state().vmHost).toBeUndefined();
   });
 });

@@ -2,7 +2,7 @@
  * The VM host: the machine tara-agent's VM runs on (e.g. a Mac running it in UTM). tara-agent only
  * sees inside the VM, so the host reports its own numbers (`POST /vmhost/metrics`, every 5 minutes
  * from examples/macos-desk-widget/lib/post-metrics.sh). They show on the Health page (checks and
- * trends) and on the desk phone's Home page.
+ * trends).
  */
 import { ago, type Check, type HealthStatus } from './monitor.js';
 
@@ -96,14 +96,6 @@ export function vmHostLine(s: VmHostSample): string {
   ]
     .filter(Boolean)
     .join(' · ');
-}
-
-/** The worst of the host's heat and memory, for the phone's colour. */
-export function vmHostStatus(s: VmHostSample): HealthStatus {
-  if (s.thermal === 'critical' || s.pressure === 'critical') return 'bad';
-  if (s.thermal === 'serious' || s.pressure === 'warn' || (s.swapBytes ?? 0) >= SWAP_WARN_BYTES)
-    return 'warn';
-  return 'ok';
 }
 
 /**

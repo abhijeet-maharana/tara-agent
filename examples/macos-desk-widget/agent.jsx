@@ -1,6 +1,5 @@
-// Agent panel: tara-agent's glance (GET /phone/state, the same data the desk phone shows), the
-// failing jobs and oldest cards from GET /attention, optional extra tiles, and a macOS notification
-// for each new urgent item. Click a tile to open that dashboard page. Data: lib/agent-state.sh.
+// Agent panel: tara-agent's glance (GET /glance), the failing jobs and oldest cards from
+// GET /attention, optional extra tiles, and a macOS notification for each new urgent item. Look only (no clicks). Data: lib/agent-state.sh.
 import { React, css, run } from 'uebersicht'; // React: <>…</> compiles to React.Fragment
 
 const DIR = 'tara-desk-widget'; // the symlink's name in Übersicht's widgets folder (install.sh)
@@ -17,6 +16,7 @@ export const className = `
   font: 12px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
   color: #e2e8f0;
   -webkit-font-smoothing: antialiased;
+  pointer-events: none; /* look only: clicks go through to the desktop */
 `;
 
 export const initialState = {
@@ -32,8 +32,7 @@ export const initialState = {
 
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 
-// A notification for urgent items new in /attention, read by this widget itself: tara-agent only
-// raises its own alerts while a desk phone listens. Same rules as the phone: the first run only
+// A notification for urgent items new in /attention, read by this widget itself. The first run only
 // records what is already there; in quiet hours nothing is shown and nothing is marked seen, so
 // what came overnight is told in one notification when they end; an item that clears and comes
 // back counts as new.
@@ -108,42 +107,56 @@ export const updateState = (event, prev) => {
   };
 };
 
+// Look: dark glass with one accent colour per tile label; red / amber / green / blue only for status.
+const ACCENT = {
+  claude: '#a78bfa',
+  needs: '#fb7185',
+  approvals: '#fbbf24',
+  running: '#2dd4bf',
+  next: '#60a5fa',
+  extra: '#a3e635',
+};
+
 const panel = css`
-  background: rgba(15, 23, 42, 0.84);
-  -webkit-backdrop-filter: blur(18px) saturate(1.4);
-  border: 1px solid rgba(148, 163, 184, 0.18);
-  border-radius: 14px;
-  padding: 12px 14px;
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+  background: radial-gradient(120% 80% at 0% 0%, rgba(45, 212, 191, 0.08), transparent 60%), rgba(10, 11, 16, 0.86);
+  -webkit-backdrop-filter: blur(20px) saturate(1.4);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 18px;
+  padding: 12px 12px 8px;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45);
   transition: opacity 0.3s;
-  &:hover {
-    opacity: 1 !important;
-  }
 `;
 const head = css`
   display: flex;
   justify-content: space-between;
-  font-size: 11px;
-  letter-spacing: 0.08em;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
-  color: #94a3b8;
-  margin-bottom: 6px;
+  color: #9ca3af;
+  margin: 0 2px 6px;
 `;
 const tile = css`
   display: flex;
   gap: 10px;
-  padding: 3px 4px;
-  margin: 0 -4px;
-  border-radius: 6px;
-  cursor: pointer;
-  &:hover {
-    background: rgba(148, 163, 184, 0.12);
-  }
+  padding: 7px 8px;
+  border-radius: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
 `;
 const label = css`
-  color: #94a3b8;
-  width: 74px;
+  width: 78px;
   flex: none;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding-top: 2px;
+`;
+const count = css`
+  font-size: 17px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  margin-right: 4px;
 `;
 const body = css`
   min-width: 0;
@@ -156,7 +169,7 @@ const line = css`
   text-overflow: ellipsis;
 `;
 const dim = css`
-  color: #8494ab;
+  color: #8b93a3;
 `;
 const offline = css`
   color: #f87171;
@@ -177,37 +190,55 @@ const ago = (ms) => {
   return `${Math.round(m / 1440)} d`;
 };
 
-const open = (href) => href && run(`open ${shq(href)}`);
-
-const Tile = ({ name, href, children }) => (
-  <div className={tile} onClick={() => open(href)}>
-    <span className={label}>{name}</span>
+const Tile = ({ name, accent = ACCENT.extra, children }) => (
+  <div className={tile}>
+    <span className={label} style={{ color: accent }}>
+      {name}
+    </span>
     <div className={body}>{children}</div>
   </div>
 );
 
-const Usage = ({ usage }) => {
-  if (!usage) return <span className={dim}>—</span>;
-  const p = Math.round(usage.share * 100);
-  const color = p >= 90 ? RED : p >= 70 ? AMBER : BLUE;
+const day = (ms) => new Date(ms).toLocaleDateString([], { weekday: 'short' });
+
+// One limit as a bar: "5h ▬▬▬▬ 84 % · 01:00". Amber from 70 %, red from 90 %.
+const Limit = ({ name, share, resetsAt, week }) => {
+  const p = Math.round(share * 100);
+  const color = p >= 90 ? RED : p >= 70 ? AMBER : `linear-gradient(90deg, ${ACCENT.claude}, #f472b6)`;
   return (
     <div className={line}>
+      <span className={dim} style={{ display: 'inline-block', width: 34 }}>
+        {name}
+      </span>
       <span
         style={{
           display: 'inline-block',
-          width: 110,
-          height: 7,
-          borderRadius: 4,
-          background: 'rgba(148,163,184,0.2)',
+          width: 92,
+          height: 6,
+          borderRadius: 3,
+          background: 'rgba(255,255,255,0.08)',
           verticalAlign: 'middle',
           marginRight: 8,
           overflow: 'hidden',
         }}
       >
-        <span style={{ display: 'block', width: `${Math.min(p, 100)}%`, height: '100%', background: color }} />
+        <span style={{ display: 'block', width: `${Math.min(p, 100)}%`, height: '100%', borderRadius: 3, background: color }} />
       </span>
-      {p} %{usage.resetsAt ? <span className={dim}> · resets {hhmm(usage.resetsAt)}</span> : null}
+      <span className={count}>{p}</span>
+      <span className={dim}>%</span>
+      {resetsAt ? <span className={dim}> · {week ? `${day(resetsAt)} ${hhmm(resetsAt)}` : hhmm(resetsAt)}</span> : null}
     </div>
+  );
+};
+
+// Claude's 5-hour window and, once a run in this tara-agent process has reported it, the 7-day one.
+const Usage = ({ usage }) => {
+  if (!usage) return <span className={dim}>—</span>;
+  return (
+    <>
+      <Limit name="5h" share={usage.share} resetsAt={usage.resetsAt} />
+      {usage.week ? <Limit name="Week" share={usage.week.share} resetsAt={usage.week.resetsAt} week /> : null}
+    </>
   );
 };
 
@@ -227,7 +258,7 @@ export const render = ({ name, url, state, attention, extra, okAt, downSince, er
   const quiet = s?.quiet?.now;
 
   return (
-    <div className={panel} style={{ opacity: downSince ? 0.75 : quiet ? 0.4 : 1 }}>
+    <div className={panel} style={{ opacity: downSince ? 0.75 : 1 }}>
       <div className={head}>
         <span>{name}</span>
         <span>{downSince ? '' : quiet ? '🌙 quiet' : okAt ? hhmm(okAt) : ''}</span>
@@ -244,17 +275,22 @@ export const render = ({ name, url, state, attention, extra, okAt, downSince, er
         <div className={dim}>{downSince ? `${url ?? ''} not reachable` : 'Loading…'}</div>
       ) : (
         <>
-          <Tile name="Claude" href={url && `${url}/`}>
+          <Tile name="Claude" accent={ACCENT.claude}>
             <Usage usage={s.usage} />
           </Tile>
 
-          <Tile name="Needs you" href={url && `${url}/`}>
+          <Tile name="Needs you" accent={ACCENT.needs}>
             <div className={line}>
               <span style={{ color: s.needs.urgent ? RED : GREEN }}>
-                {s.needs.urgent ? `🔴 ${s.needs.urgent} urgent` : '✅ nothing urgent'}
+                {s.needs.urgent ? (
+                  <>
+                    <span className={count}>{s.needs.urgent}</span>urgent
+                  </>
+                ) : (
+                  '✅ nothing urgent'
+                )}
               </span>
               {s.needs.waiting ? <span style={{ color: AMBER }}> · {s.needs.waiting} waiting</span> : null}
-              {s.held ? <span className={dim}> · {s.held} held</span> : null}
             </div>
             <List
               items={urgent}
@@ -267,9 +303,11 @@ export const render = ({ name, url, state, attention, extra, okAt, downSince, er
             />
           </Tile>
 
-          <Tile name="Approvals" href={url && `${url}/approvals`}>
+          <Tile name="Approvals" accent={ACCENT.approvals}>
             <div className={line}>
-              <span style={{ color: s.approvals.total ? AMBER : GREEN }}>{s.approvals.total}</span>
+              <span className={count} style={{ color: s.approvals.total ? AMBER : GREEN }}>
+                {s.approvals.total}
+              </span>
               {s.approvals.projects.length ? (
                 <span className={dim}>
                   {' '}
@@ -284,11 +322,11 @@ export const render = ({ name, url, state, attention, extra, okAt, downSince, er
             ))}
           </Tile>
 
-          <Tile name="Running" href={url && `${url}/sessions`}>
+          <Tile name="Running" accent={ACCENT.running}>
             {s.running.length ? (
               s.running.slice(0, 3).map((t) => (
                 <div key={t.id} className={line}>
-                  <span style={{ color: BLUE }}>●</span> {t.title}{' '}
+                  <span style={{ color: ACCENT.running }}>●</span> {t.title}{' '}
                   <span className={dim}>
                     {ago(t.startedAt)}
                     {t.step ? ` · ${t.step}` : ''}
@@ -300,7 +338,7 @@ export const render = ({ name, url, state, attention, extra, okAt, downSince, er
             )}
           </Tile>
 
-          <Tile name="Next" href={url && `${url}/schedule`}>
+          <Tile name="Next" accent={ACCENT.next}>
             {s.next.length ? (
               s.next.slice(0, 3).map((n) => (
                 <div key={`${n.project}${n.name}${n.at}`} className={line}>
@@ -313,7 +351,7 @@ export const render = ({ name, url, state, attention, extra, okAt, downSince, er
           </Tile>
 
           {(extra?.tiles ?? []).map((t) => (
-            <Tile key={t.label} name={t.label} href={t.href}>
+            <Tile key={t.label} name={t.label}>
               <div className={line}>
                 {(t.items ?? []).map((i, n) => (
                   <span key={`${i.text}${n}`} title={i.title}>
@@ -325,15 +363,6 @@ export const render = ({ name, url, state, attention, extra, okAt, downSince, er
             </Tile>
           ))}
 
-          {s.alerts.length ? (
-            <Tile name="Alerts" href={url && `${url}/`}>
-              {s.alerts.slice(0, 2).map((a) => (
-                <div key={a.id} className={line} style={{ color: a.kind === 'urgent' ? RED : undefined }}>
-                  {hhmm(a.at)} {a.text}
-                </div>
-              ))}
-            </Tile>
-          ) : null}
         </>
       )}
     </div>

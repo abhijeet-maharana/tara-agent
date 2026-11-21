@@ -114,8 +114,8 @@ function triggerLabel(trigger: JobTrigger): string {
   if (trigger.kind === 'catch-up') return ' (catch-up)';
   if (trigger.kind === 'manual') {
     if (/^[UW][A-Z0-9]+$/.test(trigger.by)) return ` (run by <@${trigger.by}>)`;
-    // Run now on the dashboard, the phone, the API: where, not a made-up person.
-    return ['dashboard', 'phone', 'api'].includes(trigger.by)
+    // Run now on the dashboard or the API: where, not a made-up person.
+    return ['dashboard', 'api'].includes(trigger.by)
       ? ` (run from the ${trigger.by === 'api' ? 'API' : trigger.by})`
       : ` (run by ${trigger.by})`;
   }

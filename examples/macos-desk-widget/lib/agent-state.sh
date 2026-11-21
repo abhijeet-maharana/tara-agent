@@ -1,7 +1,7 @@
 #!/bin/bash
 # The agent panel's data as one JSON line, run by agent.jsx every 30 s:
-#   {"name", "url", "notify", "state": GET /phone/state, "attention": GET /attention | null, "extra": EXTRA_TILES_URL | null}
-# or {"name", "url", "error"} when /phone/state can't be read. Never fails, so the panel can say "offline".
+#   {"name", "url", "notify", "state": GET /glance, "attention": GET /attention | null, "extra": EXTRA_TILES_URL | null}
+# or {"name", "url", "error"} when /glance can't be read. Never fails, so the panel can say "offline".
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
 TARA_URL="http://localhost:4000"
@@ -26,7 +26,7 @@ object() {
   if [ $? -eq 0 ] && [ "${out:0:1}" = "{" ]; then printf '%s' "$out"; else printf 'null'; fi
 }
 
-body="$(curl -sS -f -m 5 "${auth[@]}" "$TARA_URL/phone/state" 2>&1)"
+body="$(curl -sS -f -m 5 "${auth[@]}" "$TARA_URL/glance" 2>&1)"
 if [ $? -eq 0 ] && [ "${body:0:1}" = "{" ]; then
   attention="$(object "${auth[@]}" "$TARA_URL/attention")"
   extra="null"

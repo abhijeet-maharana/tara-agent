@@ -186,7 +186,7 @@ export const hostConfigSchema = z.object({
     .default([{ lock: 'chrome', cdpUrl: 'http://127.0.0.1:9222', closeTabs: true, staleMinutes: 30 }]),
   /**
    * Where runs that nobody started from Slack happen (scheduled jobs, catch-ups, Run now, queues,
-   * decisions, scheduled tasks, voice requests). `summary`: on the dashboard (live steps, the whole
+   * decisions, scheduled tasks). `summary`: on the dashboard (live steps, the whole
    * conversation, a box to reply), with one summary message in Slack when the run ends (nothing for a
    * run with nothing to report). `thread`: a `Run <name>` thread in Slack, as before. Projects and jobs
    * can override it (`delivery`).
@@ -219,8 +219,8 @@ export const hostConfigSchema = z.object({
       /** Pass requests for paths tara-agent doesn't serve to this URL (e.g. the port's previous owner). */
       fallback: z.string().url().optional(),
       /**
-       * Also serve HTTPS on this port, e.g. with a Tailscale certificate (`tailscale cert`). Browsers
-       * only allow the microphone (Live) over HTTPS. Plain HTTP on `port` stays as it is.
+       * Also serve HTTPS on this port, e.g. with a Tailscale certificate (`tailscale cert`). Plain HTTP
+       * on `port` stays as it is.
        */
       tls: z
         .object({
@@ -230,59 +230,13 @@ export const hostConfigSchema = z.object({
         })
         .optional(),
       /**
-       * The desk phone's alerts (docs/jarvis-phone.md). Quiet hours hold them (Night page, one summary
-       * after); outside them at most one is spoken per `alertGapMinutes`. Defaults: 23:00–07:00, 30.
+       * Quiet hours in the glance (`GET /glance`), local `HH:MM`: desk panels such as the macOS desk
+       * widget hold their notifications then. Default 23:00–07:00.
        */
-      phone: z
+      quietHours: z
         .object({
-          quietHours: z
-            .object({
-              from: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Use HH:MM'),
-              to: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Use HH:MM'),
-            })
-            .optional(),
-          alertGapMinutes: z.number().int().min(0).max(1440).optional(),
-          /** false: alerts light the screen and buzz once, never spoken. Default true. */
-          speakAlerts: z.boolean().optional(),
-          /**
-           * Voice (Phase 4): models for what the rules don't answer, on the host `voice` endpoint
-           * (default: `voice.models`), and the Claude model for questions about a project's code.
-           */
-          voiceModels: z.array(z.string().min(1)).min(1).optional(),
-          askModel: z.string().min(1).default('haiku'),
-          /**
-           * Voice v2: Gemini Live as the voice (key in TARA_LIVE_API_KEY). Without it, or without the
-           * key, the phone keeps Phase 4's Android speech. `idleSeconds`: quiet time before the voice
-           * session closes (it costs per minute while open). `language`: how to speak, in plain words.
-           */
-          live: z
-            .object({
-              model: z.string().min(1),
-              voice: z.string().min(1).default('Charon'),
-              idleSeconds: z.number().int().min(5).max(600).default(20),
-              language: z.string().min(1).optional(),
-              /** Silence that ends the user's turn (ms); Google's default when unset. */
-              silenceMs: z.number().int().min(100).max(5_000).optional(),
-              googleSearch: z.boolean().default(true),
-              /** The model stays silent for speech not meant for it (TV, other people). */
-              proactiveAudio: z.boolean().default(true),
-              /**
-               * Gemini's voice activity detection. `startSensitivity: high` (jarvis): with a TV or fan in
-               * the room the default never saw the owner's speech start, so nothing was answered.
-               */
-              startSensitivity: z.enum(['low', 'high']).optional(),
-              endSensitivity: z.enum(['low', 'high']).optional(),
-              url: z.string().url().optional(),
-              /** ask_claude's models (key in TARA_ANTHROPIC_API_KEY); defaults Sonnet 5.5 and Opus 5.5. */
-              claudeModel: z.string().min(1).optional(),
-              claudeHardModel: z.string().min(1).optional(),
-              /** play_music: the Cast speaker by its name (or `host`); default the first one found. */
-              speaker: z.string().min(1).optional(),
-              speakerHost: z.string().min(1).optional(),
-              /** Off: no music tools. */
-              music: z.boolean().default(true),
-            })
-            .optional(),
+          from: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Use HH:MM'),
+          to: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Use HH:MM'),
         })
         .optional(),
     })

@@ -31,6 +31,36 @@ describe('parseStreamLine', () => {
     });
   });
 
+  it('keeps every usage window the CLI reports, the weekly one too', () => {
+    const line = JSON.stringify({
+      type: 'rate_limit_event',
+      rate_limit_info: {
+        status: 'allowed',
+        resetsAt: 1795284600,
+        rateLimitType: 'five_hour',
+        unifiedWindows: {
+          five_hour: { utilization: 0.87, resetsAt: 1795284600, status: 'allowed' },
+          seven_day: { utilization: 0.12, resetsAt: 1795341600, status: 'allowed' },
+        },
+      },
+    });
+    expect(parseStreamLine(line)).toEqual([
+      {
+        kind: 'rate_limit',
+        rateLimit: {
+          status: 'allowed',
+          window: 'five_hour',
+          utilization: 0.87,
+          resetsAt: 1795284600,
+          windows: {
+            five_hour: { utilization: 0.87, resetsAt: 1795284600, status: 'allowed' },
+            seven_day: { utilization: 0.12, resetsAt: 1795341600, status: 'allowed' },
+          },
+        },
+      },
+    ]);
+  });
+
   it('reads the result with usage and cost', () => {
     const result = events[4] as Extract<StreamEvent, { kind: 'result' }>;
     expect(result).toMatchObject({ isError: false, text: 'done', numTurns: 2, permissionDenials: [] });

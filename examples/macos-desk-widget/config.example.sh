@@ -10,7 +10,7 @@ TARA_KEYCHAIN_SERVICE=""
 # What to call the virtual machine on the Mac panel, if tara-agent runs in one on this Mac.
 VM_LABEL="VM"
 
-# How this Mac names itself in tara-agent (Health page, desk phone) when it reports with --metrics.
+# How this Mac names itself in tara-agent (Health page) when it reports with --metrics.
 HOST_NAME="Mac"
 
 # Panel title for the agent.

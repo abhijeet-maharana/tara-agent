@@ -30,6 +30,17 @@ describe('loadHostConfig', () => {
     expect(host.stateDir).toBe(path.join(homedir(), '.local/state/tara-agent'));
   });
 
+  it("reads http.quietHours and ignores the retired desk phone's http.phone", () => {
+    const file = path.join(tempDir(), 'config.yaml');
+    writeFileSync(
+      file,
+      'projects: [/srv/a]\nhttp:\n  quietHours: {from: "22:30", to: "06:00"}\n  phone:\n    speakAlerts: false\n',
+    );
+    const host = loadHostConfig(file);
+    expect(host.http.quietHours).toEqual({ from: '22:30', to: '06:00' });
+    expect(host.http).not.toHaveProperty('phone');
+  });
+
   it('lists every invalid field', () => {
     const file = path.join(tempDir(), 'config.yaml');
     writeFileSync(file, 'projects: []\nconcurrency: 0\n');
@@ -242,12 +253,12 @@ describe('Store', () => {
     const db = new DatabaseSync(file);
     const { user_version: v } = db.prepare('PRAGMA user_version').get() as { user_version: number };
     // The database as it was before the upgrade: totals in cost_usd, no session_cost_usd.
-    // (twelve migrations back: the cost one, day_threads, the health tables, samples and logs, item priority, reminders,
-    // reminder tasks, item handoff notes, phone devices, phone battery, dashboard threads, VM host samples; dropping the
-    // reminders table undoes reminders and reminder tasks)
+    // (thirteen migrations back: the cost one, day_threads, the health tables, samples and logs, item priority, reminders,
+    // reminder tasks, item handoff notes, phone devices, phone battery, dashboard threads, VM host samples, dropping the
+    // phone tables; dropping the reminders table undoes reminders and reminder tasks, and the phone tables are gone already)
     db.exec(
-      `DROP TABLE vmhost_samples; DROP TABLE thread_aliases; DROP TABLE web_mirrors; DROP TABLE web_messages; DROP TABLE phone_battery; DROP TABLE phone_devices; ALTER TABLE items DROP COLUMN handoff; DROP TABLE reminders; ALTER TABLE items DROP COLUMN priority; DROP TABLE log_events; DROP TABLE host_samples; DROP TABLE health_events;
-       DROP TABLE health_state; DROP TABLE day_threads; ALTER TABLE runs DROP COLUMN session_cost_usd; PRAGMA user_version = ${v - 12};`,
+      `DROP TABLE vmhost_samples; DROP TABLE thread_aliases; DROP TABLE web_mirrors; DROP TABLE web_messages; ALTER TABLE items DROP COLUMN handoff; DROP TABLE reminders; ALTER TABLE items DROP COLUMN priority; DROP TABLE log_events; DROP TABLE host_samples; DROP TABLE health_events;
+       DROP TABLE health_state; DROP TABLE day_threads; ALTER TABLE runs DROP COLUMN session_cost_usd; PRAGMA user_version = ${v - 13};`,
     );
     const add = db.prepare(
       `INSERT INTO runs (kind, project, session_id, started_at, ended_at, status, cost_usd) VALUES ('chat', 'p', ?, ?, ?, 'ok', ?)`,

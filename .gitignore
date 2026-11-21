@@ -7,6 +7,3 @@ coverage/
 *.db
 *.db-*
 .DS_Store
-
-# Wake word models fetched by deploy/wake/train_verifier.py (CC BY-NC-SA, never committed)
-deploy/wake/.models/
