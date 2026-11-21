@@ -4,7 +4,7 @@ import { TOKENS } from './look.js';
 /**
  * `/phone`: the desk phone's glance screen (docs/jarvis-phone.md, Phase 2). One page with three views:
  *
- *   Home   needs you, approvals waiting, running now, next up, Claude usage, clock
+ *   Home   needs you, approvals waiting, running now, next up, Claude usage, the VM host's figures, clock
  *   Run    one running session's live steps (tap a run on Home); back to Home when idle
  *   Night  large dim clock and the urgent count, in quiet hours after a minute untouched
  *
@@ -55,6 +55,7 @@ button{font:inherit;color:inherit}
 .usage{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text-dim);margin-top:10px}
 .usage i{flex:1;height:6px;border-radius:3px;background:var(--border);overflow:hidden}.usage i b{display:block;height:100%;background:var(--green)}
 .usage.warn i b{background:var(--amber)}.usage.bad i b{background:var(--red)}
+.host{font-size:13px;color:var(--text-dim);margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.host.warn{color:var(--amber)}.host.bad{color:var(--red)}
 .tiles{flex:1;min-width:0;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
 .tile{--state:var(--border-light);position:relative;background:var(--card-bg);border:1px solid var(--border);border-radius:14px;padding:12px 14px;display:flex;flex-direction:column;min-height:0;min-width:0;overflow:hidden}
 .tile::before{content:'';position:absolute;top:0;left:14px;right:14px;height:3px;border-radius:0 0 3px 3px;background:var(--state)}
@@ -172,7 +173,7 @@ body.night{background:#000}body.night .bar{visibility:hidden}
 @media (orientation:portrait){
  #home{flex-direction:column}
  .time{width:auto;display:grid;grid-template-columns:auto 1fr;column-gap:16px;align-items:end}
- .clock{font-size:84px;grid-row:1/3}.date{margin:0 0 4px}.next{margin:0;grid-column:1/3;margin-top:10px}.usage{grid-column:2;grid-row:2;margin:0 0 10px}
+ .clock{font-size:84px;grid-row:1/3}.date{margin:0 0 4px}.next{margin:0;grid-column:1/3;margin-top:10px}.usage{grid-column:2;grid-row:2;margin:0 0 10px}.host{grid-column:1/3;margin:0}
  .tiles{grid-template-columns:1fr;grid-template-rows:repeat(3,minmax(0,1fr))}
  .tile{display:grid;grid-template-columns:auto 1fr;grid-template-rows:auto 1fr;column-gap:16px}
  .tile h2{grid-column:1/3}.tile .big{grid-row:2;align-self:start;min-width:64px}.tile ul,.tile .note{grid-row:2;grid-column:2;margin-top:8px}
@@ -191,6 +192,7 @@ body.night{background:#000}body.night .bar{visibility:hidden}
 <section class="page" id="home">
  <div class="time"><div class="clock" id="clock">--:--</div><div class="date" id="date"></div>
   <div class="usage" id="usage" hidden><span>Claude</span><i><b id="usageBar"></b></i><span id="usageN"></span></div>
+  <div class="host" id="host" hidden></div>
   <div class="next" id="next"></div></div>
  <div class="tiles">
   <article class="tile" id="tNeeds"><h2>Needs you</h2><div class="big" id="needsN">–</div><ul id="needsL"></ul></article>
@@ -267,6 +269,7 @@ function renderHome(){
  if(S.next.length){nx.append(el('h2',null,'Next up'));for(const j of S.next.slice(0,3)){const r=el('div','nx');const tm=el('time',null,until(j.at));tm.dataset.at=j.at;r.append(tm,el('span','ell',j.name+' · '+j.project));nx.append(r);}}
  const u=S.usage;$('usage').hidden=!u;
  if(u){const pc=Math.round(u.share*100);$('usageBar').style.width=Math.min(100,pc)+'%';$('usageN').textContent=pc+'%';$('usage').className='usage'+(u.share>=.9?' bad':u.share>=.7?' warn':'');}
+ const h=S.vmHost;$('host').hidden=!h;if(h){$('host').textContent=(h.name||'Host')+' · '+h.line;$('host').className='host'+(h.status==='ok'?'':' '+h.status);}
  renderNight();renderQuiet();ticks();
 }
 function word(s){return s==='ok'?'done':s==='silent'?'nothing to do':s==='aborted'?'stopped':s;}

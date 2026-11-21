@@ -1,5 +1,6 @@
 import type { HealthStatus } from '../health/monitor.js';
 import type { CostRow, DayRuns, JobTrend, LogGroup, Totals, Uptime } from '../health/trends.js';
+import type { VmHostSample } from '../health/vmhost.js';
 import type { HostSample } from '../store/store.js';
 import { type DashboardContext, esc, layout, pageHead, relative, section } from './dashboard.js';
 
@@ -314,6 +315,8 @@ export interface TrendsData {
   /** Checks that were fine for the whole window. */
   steady: number;
   host: HostSample[];
+  /** The VM host's own reports (src/health/vmhost.ts); empty when it doesn't report. */
+  vmHost: VmHostSample[];
   /** Health uptime across all checks, 0–1 (time not red over check-time). */
   overallUptime?: number;
 }
@@ -604,6 +607,58 @@ export function trendsPage(ctx: DashboardContext, d: TrendsData): string {
     label: '90%',
   })}${hostChart('Disk used', (h) => h.diskUsed, pct, 1, { v: 0.85, label: '85%' })}</div>`;
 
+  // The VM host's charts, only once it reports (most hosts don't run tara-agent in a VM).
+  const vmFrom = Math.max(d.from, (d.vmHost[0]?.at ?? d.now) - 5 * 60_000);
+  const vmChart = (
+    title: string,
+    pick: (h: VmHostSample) => number | undefined,
+    fmt: (v: number) => string,
+    max?: number,
+    ref?: { v: number; label: string },
+  ) =>
+    lineChart({
+      title,
+      note: vmFrom > d.from + 86_400_000 ? `since ${tipTime(vmFrom)}` : 'every 5 minutes',
+      points: d.vmHost.flatMap((h) => {
+        const v = pick(h);
+        return v === undefined ? [] : [{ at: h.at, v }];
+      }),
+      from: vmFrom,
+      to: d.now,
+      max,
+      fmt,
+      tipTime,
+      ref,
+      gapMs: 20 * 60_000,
+      empty: 'No reports in this window.',
+      height: 90,
+      xTicks: [vmFrom, d.now].map((at) => ({
+        at,
+        label: new Date(at).toLocaleString('en-GB', {
+          timeZone: ctx.timeZone,
+          ...(d.now - vmFrom > 2 * 86_400_000
+            ? { day: 'numeric', month: 'short' }
+            : { hour: '2-digit', minute: '2-digit' }),
+        }),
+      })),
+    });
+  const vmHost = d.vmHost.length
+    ? section(
+        'VM host',
+        `<div class="grid3">${vmChart(
+          'CPU temperature',
+          (h) => h.cpuTemp,
+          (v) => `${Math.round(v)} °C`,
+        )}${vmChart(
+          'VM share of its CPU',
+          (h) => h.vmCpu,
+          pct,
+          1,
+        )}${vmChart('Its memory used', (h) => h.memUsed, pct, 1, { v: 0.9, label: '90%' })}</div>`,
+        { sub: `${d.vmHost.at(-1)?.name ?? 'the machine the VM runs on'}, as it reports itself` },
+      )
+    : '';
+
   const body = `${VIZ_STYLE}${pageHead('Health', `How things went over the last ${d.days} days, against the ${d.days} days before.`)}${healthTabs(
     'trends',
   )}<div class="toolbar" style="margin-top:-6px">${rangeChips}</div>${kpis}${section(
@@ -617,7 +672,7 @@ export function trendsPage(ctx: DashboardContext, d: TrendsData): string {
     {
       sub: 'failing or slowing down first',
     },
-  )}${section('Uptime', strips, { sub: 'checks that had trouble' })}${section('Machine', host)}`;
+  )}${section('Uptime', strips, { sub: 'checks that had trouble' })}${section('Machine', host)}${vmHost}`;
   return layout(ctx, 'Health trends', 'Health', body, { script: VIZ_SCRIPT });
 }
 

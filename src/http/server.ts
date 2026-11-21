@@ -29,6 +29,7 @@ import { loadQueues } from '../config/load.js';
 import type { HostConfig, Project, QueueConfig } from '../config/schema.js';
 import type { HealthMonitor } from '../health/monitor.js';
 import type { Observability } from '../health/observability.js';
+import { parseVmHostSample, VMHOST_KEEP_DAYS, VmHostError } from '../health/vmhost.js';
 import { type LiveToolKit, PhoneLive, type PhoneLiveConfig } from '../live/phone-live.js';
 import { ReminderError, type Reminders } from '../reminders/reminders.js';
 import type { Activity } from '../runner/activity.js';
@@ -87,6 +88,9 @@ import { loadQuotes, pickQuote } from './quotes.js';
 import { remindersPage } from './reminders-page.js';
 import { isDayKey, MAX_RUNS_PER_DAY, type PlanJob, planDay, schedulePage } from './schedule.js';
 import { firstPromptOf, readTranscript } from './transcript.js';
+
+/** Sessions per page of the Sessions list. */
+const SESSIONS_PAGE = 50;
 
 export interface HttpOptions {
   bind: string;
@@ -252,6 +256,9 @@ async function readJson(req: IncomingMessage, limit = 10_000): Promise<Record<st
  *   POST /sessions/<id>/message        {text} continues that session's thread as its owner; needs the
  *                                      header `x-tara-admin: <TARA_ADMIN_TOKEN>` (for a person's own Claude
  *                                      fixing a run, never for runs)
+ *   POST /vmhost/metrics               {name?, cpuTemp?, thermal?, cpu?, memUsed?, swapBytes?, pressure?, vmCpu?,
+ *                                      vmMemBytes?, powerW?} the VM host's own figures (src/health/vmhost.ts)
+ *   GET  /vmhost/metrics?hours=1       its reports over the last hours
  *   POST /reload                       re-read every .tara/jobs.json now
  *   GET  /reminders?project=<name>     reminders still to come, soonest first
  *   POST /reminders/<project>          {text, cron? | at?, notify?, task?, title?, by?} → the reminder
@@ -448,6 +455,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     activity: options.activity,
     next: nextUp,
     usage: usageNow,
+    vmHost: () => options.store.lastVmHostSample(),
     projectTitle,
     timeZone,
     quietHours: options.phone?.quietHours,
@@ -615,10 +623,20 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
   };
 
   /** The session a running job works in (from its live task's thread), for a link to its transcript. */
-  const liveJobSession = (project: string, jobId: string) => {
+  /**
+   * The session a started job works in: its running Claude run, else (finishing up, e.g. its learning
+   * turn) the latest one since it started.
+   */
+  const liveJobSession = (project: string, jobId: string, since?: Date) => {
     const task = options.activity
       ?.tasks()
-      .find((t) => t.status === 'running' && t.kind === 'job' && t.project === project && t.jobId === jobId);
+      .find(
+        (t) =>
+          t.kind === 'job' &&
+          t.project === project &&
+          t.jobId === jobId &&
+          (t.status === 'running' || (since !== undefined && t.startedAt >= since.getTime())),
+      );
     return task?.thread
       ? options.store.getSession(threadKey(task.thread.channel, task.thread.ts))?.sessionId
       : undefined;
@@ -670,7 +688,8 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         jobs: {
           total: jobs.length,
           enabled: jobs.filter((j) => j.enabled).length,
-          running: jobs.filter((j) => j.running).length,
+          running: jobs.filter((j) => j.running && !j.waitingFor).length,
+          waiting: jobs.filter((j) => j.waitingFor).length,
         },
       };
     }
@@ -683,6 +702,24 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     }
     if (method === 'GET' && url.pathname === '/attention' && options.attention) {
       return options.attention();
+    }
+    if (url.pathname === '/vmhost/metrics') {
+      if (method === 'POST') {
+        try {
+          options.store.addVmHostSample(parseVmHostSample(await readJson(req, 4_000), now()));
+        } catch (err) {
+          if (err instanceof VmHostError) throw new HttpError(400, err.message);
+          throw err;
+        }
+        return { ok: true };
+      }
+      if (method === 'GET') {
+        const hours = Math.min(
+          24 * VMHOST_KEEP_DAYS,
+          Math.max(1, Number(url.searchParams.get('hours')) || 1),
+        );
+        return { samples: options.store.vmHostSamples(now() - hours * 3_600_000) };
+      }
     }
     if (method === 'GET' && url.pathname === '/jobs') {
       const project = knownProject(url.searchParams.get('project'));
@@ -1345,8 +1382,11 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     const dir = ctx.projects.find((p) => p.config.name === project)?.dir;
     // Sessions whose thread was cleared are still on disk: look in every project.
     const entries = transcript(id, dir);
-    const jobName = run?.jobId ? jobNames().get(`${run.project}:${run.jobId}`) : undefined;
-    const running = liveTask(id)?.status === 'running';
+    // A job's first run is recorded when it ends: until then the live task names the job.
+    const task = liveTask(id);
+    const jobId = run?.jobId ?? task?.jobId;
+    const jobName = jobId ? jobNames().get(`${run?.project ?? task?.project}:${jobId}`) : undefined;
+    const running = task?.status === 'running';
     const key = session?.threadKey;
     const at = key?.indexOf(':') ?? -1;
     const channel = key && at > 0 ? key.slice(0, at) : undefined;
@@ -1392,18 +1432,29 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       return remindersPage(ctx, { reminders: (p) => reminders.list(p), now: now() });
     }
     if ((parts[0] === 'sessions' && parts.length === 1) || oldSessionsLink) {
-      const project = url.searchParams.get('project') ?? undefined;
-      const runningThreads = new Set(
+      const project = url.searchParams.get('project') || undefined;
+      const kindParam = url.searchParams.get('kind');
+      const kind = kindParam === 'job' || kindParam === 'chat' ? kindParam : undefined;
+      const total = options.store.sessionsCount({ project, kind });
+      const pages = Math.max(1, Math.ceil(total / SESSIONS_PAGE));
+      const pageNo = Math.min(pages, Math.max(1, Math.floor(Number(url.searchParams.get('page')) || 1)));
+      // Threads with a run working in them, and the job when it is one (its run isn't recorded yet).
+      const runningThreads = new Map(
         (options.activity?.tasks() ?? [])
           .filter((t) => t.status === 'running' && t.thread)
-          .map((t) => threadKey(t.thread?.channel ?? '', t.thread?.ts ?? '')),
+          .map((t) => [threadKey(t.thread?.channel ?? '', t.thread?.ts ?? ''), t.jobId] as const),
       );
       return sessionsPage(
         ctx,
-        options.store.sessionsOverview({ project, limit: 200 }),
+        options.store.sessionsOverview({
+          project,
+          kind,
+          limit: SESSIONS_PAGE,
+          offset: (pageNo - 1) * SESSIONS_PAGE,
+        }),
         jobNames(),
-        { project, kind: url.searchParams.get('kind') ?? undefined },
-        { preview, runningThreads, now: now() },
+        { project, kind },
+        { preview, runningThreads, now: now(), page: { at: pageNo, of: pages, total } },
       );
     }
     const jobViews = (): JobView[] =>
@@ -1450,7 +1501,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         jobs: views.map((j) => ({
           ...j,
           everyMs: every.get(`${j.project}:${j.id}`),
-          liveSessionId: j.running ? liveJobSession(j.project, j.id) : undefined,
+          liveSessionId: j.startedAt ? liveJobSession(j.project, j.id, j.startedAt) : undefined,
         })),
         // Each job's latest run that did something, so a job that ran three times doesn't fill the list.
         latest: runs
@@ -1538,17 +1589,20 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       const day = url.searchParams.get('day');
       const project = projectParam();
       const chosen = isDayKey(day) ? day : today;
-      // Running jobs, each with the session to watch it in.
+      // Running jobs, each with the session to watch it in; busy ones not started yet wait.
       const running = new Map<string, string | undefined>();
+      const waiting = new Set<string>();
       for (const p of names)
         for (const j of options.scheduler.list(p))
-          if (j.running) running.set(`${p}:${j.id}`, liveJobSession(p, j.id));
+          if (j.waitingFor) waiting.add(`${p}:${j.id}`);
+          else if (j.running) running.set(`${p}:${j.id}`, liveJobSession(p, j.id, j.startedAt));
       return schedulePage(ctx, dayPlan(chosen, project), {
         day: chosen,
         today,
         project,
         now: at,
         running,
+        waiting,
         projectsWithJobs: names.filter((p) => options.scheduler.list(p).length > 0),
       });
     }

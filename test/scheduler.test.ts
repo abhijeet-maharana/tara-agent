@@ -77,6 +77,8 @@ function setup(opts: {
   during?: () => Promise<void>;
   /** The cost each model run reports, in call order (the session's running total, as the CLI does). */
   costs?: number[];
+  /** How each model run ends, in call order, where it isn't a plain success (e.g. agy out of quota). */
+  outcomes?: Array<Partial<RunOutcome> | undefined>;
 }) {
   const chat = new FakeChat('ts');
   chat.stream = opts.stream;
@@ -122,6 +124,8 @@ function setup(opts: {
       o.onEvent?.({ kind: 'text_start' });
       o.onEvent?.({ kind: 'text', text: reply });
       if (calls.length === 1 && opts.firstStatus) return { ...ok(''), status: opts.firstStatus };
+      const outcome = opts.outcomes?.[calls.length - 1];
+      if (outcome) return { ...ok(''), ...outcome };
       const costUsd = opts.costs?.[calls.length - 1];
       return costUsd === undefined ? ok(reply) : { ...ok(reply), costUsd };
     },
@@ -309,6 +313,79 @@ describe('Scheduler', () => {
       '## The card\n### Menu\nSearch overlaps the menu.\n\nUSER DECISION on "Menu": Fix it',
     );
     await scheduler.stop();
+  });
+
+  it('reruns a step on the fallback when agy is out of quota, and keeps the rest of the run there', async () => {
+    const { calls, chat, scheduler, store } = setup({
+      jobs: [
+        {
+          ...baseJob,
+          harness: 'agy',
+          model: 'gemini-x',
+          fallback: { harness: 'claude', model: 'claude-opus-5-5' },
+          handoff: { harness: 'claude', model: 'claude-opus-5-5' },
+          steps: [{ name: 'Capture' }, { name: 'Review', model: 'gemini-y' }],
+        },
+      ],
+      outcomes: [{ status: 'limit', error: 'RESOURCE_EXHAUSTED (code 429): Resource has been exhausted' }],
+      replies: ['', 'captured 40 pages', 'review: 2 findings', 'Headline\n---\nAll done'],
+    });
+    scheduler.start();
+    scheduler.trigger('shop', 'sla', 'U1');
+    await scheduler.idle();
+    expect(calls.map((c) => c.harness)).toEqual(['agy', 'claude', 'claude', 'claude']);
+    const [, capture, review, main] = calls as [RunOptions, RunOptions, RunOptions, RunOptions];
+    // The rerun does the same step; a step's own model is for agy, so the fallback's model runs it.
+    expect(capture.prompt).toContain('"### Step: Capture"');
+    expect(capture.args).toEqual(expect.arrayContaining(['--model', 'claude-opus-5-5']));
+    expect(review.args).toEqual(expect.arrayContaining(['--model', 'claude-opus-5-5']));
+    expect(main.args).toEqual(expect.arrayContaining(['--model', 'claude-opus-5-5', '--session-id', 'sid']));
+    expect(main.prompt).toContain('### Capture\ncaptured 40 pages');
+    // Replies and approved cards continue that Claude session.
+    expect(store.getSession('C1:ts1')).toMatchObject({ harness: 'claude', model: 'claude-opus-5-5' });
+    expect(chat.log.join('\n')).toContain(
+      '↪️ Step "Capture" ran on claude (claude-opus-5-5): agy was unavailable (RESOURCE_EXHAUSTED (code 429)',
+    );
+    expect(scheduler.list('shop')[0]).toMatchObject({ lastStatus: 'ok' });
+    await scheduler.stop();
+  });
+
+  it('reruns the main session on the fallback when agy has no capacity, but not for its own errors', async () => {
+    const job = {
+      ...baseJob,
+      harness: 'agy',
+      model: 'gemini-x',
+      fallback: { harness: 'claude', model: 'claude-opus-5-5' },
+    };
+    const busy = setup({
+      jobs: [job],
+      initSessionId: 'conv-1',
+      outcomes: [{ status: 'error', error: '503 UNAVAILABLE: The model is overloaded' }],
+    });
+    busy.scheduler.start();
+    busy.scheduler.trigger('shop', 'sla', 'U1');
+    await busy.scheduler.idle();
+    expect(busy.calls.map((c) => c.harness)).toEqual(['agy', 'claude']);
+    // The rerun is a fresh session in the same scratch folder.
+    expect(busy.calls[1]?.env.TARA_SCRATCH).toBe(busy.calls[0]?.env.TARA_SCRATCH);
+    expect(busy.calls[1]?.args).not.toContain('--resume');
+    expect(busy.store.getSession('C1:ts1')).toMatchObject({ harness: 'claude', model: 'claude-opus-5-5' });
+    expect(busy.chat.log.join('\n')).toContain(
+      '↪️ The run ran on claude (claude-opus-5-5): agy was unavailable',
+    );
+    expect(busy.scheduler.list('shop')[0]).toMatchObject({ lastStatus: 'ok' });
+    await busy.scheduler.stop();
+
+    const broken = setup({
+      jobs: [job],
+      outcomes: [{ status: 'error', error: 'page.goto: net::ERR_NAME_NOT_RESOLVED' }],
+    });
+    broken.scheduler.start();
+    broken.scheduler.trigger('shop', 'sla', 'U1');
+    await broken.scheduler.idle();
+    expect(broken.calls).toHaveLength(1);
+    expect(broken.scheduler.list('shop')[0]).toMatchObject({ lastStatus: 'error' });
+    await broken.scheduler.stop();
   });
 
   it('runs steps in their own sessions before the main prompt, with the job MCP servers', async () => {
@@ -829,6 +906,38 @@ describe('job threads', () => {
     await scheduler.idle();
     expect(store.lastJobRun('shop', 'sla')?.status).toBe('aborted');
     expect(threads.busy('C1:ts1')).toBe(false);
+    await scheduler.stop();
+  });
+
+  it('lists a busy job that has no free slot yet as waiting, not started', async () => {
+    const releases: Array<() => void> = [];
+    const scheduler = new Scheduler({
+      projects: [makeProject([baseJob, { ...baseJob, id: 'audit', name: 'Audit' }])],
+      host: { ...host, jobConcurrency: 1 },
+      store: new Store(':memory:'),
+      chat: new FakeChat('ts'),
+      log: { info() {}, warn() {}, error() {} },
+      env: { PATH: '/bin' },
+      newSessionId: () => 'sid',
+      run: () => new Promise((resolve) => releases.push(() => resolve(ok('Done')))),
+    });
+    scheduler.start();
+    scheduler.trigger('shop', 'sla', 'U1');
+    scheduler.trigger('shop', 'audit', 'U1');
+    while (!releases.length) await new Promise((r) => setTimeout(r, 5));
+
+    const jobs = new Map(scheduler.list('shop').map((j) => [j.id, j]));
+    expect(jobs.get('sla')).toMatchObject({ running: true, startedAt: expect.any(Date) });
+    expect(jobs.get('sla')?.waitingFor).toBeUndefined();
+    expect(jobs.get('audit')).toMatchObject({ running: true, waitingFor: 'slot' });
+    expect(jobs.get('audit')?.startedAt).toBeUndefined();
+
+    releases.shift()?.();
+    while (!releases.length) await new Promise((r) => setTimeout(r, 5));
+    expect(scheduler.list('shop').find((j) => j.id === 'audit')?.waitingFor).toBeUndefined();
+    releases.shift()?.();
+    await scheduler.idle();
+    expect(scheduler.list('shop').every((j) => !j.running && !j.startedAt)).toBe(true);
     await scheduler.stop();
   });
 });

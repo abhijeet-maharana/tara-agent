@@ -22,7 +22,7 @@ const DAY = 86_400_000;
 const HOUR = 3_600_000;
 
 export interface ObservabilityDeps {
-  store: Pick<Store, 'runStats' | 'healthEvents' | 'hostSamples' | 'logs' | 'jobRuns'>;
+  store: Pick<Store, 'runStats' | 'healthEvents' | 'hostSamples' | 'vmHostSamples' | 'logs' | 'jobRuns'>;
   projects: Project[];
   jobs: (project: string) => JobInfo[];
   monitor?: Pick<HealthMonitor, 'snapshot' | 'label'>;
@@ -103,6 +103,7 @@ export class Observability {
       uptimes: ups.map((u) => ({ ...u, label: label(u.key) })),
       steady: Math.max(0, checkCount - ups.length),
       host: store.hostSamples(from),
+      vmHost: store.vmHostSamples(from),
       overallUptime: checkCount ? 1 - downTime / checkCount : undefined,
     };
   }

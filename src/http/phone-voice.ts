@@ -27,6 +27,8 @@ export interface VoiceJob {
   name: string;
   enabled: boolean;
   running: boolean;
+  /** Busy but not started yet: what it waits for ('slot', 'lock' or 'thread'). */
+  waitingFor?: string;
   nextRun?: number;
   lastStatus?: string;
   lastRunAt?: number;

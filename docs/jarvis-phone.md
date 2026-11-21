@@ -75,7 +75,7 @@ Pages, swiped or switched by voice and by the server. Returns to Home when idle.
 
 | Page | Shows |
 |---|---|
-| **Home** | Needs you (count + top 3 from `/attention`), approvals waiting (per project, oldest age), running now (job, project, running clock, latest step), next up, Claude usage, clock |
+| **Home** | Needs you (count + top 3 from `/attention`), approvals waiting (per project, oldest age), running now (job, project, running clock, latest step), next up, Claude usage, the VM host's figures while it reports (`POST /vmhost/metrics`, amber/red when it's hot or short of memory), clock |
 | ~~**Chrome**~~ | Dropped: 🖥 in the bar opens RustDesk instead (Phase 3) |
 | **Run** | One running session's live steps (`/sessions/<id>/live`), opened from Home or by voice ("watch the blog job") |
 | **Night** | Large dim clock, urgent count only; after quiet hours begin or when the room is dark |

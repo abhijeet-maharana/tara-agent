@@ -92,7 +92,7 @@ export function splitMessage(text: string, max = MAX_CHUNK): string[] {
 }
 
 /** A GFM table's separator row, e.g. `| --- | :---: |`. */
-const TABLE_RULE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/m;
+const TABLE_RULE = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$/m;
 
 /** Slack's limit for markdown blocks is 12,000 characters per message; leave room for the rest. */
 export const MARKDOWN_MAX = 10_000;

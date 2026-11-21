@@ -17,7 +17,7 @@ import { Threads } from '../sessions/threads.js';
 import type { Item, Store } from '../store/store.js';
 import { Locks, Semaphore } from '../util/concurrency.js';
 import { deliveryOf, webOf } from '../web/chat.js';
-import { type JobStatus, type JobTrigger, runJob } from './job-runner.js';
+import { type JobStatus, type JobTrigger, type JobWait, runJob } from './job-runner.js';
 import type { DecidedCard } from './prompt.js';
 import { runName, SCHEDULE_BY, type ScheduledKind, scheduledRunText } from './slack-trigger.js';
 
@@ -25,7 +25,12 @@ export interface JobInfo {
   id: string;
   name: string;
   enabled: boolean;
+  /** Busy: started, or waiting to start (see `waitingFor`). */
   running: boolean;
+  /** A busy job that hasn't started yet: what it waits for. */
+  waitingFor?: JobWait;
+  /** When the current run got its slot and locks (unset while waiting or idle). */
+  startedAt?: Date;
   /** Unset: runs only from a queue or by hand. */
   cron?: string;
   tz: string;
@@ -41,6 +46,8 @@ export interface JobInfo {
   stepEfforts?: string[];
   /** The harness and model an approved card continues on, when not the job's own. */
   handoff?: { harness: Harness; model: string };
+  /** The harness and model its sessions move to when its own harness is out of quota or capacity. */
+  fallback?: { harness: Harness; model: string };
   /** Typical run time from the jobs file. */
   durationMinutes?: number;
   /** Named locks it holds while running (e.g. a browser's). */
@@ -104,6 +111,8 @@ const jobKey = (project: string, id: string) => `${project}:${id}`;
 export class Scheduler implements JobControl {
   private readonly entries = new Map<string, Entry>();
   private readonly running = new Set<string>();
+  /** Where each busy job is: waiting for something, or started at a time. */
+  private readonly stages = new Map<string, { waitingFor?: JobWait; startedAt?: number }>();
   /** Slots whose trigger message is posted in Slack, waiting for the bot to pick it up. */
   private readonly pending = new Map<string, { slot: number; kind: ScheduledKind; byPerson: boolean }>();
   /** Watchdogs of posted triggers, cleared on stop. */
@@ -185,11 +194,15 @@ export class Scheduler implements JobControl {
       .filter((e) => e.scheduled.project.config.name === project)
       .map(({ scheduled: { job }, cron }) => {
         const last = this.deps.store.lastJobRun(project, job.id);
+        const key = jobKey(project, job.id);
+        const stage = this.running.has(key) ? this.stages.get(key) : undefined;
         return {
           id: job.id,
           name: job.name,
           enabled: job.enabled,
-          running: this.running.has(jobKey(project, job.id)),
+          running: this.running.has(key),
+          ...(stage?.waitingFor && { waitingFor: stage.waitingFor }),
+          ...(stage?.startedAt && { startedAt: new Date(stage.startedAt) }),
           cron: job.cron,
           tz: job.tz ?? this.deps.host.timezone,
           skills: job.skills,
@@ -208,6 +221,7 @@ export class Scheduler implements JobControl {
                 ]
               : [],
           handoff: job.handoff,
+          fallback: job.fallback,
           durationMinutes: job.durationMinutes,
           locks: job.locks,
           nextRun: cron?.nextRun() ?? undefined,
@@ -539,6 +553,7 @@ export class Scheduler implements JobControl {
         newSessionId: this.deps.newSessionId,
         now: this.deps.now,
         threadUrl: this.deps.threadUrl,
+        onWait: (waitingFor) => this.stages.set(key, waitingFor ? { waitingFor } : { startedAt: this.now() }),
       },
       named,
       trigger,
@@ -553,6 +568,7 @@ export class Scheduler implements JobControl {
       .catch((err: Error) => this.deps.log.error(`[${key}] ${err.message}`))
       .finally(() => {
         this.running.delete(key);
+        this.stages.delete(key);
         this.inflight.delete(task);
       });
     this.inflight.add(task);

@@ -163,6 +163,8 @@ export function schedulePage(
     now: number;
     /** Running jobs (`project:id`) with the session to watch each in. */
     running?: Map<string, string | undefined>;
+    /** Busy jobs (`project:id`) still waiting to start: for a free slot, their locks or their thread. */
+    waiting?: Set<string>;
     /** Projects that have jobs: the others get no chip. */
     projectsWithJobs?: string[];
   },
@@ -207,10 +209,10 @@ export function schedulePage(
       : '';
 
   const clashing = new Set(plan.overlaps.flatMap(({ a, b }) => [a, b]));
-  // The latest planned slot of a running job that has no run yet: that is the one running.
+  // The latest planned slot of a busy job that has no run yet: that is the one running (or waiting).
   const runningSlot = (s: Slot) => {
     const key = `${s.project}:${s.id}`;
-    if (s.run || s.start > now || !opts.running?.has(key)) return false;
+    if (s.run || s.start > now || !(opts.running?.has(key) || opts.waiting?.has(key))) return false;
     return !plan.slots.some(
       (o) => o !== s && o.project === s.project && o.id === s.id && o.start > s.start && o.start <= now,
     );
@@ -233,11 +235,13 @@ export function schedulePage(
 <span class="actions">${
           s.run
             ? `<a href="${runHref(s.run)}">${runTag(s.run.status)}</a>`
-            : live
-              ? `<a class="tag" href="${session ? `/sessions/${esc(session)}` : `/jobs#${anchor(s)}`}">● running now</a>`
-              : s.start < now && !s.queue
-                ? '<span class="tag dim">no run</span>'
-                : ''
+            : live && opts.waiting?.has(`${s.project}:${s.id}`)
+              ? '<span class="tag dim" title="Started on time but waiting for a free job slot, its locks or its thread">⏳ waiting to start</span>'
+              : live
+                ? `<a class="tag" href="${session ? `/sessions/${esc(session)}` : `/jobs#${anchor(s)}`}">● running now</a>`
+                : s.start < now && !s.queue
+                  ? '<span class="tag dim">no run</span>'
+                  : ''
         }<span class="dim">${s.minutes} min</span></span></li>`,
       };
     }),

@@ -116,7 +116,12 @@ describe('dashboard delivery', () => {
     expect(slack.blockPosts).toHaveLength(1);
     const summary = slack.blockPosts[0];
     expect(summary?.thread).toBe('');
-    expect(summary?.text).toBe('✅ Amazon Prime is on again');
+    expect(summary?.text).toBe('Prime Check: ✅ Amazon Prime is on again');
+    // The job's name first, then its headline.
+    expect(summary?.blocks[0]).toMatchObject({
+      type: 'section',
+      text: { text: '*Prime Check* (run from the dashboard)' },
+    });
     const shown = JSON.stringify(summary?.blocks);
     expect(shown).toContain('Amazon Prime is on again');
     expect(shown).not.toContain('Checked the account page');
@@ -151,7 +156,7 @@ describe('dashboard delivery', () => {
     await scheduler.idle();
     expect(calls).toHaveLength(1);
     expect(slack.posts).toEqual([]);
-    expect(slack.blockPosts.map((b) => b.text)).toEqual(['✅ Amazon Prime is on again']);
+    expect(slack.blockPosts.map((b) => b.text)).toEqual(['Prime Check: ✅ Amazon Prime is on again']);
     expect(JSON.stringify(slack.blockPosts[0]?.blocks)).toContain('(catch-up)');
     expect(store.slotClaim('shop:prime', Date.parse('2026-10-25T12:00:00Z'))?.status).toBe('ok');
     await scheduler.stop();
@@ -173,14 +178,14 @@ describe('dashboard delivery', () => {
     failed.scheduler.start();
     failed.scheduler.trigger('shop', 'prime', 'dashboard');
     await failed.scheduler.idle();
-    expect(failed.slack.blockPosts[0]?.text).toBe('❌ Login expired');
+    expect(failed.slack.blockPosts[0]?.text).toBe('Prime Check: ❌ Login expired');
     await failed.scheduler.stop();
 
     const late = setup({ status: 'timeout' });
     late.scheduler.start();
     late.scheduler.trigger('shop', 'prime', 'dashboard');
     await late.scheduler.idle();
-    expect(late.slack.blockPosts[0]?.text).toMatch(/^⌛ Timed out after/);
+    expect(late.slack.blockPosts[0]?.text).toMatch(/^Prime Check: ⌛ Timed out after/);
     await late.scheduler.stop();
   });
 
@@ -239,7 +244,7 @@ describe('dashboard delivery', () => {
     await scheduler.idle();
     const summary = slack.blockPosts[0];
     // A table goes as a markdown block, so Slack draws it.
-    expect(summary?.blocks[0]).toMatchObject({ type: 'markdown' });
+    expect(summary?.blocks[1]).toMatchObject({ type: 'markdown' });
     expect(slack.uploads).toEqual([
       { thread: summary?.ts, file: 'labels.pdf', data: '%PDF', comment: undefined },
     ]);
@@ -304,6 +309,14 @@ describe('summaries', () => {
     });
     expect(summaryText('✅ No new notices')).toEqual({ text: '✅ No new notices', cut: false });
     expect(summaryText('x\n'.repeat(4000)).text.length).toBeLessThanOrEqual(2_800);
+  });
+
+  it('drops the run name Claude repeats at the start of its headline', async () => {
+    const { withoutName } = await import('../src/web/summary.js');
+    expect(withoutName('✅ Prime Check: Prime is on\n| a |', '*Prime Check* (catch-up)')).toBe(
+      '✅ Prime is on\n| a |',
+    );
+    expect(withoutName('✅ Amazon Prime is on again', '*Prime Check*')).toBe('✅ Amazon Prime is on again');
   });
 
   it('makes a plain notification line', () => {
@@ -376,6 +389,80 @@ describe('SessionManager with dashboard threads', () => {
       text: 'do the task',
       summary: '*Daily task*',
     });
-    expect(slack.blockPosts[0]?.text).toBe('✅ Reminder set');
+    expect(slack.blockPosts[0]?.text).toBe('Daily task: ✅ Reminder set');
+  });
+});
+
+describe('session page', () => {
+  it("shows the run's own reply as its result, never a learning turn's notes", async () => {
+    const { sessionPage } = await import('../src/http/dashboard.js');
+    const store = new Store(':memory:');
+    const base = { project: 'shop', sessionId: 's1', status: 'ok' as const };
+    store.recordRun({
+      ...base,
+      kind: 'job',
+      jobId: 'prime',
+      startedAt: 1,
+      endedAt: 2,
+      output: '✅ Prime is on',
+    });
+    store.recordRun({ ...base, kind: 'learn', startedAt: 3, endedAt: 4, output: 'SKILL.md: added a trap' });
+    const run = store.latestSessionRun('s1');
+    expect(run?.output).toBe('✅ Prime is on');
+    const ctx = { projects: [], timeZone: 'UTC', agentName: 'Jarvis' };
+    const html = sessionPage(
+      ctx,
+      undefined,
+      's1',
+      [{ kind: 'user', text: `Run the job\n${'x\n'.repeat(400)}` }],
+      {
+        run,
+      },
+    );
+    expect(html).toContain('Result');
+    expect(html).toContain('Prime is on');
+    expect(html).not.toContain('added a trap');
+    expect(html).toContain('The job’s instructions (');
+  });
+});
+
+describe('dashboard markdown', () => {
+  it('draws tables (short rules too) and the details rule', async () => {
+    const { md } = await import('../src/http/dashboard.js');
+    const html = md('✅ Done\n| # | Co |\n| :-- | --: |\n| 1 | **A** |\n---\nmore');
+    expect(html).toContain('<table class="md"><thead><tr><th>#</th><th>Co</th></tr></thead>');
+    expect(html).toContain('<td><b>A</b></td>');
+    expect(html).toContain('<hr class="md">');
+  });
+});
+
+describe('sessions list pages', () => {
+  it('pages sessions newest first and filters jobs and chats in the query', () => {
+    let t = 0;
+    const store = new Store(':memory:', () => ++t);
+    for (let i = 1; i <= 5; i++) {
+      store.saveSession({
+        threadKey: `C1:${i}`,
+        project: 'shop',
+        sessionId: `s${i}`,
+        model: 'm',
+        started: true,
+      });
+      store.recordRun({
+        kind: i % 2 ? 'job' : 'chat',
+        project: 'shop',
+        jobId: i % 2 ? 'prime' : undefined,
+        threadKey: `C1:${i}`,
+        sessionId: `s${i}`,
+        startedAt: i * 100,
+        endedAt: i * 100 + 1,
+        status: 'ok',
+      });
+    }
+    expect(store.sessionsCount()).toBe(5);
+    expect(store.sessionsOverview({ limit: 2 }).map((s) => s.sessionId)).toEqual(['s5', 's4']);
+    expect(store.sessionsOverview({ limit: 2, offset: 4 }).map((s) => s.sessionId)).toEqual(['s1']);
+    expect(store.sessionsCount({ kind: 'job' })).toBe(3);
+    expect(store.sessionsOverview({ kind: 'chat' }).map((s) => s.sessionId)).toEqual(['s4', 's2']);
   });
 });

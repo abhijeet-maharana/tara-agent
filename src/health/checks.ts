@@ -8,14 +8,14 @@ import type { JobInfo } from '../scheduler/scheduler.js';
 import type { PhoneBattery, PhoneDevice, RunStat, StoredRun } from '../store/store.js';
 import type { ClaudeLogin } from './claude-login.js';
 import { ago, type Check, type HealthSource, type HealthStatus, parseProjectChecks } from './monitor.js';
+import { type VmHostSample, vmHostChecks } from './vmhost.js';
 
 /** Run results that count as failures (as on the dashboard). */
 const FAILED = ['failed', 'error', 'timeout', 'limit'];
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
-/** Days before the Claude login ends: on the Health page (warn), then posted to Slack (bad). */
-const LOGIN_WARN_DAYS = 7;
-const LOGIN_BAD_DAYS = 3;
+/** Days before the Claude login ends that it shows amber (the Slack reminder starts then too). */
+const LOGIN_WARN_DAYS = 3;
 /** A slot this recent may still be starting (trigger posted, waiting for a job slot or a lock). */
 const SLOT_GRACE_MS = 15 * 60_000;
 
@@ -57,6 +57,8 @@ export interface AgentDeps {
   probeBrowser?: (b: HostConfig['browsers'][number]) => Promise<BrowserStatus>;
   /** Paired desk phones and their battery reports of the last few days (`PHONE_BATTERY_DAYS`). */
   phones?: () => Array<{ device: PhoneDevice; battery: PhoneBattery[] }>;
+  /** The VM host's latest report (src/health/vmhost.ts), however old; undefined = it never reported. */
+  vmHost?: () => VmHostSample | undefined;
   /** The runs' Claude login (src/health/claude-login.ts); undefined = nothing to watch. */
   claudeLogin?: () => Promise<ClaudeLogin | undefined>;
   timeZone: string;
@@ -157,12 +159,15 @@ export async function agentChecks(d: AgentDeps): Promise<Check[]> {
   else add('usage', 'Usage limit', 'ok', 'No limit reported lately');
 
   // Claude login: it renews itself until a hard end about 30 days after logging in, then every run fails.
+  // Shown here only (`quiet`): Slack hears about it from the daily reminder (health/login-reminder.ts).
   const login = await d.claudeLogin?.();
   if (login) {
     const fix = `log in again as ${login.user ?? 'the run user'}: claude auth login`;
-    if (login.error) add('login', 'Claude login', 'warn', `Can't read the login file: ${login.error}`);
-    else if (!login.loggedIn) add('login', 'Claude login', 'bad', `Not logged in · ${fix}`);
-    else if (login.endsAt === undefined) add('login', 'Claude login', 'ok', 'Logged in');
+    const add = (status: HealthStatus, detail: string) =>
+      out.push({ key: 'tara:login', group, name: 'Claude login', status, detail, quiet: true });
+    if (login.error) add('warn', `Can't read the login file: ${login.error}`);
+    else if (!login.loggedIn) add('bad', `Not logged in · ${fix}`);
+    else if (login.endsAt === undefined) add('ok', 'Logged in');
     else {
       const left = login.endsAt - at;
       const when = new Intl.DateTimeFormat('en-GB', {
@@ -173,15 +178,9 @@ export async function agentChecks(d: AgentDeps): Promise<Check[]> {
         hour: '2-digit',
         minute: '2-digit',
       }).format(login.endsAt);
-      if (left <= 0) add('login', 'Claude login', 'bad', `Ended ${ago(-left)} ago (${when}) · ${fix}`);
-      else if (left <= LOGIN_WARN_DAYS * DAY)
-        add(
-          'login',
-          'Claude login',
-          left <= LOGIN_BAD_DAYS * DAY ? 'bad' : 'warn',
-          `Ends in ${ago(left)} (${when}) · ${fix}`,
-        );
-      else add('login', 'Claude login', 'ok', `Logged in · ends in ${ago(left)} (${when})`);
+      if (left <= 0) add('bad', `Ended ${ago(-left)} ago (${when}) · ${fix}`);
+      else if (left <= LOGIN_WARN_DAYS * DAY) add('warn', `Ends in ${ago(left)} (${when}) · ${fix}`);
+      else add('ok', `Logged in · ends in ${ago(left)} (${when})`);
     }
   }
 
@@ -233,6 +232,7 @@ export async function agentChecks(d: AgentDeps): Promise<Check[]> {
           : `Not answering on ${b.cdpUrl}`,
       });
   if (d.phones) out.push(...phoneChecks(d.phones(), at));
+  if (d.vmHost) out.push(...vmHostChecks(d.vmHost(), at));
   return out;
 }
 

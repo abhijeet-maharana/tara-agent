@@ -107,6 +107,7 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `effort` | host `claude.effort` | Claude jobs: `--effort` for the run, its steps, its learning turn and replies in its thread (`low` … `max`), e.g. `max` for a tax filing, `low` for a short summary. A step may set its own |
 | `agyPermissions` | none | `agy` jobs only: `{allow, deny, ask}` rules ([agy jobs](#agy-jobs)) |
 | `handoff` | none | `{harness, model}`: an approved card continues in a fresh session on this harness ([handoff](#handoff)) |
+| `fallback` | none | `{harness, model}`: a session whose harness is out of quota or capacity reruns on this one ([fallback](#fallback)) |
 | `mcpServers` | none | The job's own stdio MCP servers by name (`{command, args, env}`), for every session of the job ([steps and MCP servers](#steps-and-mcp-servers)) |
 | `steps` | `[]` | Sessions run one after the other before the main prompt ([steps and MCP servers](#steps-and-mcp-servers)) |
 | `timeoutMinutes` | `30` | Time limit for the run, and for any one command it runs (Claude's Bash timeout is set to it) |
@@ -186,6 +187,16 @@ A job with `"harness": "agy"` runs on Google's Antigravity CLI (`agy`) instead o
 - It uses the run's scratch folder, so files the run saved there (screenshots) are still at the paths on the card.
 - Later approvals and thread replies continue that session; each later card comes with its details, since that session never saw it either. A declined card (Skip, Reject, …) runs no model at all: the card and its Slack message already show the decision.
 - The session is a normal job session on its harness: Claude gets the project's permission mode and `allowedTools`, self-improvement and the transcript page.
+
+### Fallback
+
+`"fallback": {"harness": "claude", "model": "claude-opus-5-5"}` keeps a job running when its own harness can't: e.g. an agy job on a Google plan that runs out of quota (`RESOURCE_EXHAUSTED`, 429) or finds Gemini busy (`503 UNAVAILABLE`, overloaded).
+
+- **What falls back:** a step or the main session that ends with the harness's limit (status `limit`) or an error saying 429, 503, unavailable, overloaded, capacity or resource exhausted. A timeout or any other error is the job's own trouble and doesn't.
+- **How:** that session reruns from the start on the fallback's harness and model, in the same scratch folder, and the rest of the run (later steps, the main session) starts there directly. A step's own `model` is for the job's harness, so on the fallback the fallback's `model` runs it.
+- **The thread says so:** one line per session that moved, e.g. `↪️ Step "Capture" ran on claude (claude-opus-5-5): agy was unavailable (RESOURCE_EXHAUSTED …)`.
+- **After the run:** replies and approved cards continue on the harness the main session ended on. With a [handoff](#handoff) to that same harness, approved cards simply resume that session.
+- Only fresh sessions fall back: a reply that continues an agy conversation stays on agy. The fallback must be another harness than the job's own.
 
 ### Steps and MCP servers
 
@@ -371,9 +382,11 @@ Open the HTTP address in a browser. Every page also answers JSON to tools.
 
 - **Health** (`/health`): is everything working? Every `health.intervalMinutes` tara-agent checks itself (Slack connection, Claude runs ending in errors, the usage limit, runs stuck past `stuckMinutes`, disk, memory and load, each Chrome), each project's jobs (a jobs file that didn't load, a failing streak, a scheduled slot that never started or never finished), and each project's own `healthUrl` (or whether its dashboard answers). **Needs you** lists what is red or amber; below it every source with its checks, then every change of state over the last 7 days. The sidebar badge and Home count red checks; `GET /attention` lists them as `health` items.
 
-  **Trends** (`/health/trends?days=7|14|30`): against the same number of days before, runs and failure rate, typical job length, API-equivalent cost and how many checks were up; runs per day by result and cost per day by project; the Claude usage window per hour; a jobs table (runs, failures, typical and slowest-5% length, whether the last 3 days ran longer, cost; failing or slowing jobs first); uptime strips of every check that had trouble; and the machine's load, memory and disk (sampled every 5 minutes). Every bar and line has a hover tip and a **Table** view.
+  **Trends** (`/health/trends?days=7|14|30`): against the same number of days before, runs and failure rate, typical job length, API-equivalent cost and how many checks were up; runs per day by result and cost per day by project; the Claude usage window per hour; a jobs table (runs, failures, typical and slowest-5% length, whether the last 3 days ran longer, cost; failing or slowing jobs first); uptime strips of every check that had trouble; the machine's load, memory and disk (sampled every 5 minutes); and, when tara-agent runs in a VM whose host reports (`POST /vmhost/metrics`), the host's CPU temperature, the VM's share of its CPU and its memory. Every bar and line has a hover tip and a **Table** view.
 
   **Logs** (`/health/logs?hours=1|24|168`): tara-agent's own warnings and errors (kept 31 days) and those of host `health.logUnits` from the journal, per hour, then grouped: the same message with other numbers, ids or times counts once, with how often and when it was last seen.
+
+  **Claude login** (the runs' login on this machine, which ends about 30 days after `claude auth login`) is never a health alert. From 3 days before it ends, and every day after it ended or while logged out, a top-level message in `health.alertProject`'s channel (from 09:00, once a day) mentions the `owner` with the `ssh -t <host> sudo -u <run user> -i claude auth login` steps. It stops once the login is renewed. The Health page shows it amber in those 3 days and red once it ended.
 
   A check counts as red only after two red checks in a row. Then it is posted once in the day's `Run Health Alert` thread of its project's channel (one a day, opened by its first alert) (tara-agent's own checks: `health.alertProject`), mentioning the `owner`, and once more when it is fine again. A job's single failure isn't posted (its thread already has the ❌ reply), nor is a jobs file that didn't load (it is in the logs and on the dashboard). The state is kept in the database, so a restart repeats no alert.
 
@@ -392,6 +405,8 @@ For scripts and dashboards on the same host (`127.0.0.1:4100` by default).
 | `POST /health/check` | Check everything now; returns `counts` |
 | `GET /metrics` | Prometheus text: health check status, runs, cost and tokens of the last 24 hours by project, kind and result, each job's last run, failure streak and pause state, running runs, the usage window, the machine. Behind the bearer token like the rest |
 | `GET /attention` | What needs you, most pressing first: `items` (`tier` urgent / waiting / later, `kind`, `title`, `project`, `url`) and `notes` for sources that couldn't be read |
+| `POST /vmhost/metrics` | The VM host's own figures, when tara-agent runs in a VM: `{name?, cpuTemp?, thermal?, cpu?, memUsed?, swapBytes?, pressure?, vmCpu?, vmMemBytes?, powerW?}` (shares 0–1, `thermal` nominal / fair / serious / critical, `pressure` normal / warn / critical). Sent every 5 min by [`examples/macos-desk-widget`](../examples/macos-desk-widget) `install.sh --metrics`; shown on the Health page (a **VM host** group: reports, heat, memory; and Trends charts) and the desk phone's Home. Kept 31 days |
+| `GET /vmhost/metrics?hours=1` | Its reports over the last hours |
 | `GET /jobs?project=<name>` | Jobs with next run, last status and error; `&upcoming=7` adds start times for the next 7 days |
 | `POST /jobs/<project>/<id>/run` `{"by": "who"}` | Run a job now |
 | `POST /jobs/<project>/<id>/pause` | Set `"enabled": false` in `jobs.json` and reload |

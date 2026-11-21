@@ -25,6 +25,7 @@ tara-agent runs on your own server around the clock. It runs scheduled jobs, ans
 
 **See everything**
 - **Web dashboard.** What's running, what needs you, failing jobs, the day's schedule, full transcripts of every run, and your repos' uncommitted changes. Works on a phone.
+- **Mac desk widget.** A desktop panel with what needs you, approvals, running and next, next to the Mac's own temperature, memory and load ([`examples/macos-desk-widget`](examples/macos-desk-widget)).
 
 ## How it works
 

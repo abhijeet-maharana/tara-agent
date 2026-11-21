@@ -12,6 +12,7 @@ import { CiJobs } from './github/actions.js';
 import { PullRequests } from './github/pull-requests.js';
 import { agentChecks, healthSources, jobChecks, machine, PHONE_BATTERY_DAYS } from './health/checks.js';
 import { claudeLoginReader } from './health/claude-login.js';
+import { LoginReminder } from './health/login-reminder.js';
 import { HealthMonitor } from './health/monitor.js';
 import { Observability } from './health/observability.js';
 import { gatherAttention, githubPullRequests } from './http/attention.js';
@@ -357,6 +358,7 @@ async function serve(configFlag: string | undefined) {
                     device,
                     battery: store.phoneBattery(device.id, Date.now() - PHONE_BATTERY_DAYS * 86_400_000),
                   })),
+                vmHost: () => store.lastVmHostSample(),
                 claudeLogin,
                 timeZone: host.timezone,
                 now: Date.now,
@@ -500,6 +502,7 @@ async function serve(configFlag: string | undefined) {
                               name: j.name,
                               enabled: j.enabled,
                               running: j.running,
+                              ...(j.waitingFor && { waitingFor: j.waitingFor }),
                               ...(j.nextRun && { nextRun: j.nextRun.getTime() }),
                               ...(j.lastStatus && { lastStatus: j.lastStatus }),
                               ...(j.lastRunAt && { lastRunAt: j.lastRunAt.getTime() }),
@@ -546,6 +549,23 @@ async function serve(configFlag: string | undefined) {
   reminders.start();
   // After Slack and the scheduler, so the first checks see them running.
   health?.start();
+  // The runs' Claude login: a Slack reminder with the steps, daily from 3 days before it ends.
+  const loginReminder = new LoginReminder({
+    login: claudeLogin,
+    store,
+    chat: slack.chat,
+    target: () => {
+      const p = projects.find((x) => x.config.name === host.health.alertProject) ?? projects[0];
+      return p && { channel: p.config.slackChannel, owner: p.config.owner };
+    },
+    host: hostname(),
+    timeZone: host.timezone,
+    log,
+  });
+  const remindLogin = () =>
+    void loginReminder.tick().catch((err: Error) => log.warn(`Login reminder: ${err.message}`));
+  remindLogin();
+  setInterval(remindLogin, 15 * 60_000).unref();
   // The machine every 5 minutes, for the Trends view's charts.
   const sample = () => {
     try {

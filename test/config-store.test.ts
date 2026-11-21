@@ -242,12 +242,12 @@ describe('Store', () => {
     const db = new DatabaseSync(file);
     const { user_version: v } = db.prepare('PRAGMA user_version').get() as { user_version: number };
     // The database as it was before the upgrade: totals in cost_usd, no session_cost_usd.
-    // (eleven migrations back: the cost one, day_threads, the health tables, samples and logs, item priority, reminders,
-    // reminder tasks, item handoff notes, phone devices, phone battery, dashboard threads; dropping the reminders table
-    // undoes reminders and reminder tasks)
+    // (twelve migrations back: the cost one, day_threads, the health tables, samples and logs, item priority, reminders,
+    // reminder tasks, item handoff notes, phone devices, phone battery, dashboard threads, VM host samples; dropping the
+    // reminders table undoes reminders and reminder tasks)
     db.exec(
-      `DROP TABLE thread_aliases; DROP TABLE web_mirrors; DROP TABLE web_messages; DROP TABLE phone_battery; DROP TABLE phone_devices; ALTER TABLE items DROP COLUMN handoff; DROP TABLE reminders; ALTER TABLE items DROP COLUMN priority; DROP TABLE log_events; DROP TABLE host_samples; DROP TABLE health_events;
-       DROP TABLE health_state; DROP TABLE day_threads; ALTER TABLE runs DROP COLUMN session_cost_usd; PRAGMA user_version = ${v - 11};`,
+      `DROP TABLE vmhost_samples; DROP TABLE thread_aliases; DROP TABLE web_mirrors; DROP TABLE web_messages; DROP TABLE phone_battery; DROP TABLE phone_devices; ALTER TABLE items DROP COLUMN handoff; DROP TABLE reminders; ALTER TABLE items DROP COLUMN priority; DROP TABLE log_events; DROP TABLE host_samples; DROP TABLE health_events;
+       DROP TABLE health_state; DROP TABLE day_threads; ALTER TABLE runs DROP COLUMN session_cost_usd; PRAGMA user_version = ${v - 12};`,
     );
     const add = db.prepare(
       `INSERT INTO runs (kind, project, session_id, started_at, ended_at, status, cost_usd) VALUES ('chat', 'p', ?, ?, ?, 'ok', ?)`,

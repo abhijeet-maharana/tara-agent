@@ -40,7 +40,7 @@ export interface SummaryInput {
   slackChannel: string;
   /** The dashboard thread the run happened in. */
   thread: { channel: string; ts: string };
-  /** The run's name, e.g. "*Amazon Prime Check*" (Slack mrkdwn). */
+  /** The run's name, e.g. "*Amazon Prime Check*" (Slack mrkdwn): the message's first line. */
   title: string;
   /** The reply to summarize, or a status line for a run that didn't finish. */
   text: string;
@@ -52,31 +52,60 @@ export interface SummaryInput {
   since?: number;
 }
 
+/** A title's plain words: "*Prime Check* (catch-up)" → "Prime Check (catch-up)". */
+export function plainTitle(title: string): string {
+  return title
+    .replace(/<@[A-Z0-9]+>/g, 'you')
+    .replace(/[*_`]/g, '')
+    .trim();
+}
+
 /**
- * Posts a dashboard run's result in Slack as one top-level message: its headline (a table renders as
- * one), then a line with the run's name, time and a link to the whole run. Files the run sent go in
+ * The headline without the run's name at its start ("✅ Prime Check: Prime is on" → "✅ Prime is on"),
+ * since the message already opens with the name.
+ */
+export function withoutName(text: string, title: string): string {
+  const name = plainTitle(title).replace(/\s*\(.*\)$/, '');
+  if (!name) return text;
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const lead = new RegExp(`^(\\S+\\s+)?(?:\\*\\*|\\*)?${escaped}(?:\\*\\*|\\*)?\\s*(?:[:·—–-]\\s*)`, 'i');
+  const [first = '', ...rest] = text.split('\n');
+  const trimmed = first.replace(lead, (_, icon: string | undefined) => icon ?? '');
+  return trimmed.trim() ? [trimmed, ...rest].join('\n') : text;
+}
+
+/**
+ * Posts a dashboard run's result in Slack as one top-level message: the run's name, its headline (a
+ * table renders as one), then a small line with its time and a link to the whole run. Files the run sent go in
  * that message's thread, and a reply there continues the run's session (`thread_aliases`). Returns the
  * message's ts, or undefined when it couldn't be posted (logged; the run itself is unaffected).
  */
 export async function postSummary(input: SummaryInput): Promise<string | undefined> {
   const { chat, store, web, log, slackChannel, thread } = input;
-  const { text, cut } = summaryText(input.text);
+  const summary = summaryText(input.text);
+  const text = withoutName(summary.text, input.title);
   const footer = [
-    input.title,
     input.meta,
-    input.link ? `<${input.link}|${cut ? 'Full details ↗' : 'Open the run ↗'}>` : '',
+    input.link ? `<${input.link}|${summary.cut ? 'Full details ↗' : 'Open the run ↗'}>` : '',
   ]
     .filter(Boolean)
     .join(' · ');
   const blocks: SlackBlock[] = [
+    // The name first, on its own (a markdown block would read `*…*` as italics).
+    {
+      type: 'section',
+      text: { type: 'mrkdwn', text: input.title.startsWith('*') ? input.title : `*${input.title}*` },
+    },
     textBlock(text || '_(no reply)_', SECTION_MAX + 200),
-    { type: 'context', elements: [{ type: 'mrkdwn', text: footer }] },
+    ...(footer ? [{ type: 'context', elements: [{ type: 'mrkdwn', text: footer }] }] : []),
   ];
+  // The phone's notification: "Prime Check: ✅ Prime is on again".
+  const notice =
+    [plainTitle(input.title).replace(/\s*\(.*\)$/, ''), notificationLine(text)].filter(Boolean).join(': ') ||
+    'Run finished';
   let ts: string;
   try {
-    ts = await sendWithFallback(blocks, (b) =>
-      chat.postBlocks(slackChannel, undefined, notificationLine(text) || 'Run finished', b ?? blocks),
-    );
+    ts = await sendWithFallback(blocks, (b) => chat.postBlocks(slackChannel, undefined, notice, b ?? blocks));
   } catch (err) {
     log.warn(`summary not posted in Slack: ${(err as Error).message}`);
     return undefined;

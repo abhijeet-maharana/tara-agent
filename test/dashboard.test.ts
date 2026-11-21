@@ -530,6 +530,7 @@ describe('home page', () => {
   const page = homePage(ctx, {
     jobs: [
       job('ga4', { running: true, liveSessionId: 'live-1' }),
+      job('blog', { running: true, waitingFor: 'slot' }),
       job('watch', { everyMs: 10 * 60_000 }),
       job('daily'),
     ],
@@ -557,7 +558,10 @@ describe('home page', () => {
     );
     expect(page).toContain('href="/runs/2">sla</a><span class="line" title="login expired"'); // no session: the run page
     expect(page).toContain('12 more runs in the last 24 hours found nothing to do');
-    expect(page).toContain('● Running now: <a href="/sessions/live-1">GA4</a>');
+    expect(page).toContain('● Running now: <a href="/sessions/live-1">GA4</a></b>');
+    expect(page).toContain(
+      '⏳ Waiting to start: <a href="/jobs#job-shop-blog" title="waiting for a free job slot">BLOG</a>',
+    );
   });
 
   it('keeps frequent jobs out of "Coming up" and shows usage', () => {
@@ -1150,6 +1154,8 @@ describe('sessions page', () => {
       { ...session('job-3', NOW - 21 * 3_600_000, { kind: 'chat' }), jobId: 'audit' },
       // No run recorded (a restart stopped it), but a job's prompt.
       { ...session('lost', NOW - 22 * 3_600_000), turns: 0 },
+      // A job's first run, still going: nothing recorded yet, the prompt starts with the memory.
+      { ...session('live-job', NOW - 30 * 60_000), turns: 0 },
     ],
     new Map([['shop:prep', 'Form Prep']]),
     {},
@@ -1159,8 +1165,13 @@ describe('sessions page', () => {
           ? 'check the redis health\n\nYour folders:\n- Scratch'
           : id === 'lost'
             ? '## Script Output\nThe following data'
-            : undefined,
-      runningThreads: new Set(['C1:chat-1']),
+            : id === 'live-job'
+              ? '## Project memory\n- notes'
+              : undefined,
+      runningThreads: new Map([
+        ['C1:chat-1', undefined],
+        ['C1:live-job', 'prep'],
+      ]),
       now: NOW,
     },
   );
@@ -1172,6 +1183,11 @@ describe('sessions page', () => {
     expect(page).toContain('💬 check the redis health</span>');
     expect(page).not.toContain('Your folders');
     expect(page).toContain('⏱ A job run with no record');
+    // A running job's session is named after the job, not its prompt's first line.
+    expect(page).toContain(
+      '⏱ Form Prep</span>\n<span class="meta"><span class="tag dim">Shop</span><span class="tag">● running</span>',
+    );
+    expect(page).not.toContain('Project memory');
     expect(page).toContain('⏱ audit</span><span class="line">Last: a reply in its Slack thread</span>');
   });
 

@@ -27,7 +27,7 @@ import {
   JOB_SYSTEM_PROMPT,
 } from './prompt.js';
 import { openRunThread } from './slack-trigger.js';
-import { expandMcpServers, runSteps, type StepsResult } from './steps.js';
+import { expandMcpServers, fallbackNote, harnessUnavailable, runSteps, type StepsResult } from './steps.js';
 
 export type JobTrigger =
   /**
@@ -86,7 +86,12 @@ export interface JobRunnerDeps {
   now?: () => number;
   /** A thread's link: a Slack thread's once Slack is connected, a dashboard thread's page. */
   threadUrl?: (channel: string, ts: string) => string | undefined;
+  /** What the run waits for before it starts; called with undefined once it has its slot and locks. */
+  onWait?: (waitingFor: JobWait | undefined) => void;
 }
+
+/** What a run waits for: its thread (a chat turn working in it), a free job slot, or its locks. */
+export type JobWait = 'thread' | 'slot' | 'lock';
 
 const SLACK_USER = /^[UW][A-Z0-9]+$/;
 
@@ -108,7 +113,11 @@ export function streamRecipient(trigger: JobTrigger, owner: string | undefined):
 function triggerLabel(trigger: JobTrigger): string {
   if (trigger.kind === 'catch-up') return ' (catch-up)';
   if (trigger.kind === 'manual') {
-    return ` (run by ${/^[UW][A-Z0-9]+$/.test(trigger.by) ? `<@${trigger.by}>` : trigger.by})`;
+    if (/^[UW][A-Z0-9]+$/.test(trigger.by)) return ` (run by <@${trigger.by}>)`;
+    // Run now on the dashboard, the phone, the API: where, not a made-up person.
+    return ['dashboard', 'phone', 'api'].includes(trigger.by)
+      ? ` (run from the ${trigger.by === 'api' ? 'API' : trigger.by})`
+      : ` (run by ${trigger.by})`;
   }
   if (trigger.kind === 'resume') return ' (continuing after your decision)';
   if (trigger.kind === 'decision') return ' (acting on your decision)';
@@ -168,14 +177,19 @@ export async function runJob(
   };
   const postMain = async (text: string) => chat.post(channel, await thread(), text);
   const reactTo = requestTs;
+  // Before the first await, so the run never looks started while it waits.
+  deps.onWait?.(inThread ? 'thread' : 'slot');
   if (reactTo) await chat.react(channel, reactTo, 'eyes').catch(() => {});
 
   // An existing thread may have a chat turn in it: wait for it before taking a slot and locks.
   let hold: ThreadHold | undefined = inThread
     ? await deps.threads.enter(threadKey(channel, inThread))
     : undefined;
+  deps.onWait?.('slot');
   const releaseSlot = await deps.slots.acquire();
+  if (job.locks.length) deps.onWait?.('lock');
   const releaseLocks = await deps.locks.acquire(job.locks);
+  deps.onWait?.(undefined);
   const startedAt = now();
   const lessons: LearnRequest[] = [];
   const record = (status: JobStatus, extra: Partial<RunRecord> = {}) => {
@@ -290,8 +304,13 @@ export async function runJob(
         scratchId,
       };
     // Otherwise a continued run stays on the CLI its session lives in.
-    const harness = session.harness ?? 'claude';
+    let harness = session.harness ?? 'claude';
     const resuming = trigger.kind === 'resume' && !handoff;
+    // A fresh session whose CLI is out of quota or capacity reruns on the job's fallback; a continued
+    // conversation can't move, so it stays.
+    const fallback = !resuming && job.fallback && harness !== job.fallback.harness ? job.fallback : undefined;
+    /** Lines for the thread: each session that moved to the fallback. */
+    const fallbackNotes: string[] = [];
     store.saveSession(session);
     const folders = {
       scratch: sessionScratch(project, stateDir, job.id, scratchId),
@@ -366,7 +385,18 @@ export async function runJob(
         mcpServers,
         signal: stop,
         onStep: (i, name) => status.push(`⏳ ${title} · step ${i}/${job.steps.length}: ${name}`),
+        fallback,
+        onFallback: (note) => {
+          fallbackNotes.push(note);
+          log.warn(`[${project.config.name}] job ${job.id}: ${note}`);
+        },
       });
+      // A step found the harness unavailable: the main session starts on the fallback too.
+      if (fallback && stepsDone.harness === fallback.harness && harness !== fallback.harness) {
+        harness = fallback.harness;
+        session = { ...session, harness, model: fallback.model };
+        store.saveSession(session);
+      }
       if (stop.aborted) {
         await status.flush();
         await chat.update(channel, statusTs, `${title} · ⏹ stopped`);
@@ -394,18 +424,18 @@ export async function runJob(
       .filter(Boolean)
       .join('\n\n');
     const allowedTools = job.allowedTools ?? project.config.allowedTools;
-    const agy =
-      harness === 'agy'
-        ? buildAgyArgs({
-            conversationId: resuming ? session.sessionId : undefined,
-            model: session.model,
-            permissionMode: project.config.permissionMode,
-            permissions: job.agyPermissions,
-            timeoutMs,
-          })
-        : undefined;
-    const outcome: RunOutcome = await deps
-      .run({
+    const runMain = (): Promise<RunOutcome> => {
+      const agy =
+        harness === 'agy'
+          ? buildAgyArgs({
+              conversationId: resuming ? session.sessionId : undefined,
+              model: session.model,
+              permissionMode: project.config.permissionMode,
+              permissions: job.agyPermissions,
+              timeoutMs,
+            })
+          : undefined;
+      return deps.run({
         harness,
         bin: agy ? deps.host.agy.bin : deps.host.claude.bin,
         args:
@@ -479,8 +509,34 @@ export async function runJob(
           } else if (event.kind === 'text_start') flushBlock();
           else if (event.kind === 'text' && live) block += event.text;
         },
-      })
-      .finally(() => bridged?.dispose());
+      });
+    };
+    let outcome: RunOutcome;
+    try {
+      outcome = await runMain();
+      if (fallback && harness !== fallback.harness && !stop.aborted && harnessUnavailable(outcome)) {
+        const note = fallbackNote('The run', harness, fallback, outcome);
+        fallbackNotes.push(note);
+        log.warn(`[${project.config.name}] job ${job.id}: ${note}`);
+        status.push(`⏳ ${title} · ${harness} unavailable, running on ${fallback.harness}`);
+        flushBlock();
+        // A fresh session on the fallback, in the same scratch folder (the steps' files are there).
+        harness = fallback.harness;
+        session = {
+          threadKey: key,
+          project: project.config.name,
+          sessionId: (deps.newSessionId ?? randomUUID)(),
+          model: fallback.model,
+          started: false,
+          harness,
+          scratchId,
+        };
+        store.saveSession(session);
+        outcome = await runMain();
+      }
+    } finally {
+      bridged?.dispose();
+    }
     await status.flush();
 
     /**
@@ -557,7 +613,7 @@ export async function runJob(
 
     const usage = {
       sessionId: outcome.sessionId ?? session.sessionId,
-      model: outcome.model ?? job.model,
+      model: outcome.model ?? session.model,
       threadKey: key,
       costUsd: outcome.costUsd,
       // Steps count towards the run: each is a fresh session, so its whole cost is this run's.
@@ -587,7 +643,8 @@ export async function runJob(
               : `❌ failed: ${(outcome.error ?? 'unknown error').slice(0, 500)}`;
       await chat.update(channel, statusTs, `${title} · ${reason}`);
       flushBlock();
-      await live?.finish({ summary: reason, ok: false, answer: '', notes: [] });
+      await live?.finish({ summary: reason, ok: false, answer: '', notes: fallbackNotes });
+      if (!live) for (const note of fallbackNotes) await chat.post(channel, rootTs, note);
       // Not streamed: what Claude wrote before it stopped still goes in the thread, to debug the run.
       if (!live && outcome.text.trim()) await postMarkdown(chat, channel, rootTs, outcome.text);
       // A run a person stopped needs no message; anything else that broke does ("⌛ Timed out after 30m").
@@ -612,9 +669,9 @@ export async function runJob(
           summary: `🔇 Nothing to report · ${meta}`,
           ok: true,
           answer: null,
-          notes: [said],
+          notes: [...fallbackNotes, said],
         });
-      else await chat.post(channel, rootTs, said);
+      else for (const note of [...fallbackNotes, said]) await chat.post(channel, rootTs, note);
       learnIf(undefined, rootTs);
       return record('silent', { ...usage, output: outcome.text });
     }
@@ -631,9 +688,10 @@ export async function runJob(
         summary: failure ? `❌ Failed · ${meta}` : `✅ Done · ${meta}`,
         ok: !failure,
         answer: outcome.text,
-        notes: [],
+        notes: fallbackNotes,
       });
     } else {
+      for (const note of fallbackNotes) await chat.post(channel, rootTs, note);
       await postMarkdown(chat, channel, rootTs, outcome.text);
     }
     await summarize(outcome.text, meta);

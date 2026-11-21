@@ -1,4 +1,6 @@
 import type { ServerResponse } from 'node:http';
+import type { HealthStatus } from '../health/monitor.js';
+import { VMHOST_WARN_MS, type VmHostSample, vmHostLine, vmHostStatus } from '../health/vmhost.js';
 import type { ActivityEvent, Task } from '../runner/activity.js';
 import type { Item } from '../store/store.js';
 import type { Attention, AttentionItem } from './attention.js';
@@ -99,6 +101,8 @@ export interface GlanceState {
   recent: GlanceTask[];
   next: NextRun[];
   usage?: { share: number; resetsAt?: number };
+  /** The machine the VM runs on, while its reports are fresh: e.g. "58 °C · CPU 23 % · …". */
+  vmHost?: { name?: string; line: string; status: HealthStatus; at: number };
   alerts: PhoneAlert[];
   /** Urgent items held in quiet hours, told when they end. */
   held: number;
@@ -111,6 +115,8 @@ export interface PhoneHubOptions {
   activity?: { tasks: () => Task[]; subscribe?: (listener: (event: ActivityEvent) => void) => () => void };
   next: (at: number) => NextRun[];
   usage: (at: number) => { share: number; resetsAt?: number } | undefined;
+  /** The VM host's latest report (src/health/vmhost.ts), however old. */
+  vmHost?: () => VmHostSample | undefined;
   /** How the screen names a project. */
   projectTitle: (name: string) => string;
   timeZone: string;
@@ -278,6 +284,7 @@ export class PhoneHub {
       };
     };
     const usage = this.opts.usage(at);
+    const host = this.opts.vmHost?.();
     this.last = {
       build: this.opts.build,
       at,
@@ -309,6 +316,15 @@ export class PhoneHub {
         .map(slim),
       next: this.opts.next(at),
       ...(usage && { usage: { share: usage.share, ...(usage.resetsAt && { resetsAt: usage.resetsAt }) } }),
+      ...(host &&
+        at - host.at < VMHOST_WARN_MS && {
+          vmHost: {
+            ...(host.name && { name: host.name }),
+            line: vmHostLine(host),
+            status: vmHostStatus(host),
+            at: host.at,
+          },
+        }),
       alerts: this.alerts.filter((a) => at - a.at < ALERT_KEEP_MS).slice(0, 5),
       held: this.held.length,
     };

@@ -161,18 +161,31 @@ export function readTranscript(
   readAs?: string,
 ): TranscriptEntry[] | undefined {
   const file = transcriptPath(cwd, sessionId, configDir);
-  if (!/^[0-9a-f-]{36}$/i.test(sessionId) || !existsSync(file)) return undefined;
-  let jsonl: string;
-  try {
-    jsonl = readFileSync(file, 'utf8');
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'EACCES' || !readAs) throw err;
-    jsonl = execFileSync('sudo', ['-n', '-u', readAs, '/bin/cat', '--', file], {
-      encoding: 'utf8',
-      maxBuffer: 256 * 1024 * 1024,
-    });
-  }
-  return parseTranscript(jsonl);
+  if (!/^[0-9a-f-]{36}$/i.test(sessionId)) return undefined;
+  // The run user's folder may be closed to tara-agent (it can't even see the file): read it as them.
+  const asRunUser = () => {
+    if (!readAs) return undefined;
+    try {
+      return execFileSync('sudo', ['-n', '-u', readAs, '/bin/cat', '--', file], {
+        encoding: 'utf8',
+        maxBuffer: 256 * 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      if (/No such file/i.test(String((err as { stderr?: unknown }).stderr ?? ''))) return undefined;
+      throw err;
+    }
+  };
+  let jsonl: string | undefined;
+  if (!existsSync(file)) jsonl = asRunUser();
+  else
+    try {
+      jsonl = readFileSync(file, 'utf8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EACCES' || !readAs) throw err;
+      jsonl = asRunUser();
+    }
+  return jsonl === undefined ? undefined : parseTranscript(jsonl);
 }
 
 /** The first thing someone asked in a session, without the leading Slack mention. */

@@ -418,7 +418,7 @@ describe('agentChecks', () => {
     expect(c['Memory and load']?.[0]).toBe('bad');
   });
 
-  it('warns a week before the Claude login ends and turns red three days before', async () => {
+  it('shows the Claude login amber three days before it ends, red once it ended, never alerting', async () => {
     const login = (over: Partial<ClaudeLogin>) => async (): Promise<ClaudeLogin> => ({
       loggedIn: true,
       user: 'tara',
@@ -432,10 +432,16 @@ describe('agentChecks', () => {
       'Logged in · ends in 9d (Sun 22 Nov, 09:00)',
     ]);
     expect(await check({ endsAt: now + 6 * DAY })).toEqual([
-      'warn',
-      'Ends in 6d (Thu 19 Nov, 09:00) · log in again as tara: claude auth login',
+      'ok',
+      'Logged in · ends in 6d (Thu 19 Nov, 09:00)',
     ]);
-    expect((await check({ endsAt: now + 2 * DAY }))?.[0]).toBe('bad');
+    expect(await check({ endsAt: now + 2 * DAY })).toEqual([
+      'warn',
+      'Ends in 2d (Sun 15 Nov, 09:00) · log in again as tara: claude auth login',
+    ]);
+    // Slack hears about it from the daily reminder, never from a health alert.
+    const rows = await agentChecks(deps({ claudeLogin: login({ endsAt: now - 1 }) }));
+    expect(rows.find((c) => c.name === 'Claude login')?.quiet).toBe(true);
     expect(await check({ endsAt: now - 3_600_000 })).toEqual([
       'bad',
       'Ended 1h ago (Fri 13 Nov, 08:00) · log in again as tara: claude auth login',

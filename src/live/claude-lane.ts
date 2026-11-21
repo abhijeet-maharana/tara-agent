@@ -57,7 +57,7 @@ const READ_TOOLS: Anthropic.Beta.BetaTool[] = [
   {
     name: 'jobs',
     description:
-      'Every scheduled job: project, id, name, paused, running, next run, last status, last error.',
+      'Every scheduled job: project, id, name, paused, running (or waitingFor a slot, lock or thread), next run, last status, last error.',
     input_schema: { type: 'object', properties: { project: { type: 'string' } } },
   },
   {
@@ -274,7 +274,7 @@ Answer in this shape: first one or two plain sentences to be spoken (no lists, n
               id: j.id,
               name: j.name,
               ...(j.enabled ? {} : { paused: true }),
-              ...(j.running && { running: true }),
+              ...(j.running && (j.waitingFor ? { waitingFor: j.waitingFor } : { running: true })),
               next: iso(j.nextRun),
               last: j.lastStatus,
               lastAt: iso(j.lastRunAt),

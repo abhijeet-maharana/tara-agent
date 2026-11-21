@@ -171,7 +171,10 @@ export function md(text: string): string {
     .join('');
 }
 
-/** Block level: headings, runs of bullets (one list) and runs of quote lines; other lines joined by <br>. */
+/** A GFM table's rule row, e.g. `| --- | :--: |`. */
+const TABLE_RULE = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$/;
+
+/** Block level: tables, headings, runs of bullets (one list) and runs of quote lines; other lines joined by <br>. */
 function mdLines(part: string): string {
   const out: string[] = [];
   // Typed through `as`: TS would otherwise narrow it to null, not seeing the closures assign it.
@@ -190,7 +193,38 @@ function mdLines(part: string): string {
     if (text.length) out.push(text.join('<br>'));
     text = [];
   };
-  for (const line of part.split('\n')) {
+  const lines = part.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] as string;
+    // A table: a `|` row, then a `| --- |` rule, then its rows.
+    if (/^\s*\|.*\|\s*$/.test(line) && TABLE_RULE.test(lines[i + 1] ?? '')) {
+      flushText();
+      flush();
+      const cells = (row: string) =>
+        row
+          .trim()
+          .replace(/^\||\|$/g, '')
+          .split('|')
+          .map((c) => inline(c.trim()));
+      const head = cells(line);
+      const rows: string[][] = [];
+      i += 2;
+      while (i < lines.length && /^\s*\|/.test(lines[i] as string)) rows.push(cells(lines[i++] as string));
+      i--;
+      out.push(
+        `<div class="tbl-wrap"><table class="md"><thead><tr>${head.map((h) => `<th>${h}</th>`).join('')}</tr></thead><tbody>${rows
+          .map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join('')}</tr>`)
+          .join('')}</tbody></table></div>`,
+      );
+      continue;
+    }
+    // A line of only dashes: the headline/details split of a job's reply.
+    if (/^\s*-{3,}\s*$/.test(line)) {
+      flushText();
+      flush();
+      out.push('<hr class="md">');
+      continue;
+    }
     const bullet = /^\s*[-*•]\s+(.*)$/.exec(line);
     const quote = /^>\s?(.*)$/.exec(line);
     const tag = bullet ? 'ul' : quote ? 'blockquote' : null;
@@ -300,20 +334,29 @@ export function headline(r: StoredRun): string {
     .slice(0, 200);
 }
 
-export type JobState = 'running' | 'failing' | 'paused' | 'ok' | 'new';
+export type JobState = 'running' | 'waiting' | 'failing' | 'paused' | 'ok' | 'new';
 export function jobState(j: JobInfo): JobState {
-  if (j.running) return 'running';
+  if (j.running) return j.waitingFor ? 'waiting' : 'running';
   if (!j.enabled) return 'paused';
   if (j.lastStatus && FAILED.includes(j.lastStatus)) return 'failing';
   return j.lastStatus ? 'ok' : 'new';
 }
 const STATE: Record<JobState, { label: string; tone: string; card: string }> = {
   running: { label: 'running', tone: '', card: 'accent' },
+  waiting: { label: 'waiting', tone: 'dim', card: '' },
   failing: { label: 'failing', tone: 'bad', card: 'bad' },
   paused: { label: 'paused', tone: 'warn', card: 'warn' },
   ok: { label: 'ok', tone: 'ok', card: '' },
   new: { label: 'not run yet', tone: 'dim', card: '' },
 };
+
+/** What a busy job that hasn't started waits for, in words. */
+export const waitText = (j: Pick<JobInfo, 'waitingFor' | 'locks'>) =>
+  j.waitingFor === 'thread'
+    ? 'waiting for the reply working in its thread'
+    : j.waitingFor === 'lock'
+      ? `waiting for ${j.locks?.length ? j.locks.join(', ') : 'its locks'}`
+      : 'waiting for a free job slot';
 
 /** Consecutive failed runs, newest first. */
 const failureStreak = (runs: StoredRun[]) => {
@@ -450,6 +493,16 @@ details{margin-top:8px;font-size:13.5px}summary{cursor:pointer;color:var(--text-
 .input:focus{border-color:var(--accent);outline:none}textarea.input{min-height:80px;resize:vertical}
 .field{display:grid;gap:4px;font-size:13px;color:var(--text-dim)}.fields{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .empty{color:var(--text-dim);padding:10px 0}.dim{color:var(--text-dim)}.actions.below{margin-top:10px}.card.spaced{margin-top:16px}
+.tbl-wrap{overflow-x:auto;margin:8px 0}table.md{border-collapse:collapse;font-size:13px;min-width:60%}
+table.md th,table.md td{border:1px solid var(--border);padding:5px 9px;text-align:left;vertical-align:top}
+table.md th{background:var(--bg);color:var(--text-heading);font-weight:600}hr.md{border:0;border-top:1px solid var(--border);margin:12px 0}
+.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.pager{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:16px 0 4px;font-size:13px}
+.composer{position:sticky;bottom:12px;z-index:5;margin:18px 0 6px;background:var(--card-bg);border:1px solid var(--border-light);border-radius:14px;padding:10px 12px 8px;box-shadow:0 8px 28px rgba(0,0,0,.28)}
+.composer:focus-within{border-color:var(--accent)}
+.composer textarea{display:block;width:100%;min-height:44px;max-height:40vh;border:0;background:transparent;color:var(--text);font:inherit;font-size:15px;line-height:1.45;resize:none;outline:none;padding:2px 0}
+.composer-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:6px;font-size:12px;color:var(--text-dim)}
+.composer-bar .btn{min-width:84px;justify-content:center}
 .msg{margin:10px 0;padding:10px 12px;border-radius:var(--radius);background:var(--card-bg);border:1px solid var(--border);overflow-wrap:anywhere;font-size:14px}
 .msg.user{border-left:3px solid var(--accent)}.msg .who{font-size:12px;color:var(--text-dim);margin-bottom:4px}
 .tool{margin:6px 0;padding:6px 10px;border:1px solid var(--border);border-radius:8px;background:var(--card-bg)}.tool.err summary{color:var(--red)}
@@ -781,6 +834,14 @@ export function modelUses(projects: Project[], jobs: JobInfo[], host: HostModels
     'job',
   );
   grouped(
+    'When unavailable',
+    jobs.flatMap(
+      (j): Array<[string, string]> =>
+        j.fallback ? [[onHarness(j.fallback.harness, j.fallback.model), j.name]] : [],
+    ),
+    'job',
+  );
+  grouped(
     'After approval',
     jobs.flatMap(
       (j): Array<[string, string]> =>
@@ -829,7 +890,8 @@ export function homePage(ctx: DashboardContext, data: HomeData): string {
   const tz = ctx.timeZone;
   const failing = jobs.filter((j) => jobState(j) === 'failing');
   const paused = jobs.filter((j) => !j.enabled);
-  const running = jobs.filter((j) => j.running);
+  const running = jobs.filter((j) => j.running && !j.waitingFor);
+  const waitingJobs = jobs.filter((j) => j.running && j.waitingFor);
   const frequent = jobs.filter((j) => j.enabled && j.everyMs !== undefined);
   const upcoming = jobs
     .filter((j) => j.enabled && j.nextRun && j.everyMs === undefined)
@@ -845,9 +907,13 @@ export function homePage(ctx: DashboardContext, data: HomeData): string {
         `<a href="${j.liveSessionId ? `/sessions/${esc(j.liveSessionId)}` : `/jobs#${anchor(j)}`}">${esc(j.name)}</a>`,
     )
     .join(', ');
+  // Busy jobs that haven't started: started on time, but waiting for a slot, a lock or their thread.
+  const waitingLinks = waitingJobs
+    .map((j) => `<a href="/jobs#${anchor(j)}" title="${esc(waitText(j))}">${esc(j.name)}</a>`)
+    .join(', ');
   const nowbar = `<div class="nowbar${running.length ? ' live' : ''}"><b>${
     running.length ? `● Running now: ${runningLinks}` : '○ Nothing running'
-  }</b><span class="dim">· up ${uptime} · ${jobs.length - paused.length} of ${jobs.length} jobs on</span></div>`;
+  }</b>${waitingJobs.length ? `<span>⏳ Waiting to start: ${waitingLinks}</span>` : ''}<span class="dim">· up ${uptime} · ${jobs.length - paused.length} of ${jobs.length} jobs on</span></div>`;
 
   const waiting = ctx.waiting ?? pending.length;
   const usage = data.usage;
@@ -1013,7 +1079,14 @@ ${modelsSection(data.models ?? [], data.effort)}`,
   );
 }
 
-const STATE_ORDER: Record<JobState, number> = { failing: 0, running: 1, ok: 2, new: 2, paused: 3 };
+const STATE_ORDER: Record<JobState, number> = {
+  failing: 0,
+  running: 1,
+  waiting: 1,
+  ok: 2,
+  new: 2,
+  paused: 3,
+};
 
 /** Where a job sits on the jobs page: on a schedule, started by hand, or run by its queue. */
 const group = (j: JobView): 'scheduled' | 'ondemand' | 'queued' =>
@@ -1056,7 +1129,7 @@ export function jobsPage(
       : '';
   const stateChips = [
     chip('state', '', 'Any state', jobs.length),
-    ...(['failing', 'running', 'paused'] as const).map((s) =>
+    ...(['failing', 'running', 'waiting', 'paused'] as const).map((s) =>
       chip(
         'state',
         s,
@@ -1111,7 +1184,7 @@ export function jobsPage(
       `${j.name} ${j.id} ${j.skills.join(' ')}`.toLowerCase(),
     )}">
 <div class="card-head"><div class="grow"><div class="title">${esc(j.name)}</div>
-<div class="meta"><span class="tag ${STATE[state].tone}">${STATE[state].label}</span>${projectTag(ctx, j.project)}${
+<div class="meta"><span class="tag ${STATE[state].tone}"${state === 'waiting' ? ` title="${esc(waitText(j))}"` : ''}>${STATE[state].label}</span>${projectTag(ctx, j.project)}${
       j.effort
         ? `<span class="tag dim" title="Runs at --effort ${esc(j.effort)}">effort ${esc(j.effort)}</span>`
         : ''
@@ -1143,7 +1216,9 @@ ${state === 'failing' && j.lastError ? `<div class="meta error">Last error: ${es
       j.stepModels?.length ? ` · steps: ${esc(j.stepModels.join(', '))}` : ''
     }${j.effort ? ` · effort ${esc(j.effort)}` : j.harness === 'agy' ? '' : ' · default effort'}${
       j.stepEfforts?.length ? ` · step effort: ${esc(j.stepEfforts.join(', '))}` : ''
-    }${j.handoff ? ` · after approval: ${esc(onHarness(j.handoff.harness, j.handoff.model))}` : ''}</dd>
+    }${j.fallback ? ` · when unavailable: ${esc(onHarness(j.fallback.harness, j.fallback.model))}` : ''}${
+      j.handoff ? ` · after approval: ${esc(onHarness(j.handoff.harness, j.handoff.model))}` : ''
+    }</dd>
 <dt>Length</dt><dd>${j.durationMinutes ? `${j.durationMinutes} min planned` : 'not planned'}${week?.typicalMinutes ? ` · ~${week.typicalMinutes} min in the last 7 days` : ''} <button type="button" class="btn quiet" data-length="${esc(j.project)}/${esc(j.id)}" data-name="${esc(j.name)}" data-minutes="${j.durationMinutes ?? week?.typicalMinutes ?? ''}" title="The planned length the Timeline uses for overlaps and free time">Change</button></dd>
 <dt>Schedule</dt><dd>${
       j.cron
@@ -1233,9 +1308,11 @@ export function sessionsPage(
   opts: {
     /** A session's first message (chats), read from its transcript. */
     preview?: (project: string, sessionId: string) => string | undefined;
-    /** Slack threads with a run working in them now. */
-    runningThreads?: Set<string>;
+    /** Threads with a run working in them now, with the job's id when it is a job run. */
+    runningThreads?: Map<string, string | undefined>;
     now?: number;
+    /** Which page of how many (50 sessions each), and how many sessions in all. */
+    page?: { at: number; of: number; total: number };
   } = {},
 ): string {
   const chips = (key: 'project' | 'kind', values: [string, string][]) =>
@@ -1254,7 +1331,9 @@ export function sessionsPage(
   // a restart) is still recognisable as a job's.
   const jobPrompt = (s: SessionOverview) =>
     opts.preview?.(s.project, s.sessionId)?.startsWith('## Script ') ?? false;
-  const kindOf = (s: SessionOverview) => (s.jobId || s.lastRun?.jobId || jobPrompt(s) ? 'job' : 'chat');
+  // A job's first run is recorded when it ends: while it runs, the live run names the job.
+  const jobOf = (s: SessionOverview) => s.jobId ?? s.lastRun?.jobId ?? opts.runningThreads?.get(s.threadKey);
+  const kindOf = (s: SessionOverview) => (jobOf(s) || jobPrompt(s) ? 'job' : 'chat');
   const dayOf = (ms: number) => new Date(ms).toLocaleDateString('en-CA', { timeZone: tz });
   const today = dayOf(now);
   const yesterday = dayOf(now - 86_400_000);
@@ -1276,7 +1355,7 @@ export function sessionsPage(
       const run = s.lastRun;
       const kind = kindOf(s);
       const at = run?.startedAt ?? s.updatedAt;
-      const jobId = s.jobId ?? run?.jobId;
+      const jobId = jobOf(s);
       const jobName = jobId ? (jobNames.get(`${s.project}:${jobId}`) ?? jobId) : undefined;
       // A chat's title is its message's first line (tara-agent adds context below it).
       const message = opts
@@ -1306,6 +1385,20 @@ ${run && !running ? `<span>${formatDuration(run.endedAt - run.startedAt)}</span>
     })
     .join('');
   const filtered = Boolean(filter.project || filter.kind);
+  const page = opts.page;
+  const pageLink = (n: number, label: string, rel: string) => {
+    const params = new URLSearchParams();
+    if (filter.project) params.set('project', filter.project);
+    if (filter.kind) params.set('kind', filter.kind);
+    if (n > 1) params.set('page', String(n));
+    return `<a class="btn quiet" rel="${rel}" href="/sessions${params.size ? `?${params}` : ''}">${label}</a>`;
+  };
+  const pager =
+    page && page.of > 1
+      ? `<nav class="pager" aria-label="Pages">${page.at > 1 ? pageLink(page.at - 1, '← Newer', 'prev') : '<span></span>'}<span class="dim">Page ${page.at} of ${page.of} · ${page.total} sessions</span>${
+          page.at < page.of ? pageLink(page.at + 1, 'Older →', 'next') : '<span></span>'
+        }</nav>`
+      : '';
   return layout(
     ctx,
     'Sessions',
@@ -1322,15 +1415,35 @@ ${run && !running ? `<span>${formatDuration(run.endedAt - run.startedAt)}</span>
       ['', 'Chats and jobs'],
       ['chat', 'Chats'],
       ['job', 'Jobs'],
-    ])}</div><input id="sq" class="input" type="search" placeholder="Search sessions" aria-label="Search sessions"></div>
-<div class="todo sessions">${rows || `<div class="empty">${filtered ? 'No sessions match.' : 'No sessions yet.'}</div>`}</div><div id="none" class="empty" hidden>No sessions match.</div>`,
+    ])}</div><input id="sq" class="input" type="search" placeholder="Search this page" aria-label="Search the sessions on this page"></div>
+<div class="todo sessions">${rows || `<div class="empty">${filtered ? 'No sessions match.' : 'No sessions yet.'}</div>`}</div><div id="none" class="empty" hidden>No sessions on this page match.</div>${pager}`,
     { script: SESSIONS_SCRIPT },
   );
 }
 
-/** The Sessions search: filters the rows as you type and hides day headings left empty. */
+/**
+ * The Sessions search: filters the rows as you type and hides day headings left empty. On the first
+ * page the list refreshes itself every 10 s (new runs, ● running, results), unless you are searching.
+ */
 const SESSIONS_SCRIPT = `
 const sq = document.getElementById('sq');
+const firstPage = !new URLSearchParams(location.search).get('page') || new URLSearchParams(location.search).get('page') === '1';
+async function refreshSessions() {
+  if (document.hidden || (sq && sq.value.trim())) return;
+  try {
+    const r = await fetch(location.href, { headers: { accept: 'text/html' } });
+    if (!r.ok) return;
+    const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+    const fresh = doc.querySelector('.sessions');
+    const list = document.querySelector('.sessions');
+    if (fresh && list && fresh.innerHTML !== list.innerHTML) list.innerHTML = fresh.innerHTML;
+    const pager = doc.querySelector('.pager');
+    const old = document.querySelector('.pager');
+    if (pager && old) old.replaceWith(pager);
+  } catch {}
+}
+if (firstPage) setInterval(refreshSessions, 10000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden && firstPage) refreshSessions(); });
 sq?.addEventListener('input', () => {
   const q = sq.value.trim().toLowerCase();
   let shown = 0, day = null, dayShown = 0;
@@ -1355,11 +1468,17 @@ function entryHtml(e: TranscriptEntry, timeZone: string): string {
     // Chat prompts start with the sender's Slack mention; show it as a message instead.
     const sender = /^<@([A-Z0-9]+)>:\s*/.exec(rest);
     if (sender) rest = rest.slice(sender[0].length);
-    return `<div class="msg user"><div class="who">${sender ? 'Message' : 'Prompt'}${time}</div>${
-      script
-        ? `<details><summary>What the check before the run found</summary><pre>${esc(script[2])}</pre></details>`
-        : ''
-    }${md(rest)}</div>`;
+    const found = script
+      ? `<details><summary>What the check before the run found</summary><pre>${esc(script[2])}</pre></details>`
+      : '';
+    // A job's prompt (memory, instructions) and a learning turn's are long and the same every run: folded.
+    if (!sender && rest.length > 600) {
+      const what = /Reply with exactly NONE/.test(rest)
+        ? 'Learning turn: its instructions'
+        : 'The job’s instructions';
+      return `<div class="msg user"><div class="who">Prompt${time}</div>${found}<details><summary>${what} (${rest.split('\n').length} lines)</summary>${md(rest)}</details></div>`;
+    }
+    return `<div class="msg user"><div class="who">${sender ? 'Message' : 'Prompt'}${time}</div>${found}${md(rest)}</div>`;
   }
   if (e.kind === 'assistant')
     return `<div class="msg"><div class="who">Claude${time}</div>${md(e.text)}</div>`;
@@ -1410,11 +1529,16 @@ export function sessionPage(
     !running && run?.error && FAILED.includes(run.status)
       ? `<article class="card bad spaced"><div class="title">Error</div><pre>${esc(run.error)}</pre></article>`
       : '';
+  // What the run came to, first: its whole reply (the Slack summary is its headline).
+  const result =
+    !running && run?.output?.trim()
+      ? `<article class="card spaced${FAILED.includes(run.status) ? ' bad' : ''}"><div class="title">Result <span class="dim">${esc(when(run.endedAt, ctx.timeZone))}</span></div>${md(run.output)}</article>`
+      : '';
   const body = entries?.length
-    ? entries.map((e) => entryHtml(e, ctx.timeZone)).join('')
-    : run?.output
-      ? `<div class="empty">No transcript for this session on this machine (old, or run on another CLI). The run's reply:</div><div class="msg">${md(run.output)}</div>`
-      : `<div class="empty">${running ? 'The transcript shows here when the run ends.' : 'No transcript for this session on this machine.'}</div>`;
+    ? section('Conversation', entries.map((e) => entryHtml(e, ctx.timeZone)).join(''), {
+        sub: `${entries.filter((e) => e.kind === 'tool').length} steps`,
+      })
+    : `<div class="empty">${running ? 'The conversation shows here as the run writes it; reload to see more.' : 'No transcript for this session on this machine (old, or run on another CLI).'}</div>`;
   // While it runs: its steps and the end of what it is writing, polled; the page reloads when it ends.
   const live = running
     ? `<section class="card accent live" id="live" data-session="${esc(sessionId)}" aria-live="polite"><div class="card-head"><div class="grow"><div class="title">● Working <span class="dim" id="live-clock"></span></div><div class="meta" id="live-meta">Connecting…</div></div>${
@@ -1436,13 +1560,19 @@ export function sessionPage(
     opts.canSay === undefined
       ? ''
       : opts.canSay
-        ? `<form class="card spaced say" id="say" data-session="${esc(sessionId)}"><label class="title" for="say-text">Reply</label>
-<textarea class="input" id="say-text" name="text" rows="3" placeholder="${running ? 'Read when the current turn ends. Type stop to stop it.' : 'Continue this conversation…'}" required></textarea>
-<div class="actions"><button type="submit" class="btn">Send</button></div></form>`
-        : '<div class="empty"><a href="/unlock">Unlock this browser</a> to reply in this session.</div>';
-  return layout(ctx, title, 'Sessions', `${pageHead(title)}${head}${error}${live}${body}${files}${say}`, {
-    script: [running ? LIVE_SCRIPT : '', opts.canSay ? SAY_SCRIPT : ''].join('') || undefined,
-  });
+        ? `<form class="composer" id="say" data-session="${esc(sessionId)}"><label class="sr-only" for="say-text">Reply</label>
+<textarea id="say-text" name="text" rows="1" placeholder="${running ? 'Reply… read when the current turn ends (type stop to stop it)' : 'Reply to continue this conversation…'}" required></textarea>
+<div class="composer-bar"><span>⌘/Ctrl + Enter to send</span><button type="submit" class="btn">Send</button></div></form>`
+        : '<div class="empty spaced"><a href="/unlock">Unlock this browser</a> to reply in this session.</div>';
+  return layout(
+    ctx,
+    title,
+    'Sessions',
+    `${pageHead(title)}${head}${error}${live}${result}${files}${body}${say}`,
+    {
+      script: [running ? LIVE_SCRIPT : '', opts.canSay ? SAY_SCRIPT : ''].join('') || undefined,
+    },
+  );
 }
 
 /** The session page's reply box: posts `/sessions/<id>/say`, then reloads to show the turn running. */
@@ -1451,6 +1581,8 @@ const SAY_SCRIPT = `
   const form = document.getElementById('say');
   if (!form) return;
   const box = form.querySelector('textarea');
+  const fit = () => { box.style.height = 'auto'; box.style.height = box.scrollHeight + 'px'; };
+  box.addEventListener('input', fit);
   box.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) form.requestSubmit(); });
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -1461,6 +1593,7 @@ const SAY_SCRIPT = `
     try {
       await post('/sessions/' + encodeURIComponent(form.dataset.session) + '/say', { text });
       box.value = '';
+      fit();
       toast('Sent');
       setTimeout(() => location.reload(), 1500);
     } catch (err) { toast(err.message, { error: true }); button.disabled = false; }

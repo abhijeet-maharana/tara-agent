@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { Harness } from '../config/schema.js';
+import type { VmHostSample } from '../health/vmhost.js';
 
 export interface SessionRow {
   /** `<channel>:<thread ts>` */
@@ -382,6 +383,20 @@ const MIGRATIONS = [
      web_key    TEXT NOT NULL,
      created_at INTEGER NOT NULL
    );`,
+  // The VM host's own reports (src/health/vmhost.ts): the machine tara-agent's VM runs on.
+  `CREATE TABLE vmhost_samples (
+     at           INTEGER PRIMARY KEY,
+     name         TEXT,
+     cpu_temp     REAL,
+     thermal      TEXT,
+     cpu          REAL,
+     mem_used     REAL,
+     swap_bytes   REAL,
+     pressure     TEXT,
+     vm_cpu       REAL,
+     vm_mem_bytes REAL,
+     power_w      REAL
+   );`,
 ];
 
 /** One message of a dashboard thread (src/web/). */
@@ -663,6 +678,26 @@ function toPhoneDevice(r: Record<string, unknown>): PhoneDevice {
 }
 
 /** SQLite state: sessions and run history. Lives outside every project repo. */
+function vmHostRow(r: Record<string, unknown>): VmHostSample {
+  const n = (k: string) => (r[k] == null ? undefined : (r[k] as number));
+  const t = (k: string) => (r[k] == null ? undefined : (r[k] as string));
+  const s: VmHostSample = {
+    at: r.at as number,
+    name: t('name'),
+    cpuTemp: n('cpu_temp'),
+    thermal: t('thermal') as VmHostSample['thermal'],
+    cpu: n('cpu'),
+    memUsed: n('mem_used'),
+    swapBytes: n('swap_bytes'),
+    pressure: t('pressure') as VmHostSample['pressure'],
+    vmCpu: n('vm_cpu'),
+    vmMemBytes: n('vm_mem_bytes'),
+    powerW: n('power_w'),
+  };
+  for (const k of Object.keys(s) as Array<keyof VmHostSample>) if (s[k] === undefined) delete s[k];
+  return s;
+}
+
 export class Store {
   private readonly db: DatabaseSync;
 
@@ -673,7 +708,12 @@ export class Store {
   ) {
     if (file !== ':memory:') mkdirSync(path.dirname(file), { recursive: true });
     this.db = new DatabaseSync(file);
-    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
+    // synchronous=NORMAL: in WAL mode this skips the fsync on every commit (only
+    // checkpoints sync). Still corruption-safe; a power cut may drop the last few
+    // commits. Cuts write pressure on jarvis's slow SSD.
+    this.db.exec(
+      'PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;',
+    );
     this.migrate();
   }
 
@@ -758,17 +798,16 @@ export class Store {
   }
 
   /** Sessions, most recently active first, each with its latest run. */
-  sessionsOverview(opts: { project?: string; sessionId?: string; limit?: number } = {}): SessionOverview[] {
-    const where: string[] = [];
-    const args: (string | number)[] = [];
-    if (opts.project) {
-      where.push('s.project = ?');
-      args.push(opts.project);
-    }
-    if (opts.sessionId) {
-      where.push('s.session_id = ?');
-      args.push(opts.sessionId);
-    }
+  sessionsOverview(
+    opts: {
+      project?: string;
+      sessionId?: string;
+      kind?: 'job' | 'chat';
+      limit?: number;
+      offset?: number;
+    } = {},
+  ): SessionOverview[] {
+    const { where, args } = this.sessionFilter(opts);
     const rows = this.db
       .prepare(
         `SELECT s.thread_key, s.project, s.session_id, s.model, s.started, s.harness, s.created_at, s.updated_at,
@@ -777,9 +816,9 @@ export class Store {
            (SELECT job_id FROM runs x WHERE x.thread_key = s.thread_key AND x.job_id IS NOT NULL ORDER BY x.started_at LIMIT 1) AS job_id
          FROM sessions s ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
          ORDER BY COALESCE((SELECT MAX(x.started_at) FROM runs x WHERE x.thread_key = s.thread_key), s.updated_at) DESC
-         LIMIT ?`,
+         LIMIT ? OFFSET ?`,
       )
-      .all(...args, opts.limit ?? 200) as Record<string, unknown>[];
+      .all(...args, opts.limit ?? 200, opts.offset ?? 0) as Record<string, unknown>[];
     return rows.map((r) => ({
       threadKey: r.thread_key as string,
       project: r.project as string,
@@ -793,6 +832,35 @@ export class Store {
       lastRun: r.last_run_id ? this.getRun(r.last_run_id as number) : undefined,
       jobId: (r.job_id as string | null) ?? undefined,
     }));
+  }
+
+  /** How many sessions `sessionsOverview` would list without a limit (for its pages). */
+  sessionsCount(opts: { project?: string; kind?: 'job' | 'chat' } = {}): number {
+    const { where, args } = this.sessionFilter(opts);
+    return (
+      this.db
+        .prepare(`SELECT COUNT(*) n FROM sessions s ${where.length ? `WHERE ${where.join(' AND ')}` : ''}`)
+        .get(...args) as { n: number }
+    ).n;
+  }
+
+  /** A session is a job's when a run of a job happened in its thread; otherwise a chat. */
+  private sessionFilter(opts: { project?: string; sessionId?: string; kind?: 'job' | 'chat' }) {
+    const where: string[] = [];
+    const args: (string | number)[] = [];
+    if (opts.project) {
+      where.push('s.project = ?');
+      args.push(opts.project);
+    }
+    if (opts.sessionId) {
+      where.push('s.session_id = ?');
+      args.push(opts.sessionId);
+    }
+    if (opts.kind)
+      where.push(
+        `${opts.kind === 'chat' ? 'NOT ' : ''}EXISTS (SELECT 1 FROM runs x WHERE x.thread_key = s.thread_key AND x.job_id IS NOT NULL)`,
+      );
+    return { where, args };
   }
 
   /**
@@ -821,6 +889,7 @@ export class Store {
     // Samples and log lines are only charted for weeks; a month is plenty.
     const month = Math.max(before, this.now() - 31 * 86_400_000);
     this.db.prepare('DELETE FROM host_samples WHERE at < ?').run(month);
+    this.db.prepare('DELETE FROM vmhost_samples WHERE at < ?').run(month);
     this.db.prepare('DELETE FROM log_events WHERE at < ?').run(month);
     return { runs: Number(runs), claims: Number(claims), sessions: Number(sessions) };
   }
@@ -1036,6 +1105,44 @@ export class Store {
     ).map((r) => ({ at: r.at, load: r.load, memUsed: r.mem_used, diskUsed: r.disk_used ?? undefined }));
   }
 
+  addVmHostSample(s: VmHostSample): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO vmhost_samples (at, name, cpu_temp, thermal, cpu, mem_used, swap_bytes, pressure, vm_cpu, vm_mem_bytes, power_w)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        s.at,
+        s.name ?? null,
+        s.cpuTemp ?? null,
+        s.thermal ?? null,
+        s.cpu ?? null,
+        s.memUsed ?? null,
+        s.swapBytes ?? null,
+        s.pressure ?? null,
+        s.vmCpu ?? null,
+        s.vmMemBytes ?? null,
+        s.powerW ?? null,
+      );
+  }
+
+  vmHostSamples(since: number): VmHostSample[] {
+    return (
+      this.db.prepare('SELECT * FROM vmhost_samples WHERE at >= ? ORDER BY at').all(since) as Record<
+        string,
+        unknown
+      >[]
+    ).map(vmHostRow);
+  }
+
+  /** The VM host's latest report, however old. */
+  lastVmHostSample(): VmHostSample | undefined {
+    const r = this.db.prepare('SELECT * FROM vmhost_samples ORDER BY at DESC LIMIT 1').get() as
+      | Record<string, unknown>
+      | undefined;
+    return r ? vmHostRow(r) : undefined;
+  }
+
   addLog(e: LogEvent): void {
     this.db
       .prepare('INSERT INTO log_events (at, level, message) VALUES (?, ?, ?)')
@@ -1068,9 +1175,13 @@ export class Store {
   }
 
   /** The latest run of a Claude (or agy) session, whatever thread it ran in. */
+  /** A session's latest run, not counting learning turns (their reply is notes, not the run's result). */
   latestSessionRun(sessionId: string): StoredRun | undefined {
     const row = this.db
-      .prepare('SELECT * FROM runs WHERE session_id = ? ORDER BY started_at DESC LIMIT 1')
+      .prepare(
+        `SELECT * FROM runs WHERE session_id = ?
+         ORDER BY kind = 'learn', started_at DESC LIMIT 1`,
+      )
       .get(sessionId);
     return row ? toRun(row as Record<string, unknown>) : undefined;
   }

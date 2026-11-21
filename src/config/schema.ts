@@ -564,6 +564,12 @@ export const jobSchema = z
      * on it. A declined card (Skip, Reject, …) runs no model at all.
      */
     handoff: z.object({ harness: z.enum(harnesses), model: z.string().min(1) }).optional(),
+    /**
+     * When the job's harness is out of quota or capacity (e.g. agy's `RESOURCE_EXHAUSTED` or
+     * `503 UNAVAILABLE`), rerun that session on this harness and model instead, and keep the rest of the
+     * run there. Only fresh sessions fall back: a reply that continues a conversation stays on its CLI.
+     */
+    fallback: z.object({ harness: z.enum(harnesses), model: z.string().min(1) }).optional(),
     /** The job's own MCP servers, by name (not `tara`). */
     mcpServers: z
       .record(z.string().regex(/^[a-z0-9_-]+$/, 'lowercase letters, digits, _ and -'), mcpServerSchema)
@@ -593,6 +599,10 @@ export const jobSchema = z
   .refine((j) => j.skills.length > 0, {
     message: 'a job needs a skill: its instructions are the skill\'s "## Job: <id>" section',
     path: ['skills'],
+  })
+  .refine((j) => !j.fallback || j.fallback.harness !== j.harness, {
+    message: "a fallback needs another harness than the job's own",
+    path: ['fallback'],
   });
 
 const hhmm = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'HH:MM');

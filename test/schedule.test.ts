@@ -169,6 +169,15 @@ describe('schedule page', () => {
     expect(page).toContain('Now · 10:32 am');
     expect(page.indexOf('Now · 10:32 am')).toBeGreaterThan(page.indexOf('10:30 am'));
     expect(page).toContain('<a class="tag" href="/sessions/live-1">● running now</a>');
+    // The same job still waiting for a slot: no link, a waiting tag.
+    const waiting = schedulePage(ctx, plan, {
+      day: '2026-11-10',
+      today: '2026-11-10',
+      now: at(10, 32),
+      waiting: new Set(['shop:audit']),
+    });
+    expect(waiting).toContain('⏳ waiting to start</span>');
+    expect(waiting).not.toContain('● running now');
     expect(page).toContain('<a href="/sessions/sess-7">');
     expect(page).toContain('<span class="when">Every 10 min</span>');
     expect(page).toContain('>Yesterday</a>');

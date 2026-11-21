@@ -457,6 +457,8 @@ export class Bridge {
       name: j.name,
       enabled: j.enabled,
       running: j.running,
+      // Busy but not started yet: 'slot', 'lock' or 'thread'.
+      waitingFor: j.waitingFor ?? null,
       nextRun: j.nextRun?.toISOString() ?? null,
       lastStatus: j.lastStatus ?? null,
     }));
