@@ -14,6 +14,24 @@ export const permissionModes = [
 
 /** The agent CLI a run goes through: Claude Code, or Google's Antigravity CLI (`agy`). */
 export const harnesses = ['claude', 'agy'] as const;
+
+/**
+ * Project settings that decide what tara-agent itself does with its own rights (where it sends approved
+ * items and card events, which billing and permission mode runs get, who the owner is, what it proxies
+ * and reads). Host `trusted` can pin them, so a run editing `.tara/config.json` can't change them.
+ */
+export const PINNED_PROJECT_KEYS = [
+  'slackChannel',
+  'owner',
+  'permissionMode',
+  'billing',
+  'systemPromptFile',
+  'dashboardUrl',
+  'healthUrl',
+  'keepTabsUrl',
+  'approvals',
+  'reminders',
+] as const;
 /** Claude Code `--effort` levels. */
 export const efforts = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 export const effortSchema = z.enum(efforts);
@@ -134,15 +152,43 @@ export const hostConfigSchema = z.object({
    * See docs/security.md "Pull requests".
    */
   github: z.array(githubRepoSchema).default([]),
+  /**
+   * Settings of a project that only the host config may set, keyed by the project's repo path (as listed
+   * in `projects`). Runs can edit `.tara/config.json`, so for a project listed here the keys in
+   * `PINNED_PROJECT_KEYS` come from this entry only: the repo's own values for them are ignored (and shown
+   * on the Health page when they differ). `executorUrls`: the only URLs its queues may send approved items
+   * to. See docs/security.md "Pinned project settings".
+   */
+  trusted: z
+    .record(
+      z.string(),
+      z
+        .object({ executorUrls: z.array(z.string().url()).default([]) })
+        .catchall(z.unknown())
+        .superRefine((entry, ctx) => {
+          for (const key of Object.keys(entry))
+            if (key !== 'executorUrls' && !(PINNED_PROJECT_KEYS as readonly string[]).includes(key))
+              ctx.addIssue({ code: 'custom', path: [key], message: `"${key}" can't be pinned` });
+        }),
+    )
+    .default({}),
   /** Where the SQLite state lives. Defaults to `~/.local/state/tara-agent`. */
   stateDir: z.string().optional(),
   /** Days after its last use that a session's scratch folder (`TARA_SCRATCH`) is deleted. */
   scratchDays: z.number().min(1).default(3),
   /**
    * Days of history kept in the state database: runs, slot claims and sessions not used since are
-   * deleted daily (each job's latest run stays). Approval cards are kept.
+   * deleted daily (each job's latest run stays). Finished approval cards are kept 60 days.
    */
   retentionDays: z.number().int().min(14).default(90),
+  /**
+   * Daily copies of the state database, checked after writing. `dir` defaults to `<stateDir>/backups`;
+   * point it at another disk (or a folder another machine copies off) so a failing disk doesn't take
+   * the copies with it. `keep` is how many days of copies stay.
+   */
+  backup: z
+    .object({ dir: z.string().optional(), keep: z.number().int().min(1).default(7) })
+    .default({ keep: 7 }),
   /**
    * Stream replies into Slack threads as Claude writes them, with a live task card (needs the Slack
    * app's "Agents & AI Apps" feature; falls back to an edited status message without it).
@@ -216,6 +262,13 @@ export const hostConfigSchema = z.object({
        * localhost keep this to trusted networks, e.g. ["127.0.0.0/8", "::1/128", "100.64.0.0/10"] (Tailscale).
        */
       allowFrom: z.array(z.string()).default(['127.0.0.0/8', '::1/128']),
+      /**
+       * Extra host names the dashboard is opened by, when bound beyond localhost. IP addresses,
+       * `localhost`, one-word names (`jarvis`), Tailscale names (`*.ts.net`) and the host of
+       * `dashboardUrl` are always accepted; any other name in a request's Host is refused, which stops
+       * DNS-rebinding pages from reaching the API.
+       */
+      hosts: z.array(z.string().min(1)).default([]),
       /** Pass requests for paths tara-agent doesn't serve to this URL (e.g. the port's previous owner). */
       fallback: z.string().url().optional(),
       /**
@@ -227,8 +280,16 @@ export const hostConfigSchema = z.object({
           port: z.number().int().min(1).max(65535).default(4443),
           cert: z.string().min(1),
           key: z.string().min(1),
+          /** HTTPS twin of `appPort`, for the dashboard opened over HTTPS. */
+          appPort: z.number().int().min(1).max(65535).optional(),
         })
         .optional(),
+      /**
+       * Serve project apps shown as tabs (`/app/<name>/…`) on this port instead of the dashboard's own:
+       * another origin, so a run that edits an app's pages can't use your unlocked browser to decide its
+       * own cards. Unset: same origin as the dashboard (older behaviour).
+       */
+      appPort: z.number().int().min(1).max(65535).optional(),
       /**
        * Quiet hours in the glance (`GET /glance`), local `HH:MM`: desk panels such as the macOS desk
        * widget hold their notifications then. Default 23:00–07:00.
@@ -240,7 +301,13 @@ export const hostConfigSchema = z.object({
         })
         .optional(),
     })
-    .default({ enabled: true, bind: '127.0.0.1', port: 4100, allowFrom: ['127.0.0.0/8', '::1/128'] }),
+    .default({
+      enabled: true,
+      bind: '127.0.0.1',
+      port: 4100,
+      allowFrom: ['127.0.0.0/8', '::1/128'],
+      hosts: [],
+    }),
   /**
    * The Code page: each repo's files and uncommitted changes, read-only. Without `repos`, the
    * projects are shown. See docs/code-view.md.
@@ -534,6 +601,17 @@ export const jobSchema = z
     /** Named locks held for the whole run, e.g. ["chrome"] for jobs that drive the shared browser. */
     locks: z.array(z.string()).default([]),
     timeoutMinutes: z.number().positive().default(30),
+    /**
+     * The whole run's time, steps included: each session gets its own `timeoutMinutes` but no more than
+     * what is left of this (the main session at least 5 minutes, to report). Default: twice
+     * `timeoutMinutes` for a job with steps, else `timeoutMinutes`.
+     */
+    runTimeoutMinutes: z.number().positive().optional(),
+    /**
+     * A scheduled run that waited longer than this for a job slot or its locks is skipped instead of
+     * starting late (e.g. a morning report). Unset: it always runs.
+     */
+    maxWaitMinutes: z.number().positive().optional(),
     /** Run the most recent missed slot after downtime (see host `catchUpHours`). */
     catchUp: z.boolean().default(true),
     /** Overrides the project's `selfImprove` for this job, e.g. `trouble` for a job that runs every few minutes. */
@@ -731,6 +809,10 @@ export interface Project {
   config: ProjectConfig;
   /** Contents of `systemPromptFile`, if set. */
   systemPrompt?: string;
+  /** Pinned by the host config (`trusted`): the URLs its queues may send to. */
+  trusted?: { executorUrls: string[] };
+  /** Pinned keys the repo's config set to something else (ignored), for the Health page. */
+  pinDrift?: string[];
 }
 
 /** A job with its project and fully merged environment. */

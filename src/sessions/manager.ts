@@ -9,6 +9,7 @@ import { buildClaudeArgs } from '../runner/args.js';
 import { buildChildEnv } from '../runner/env.js';
 import type { Runner, RunOutcome } from '../runner/run.js';
 import { sessionScratch } from '../runner/workspace.js';
+import { limitResetAt } from '../scheduler/limits.js';
 import { foldersNote, identityPrompt } from '../scheduler/prompt.js';
 import type { JobControl, JobInfo } from '../scheduler/scheduler.js';
 import { findRunJob, parseScheduledRun, SCHEDULE_BY } from '../scheduler/slack-trigger.js';
@@ -113,6 +114,8 @@ export interface ManagerDeps {
   now?: () => number;
   /** A thread's link: a Slack thread's, or a dashboard thread's page (for chat summaries). */
   threadUrl?: (channel: string, ts: string) => string | undefined;
+  /** The Approvals page, linked from a chat summary whose turn left cards there. */
+  approvalsUrl?: string;
 }
 
 const BASE_PROMPT = `You are running headless for a Slack thread, through tara-agent.
@@ -130,6 +133,19 @@ const STOP =
 export const isStopRequest = (text: string) => STOP.test(text.trim());
 
 export const threadKey = (channel: string, threadTs: string) => `${channel}:${threadTs}`;
+
+/** A message older than this when found after a restart is not answered late: its sender is asked to resend. */
+export const RECOVER_MAX_MS = 6 * 3_600_000;
+
+/** A message as a recovery note quotes it: "“plan next week's posts”" (its first line, short). */
+function quoteOf(text: string): string {
+  const line =
+    text
+      .split('\n')
+      .find((l) => l.trim())
+      ?.trim() ?? '';
+  return `“${line.length > 80 ? `${line.slice(0, 79)}…` : line}”`;
+}
 
 export class SessionManager {
   private readonly byChannel: Map<string, Project>;
@@ -191,10 +207,75 @@ export class SessionManager {
     // "Run Weekly Redis Health Audit": start the job straight away, no model needed.
     if (await this.runRequest(project, msg, text)) return;
 
-    // The running turn can't read new messages; this one goes next, once it has finished.
-    if (this.threads.busy(key))
-      await reply('⏳ Noted. I’ll read this when the current work finishes. Say *stop* to stop it now.');
-    await this.threads.run(key, (signal) => this.turn(project, key, msg, signal));
+    // Kept in the store until its turn ends: a crash while it waits (or works) doesn't lose it (`recover`).
+    const inboxId = this.deps.store.addInbox({
+      channel: msg.channel,
+      threadTs: msg.threadTs,
+      ts: msg.ts,
+      user: msg.user,
+      text: msg.text,
+      summary: msg.summary,
+      mention: msg.mentionWhenDone,
+      files: msg.attachments?.length ?? 0,
+    });
+    try {
+      // The running turn can't read new messages; this one goes next, once it has finished.
+      if (this.threads.busy(key))
+        await reply('⏳ Noted. I’ll read this when the current work finishes. Say *stop* to stop it now.');
+      await this.threads.run(key, (signal) => this.turn(project, key, msg, signal, inboxId));
+    } finally {
+      this.deps.store.removeInbox(inboxId);
+    }
+  }
+
+  /**
+   * Chat messages left unanswered by a crash (or a restart that didn't wait), found in the store at
+   * start. One that was still waiting is answered now, as if it had just arrived; one older than
+   * `RECOVER_MAX_MS`, or whose files are gone, gets a note asking to send it again. One whose turn had
+   * started is not run again (it may have half done something): its thread says it was interrupted.
+   */
+  async recover(): Promise<void> {
+    const { store, chat } = this.deps;
+    const left = store.inbox();
+    if (!left.length) return;
+    this.log.warn(
+      `${left.length} chat ${left.length === 1 ? 'message' : 'messages'} left from before the restart`,
+    );
+    const now = this.now();
+    const runs: Promise<void>[] = [];
+    for (const m of left) {
+      store.removeInbox(m.id);
+      const said = quoteOf(m.text);
+      const note = (text: string) =>
+        chat
+          .post(m.channel, m.threadTs, text)
+          .catch((err: Error) => this.log.warn(`recovery note not posted: ${err.message}`));
+      if (m.startedAt !== undefined) {
+        await note(
+          `⚠️ tara-agent restarted while I was working on ${said}. I may have done part of it: reply to continue, or check before asking again.`,
+        );
+        continue;
+      }
+      if (m.files > 0 || now - m.receivedAt > RECOVER_MAX_MS) {
+        await note(
+          `⚠️ Your message ${said} was lost in a restart${m.files ? ' with its files' : ''}. Send it again if it still matters.`,
+        );
+        continue;
+      }
+      await note(`↩️ Picking up your message ${said}: it was waiting when tara-agent restarted.`);
+      runs.push(
+        this.handle({
+          channel: m.channel,
+          threadTs: m.threadTs,
+          ts: m.ts,
+          user: m.user,
+          text: m.text,
+          ...(m.summary && { summary: m.summary }),
+          ...(m.mention && { mentionWhenDone: m.mention }),
+        }).catch((err: Error) => this.log.error(`recovered message: ${err.message}`)),
+      );
+    }
+    await Promise.all(runs);
   }
 
   /** Handles "run <job name>". False when the message isn't one (it then goes to Claude). */
@@ -284,15 +365,22 @@ export class SessionManager {
       );
       return;
     }
+    // Asked for as a reply in a Slack thread (a run's summary, a chat): a dashboard run answers there.
+    const answersHere = !ownThread && !isWebChannel(channel) && job.delivery !== 'thread';
     const result = this.deps.jobs?.trigger(
       project.config.name,
       job.id,
       user,
       ownThread ? { channel, ts: threadTs } : undefined,
+      answersHere ? { replyIn: { channel, ts: threadTs } } : undefined,
     );
     if (result === 'running') await reply(`🔄 *${job.name}* is already running.`);
     else if (result === 'started' && !ownThread)
-      await reply(`▶️ Started *${job.name}*. It posts its own message in this channel.`);
+      await reply(
+        answersHere
+          ? `▶️ Started *${job.name}*. Its result comes in this thread; the run itself is on the dashboard.`
+          : `▶️ Started *${job.name}*. It posts its own message in this channel.`,
+      );
   }
 
   /** Stops every running turn (used on shutdown). */
@@ -334,6 +422,8 @@ export class SessionManager {
     key: string,
     msg: IncomingMessage,
     signal: AbortSignal,
+    /** Its `inbox` row, marked started once the turn has its slot. */
+    inboxId?: number,
   ): Promise<void> {
     const { chat, store, host } = this.deps;
     const name = project.config.name;
@@ -381,6 +471,7 @@ export class SessionManager {
     // The slot is taken only after the setup above, and released in the finally below: a setup error
     // (SQLite busy, a bridge file that can't be written) must never leak a chat slot.
     const release = await this.slots.acquire();
+    if (inboxId !== undefined) store.startInbox(inboxId);
     reply.working();
     const startedAt = this.now();
     let env: NodeJS.ProcessEnv = {};
@@ -498,6 +589,7 @@ export class SessionManager {
       outputTokens: outcome.usage?.output,
       cacheReadTokens: outcome.usage?.cacheRead,
       cacheCreationTokens: outcome.usage?.cacheCreation,
+      contextTokens: outcome.contextTokens,
       toolCalls: outcome.toolCalls,
       rateLimitUtilization: outcome.rateLimit?.utilization,
       error: outcome.error,
@@ -561,9 +653,15 @@ export class SessionManager {
         reaction = 'white_check_mark';
         break;
       case 'limit': {
-        const resets = o.rateLimit?.resetsAt
-          ? ` Resets at ${new Date(o.rateLimit.resetsAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.`
-          : '';
+        const resetAt = limitResetAt(o, this.deps.host.timezone, this.now());
+        // Scheduled runs on this CLI wait for the reset too, instead of each starting and failing.
+        this.deps.jobs?.noteLimit?.(store.getSession(key)?.harness ?? 'claude', resetAt);
+        const resets = ` Resets ${new Intl.DateTimeFormat('en-GB', {
+          timeZone: this.deps.host.timezone,
+          weekday: 'short',
+          hour: '2-digit',
+          minute: '2-digit',
+        }).format(resetAt)}.`;
         summary = `⏸ Claude usage limit reached.${resets} Reply again later to continue.`;
         reaction = 'double_vertical_bar';
         break;
@@ -599,8 +697,15 @@ export class SessionManager {
     // A run nobody watches, in a dashboard thread: its result goes to Slack. Stopped or silent: nothing.
     const web = webOf(chat);
     if (msg.summary && web && isWebChannel(msg.channel) && o.status !== 'aborted') {
-      const said = o.status === 'ok' ? o.text : summary;
-      if (said.trim())
+      // The summary says how many cards wait; they follow in its Slack thread (`postSummary`).
+      const since = this.now() - o.durationMs - 60_000;
+      const cards = store
+        .itemsInThread(msg.channel, msg.threadTs, 200)
+        .filter((i) => i.status === 'pending' && i.createdAt >= since).length;
+      const said =
+        (o.status === 'ok' ? o.text : summary).trim() ||
+        (cards ? `Left ${cards} ${cards === 1 ? 'card' : 'cards'} for you` : '');
+      if (said)
         await postSummary({
           chat,
           store,
@@ -612,7 +717,9 @@ export class SessionManager {
           text: said,
           meta: formatDuration(o.durationMs),
           link: this.deps.threadUrl?.(msg.channel, msg.threadTs),
-          since: this.now() - o.durationMs - 60_000,
+          since,
+          cards,
+          approvalsUrl: this.deps.approvalsUrl,
         });
     }
     if (msg.mentionWhenDone && !isWebChannel(msg.channel))

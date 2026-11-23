@@ -13,7 +13,15 @@ describe('parseStreamLine', () => {
   const events = readFileSync(fixture, 'utf8').split('\n').flatMap(parseStreamLine);
 
   it('extracts init, tool, rate limit and result events', () => {
-    expect(events.map((e) => e.kind)).toEqual(['init', 'tool', 'rate_limit', 'tool_result', 'result']);
+    expect(events.map((e) => e.kind)).toEqual([
+      'init',
+      'tool',
+      'context',
+      'rate_limit',
+      'tool_result',
+      'context',
+      'result',
+    ]);
     expect(events[0]).toEqual({
       kind: 'init',
       sessionId: '11111111-2222-4333-8444-555555555555',
@@ -25,10 +33,24 @@ describe('parseStreamLine', () => {
       name: 'Bash',
       status: 'Bash: List files in current directory',
     });
-    expect(events[3]).toEqual({ kind: 'tool_result', id: 'toolu_1', isError: false });
-    expect(events[2]).toMatchObject({
+    expect(events[4]).toEqual({ kind: 'tool_result', id: 'toolu_1', isError: false });
+    expect(events[3]).toMatchObject({
       rateLimit: { status: 'allowed', window: 'five_hour', utilization: 0.02 },
     });
+  });
+
+  it("reports the context size of each main-conversation model call, not a sub-agent's", () => {
+    const call = (parent: string | null) =>
+      JSON.stringify({
+        type: 'assistant',
+        parent_tool_use_id: parent,
+        message: {
+          content: [{ type: 'text', text: 'hi' }],
+          usage: { input_tokens: 5, cache_read_input_tokens: 40_000, cache_creation_input_tokens: 1_000 },
+        },
+      });
+    expect(parseStreamLine(call(null))).toEqual([{ kind: 'context', tokens: 41_005 }]);
+    expect(parseStreamLine(call('toolu_9'))).toEqual([]);
   });
 
   it('keeps every usage window the CLI reports, the weekly one too', () => {
@@ -62,7 +84,7 @@ describe('parseStreamLine', () => {
   });
 
   it('reads the result with usage and cost', () => {
-    const result = events[4] as Extract<StreamEvent, { kind: 'result' }>;
+    const result = events[6] as Extract<StreamEvent, { kind: 'result' }>;
     expect(result).toMatchObject({ isError: false, text: 'done', numTurns: 2, permissionDenials: [] });
     expect(result.usage).toEqual({ input: 4, output: 77, cacheRead: 37611, cacheCreation: 14122 });
     expect(result.costUsd).toBeCloseTo(0.0032, 4);
@@ -217,7 +239,16 @@ describe('runClaude', () => {
       toolCalls: 1,
     });
     expect(o.rateLimit?.utilization).toBe(0.02);
-    expect(events.map((e) => e.kind)).toEqual(['init', 'tool', 'rate_limit', 'tool_result', 'result']);
+    expect(o.contextTokens).toBeGreaterThan(0);
+    expect(events.map((e) => e.kind)).toEqual([
+      'init',
+      'tool',
+      'context',
+      'rate_limit',
+      'tool_result',
+      'context',
+      'result',
+    ]);
   });
 
   it('sends the prompt on stdin', async () => {

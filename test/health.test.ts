@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -10,6 +10,7 @@ import {
   healthSources,
   type JobsDeps,
   jobChecks,
+  oversizedSkills,
   projectChecks,
 } from '../src/health/checks.js';
 import { type ClaudeLogin, claudeLoginReader, parseCredentials } from '../src/health/claude-login.js';
@@ -295,6 +296,43 @@ describe('jobChecks', () => {
     ]);
   });
 
+  it('warns, quietly, about skills too long for every run to read', () => {
+    const many = Array.from({ length: 7 }, (_, i) => ({ name: `skill-${i}`, chars: 140_000 - i * 10_000 }));
+    const rows = jobChecks(deps({ skills: () => many }));
+    expect(rows).toContainEqual(
+      expect.objectContaining({
+        key: 'jobs:shop:skills',
+        status: 'warn',
+        quiet: true,
+        detail:
+          '7 skills are over 25k characters, and every run reads all of it: skill-0 140k, skill-1 130k, skill-2 120k, skill-3 110k, skill-4 100k, +2 more. Tidy it: rules in place, detail in references/',
+      }),
+    );
+    expect(jobChecks(deps({ skills: () => [] })).some((c) => c.key === 'jobs:shop:skills')).toBe(false);
+  });
+
+  it('finds the long SKILL.md files through the .claude/skills link', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'tara-skills-'));
+    const skills = path.join(dir, '.agents', 'skills');
+    for (const [name, chars] of [
+      ['big', 30_000],
+      ['small', 500],
+      ['multibyte', 20_000],
+      ['vendored', 40_000],
+    ] as const) {
+      mkdirSync(path.join(skills, name), { recursive: true });
+      // 20k "é" is 40k bytes but only 20k characters: under the limit.
+      writeFileSync(path.join(skills, name, 'SKILL.md'), (name === 'multibyte' ? 'é' : 'x').repeat(chars));
+    }
+    mkdirSync(path.join(skills, 'no-skill-file'));
+    // A third-party skill kept as published (its own LICENSE): not ours to shorten.
+    writeFileSync(path.join(skills, 'vendored', 'LICENSE'), 'MIT');
+    mkdirSync(path.join(dir, '.claude'));
+    symlinkSync('../.agents/skills', path.join(dir, '.claude', 'skills'));
+    expect(oversizedSkills(dir)).toEqual([{ name: 'big', chars: 30_000 }]);
+    expect(oversizedSkills(path.join(dir, 'missing'))).toEqual([]);
+  });
+
   it('marks a failing streak amber, then red at failingAfter', () => {
     const once = jobChecks(
       deps({ recent: () => [run('failed', now - 600_000, { output: '❌ Portal login expired' })] }),
@@ -380,6 +418,31 @@ describe('agentChecks', () => {
       Disk: ['ok', '50% used · database 12 MB'],
       'Memory and load': ['ok', '40% memory free · load 0.5 on 4 CPUs'],
     });
+  });
+
+  it('reports projects left out at start and the daily database copy', async () => {
+    const c = byName(
+      await agentChecks(
+        deps({
+          skippedProjects: () => [
+            { dir: '/srv/shop', message: 'Invalid JSON in /srv/shop/.tara/config.json' },
+          ],
+          backup: () => ({ day: '2026-11-13' }),
+          pinDrift: () => [{ project: 'shop', keys: ['billing'] }],
+        }),
+      ),
+    );
+    expect(c.Projects?.[0]).toBe('bad');
+    expect(c.Projects?.[1]).toContain('/srv/shop: Invalid JSON');
+    expect(c['Database backup']).toEqual(['ok', "Today's copy is written and checked"]);
+    expect(c['Pinned settings']?.[1]).toContain('shop: billing');
+    const old = byName(await agentChecks(deps({ backup: () => ({ day: '2026-11-11' }) })));
+    expect(old['Database backup']).toEqual(['warn', 'Latest copy is from 2026-11-11']);
+    const ro = byName(await agentChecks(deps({ dbWrite: () => 'attempt to write a readonly database' })));
+    expect(ro.Database?.[0]).toBe('bad');
+    expect(byName(await agentChecks(deps({ dbWrite: () => undefined }))).Database).toBeUndefined();
+    const failed = byName(await agentChecks(deps({ backup: () => ({ error: 'disk I/O error' }) })));
+    expect(failed['Database backup']).toEqual(['bad', 'The last copy failed: disk I/O error']);
   });
 
   it('turns red for a lost Slack link, failing CLI, usage limit, stuck runs and a full disk', async () => {

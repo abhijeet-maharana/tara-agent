@@ -9,7 +9,7 @@ import type { Store, WebMessage } from '../store/store.js';
  * Dashboard threads: where runs nobody started from Slack happen (host `delivery: summary`). They look
  * like Slack threads to the rest of tara-agent (a channel and a thread ts, so sessions, locks, cards and
  * files work unchanged), but live in SQLite and show on the dashboard's session page. Slack gets one
- * summary when a run ends (`postSummary`), plus a copy of every card with buttons (`RoutedChat`), and a
+ * summary when a run ends (`postSummary`), plus a copy of a permission prompt (`RoutedChat`), and a
  * reply in either Slack thread continues the run's session (`thread_aliases`).
  *
  * A dashboard channel is `web-<project>`: project names are lowercase with dashes, and Slack channel ids
@@ -211,11 +211,24 @@ export interface RoutedChatOptions {
   link?: (channel: string, threadTs: string) => string | undefined;
 }
 
+/** Whether a Block Kit message is an approval card (`tara:approval:` buttons). */
+export function isApprovalCard(blocks: SlackBlock[] | undefined): boolean {
+  return Boolean(
+    blocks?.some(
+      (b) =>
+        b.type === 'actions' &&
+        Array.isArray(b.elements) &&
+        (b.elements as Array<{ action_id?: string }>).some((e) => e.action_id?.startsWith('tara:approval:')),
+    ),
+  );
+}
+
 /**
  * The chat everything in tara-agent talks to: Slack for Slack channels, the dashboard for dashboard
- * ones. A card with buttons posted in a dashboard thread is also copied to the project's Slack channel
- * (a decision is the one thing worth a notification), its edits follow it there, and a reply in that
- * copy's Slack thread goes to the run's session.
+ * ones. Approval cards are not copied as they are posted: the run's Slack summary says how many wait
+ * and `postSummary` copies them into its thread. Only other cards with buttons (a permission prompt,
+ * which blocks its run) are copied to the project's Slack channel at once. Edits of any copied message
+ * follow it there (`web_mirrors`), and a reply in that copy's Slack thread goes to the run's session.
  */
 export class RoutedChat implements ChatPort {
   constructor(
@@ -257,6 +270,7 @@ export class RoutedChat implements ChatPort {
 
   async update(channel: string, ts: string, text: string, blocks?: SlackBlock[]): Promise<void> {
     await this.to(channel).update(channel, ts, text, blocks);
+    // Slack copies (a permission prompt, approval cards under a summary) follow their card.
     const mirror = isWebChannel(channel) ? this.opts.store.webMirror(ts) : undefined;
     if (mirror) {
       const thread = this.opts.store.getWebMessage(channel, ts)?.threadTs;
@@ -280,7 +294,8 @@ export class RoutedChat implements ChatPort {
     blocks: SlackBlock[],
   ): Promise<string> {
     const ts = await this.to(channel).postBlocks(channel, threadTs, text, blocks);
-    if (isWebChannel(channel) && hasButtons(blocks)) {
+    // Approval cards wait on the Approvals page; a permission prompt blocks its run, so it goes to Slack.
+    if (isWebChannel(channel) && hasButtons(blocks) && !isApprovalCard(blocks)) {
       const slackChannel = this.opts.slackChannelFor(channel);
       const thread = threadTs ?? ts;
       if (slackChannel) {

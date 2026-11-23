@@ -44,6 +44,8 @@ export interface RunRecord {
   outputTokens?: number;
   cacheReadTokens?: number;
   cacheCreationTokens?: number;
+  /** The session's context size when the run ended (its last model call's input + cache tokens). */
+  contextTokens?: number;
   toolCalls?: number;
   rateLimitUtilization?: number;
   error?: string;
@@ -51,6 +53,34 @@ export interface RunRecord {
   output?: string;
   /** Pre-run script output (jobs only), capped. */
   scriptOutput?: string;
+}
+
+/** A chat message waiting for (or in) its turn (`Store.addInbox`). */
+export interface InboxMessage {
+  id: number;
+  channel: string;
+  threadTs: string;
+  ts: string;
+  user: string;
+  text: string;
+  summary?: string;
+  mention?: string;
+  /** How many files came with it (they can't be fetched again after a restart). */
+  files: number;
+  receivedAt: number;
+  /** When its turn started; unset: it was still waiting. */
+  startedAt?: number;
+}
+
+/** Where a decision on a card is acted on: a fresh session, or the one that raised the card. */
+export type SessionMode = 'new' | 'continue';
+
+/** A thread's session as a card's advice sees it (`Store.threadState`). */
+export interface ThreadState {
+  turns: number;
+  /** When its latest run ended. */
+  lastAt: number;
+  contextTokens?: number;
 }
 
 export interface StoredRun extends RunRecord {
@@ -112,6 +142,8 @@ export interface HostSample {
   /** 0–1. */
   memUsed: number;
   diskUsed?: number;
+  /** Swap in use, 0–1 (Linux; includes zram). */
+  swapUsed?: number;
 }
 
 export interface LogEvent {
@@ -400,6 +432,58 @@ const MIGRATIONS = [
   // The desk phone was retired (2026-11-21): the macOS desk widget reads GET /glance instead.
   `DROP TABLE IF EXISTS phone_battery;
    DROP TABLE IF EXISTS phone_devices;`,
+  // Capacity history (e.g. deciding whether the VM host is big enough): the machine's swap, and how
+  // long the VM host's keyboard and mouse had been idle, i.e. whether someone was using it.
+  `ALTER TABLE host_samples ADD COLUMN swap_used REAL;
+   ALTER TABLE vmhost_samples ADD COLUMN idle_sec REAL;`,
+  // A waiting card's chat on the Approvals page: the owner's notes and Jarvis's answers to them.
+  `CREATE TABLE item_chat (
+     id      INTEGER PRIMARY KEY AUTOINCREMENT,
+     item_id TEXT NOT NULL,
+     role    TEXT NOT NULL,
+     text    TEXT NOT NULL,
+     at      INTEGER NOT NULL
+   );
+   CREATE INDEX item_chat_item ON item_chat (item_id, id);`,
+  // Keys that ever had a decided or closed card, kept after the cards themselves are deleted (60 days),
+  // so auto-approve never treats an old key as new. Filled by a trigger wherever a card leaves `pending`.
+  `CREATE TABLE decided_keys (
+     project TEXT NOT NULL,
+     key     TEXT NOT NULL,
+     at      INTEGER NOT NULL,
+     PRIMARY KEY (project, key)
+   );
+   INSERT OR IGNORE INTO decided_keys (project, key, at)
+     SELECT project, key, MIN(updated_at) FROM items WHERE key IS NOT NULL AND status <> 'pending' GROUP BY project, key;
+   CREATE TRIGGER items_decided_key AFTER UPDATE OF status ON items
+     WHEN NEW.key IS NOT NULL AND NEW.status <> 'pending'
+     BEGIN
+       INSERT OR IGNORE INTO decided_keys (project, key, at) VALUES (NEW.project, NEW.key, NEW.updated_at);
+     END;`,
+  // When an item's executor actually started on it (its run past its slot and locks, or the POST to a URL
+  // executor). An item still `running` without it at a restart never reached the executor: it goes back.
+  `ALTER TABLE items ADD COLUMN run_started_at INTEGER;`,
+  // One row the Health page writes on every check: a disk gone read-only or a damaged file shows at once.
+  `CREATE TABLE heartbeat (id INTEGER PRIMARY KEY CHECK (id = 1), at INTEGER NOT NULL);`,
+  // A run's context size when it ended (what a card's "new or same session" advice looks at); a card's
+  // session choice (shown while it waits, then the one used); the card chat moved to the session page.
+  `ALTER TABLE runs ADD COLUMN context_tokens INTEGER;
+   ALTER TABLE items ADD COLUMN session_mode TEXT;
+   DROP TABLE IF EXISTS item_chat;`,
+  // Chat messages not yet answered, so a crash loses none: kept from arrival until their turn ends.
+  `CREATE TABLE inbox (
+     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+     channel     TEXT NOT NULL,
+     thread_ts   TEXT NOT NULL,
+     ts          TEXT NOT NULL,
+     user        TEXT NOT NULL,
+     text        TEXT NOT NULL,
+     summary     TEXT,
+     mention     TEXT,
+     files       INTEGER NOT NULL DEFAULT 0,
+     received_at INTEGER NOT NULL,
+     started_at  INTEGER
+   );`,
 ];
 
 /** One message of a dashboard thread (src/web/). */
@@ -494,6 +578,11 @@ export interface Item {
    * fresh session needs. With them, a decision starts a new `Run` thread instead of resuming the run.
    */
   handoff?: string;
+  /**
+   * Where a decision is acted on (see approvals/session-choice.ts): while the card waits, the advice it
+   * shows; once decided, the one used. Unset for cards with no choice (drafts, notices).
+   */
+  session?: SessionMode;
   media: ItemMedia[];
   fields: ItemField[];
   checks: ItemCheck[];
@@ -571,6 +660,7 @@ function toItem(r: Record<string, unknown>): Item {
     title: r.title as string,
     body: opt(r.body),
     handoff: opt(r.handoff),
+    session: opt(r.session_mode),
     media: JSON.parse(r.media as string) as ItemMedia[],
     fields: JSON.parse(r.fields as string) as ItemField[],
     checks: JSON.parse(r.checks as string) as ItemCheck[],
@@ -619,6 +709,7 @@ function toRun(r: Record<string, unknown>): StoredRun {
     outputTokens: opt(r.output_tokens),
     cacheReadTokens: opt(r.cache_read_tokens),
     cacheCreationTokens: opt(r.cache_creation_tokens),
+    contextTokens: opt(r.context_tokens),
     toolCalls: opt(r.tool_calls),
     rateLimitUtilization: opt(r.rate_limit_util),
     error: opt(r.error),
@@ -660,6 +751,7 @@ function vmHostRow(r: Record<string, unknown>): VmHostSample {
     vmCpu: n('vm_cpu'),
     vmMemBytes: n('vm_mem_bytes'),
     powerW: n('power_w'),
+    idleSec: n('idle_sec'),
   };
   for (const k of Object.keys(s) as Array<keyof VmHostSample>) if (s[k] === undefined) delete s[k];
   return s;
@@ -675,10 +767,11 @@ export class Store {
   ) {
     if (file !== ':memory:') mkdirSync(path.dirname(file), { recursive: true });
     this.db = new DatabaseSync(file);
-    // synchronous=NORMAL: in WAL mode this skips the fsync on every commit (only
-    // checkpoints sync). Still corruption-safe; a power cut may drop the last few
-    // commits. Cuts write pressure on jarvis's slow SSD.
-    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;');
+    // synchronous=FULL: every commit is on disk before the call returns. Sending at most once rests on
+    // that: an item marked `running` (or a slot claimed) before a send must still say so after a power
+    // cut, or the send happens again. NORMAL would drop the last commits in WAL mode. Writes are a few a
+    // minute, so the fsyncs cost little.
+    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000;');
     this.migrate();
   }
 
@@ -686,6 +779,12 @@ export class Store {
     const { user_version: version } = this.db.prepare('PRAGMA user_version').get() as {
       user_version: number;
     };
+    // A database from a newer build: its migrations are unknown here, and running on it would quietly
+    // use the wrong schema.
+    if (version > MIGRATIONS.length)
+      throw new Error(
+        `The state database is at schema version ${version}, newer than this build knows (${MIGRATIONS.length}). Deploy the newer build, or restore a backup taken before it.`,
+      );
     for (let v = version; v < MIGRATIONS.length; v++) {
       this.db.exec('BEGIN');
       try {
@@ -851,10 +950,11 @@ export class Store {
     this.db.prepare('DELETE FROM web_mirrors WHERE created_at < ?').run(before);
     this.db.prepare('DELETE FROM thread_aliases WHERE created_at < ?').run(before);
     this.db.prepare('DELETE FROM health_events WHERE at < ?').run(before);
-    // Samples and log lines are only charted for weeks; a month is plenty.
+    // Machine samples are small (one row per 5 min) and answer capacity questions over months, so
+    // they are kept as long as runs. Log lines are only read for weeks; a month is plenty.
+    this.db.prepare('DELETE FROM host_samples WHERE at < ?').run(before);
+    this.db.prepare('DELETE FROM vmhost_samples WHERE at < ?').run(before);
     const month = Math.max(before, this.now() - 31 * 86_400_000);
-    this.db.prepare('DELETE FROM host_samples WHERE at < ?').run(month);
-    this.db.prepare('DELETE FROM vmhost_samples WHERE at < ?').run(month);
     this.db.prepare('DELETE FROM log_events WHERE at < ?').run(month);
     return { runs: Number(runs), claims: Number(claims), sessions: Number(sessions) };
   }
@@ -884,8 +984,8 @@ export class Store {
       .prepare(
         `INSERT INTO runs (kind, project, job_id, thread_key, session_id, model, started_at, ended_at, status,
            cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, tool_calls,
-           rate_limit_util, error, output, script_output, session_cost_usd)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           rate_limit_util, error, output, script_output, session_cost_usd, context_tokens)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         r.kind,
@@ -908,8 +1008,40 @@ export class Store {
         r.output?.slice(0, OUTPUT_CAP) ?? null,
         r.scriptOutput?.slice(0, OUTPUT_CAP) ?? null,
         r.sessionId && r.costUsd !== undefined ? r.costUsd : null,
+        r.contextTokens ?? null,
       );
-    return Number(result.lastInsertRowid);
+    const id = Number(result.lastInsertRowid);
+    if (r.threadKey)
+      for (const listener of this.runListeners) {
+        try {
+          listener(r.threadKey, r);
+        } catch {}
+      }
+    return id;
+  }
+
+  private readonly runListeners: Array<(threadKey: string, run: RunRecord) => void> = [];
+
+  /** Called after each run recorded in a thread (cards there refresh their session advice). */
+  onRun(listener: (threadKey: string, run: RunRecord) => void): void {
+    this.runListeners.push(listener);
+  }
+
+  /**
+   * What a thread's session looks like now: its turns (runs other than learning turns), the context
+   * size its latest run ended with, and when that run ended. Undefined when nothing ran in it.
+   */
+  threadState(threadKey: string): ThreadState | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS turns, MAX(ended_at) AS last_at,
+           (SELECT context_tokens FROM runs x WHERE x.thread_key = ? AND x.kind != 'learn'
+             ORDER BY x.ended_at DESC, x.id DESC LIMIT 1) AS context
+         FROM runs WHERE thread_key = ? AND kind != 'learn'`,
+      )
+      .get(threadKey, threadKey) as { turns: number; last_at: number | null; context: number | null };
+    if (!row.turns || row.last_at === null) return undefined;
+    return { turns: row.turns, lastAt: row.last_at, contextTokens: row.context ?? undefined };
   }
 
   runsSince(since: number): StoredRun[] {
@@ -1001,23 +1133,39 @@ export class Store {
 
   addHostSample(s: HostSample): void {
     this.db
-      .prepare('INSERT OR REPLACE INTO host_samples (at, load, mem_used, disk_used) VALUES (?, ?, ?, ?)')
-      .run(s.at, s.load, s.memUsed, s.diskUsed ?? null);
+      .prepare(
+        'INSERT OR REPLACE INTO host_samples (at, load, mem_used, disk_used, swap_used) VALUES (?, ?, ?, ?, ?)',
+      )
+      .run(s.at, s.load, s.memUsed, s.diskUsed ?? null, s.swapUsed ?? null);
   }
 
   hostSamples(since: number): HostSample[] {
     return (
       this.db
-        .prepare('SELECT at, load, mem_used, disk_used FROM host_samples WHERE at >= ? ORDER BY at')
-        .all(since) as Array<{ at: number; load: number; mem_used: number; disk_used: number | null }>
-    ).map((r) => ({ at: r.at, load: r.load, memUsed: r.mem_used, diskUsed: r.disk_used ?? undefined }));
+        .prepare(
+          'SELECT at, load, mem_used, disk_used, swap_used FROM host_samples WHERE at >= ? ORDER BY at',
+        )
+        .all(since) as Array<{
+        at: number;
+        load: number;
+        mem_used: number;
+        disk_used: number | null;
+        swap_used: number | null;
+      }>
+    ).map((r) => ({
+      at: r.at,
+      load: r.load,
+      memUsed: r.mem_used,
+      diskUsed: r.disk_used ?? undefined,
+      ...(r.swap_used != null && { swapUsed: r.swap_used }),
+    }));
   }
 
   addVmHostSample(s: VmHostSample): void {
     this.db
       .prepare(
-        `INSERT OR REPLACE INTO vmhost_samples (at, name, cpu_temp, thermal, cpu, mem_used, swap_bytes, pressure, vm_cpu, vm_mem_bytes, power_w)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT OR REPLACE INTO vmhost_samples (at, name, cpu_temp, thermal, cpu, mem_used, swap_bytes, pressure, vm_cpu, vm_mem_bytes, power_w, idle_sec)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         s.at,
@@ -1031,6 +1179,7 @@ export class Store {
         s.vmCpu ?? null,
         s.vmMemBytes ?? null,
         s.powerW ?? null,
+        s.idleSec ?? null,
       );
   }
 
@@ -1115,15 +1264,26 @@ export class Store {
    * at most once. Two exceptions may be claimed again: a run stopped by a shutdown (`aborted`), and a
    * claim still `running` from before `retakeBefore` (its process died without finishing it).
    */
-  claimSlot(jobKey: string, slot: number, retakeBefore = 0): boolean {
+  claimSlot(jobKey: string, slot: number, retakeBefore = 0, alsoRetake: string[] = []): boolean {
+    // `alsoRetake`: other finished statuses that may be claimed again, e.g. `held` after a usage limit reset.
+    const extra = alsoRetake.length
+      ? ` OR job_claims.status IN (${alsoRetake.map(() => '?').join(', ')})`
+      : '';
     const result = this.db
       .prepare(
         `INSERT INTO job_claims (job_key, slot, status, claimed_at) VALUES (?, ?, 'running', ?)
          ON CONFLICT (job_key, slot) DO UPDATE SET status = 'running', claimed_at = excluded.claimed_at
-         WHERE job_claims.status = 'aborted' OR (job_claims.status = 'running' AND job_claims.claimed_at < ?)`,
+         WHERE job_claims.status = 'aborted' OR (job_claims.status = 'running' AND job_claims.claimed_at < ?)${extra}`,
       )
-      .run(jobKey, slot, this.now(), retakeBefore);
+      .run(jobKey, slot, this.now(), retakeBefore, ...alsoRetake);
     return result.changes > 0;
+  }
+
+  /** A job's latest claimed slot, whatever its status. */
+  latestClaim(jobKey: string): { slot: number; status: string } | undefined {
+    return this.db
+      .prepare('SELECT slot, status FROM job_claims WHERE job_key = ? ORDER BY slot DESC LIMIT 1')
+      .get(jobKey) as { slot: number; status: string } | undefined;
   }
 
   finishSlot(jobKey: string, slot: number, status: string): void {
@@ -1323,12 +1483,13 @@ export class Store {
     );
   }
 
-  /** True when an item with this key was ever decided or closed (anything but pending). */
+  /**
+   * True when an item with this key was ever decided or closed (anything but pending), even one since
+   * deleted by retention (`decided_keys`).
+   */
   hasDecidedKey(project: string, key: string): boolean {
     return Boolean(
-      this.db
-        .prepare("SELECT 1 FROM items WHERE project = ? AND key = ? AND status <> 'pending' LIMIT 1")
-        .get(project, key),
+      this.db.prepare('SELECT 1 FROM decided_keys WHERE project = ? AND key = ?').get(project, key),
     );
   }
 
@@ -1390,6 +1551,60 @@ export class Store {
 
   setItemMessage(id: string, messageTs: string): void {
     this.db.prepare('UPDATE items SET message_ts = ? WHERE id = ?').run(messageTs, id);
+  }
+
+  /** Keeps a chat message until its turn ends (`removeInbox`), so a crash doesn't lose it. */
+  addInbox(m: Omit<InboxMessage, 'id' | 'receivedAt' | 'startedAt'>): number {
+    const r = this.db
+      .prepare(
+        `INSERT INTO inbox (channel, thread_ts, ts, user, text, summary, mention, files, received_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        m.channel,
+        m.threadTs,
+        m.ts,
+        m.user,
+        m.text,
+        m.summary ?? null,
+        m.mention ?? null,
+        m.files,
+        this.now(),
+      );
+    return Number(r.lastInsertRowid);
+  }
+
+  /** Its turn has started (a crash now interrupts it, rather than leaving it unread). */
+  startInbox(id: number): void {
+    this.db.prepare('UPDATE inbox SET started_at = ? WHERE id = ?').run(this.now(), id);
+  }
+
+  removeInbox(id: number): void {
+    this.db.prepare('DELETE FROM inbox WHERE id = ?').run(id);
+  }
+
+  /** Messages left from before a restart, oldest first. */
+  inbox(): InboxMessage[] {
+    const rows = this.db.prepare('SELECT * FROM inbox ORDER BY id').all() as Record<string, unknown>[];
+    const opt = <T>(v: unknown) => (v ?? undefined) as T | undefined;
+    return rows.map((r) => ({
+      id: r.id as number,
+      channel: r.channel as string,
+      threadTs: r.thread_ts as string,
+      ts: r.ts as string,
+      user: r.user as string,
+      text: r.text as string,
+      summary: opt(r.summary),
+      mention: opt(r.mention),
+      files: r.files as number,
+      receivedAt: r.received_at as number,
+      startedAt: opt(r.started_at),
+    }));
+  }
+
+  /** A card's session choice: the advice it shows while it waits, the one used once decided. */
+  setItemSession(id: string, mode: SessionMode | undefined): void {
+    this.db.prepare('UPDATE items SET session_mode = ? WHERE id = ?').run(mode ?? null, id);
   }
 
   setItemDetail(id: string, detailTs: string): void {
@@ -1484,7 +1699,7 @@ export class Store {
     for (const id of ids) {
       const r = this.db
         .prepare(
-          "UPDATE items SET status = 'running', started_at = ?, updated_at = ? WHERE id = ? AND status = 'approved'",
+          "UPDATE items SET status = 'running', started_at = ?, run_started_at = NULL, updated_at = ? WHERE id = ? AND status = 'approved'",
         )
         .run(t, t, id);
       if (r.changes > 0) started.push(this.getItem(id) as Item);
@@ -1524,6 +1739,28 @@ export class Store {
       )
       .run(runAfter, note?.slice(0, 4_000) ?? null, this.now(), id);
     return r.changes > 0 ? this.getItem(id) : undefined;
+  }
+
+  /** The executor started on these running items (see `run_started_at`). */
+  markRunStarted(ids: string[]): void {
+    const t = this.now();
+    const mark = this.db.prepare("UPDATE items SET run_started_at = ? WHERE id = ? AND status = 'running'");
+    for (const id of ids) mark.run(t, id);
+  }
+
+  /**
+   * Running items their executor never started on (they waited for its run when tara-agent stopped):
+   * back to approved, so a restart doesn't fail drafts nobody tried to send. Returns them.
+   */
+  restoreUnstarted(note: string): Item[] {
+    const ids = (
+      this.db
+        .prepare("SELECT id FROM items WHERE status = 'running' AND run_started_at IS NULL")
+        .all() as Array<{
+        id: string;
+      }>
+    ).map((r) => r.id);
+    return ids.map((id) => this.deferItem(id, this.now(), note)).filter((i): i is Item => Boolean(i));
   }
 
   /** Running items nobody reported (the run ended or tara-agent restarted): failed, never run again. */
@@ -1780,6 +2017,35 @@ export class Store {
         .prepare('SELECT slack_key FROM thread_aliases WHERE web_key = ? ORDER BY created_at')
         .all(webKey) as { slack_key: string }[]
     ).map((r) => r.slack_key);
+  }
+
+  /** Writes one row and reads it back: undefined when the database takes writes, else what failed. */
+  checkWrite(): string | undefined {
+    try {
+      const at = this.now();
+      this.db.prepare('INSERT OR REPLACE INTO heartbeat (id, at) VALUES (1, ?)').run(at);
+      const row = this.db.prepare('SELECT at FROM heartbeat WHERE id = 1').get() as
+        | { at: number }
+        | undefined;
+      return row?.at === at ? undefined : 'the row written was not read back';
+    } catch (err) {
+      return (err as Error).message;
+    }
+  }
+
+  /**
+   * Writes a consistent copy of the database to `file` (which must not exist) and checks the copy.
+   * Returns `ok`, or what `quick_check` found wrong with it.
+   */
+  backupTo(file: string): string {
+    this.db.prepare('VACUUM INTO ?').run(file);
+    const copy = new DatabaseSync(file, { readOnly: true });
+    try {
+      const rows = copy.prepare('PRAGMA quick_check').all() as Array<{ quick_check: string }>;
+      return rows.map((r) => r.quick_check).join('; ');
+    } finally {
+      copy.close();
+    }
   }
 
   close(): void {

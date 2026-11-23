@@ -13,6 +13,8 @@ import { notificationLine, summaryText } from '../src/web/summary.js';
 import { FakeChat, testHost } from './fakes.js';
 
 const quiet = { info() {}, warn() {}, error() {} };
+/** A fresh state folder, so the day's quiet-runs file never carries over between tests. */
+const tmpState = () => mkdtempSync(path.join(tmpdir(), 'tara-state-'));
 
 function makeProject(jobs: object[], extra: object = {}): Project {
   const dir = mkdtempSync(path.join(tmpdir(), 'tara-web-'));
@@ -74,6 +76,7 @@ function setup(opts: {
   status?: RunOutcome['status'];
   store?: Store;
   now?: () => number;
+  stateDir?: string;
 }) {
   const store = opts.store ?? new Store(':memory:');
   const { slack, web, chat } = routed(store);
@@ -81,7 +84,7 @@ function setup(opts: {
   const replies = [...(opts.replies ?? [])];
   const scheduler = new Scheduler({
     projects: [opts.project ?? makeProject(opts.jobs ?? [job])],
-    host: testHost(),
+    host: testHost({ stateDir: opts.stateDir ?? tmpState() }),
     store,
     chat,
     threads: new Threads(),
@@ -117,10 +120,10 @@ describe('dashboard delivery', () => {
     const summary = slack.blockPosts[0];
     expect(summary?.thread).toBe('');
     expect(summary?.text).toBe('Prime Check: ✅ Amazon Prime is on again');
-    // The job's name first, then its headline.
+    // One first line: the status, the job's name, then its headline.
     expect(summary?.blocks[0]).toMatchObject({
       type: 'section',
-      text: { text: '*Prime Check* (run from the dashboard)' },
+      text: { text: '✅ *Prime Check* (run from the dashboard) · Amazon Prime is on again' },
     });
     const shown = JSON.stringify(summary?.blocks);
     expect(shown).toContain('Amazon Prime is on again');
@@ -150,15 +153,184 @@ describe('dashboard delivery', () => {
     first.scheduler.start(); // first sight of the job: nothing to catch up
     await first.scheduler.stop();
     now = Date.parse('2026-10-25T12:30:00Z');
-    const { slack, calls, scheduler } = setup({ store, now: () => now });
+    const { slack, calls, scheduler } = setup({
+      store,
+      now: () => now,
+      replies: ['⚠️ Amazon Prime was off, turned it on\n---\nChecked the account page.'],
+    });
     scheduler.start(); // the 12:00 slot was missed: caught up on the dashboard
     await new Promise((r) => setImmediate(r));
     await scheduler.idle();
     expect(calls).toHaveLength(1);
     expect(slack.posts).toEqual([]);
-    expect(slack.blockPosts.map((b) => b.text)).toEqual(['Prime Check: ✅ Amazon Prime is on again']);
+    expect(slack.blockPosts.map((b) => b.text)).toEqual([
+      'Prime Check: ⚠️ Amazon Prime was off, turned it on',
+    ]);
     expect(JSON.stringify(slack.blockPosts[0]?.blocks)).toContain('(catch-up)');
     expect(store.slotClaim('shop:prime', Date.parse('2026-10-25T12:00:00Z'))?.status).toBe('ok');
+    await scheduler.stop();
+  });
+
+  it('posts a summary after every scheduled run, a ✅ one with its reason too', async () => {
+    let now = Date.parse('2026-10-25T10:20:00Z');
+    const store = new Store(':memory:', () => now);
+    const first = setup({ store, now: () => now });
+    first.scheduler.start();
+    await first.scheduler.stop();
+    now = Date.parse('2026-10-25T12:30:00Z');
+    const { slack, scheduler } = setup({
+      store,
+      now: () => now,
+      replies: ['✅ Nothing to do: Prime is already on\n---\nChecked the account page.'],
+    });
+    scheduler.start();
+    await new Promise((r) => setImmediate(r));
+    await scheduler.idle();
+    expect(slack.blockPosts.map((b) => b.text)).toEqual([
+      'Prime Check: ✅ Nothing to do: Prime is already on',
+    ]);
+    expect(slack.blockPosts[0]?.blocks[0]).toMatchObject({
+      text: { text: '✅ *Prime Check* (catch-up) · Nothing to do: Prime is already on' },
+    });
+    await scheduler.stop();
+  });
+
+  it('posts one line with the card count, the cards in its thread, and the result of a decision under it', async () => {
+    // A ticking clock: the follow-up starts after the cards were raised.
+    let t = Date.parse('2026-10-25T12:00:00Z');
+    const clock = () => (t += 1000);
+    const store = new Store(':memory:', clock);
+    const { slack, chat } = routed(store);
+    let thread = '';
+    const scheduler = new Scheduler({
+      projects: [makeProject([job])],
+      host: testHost({ stateDir: tmpState() }),
+      store,
+      chat,
+      log: quiet,
+      env: { PATH: '/bin' },
+      newSessionId: () => 'sid',
+      now: clock,
+      approvalsUrl: 'https://dash.example/approvals',
+      run: async (o) => {
+        const key = o.env.TARA_THREAD as string;
+        const at = key.indexOf(':');
+        thread = key.slice(at + 1);
+        if (!o.args.includes('--resume')) {
+          o.onEvent?.({ kind: 'init', sessionId: 'sid', model: 'm' });
+          for (const n of [1, 2]) {
+            const item = store.proposeItem({
+              project: 'shop',
+              kind: 'ui-review',
+              mode: 'resume',
+              title: `UI issue ${n}`,
+              options: ['Fix it', 'Skip'],
+              jobId: 'prime',
+              channel: key.slice(0, at),
+              threadTs: thread,
+            });
+            const ts = await chat.postBlocks(key.slice(0, at), thread, `Approval needed ${n}`, [
+              {
+                type: 'actions',
+                elements: [{ type: 'button', action_id: 'tara:approval:0', value: item.id }],
+              },
+            ]);
+            store.setItemMessage(item.id, ts);
+          }
+          // A draft: no buttons, so it is listed with a link to the Approvals page.
+          store.proposeItem({
+            project: 'shop',
+            kind: 'post',
+            mode: 'queue',
+            title: 'LinkedIn post <draft>',
+            options: ['Approve'],
+            jobId: 'prime',
+            channel: key.slice(0, at),
+            threadTs: thread,
+          });
+          return ok('⚠️ 2 UI issues found\n| Page | Issue |\n|---|---|\n| / | a |\n| /buy | b |');
+        }
+        return ok('✅ Fixed UI issue 1, uncommitted');
+      },
+    });
+    scheduler.start();
+    scheduler.trigger('shop', 'prime', 'dashboard');
+    await scheduler.idle();
+    // One channel message: no table; the count and a link to the Approvals page.
+    const summary = slack.blockPosts[0];
+    expect(slack.blockPosts.filter((p) => !p.thread)).toEqual([summary]);
+    expect(summary?.blocks).toHaveLength(2);
+    expect(summary?.blocks[0]).toMatchObject({
+      text: { text: '⚠️ *Prime Check* (run from the dashboard) · 2 UI issues found' },
+    });
+    expect(JSON.stringify(summary?.blocks[1])).toContain(
+      '<https://dash.example/approvals|🟡 3 cards wait for you on the Approvals page ↗>',
+    );
+    // The approval cards follow in its thread with their buttons, linked to the cards so a decision
+    // edits them; the draft is one line with a link.
+    const copies = slack.blockPosts.slice(1);
+    expect(copies.map((p) => [p.thread, p.text])).toEqual([
+      [summary?.ts, 'Approval needed 1'],
+      [summary?.ts, 'Approval needed 2'],
+    ]);
+    const cards = store.itemsInThread(webChannel('shop'), thread).filter((i) => i.mode === 'resume');
+    expect(cards.map((i) => store.webMirror(i.messageTs as string)?.ts)).toEqual(copies.map((p) => p.ts));
+    const draft = store.itemsInThread(webChannel('shop'), thread).find((i) => i.mode === 'queue');
+    expect(slack.posts.filter((p) => p.thread === summary?.ts).map((p) => p.text)).toEqual([
+      `📝 *1 draft waits on the Approvals page*\n• <https://dash.example/approvals#item-${draft?.id}|LinkedIn post  draft>`,
+    ]);
+
+    // The decision continues the run; its result is a reply under the job's summary.
+    expect(
+      await scheduler.resume('shop', 'prime', {
+        channel: webChannel('shop'),
+        threadTs: thread,
+        text: 'Fix it',
+        by: 'U1',
+        card: { title: 'UI issue 1', body: '', declined: false },
+      }),
+    ).toBe('ok');
+    expect(slack.blockPosts).toHaveLength(4);
+    expect(slack.blockPosts[3]).toMatchObject({
+      thread: summary?.ts,
+      text: 'Prime Check: ✅ Fixed UI issue 1, uncommitted',
+    });
+    // Its reply doesn't take over the job's Slack thread: replies there still reach the job's session.
+    expect(store.aliasesOf(`${webChannel('shop')}:${thread}`)).toEqual([`C1:${summary?.ts}`]);
+    await scheduler.stop();
+  });
+
+  it('posts one message for a usage limit that stops many runs, and closes it once runs work again', async () => {
+    const store = new Store(':memory:');
+    const { slack, chat } = routed(store);
+    let limited = true;
+    const scheduler = new Scheduler({
+      projects: [makeProject([job, { ...job, id: 'notices', name: 'Notices' }])],
+      host: testHost({ stateDir: tmpState() }),
+      store,
+      chat,
+      log: quiet,
+      env: { PATH: '/bin' },
+      newSessionId: () => 'sid',
+      run: async () =>
+        limited
+          ? { ...ok(''), status: 'limit', error: "You've hit your weekly limit · resets Nov 22, 3:30pm" }
+          : ok('⚠️ One notice to read'),
+    });
+    scheduler.start();
+    scheduler.trigger('shop', 'prime', 'dashboard');
+    await scheduler.idle();
+    scheduler.trigger('shop', 'notices', 'dashboard');
+    await scheduler.idle();
+    expect(slack.blockPosts).toEqual([]);
+    expect(slack.posts).toHaveLength(1);
+    expect(slack.posts[0]?.text).toContain('⏸ *Claude usage limit reached*');
+    expect(slack.updates.at(-1)?.text).toContain('_Skipped (2):_ Prime Check, Notices');
+    expect(slack.updates.at(-1)?.text).toContain('resets Nov 22');
+    limited = false;
+    scheduler.trigger('shop', 'prime', 'dashboard');
+    await scheduler.idle();
+    expect(slack.updates.at(-1)?.text).toContain('✅ _Over: runs work again._');
     await scheduler.stop();
   });
 
@@ -218,12 +390,29 @@ describe('dashboard delivery', () => {
     await scheduler.stop();
   });
 
+  it('answers "run <skill>" asked as a reply in a Slack thread in that thread, the run on the dashboard', async () => {
+    const { slack, calls, scheduler } = setup({ replies: ['✅ Prime is on', ''] });
+    scheduler.start();
+    scheduler.trigger('shop', 'prime', 'U1', undefined, { replyIn: { channel: 'C1', ts: '600.1' } });
+    await scheduler.idle();
+    expect(calls[0]?.env.TARA_THREAD?.startsWith('web-shop:')).toBe(true);
+    expect(slack.posts).toEqual([]);
+    expect(slack.blockPosts.map((b) => b.thread)).toEqual(['600.1']);
+    expect(slack.blockPosts[0]?.text).toBe('Prime Check: ✅ Prime is on');
+    // Even with nothing to report, the person who asked gets an answer there.
+    scheduler.trigger('shop', 'prime', 'U1', undefined, { replyIn: { channel: 'C1', ts: '600.1' } });
+    await scheduler.idle();
+    expect(slack.blockPosts.map((b) => b.thread)).toEqual(['600.1', '600.1']);
+    expect(slack.blockPosts[1]?.text).toContain('Nothing to report');
+    await scheduler.stop();
+  });
+
   it('attaches the files a run sent to its summary', async () => {
     const store = new Store(':memory:');
     const { slack, chat } = routed(store);
     const scheduler = new Scheduler({
       projects: [makeProject([job])],
-      host: testHost(),
+      host: testHost({ stateDir: tmpState() }),
       store,
       chat,
       log: quiet,
@@ -253,27 +442,32 @@ describe('dashboard delivery', () => {
 });
 
 describe('RoutedChat', () => {
-  it('copies a card with buttons to Slack, keeps it in step, and sends replies there to the run', async () => {
+  it('keeps approval cards off Slack, copies a permission prompt and keeps it in step', async () => {
     const store = new Store(':memory:');
     const { slack, chat } = routed(store);
     const channel = webChannel('shop');
     const root = await chat.post(channel, undefined, 'Run Prime Check');
-    const blocks = [
-      { type: 'section', text: { type: 'mrkdwn', text: 'Approve?' } },
+    await chat.postBlocks(channel, root, 'Approval needed', [
       { type: 'actions', elements: [{ type: 'button', action_id: 'tara:approval:0', value: 'i1' }] },
+    ]);
+    expect(slack.blockPosts).toEqual([]);
+
+    const blocks = [
+      { type: 'section', text: { type: 'mrkdwn', text: 'Allow Bash?' } },
+      { type: 'actions', elements: [{ type: 'button', action_id: 'tara:perm:allow', value: 'p1' }] },
     ];
-    const card = await chat.postBlocks(channel, root, 'Approval needed', blocks);
+    const prompt = await chat.postBlocks(channel, root, 'Permission needed', blocks);
     expect(slack.blockPosts).toHaveLength(1);
     const copy = slack.blockPosts[0];
     expect(copy?.thread).toBe('');
     expect(JSON.stringify(copy?.blocks)).toContain(`https://dash.example/t/${channel}/${root}`);
     expect(store.threadAlias(`C1:${copy?.ts}`)).toBe(`${channel}:${root}`);
 
-    await chat.update(channel, card, 'Decided', [
-      { type: 'section', text: { type: 'mrkdwn', text: '✅ Approve' } },
+    await chat.update(channel, prompt, 'Allowed', [
+      { type: 'section', text: { type: 'mrkdwn', text: '✅ Allowed' } },
     ]);
     expect(slack.updates[0]?.ts).toBe(copy?.ts);
-    expect(store.getWebMessage(channel, card)?.text).toBe('Decided');
+    expect(store.getWebMessage(channel, prompt)?.text).toBe('Allowed');
 
     // Plain messages stay on the dashboard.
     await chat.post(channel, root, '⏳ working');
@@ -317,6 +511,22 @@ describe('summaries', () => {
       '✅ Prime is on\n| a |',
     );
     expect(withoutName('✅ Amazon Prime is on again', '*Prime Check*')).toBe('✅ Amazon Prime is on again');
+    expect(withoutName('*Prime Check:* ⚠️ 5 cards wait', '*Prime Check*')).toBe('⚠️ 5 cards wait');
+    expect(withoutName('⚠️ **Prime Check: no new errors.**', '*Prime Check*')).toBe('⚠️ **no new errors.**');
+  });
+
+  it('opens with the status, the name and the first line of the headline', async () => {
+    const { summaryHeader } = await import('../src/web/summary.js');
+    expect(summaryHeader('*UI Review*', '⚠️ 3 **low** issues\n| a |\n|---|\n| 1 |')).toEqual({
+      header: '⚠️ *UI Review* · 3 *low* issues',
+      body: '| a |\n|---|\n| 1 |',
+    });
+    // A table first, or a long line: the name alone, the headline in full below.
+    expect(summaryHeader('*UI Review*', '| a |\n|---|')).toEqual({
+      header: '*UI Review*',
+      body: '| a |\n|---|',
+    });
+    expect(summaryHeader('*UI Review*', 'x'.repeat(201)).header).toBe('*UI Review*');
   });
 
   it('makes a plain notification line', () => {
@@ -332,7 +542,7 @@ describe('SessionManager with dashboard threads', () => {
     const calls: RunOptions[] = [];
     const manager = new SessionManager({
       projects: [makeProject([])],
-      host: testHost(),
+      host: testHost({ stateDir: tmpState() }),
       store,
       chat,
       log: quiet,
@@ -362,7 +572,7 @@ describe('SessionManager with dashboard threads', () => {
     const { slack, chat } = routed(store);
     const manager = new SessionManager({
       projects: [makeProject([], { allowedUsers: ['U9'] })],
-      host: testHost(),
+      host: testHost({ stateDir: tmpState() }),
       store,
       chat,
       log: quiet,
@@ -390,6 +600,44 @@ describe('SessionManager with dashboard threads', () => {
       summary: '*Daily task*',
     });
     expect(slack.blockPosts[0]?.text).toBe('Daily task: ✅ Reminder set');
+  });
+
+  it("says in a chat's Slack summary how many cards it left, since approval cards aren't copied to Slack", async () => {
+    const store = new Store(':memory:');
+    const { slack, chat } = routed(store);
+    const manager = new SessionManager({
+      projects: [makeProject([])],
+      host: testHost({ stateDir: tmpState() }),
+      store,
+      chat,
+      log: quiet,
+      env: { PATH: '/bin' },
+      newSessionId: () => 'fresh',
+      approvalsUrl: 'https://dash.example/approvals',
+      run: async () => {
+        store.proposeItem({
+          project: 'shop',
+          kind: 'email',
+          mode: 'queue',
+          title: 'Reply to Ann',
+          options: ['Approve'],
+          channel: 'web-shop',
+          threadTs: '3.0',
+        });
+        return ok('');
+      },
+    });
+    await manager.handle({
+      channel: 'web-shop',
+      threadTs: '3.0',
+      ts: '3.0',
+      user: 'U1',
+      text: 'draft the reply',
+      summary: '*Card decision*',
+    });
+    const posted = JSON.stringify(slack.blockPosts);
+    expect(posted).toContain('Left 1 card for you');
+    expect(posted).toContain('https://dash.example/approvals');
   });
 });
 

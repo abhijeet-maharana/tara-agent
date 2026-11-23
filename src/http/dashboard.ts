@@ -4,7 +4,7 @@ import { formatDuration } from '../slack/format.js';
 import type { Item, SessionOverview, StoredRun } from '../store/store.js';
 import { cronText } from './cron-text.js';
 import { SWITCHER_CSS, TOKENS } from './look.js';
-import { firstPrompt, type TranscriptEntry } from './transcript.js';
+import { firstPrompt, promptTitle, type TranscriptEntry } from './transcript.js';
 
 /**
  * Server-rendered pages for people (the same paths answer JSON for tools): a home page with what
@@ -135,6 +135,36 @@ export interface HomeData {
   health?: { problems: Array<{ name: string; where: string }>; watch: number };
   /** One line from the projects' `.tara/quotes.txt`, picked at random for this visit (see quotes.ts). */
   quote?: string;
+  /**
+   * Every run working now (`Activity`): jobs and their steps, chat turns (replies in Slack or on the
+   * dashboard, notes, decisions, scheduled tasks), learning turns. Undefined: only jobs are known.
+   */
+  live?: LiveRun[];
+}
+
+/** A run working now, as Home's "Running now" lists it. */
+export interface LiveRun {
+  kind: 'chat' | 'job' | 'ask' | 'learn';
+  project: string;
+  title: string;
+  jobId?: string;
+  /** Its session's page, when its thread is known. */
+  href?: string;
+}
+
+const LIVE_ICON: Record<LiveRun['kind'], string> = { job: '⏱', chat: '💬', ask: '❓', learn: '📝' };
+const LIVE_TITLE_MAX = 60;
+
+/** A live run's link on Home: its icon and the first line of what it is about. */
+function liveLink(r: LiveRun): string {
+  const line =
+    r.title
+      .split('\n')
+      .find((l) => l.trim())
+      ?.trim() ?? r.kind;
+  const short = line.length > LIVE_TITLE_MAX ? `${line.slice(0, LIVE_TITLE_MAX - 1)}…` : line;
+  const text = `${LIVE_ICON[r.kind]} ${esc(short)}`;
+  return r.href ? `<a href="${esc(r.href)}">${text}</a>` : `<span>${text}</span>`;
 }
 
 /** Host-level model settings the dashboard shows: effort and voice notes (`voice`). */
@@ -247,14 +277,23 @@ function mdLines(part: string): string {
   return out.join('');
 }
 
-/** Inline: code spans and links are set aside first, so bold/italic never reach into them. */
-function inline(line: string): string {
+/**
+ * Inline: code spans and links are set aside first, so bold/italic never reach into them. `resolve`
+ * turns a relative link (`references/x.md`) into a URL, or undefined to show its label only; without
+ * it only http(s) links are links.
+ */
+export function inline(line: string, resolve?: (href: string) => string | undefined): string {
   const kept: string[] = [];
   const keep = (html: string) => `\uE000${kept.push(html) - 1}\uE000`;
-  const link = (url: string, label: string) => keep(`<a href="${esc(url)}">${inline(label)}</a>`);
+  const link = (url: string, label: string) => keep(`<a href="${esc(url)}">${inline(label, resolve)}</a>`);
   const s = line
     .replace(/`([^`\n]+)`/g, (_, c: string) => keep(`<code>${esc(c)}</code>`))
     .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, l: string, u: string) => link(u, l))
+    .replace(/\[([^\]\n]+)\]\(([^\s)]+)\)/g, (all: string, l: string, u: string) => {
+      if (!resolve) return all;
+      const url = resolve(u);
+      return url ? link(url, l) : keep(inline(l, resolve));
+    })
     .replace(/<(https?:\/\/[^|>\s]+)\|([^>\n]+)>/g, (_, u: string, l: string) => link(u, l));
   return esc(s)
     .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
@@ -898,19 +937,23 @@ export function homePage(ctx: DashboardContext, data: HomeData): string {
   const names = new Map(jobs.map((j) => [`${j.project}:${j.id}`, j.name]));
   const uptime = span(Math.floor(data.uptimeSeconds / 60));
 
-  // Each running job links to its live transcript when its session is known.
-  const runningLinks = running
+  // Every run working now (chats and learning turns too), each linking to its live session; a started
+  // job with no run of its own at the moment (between steps, setting up) is listed by name.
+  const live = data.live ?? [];
+  const jobLinks = running
+    .filter((j) => !live.some((r) => r.project === j.project && r.jobId === j.id))
     .map(
       (j) =>
-        `<a href="${j.liveSessionId ? `/sessions/${esc(j.liveSessionId)}` : `/jobs#${anchor(j)}`}">${esc(j.name)}</a>`,
-    )
-    .join(', ');
+        `<a href="${j.liveSessionId ? `/sessions/${esc(j.liveSessionId)}` : `/jobs#${anchor(j)}`}">${data.live ? '⏱ ' : ''}${esc(j.name)}</a>`,
+    );
+  const runningLinks = [...live.map(liveLink), ...jobLinks].join(', ');
+  const busy = live.length + jobLinks.length;
   // Busy jobs that haven't started: started on time, but waiting for a slot, a lock or their thread.
   const waitingLinks = waitingJobs
     .map((j) => `<a href="/jobs#${anchor(j)}" title="${esc(waitText(j))}">${esc(j.name)}</a>`)
     .join(', ');
-  const nowbar = `<div class="nowbar${running.length ? ' live' : ''}"><b>${
-    running.length ? `● Running now: ${runningLinks}` : '○ Nothing running'
+  const nowbar = `<div class="nowbar${busy ? ' live' : ''}"><b>${
+    busy ? `● Running now: ${runningLinks}` : '○ Nothing running'
   }</b>${waitingJobs.length ? `<span>⏳ Waiting to start: ${waitingLinks}</span>` : ''}<span class="dim">· up ${uptime} · ${jobs.length - paused.length} of ${jobs.length} jobs on</span></div>`;
 
   const waiting = ctx.waiting ?? pending.length;
@@ -1355,11 +1398,8 @@ export function sessionsPage(
       const at = run?.startedAt ?? s.updatedAt;
       const jobId = jobOf(s);
       const jobName = jobId ? (jobNames.get(`${s.project}:${jobId}`) ?? jobId) : undefined;
-      // A chat's title is its message's first line (tara-agent adds context below it).
-      const message = opts
-        .preview?.(s.project, s.sessionId)
-        ?.split('\n')
-        .find((l) => l.trim());
+      // A chat's title is its message's first line (tara-agent adds context around it).
+      const message = promptTitle(opts.preview?.(s.project, s.sessionId));
       const title =
         kind === 'job'
           ? (jobName ?? 'A job run with no record (stopped before it finished?)')
@@ -1506,7 +1546,7 @@ export function sessionPage(
   } = {},
 ): string {
   const { run, running } = opts;
-  const title = opts.jobName ?? (entries ? firstPrompt(entries)?.slice(0, 80) : undefined) ?? 'Conversation';
+  const title = opts.jobName ?? (entries ? promptTitle(firstPrompt(entries)) : undefined) ?? 'Conversation';
   const project = session?.project ?? run?.project;
   const status = running
     ? '<span class="tag">● running</span>'
@@ -1656,15 +1696,19 @@ const LIVE_SCRIPT = `
  * server proxies to the project's `dashboardUrl`. As the app moves between its pages, the script keeps
  * this page's address on `/p/<name>/…` and the matching tab marked, so links and reloads land back there.
  */
-export function tabPage(ctx: DashboardContext, project: Project, rest: string): string {
+export function tabPage(ctx: DashboardContext, project: Project, rest: string, appOrigin?: string): string {
   const name = project.config.name;
   const title = project.config.title ?? name;
   const app = `/app/${name}`;
+  // With `appOrigin` (host `http.appPort`) the app is on another origin: it reports where it is by
+  // postMessage (the proxy adds that to its pages) instead of this page reading the frame.
   return layout(
     ctx,
     title,
     '',
-    `<iframe class="app-frame" src="${esc(app + rest)}" title="${esc(title)}" data-app="${esc(name)}"></iframe>`,
+    `<iframe class="app-frame" src="${esc((appOrigin ?? '') + app + rest)}" title="${esc(title)}" data-app="${esc(name)}"${
+      appOrigin ? ` data-origin="${esc(appOrigin)}"` : ''
+    }></iframe>`,
     { framed: true, script: TAB_SCRIPT },
   );
 }
@@ -1679,18 +1723,55 @@ const TAB_SCRIPT = `
     const best = tabs.filter((a) => under(rest, a.dataset.tab)).sort((a, b) => b.dataset.tab.length - a.dataset.tab.length)[0];
     tabs.forEach((a) => { a.classList.toggle('on', a === best); if (a === best) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
   };
-  const sync = () => {
-    let loc;
-    try { loc = frame.contentWindow.location; } catch { return; }
+  const follow = (loc, title) => {
     if (!under(loc.pathname, app)) return;
     const rest = loc.pathname.slice(app.length) || '/';
     const next = shell + rest + loc.search + loc.hash;
     if (next !== location.pathname + location.search + location.hash) history.replaceState(null, '', next);
     mark(rest);
-    try { if (frame.contentDocument.title) document.title = frame.contentDocument.title; } catch {}
+    if (title) document.title = title;
+  };
+  const sync = () => {
+    let loc, title;
+    try { loc = { pathname: frame.contentWindow.location.pathname, search: frame.contentWindow.location.search, hash: frame.contentWindow.location.hash }; title = frame.contentDocument.title; } catch { return; }
+    follow(loc, title);
   };
   mark(location.pathname.slice(shell.length) || '/');
-  frame.addEventListener('load', () => {
+  // What the app asks of this page by postMessage: where it is (on its own origin), to open a dashboard
+  // page, or to decide one of its project's cards. Only this page may decide, and only after a person
+  // confirms here: the app's own scripts can't call the dashboard (another origin with http.appPort).
+  const origin = frame.dataset.origin || location.origin;
+  addEventListener('message', async (e) => {
+    if (e.origin !== origin || e.source !== frame.contentWindow || !e.data) return;
+    const d = e.data;
+    if (d.type === 'tara:location' && frame.dataset.origin)
+      follow({ pathname: String(d.path), search: String(d.search || ''), hash: String(d.hash || '') }, String(d.title || ''));
+    if (d.type === 'tara:navigate' && typeof d.href === 'string' && d.href.startsWith('/') && !d.href.startsWith('//'))
+      location.assign(d.href);
+    if (d.type === 'tara:decide') {
+      const reply = (r) => frame.contentWindow.postMessage(Object.assign({ type: 'tara:decided', requestId: d.requestId }, r), origin);
+      try {
+        const id = encodeURIComponent(String(d.id));
+        const got = await fetch('/items/' + id);
+        const item = got.ok ? (await got.json()).item : undefined;
+        const option = String(d.option || '');
+        if (!item || item.project !== name) return reply({ ok: false, error: 'No such card in this project' });
+        if (!(item.options || []).includes(option)) return reply({ ok: false, error: 'The card has no option "' + option + '"' });
+        if (!confirm(option + ': "' + item.title + '"?')) return reply({ ok: false, error: 'Not confirmed' });
+        const res = await fetch('/items/' + id + '/decide', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ option, seen: item.updatedAt }),
+        });
+        if (res.ok) return reply({ ok: true });
+        const err = await res.json().catch(() => ({}));
+        reply({ ok: false, error: err.error || 'HTTP ' + res.status });
+      } catch (err) {
+        reply({ ok: false, error: String(err && err.message || err) });
+      }
+    }
+  });
+  if (!frame.dataset.origin) frame.addEventListener('load', () => {
     sync();
     const w = frame.contentWindow;
     try {

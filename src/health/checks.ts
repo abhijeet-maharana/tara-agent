@@ -1,9 +1,11 @@
-import { statfsSync, statSync } from 'node:fs';
+import { readdirSync, readFileSync, statfsSync, statSync } from 'node:fs';
 import { cpus, freemem, loadavg, totalmem } from 'node:os';
+import path from 'node:path';
 import type { HostConfig, Project } from '../config/schema.js';
 import type { BrowserStatus } from '../http/browser-usage.js';
 import type { Task } from '../runner/activity.js';
 import type { RateLimit } from '../runner/stream.js';
+import { SKILL_MAX_CHARS } from '../scheduler/prompt.js';
 import type { JobInfo } from '../scheduler/scheduler.js';
 import type { RunStat, StoredRun } from '../store/store.js';
 import type { ClaudeLogin } from './claude-login.js';
@@ -59,6 +61,14 @@ export interface AgentDeps {
   vmHost?: () => VmHostSample | undefined;
   /** The runs' Claude login (src/health/claude-login.ts); undefined = nothing to watch. */
   claudeLogin?: () => Promise<ClaudeLogin | undefined>;
+  /** Projects left out at start because their config didn't load. */
+  skippedProjects?: () => Array<{ dir: string; message: string }>;
+  /** Writes to the state database: undefined when it works, else the error (a read-only disk, damage). */
+  dbWrite?: () => string | undefined;
+  /** Pinned settings (host `trusted`) a repo's config tried to change, by project. */
+  pinDrift?: () => Array<{ project: string; keys: string[] }>;
+  /** The daily database copy (store/backup.ts): the local day of the latest good one, or the last error. */
+  backup?: () => { day?: string; error?: string };
   timeZone: string;
   now: () => number;
   /** Tests: stand-ins for the machine's figures. */
@@ -76,7 +86,7 @@ function dayClock(ms: number, now: number, timeZone: string): string {
   return `${new Intl.DateTimeFormat('en-GB', { timeZone, weekday: 'short' }).format(ms)} ${time}`;
 }
 
-/** This machine now: disk use of the state folder's disk, free memory, load, CPUs, database size. */
+/** This machine now: disk use of the state folder's disk, free memory, swap, load, CPUs, database size. */
 export function machine(stateDir: string | undefined, dbFile?: string) {
   let diskUsed: number | undefined;
   try {
@@ -89,8 +99,18 @@ export function machine(stateDir: string | undefined, dbFile?: string) {
       try {
         dbBytes = (dbBytes ?? 0) + statSync(f).size;
       } catch {}
+  // Swap in use, 0–1 (Linux only; includes zram, which is compressed RAM rather than disk).
+  let swapUsed: number | undefined;
+  try {
+    const info = readFileSync('/proc/meminfo', 'utf8');
+    const kb = (k: string) => Number(new RegExp(`^${k}:\\s+(\\d+)`, 'm').exec(info)?.[1]);
+    const total = kb('SwapTotal');
+    const used = 1 - kb('SwapFree') / total;
+    if (total > 0 && Number.isFinite(used)) swapUsed = used;
+  } catch {}
   return {
     diskUsed,
+    swapUsed,
     memFree: freemem() / totalmem(),
     load: loadavg()[0] ?? 0,
     cpus: cpus().length || 1,
@@ -116,6 +136,49 @@ export async function agentChecks(d: AgentDeps): Promise<Check[]> {
         'Slack',
         'bad',
         `${s.state[0]?.toUpperCase()}${s.state.slice(1)} for ${ago(at - s.since)}${last}`,
+      );
+  }
+
+  const skipped = d.skippedProjects?.() ?? [];
+  if (skipped.length)
+    add(
+      'projects',
+      'Projects',
+      'bad',
+      `Left out at start (fix the config, then restart): ${skipped.map((p) => `${p.dir}: ${firstLine(p.message)}`).join(' · ')}`,
+    );
+
+  const dbError = d.dbWrite?.();
+  if (dbError !== undefined)
+    add(
+      'database',
+      'Database',
+      'bad',
+      `Writes fail, so runs, cards and claims aren't saved: ${firstLine(dbError)}`,
+    );
+
+  const drift = d.pinDrift?.() ?? [];
+  if (drift.length)
+    add(
+      'pinned',
+      'Pinned settings',
+      'warn',
+      `Ignored in the repo's .tara/config.json (host trusted wins): ${drift.map((p) => `${p.project}: ${p.keys.join(', ')}`).join(' · ')}`,
+    );
+
+  const backup = d.backup?.();
+  if (backup) {
+    const today = new Intl.DateTimeFormat('en-CA', { timeZone: d.timeZone }).format(at);
+    if (backup.error)
+      add('backup', 'Database backup', 'bad', `The last copy failed: ${firstLine(backup.error)}`);
+    else if (backup.day === today)
+      add('backup', 'Database backup', 'ok', `Today's copy is written and checked`);
+    else
+      add(
+        'backup',
+        'Database backup',
+        'warn',
+        backup.day ? `Latest copy is from ${backup.day}` : 'No copy yet',
       );
   }
 
@@ -233,8 +296,40 @@ export async function agentChecks(d: AgentDeps): Promise<Check[]> {
   return out;
 }
 
+/**
+ * A project's skills whose SKILL.md is over `max` characters, longest first. Every run of a job reads
+ * its whole skill, and learning turns tend to grow them. Only files already over `max` bytes are read
+ * (a character is at least a byte), so the scan stays cheap. A skill with its own LICENSE file is a
+ * third-party one kept as published: not ours to shorten, so not listed.
+ */
+export function oversizedSkills(
+  projectDir: string,
+  max = SKILL_MAX_CHARS,
+): Array<{ name: string; chars: number }> {
+  const dir = path.join(projectDir, '.claude', 'skills');
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const out: Array<{ name: string; chars: number }> = [];
+  for (const name of names) {
+    const file = path.join(dir, name, 'SKILL.md');
+    try {
+      if (statSync(file).size <= max) continue;
+      if (readdirSync(path.join(dir, name)).some((f) => /^LICEN[CS]E(\.|$)/i.test(f))) continue;
+      const chars = readFileSync(file, 'utf8').length;
+      if (chars > max) out.push({ name, chars });
+    } catch {}
+  }
+  return out.sort((a, b) => b.chars - a.chars);
+}
+
 export interface JobsDeps {
   project: Project;
+  /** Its skills over the size limit (`oversizedSkills`); unset: not checked. */
+  skills?: () => Array<{ name: string; chars: number }>;
   jobs: () => JobInfo[];
   recent: (jobId: string) => StoredRun[];
   latestSlots: (at: number) => Array<{ id: string; key: string; slot: number; firstSeen: number }>;
@@ -318,6 +413,23 @@ export function jobChecks(d: JobsDeps): Check[] {
     else if (claim.status === 'skipped')
       add('warn', `Skipped ${when}: paused, or the run before was still going`, true);
     else if (claim.status === 'aborted') add('warn', `The ${when} run was stopped by a restart`, true);
+    else if (claim.status === 'held')
+      add('warn', `Held at ${when}: usage limit reached; it runs once the limit resets`, true);
+  }
+
+  const long = d.skills?.() ?? [];
+  if (long.length) {
+    const k = (n: number) => `${Math.round(n / 1000)}k`;
+    const shown = long.slice(0, 5).map((s) => `${s.name} ${k(s.chars)}`);
+    out.push({
+      key: key('skills'),
+      project,
+      group,
+      name: 'Skill size',
+      status: 'warn',
+      detail: `${long.length} ${long.length === 1 ? 'skill is' : 'skills are'} over ${k(SKILL_MAX_CHARS)} characters, and every run reads all of it: ${shown.join(', ')}${long.length > 5 ? `, +${long.length - 5} more` : ''}. Tidy it: rules in place, detail in references/`,
+      quiet: true, // a slow problem: the page shows it, Slack doesn't need to
+    });
   }
 
   const enabled = jobs.filter((j) => j.enabled);

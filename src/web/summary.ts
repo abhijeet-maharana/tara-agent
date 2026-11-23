@@ -1,9 +1,9 @@
 import { readFile } from 'node:fs/promises';
 import { splitAtSeparator } from '../scheduler/prompt.js';
 import type { ChatPort, Logger, SlackBlock } from '../sessions/manager.js';
-import { hasTable, MARKDOWN_MAX, sendWithFallback, textBlock } from '../slack/format.js';
-import type { Store } from '../store/store.js';
-import type { WebChat } from './chat.js';
+import { hasTable, MARKDOWN_MAX, sendWithFallback, textBlock, toSlackMrkdwn } from '../slack/format.js';
+import type { Item, Store } from '../store/store.js';
+import { isApprovalCard, type WebChat } from './chat.js';
 
 /** Slack's limit for a section's text, less room for "… more on the dashboard". */
 const SECTION_MAX = 2_800;
@@ -30,6 +30,22 @@ export function notificationLine(text: string): string {
     .slice(0, 150);
 }
 
+/**
+ * The Slack summary that stands for a dashboard thread (the first one posted for it), as its ts in
+ * `slackChannel`, or undefined when it has none.
+ */
+export function slackSummaryOf(
+  store: Pick<Store, 'aliasesOf' | 'isMirror'>,
+  slackChannel: string,
+  channel: string,
+  threadTs: string,
+): string | undefined {
+  const key = store
+    .aliasesOf(`${channel}:${threadTs}`)
+    .find((k) => k.startsWith(`${slackChannel}:`) && !store.isMirror(k));
+  return key?.slice(slackChannel.length + 1);
+}
+
 export interface SummaryInput {
   /** Slack (or the router, which sends a Slack channel to Slack). */
   chat: ChatPort;
@@ -50,6 +66,18 @@ export interface SummaryInput {
   link?: string;
   /** Files the run posted from this time (ms) on are attached in the summary's thread. */
   since?: number;
+  /**
+   * Cards the run left on the Approvals page. Slack then gets only the headline's first line and a link
+   * there: the cards hold the details, and go in the summary's thread (`postCardsInThread`).
+   */
+  cards?: number;
+  /** The Approvals page, for that link. */
+  approvalsUrl?: string;
+  /**
+   * A follow-up (the job continuing after your decision, or acting on it): the job's Slack summary it
+   * belongs under. It is then a reply there, not a new channel message.
+   */
+  replyIn?: string;
 }
 
 /** A title's plain words: "*Prime Check* (catch-up)" → "Prime Check (catch-up)". */
@@ -68,35 +96,82 @@ export function withoutName(text: string, title: string): string {
   const name = plainTitle(title).replace(/\s*\(.*\)$/, '');
   if (!name) return text;
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const lead = new RegExp(`^(\\S+\\s+)?(?:\\*\\*|\\*)?${escaped}(?:\\*\\*|\\*)?\\s*(?:[:·—–-]\\s*)`, 'i');
+  // "✅ Prime Check: …", "*Prime Check:* …", "**Prime Check**: …" and "**Prime Check: …**" all lose the
+  // name; a bold that opened before it and closes later is kept.
+  const lead = new RegExp(
+    `^(\\S+\\s+)?(\\*\\*|\\*)?${escaped}(\\*\\*|\\*)?\\s*[:·—–-]\\s*(\\*\\*|\\*)?\\s*`,
+    'i',
+  );
   const [first = '', ...rest] = text.split('\n');
-  const trimmed = first.replace(lead, (_, icon: string | undefined) => icon ?? '');
+  const trimmed = first.replace(
+    lead,
+    (_, icon: string | undefined, open: string | undefined, close?: string, after?: string) =>
+      (icon ?? '') + (open && !close && !after ? open : ''),
+  );
   return trimmed.trim() ? [trimmed, ...rest].join('\n') : text;
 }
 
+/** A headline's first line that fits next to the run's name: short, and not a table or code. */
+const LEAD_MAX = 200;
+/** The status emoji a headline starts with ("✅", "⚠️", "❌"…). */
+const ICON = /^(\p{Extended_Pictographic}(?:\uFE0F|\u200D\p{Extended_Pictographic})*\uFE0F?)\s*/u;
+
 /**
- * Posts a dashboard run's result in Slack as one top-level message: the run's name, its headline (a
- * table renders as one), then a small line with its time and a link to the whole run. Files the run sent go in
- * that message's thread, and a reply there continues the run's session (`thread_aliases`). Returns the
- * message's ts, or undefined when it couldn't be posted (logged; the run itself is unaffected).
+ * The message's first line: the headline's status emoji, the run's name in bold, then the rest of the
+ * headline's first line ("⚠️ *UI Review* · 3 low issues on 17 pages"), so Slack and the phone show the
+ * outcome at a glance. The rest of the headline goes below. A first line that is long, a table or code
+ * stays below in full, and the name stands alone.
+ */
+export function summaryHeader(title: string, text: string): { header: string; body: string } {
+  const name = title.startsWith('*') ? title : `*${title}*`;
+  const [first = '', ...rest] = text.split('\n');
+  const line = first.trim();
+  if (!line || line.length > LEAD_MAX || line.startsWith('|') || line.startsWith('```'))
+    return { header: name, body: text };
+  const icon = ICON.exec(line);
+  const words = icon ? line.slice(icon[0].length) : line;
+  return {
+    header: [icon ? `${icon[1]} ${name}` : name, toSlackMrkdwn(words).trim()].filter(Boolean).join(' · '),
+    body: rest.join('\n').trim(),
+  };
+}
+
+/**
+ * Posts a dashboard run's result in Slack as one top-level message: its status, name and headline on
+ * the first line (a table renders as one below), then a small line with its time, the cards waiting on
+ * the Approvals page and a link to the whole run. With cards, only the first line: "⚠️ *UI Review* · 3
+ * UI issues found", and the cards follow in that message's thread, with their buttons. Files the run
+ * sent go in that thread too, and a reply there continues the run's session (`thread_aliases`). Returns
+ * the message's ts, or undefined when it couldn't be posted (logged; the run itself is unaffected).
  */
 export async function postSummary(input: SummaryInput): Promise<string | undefined> {
   const { chat, store, web, log, slackChannel, thread } = input;
   const summary = summaryText(input.text);
   const text = withoutName(summary.text, input.title);
+  const cards = input.cards ?? 0;
+  const waiting = `🟡 ${cards} ${cards === 1 ? 'card waits' : 'cards wait'} for you`;
   const footer = [
     input.meta,
-    input.link ? `<${input.link}|${summary.cut ? 'Full details ↗' : 'Open the run ↗'}>` : '',
+    cards
+      ? input.approvalsUrl
+        ? `<${input.approvalsUrl}|${waiting} on the Approvals page ↗>`
+        : waiting
+      : '',
+    input.link ? `<${input.link}|${summary.cut || cards ? 'Full details ↗' : 'Open the run ↗'}>` : '',
   ]
     .filter(Boolean)
     .join(' · ');
+  const shown = summaryHeader(input.title, text || '_(no reply)_');
+  // With cards, one line is enough: what they are about is on each card.
+  const { header, body } = !cards
+    ? shown
+    : shown.body === (text || '_(no reply)_')
+      ? { header: `${shown.header} · ${waiting}`, body: '' }
+      : { header: shown.header, body: '' };
   const blocks: SlackBlock[] = [
-    // The name first, on its own (a markdown block would read `*…*` as italics).
-    {
-      type: 'section',
-      text: { type: 'mrkdwn', text: input.title.startsWith('*') ? input.title : `*${input.title}*` },
-    },
-    textBlock(text || '_(no reply)_', SECTION_MAX + 200),
+    // A section, not a markdown block, which would read the name's `*…*` as italics.
+    { type: 'section', text: { type: 'mrkdwn', text: header } },
+    ...(body ? [textBlock(body, SECTION_MAX + 200)] : []),
     ...(footer ? [{ type: 'context', elements: [{ type: 'mrkdwn', text: footer }] }] : []),
   ];
   // The phone's notification: "Prime Check: ✅ Prime is on again".
@@ -105,19 +180,72 @@ export async function postSummary(input: SummaryInput): Promise<string | undefin
     'Run finished';
   let ts: string;
   try {
-    ts = await sendWithFallback(blocks, (b) => chat.postBlocks(slackChannel, undefined, notice, b ?? blocks));
+    ts = await sendWithFallback(blocks, (b) =>
+      chat.postBlocks(slackChannel, input.replyIn, notice, b ?? blocks),
+    );
   } catch (err) {
     log.warn(`summary not posted in Slack: ${(err as Error).message}`);
     return undefined;
   }
-  store.saveThreadAlias(`${slackChannel}:${ts}`, `${thread.channel}:${thread.ts}`);
+  // A reply is not a thread of its own: the summary it went under already leads to the job's session.
+  if (!input.replyIn) store.saveThreadAlias(`${slackChannel}:${ts}`, `${thread.channel}:${thread.ts}`);
   for (const file of web.files(thread.channel, thread.ts, input.since ?? 0)) {
     try {
       const data = await readFile(file.path);
-      await chat.uploadFile(slackChannel, ts, { name: file.name, data }, file.comment);
+      await chat.uploadFile(slackChannel, input.replyIn ?? ts, { name: file.name, data }, file.comment);
     } catch (err) {
       log.warn(`file ${file.name} not attached to the summary: ${(err as Error).message}`);
     }
   }
+  if (cards) await postCardsInThread(input, input.replyIn ?? ts);
   return ts;
+}
+
+/** Drafts listed by name in one reply under a summary; the rest are counted. */
+const DRAFTS_LISTED = 10;
+
+/**
+ * The cards a run left, as replies under its Slack summary (`at`), so they can be decided there
+ * without the channel getting a message per card. An approval card is copied with its buttons and
+ * linked to its dashboard message (`web_mirrors`), so a decision, an update or a withdrawal on either
+ * side edits the copy too (`RoutedChat.update`), and a tap decides the card by its id. Drafts (no
+ * buttons: they are reviewed and edited on the Approvals page) get one reply that links to each.
+ */
+async function postCardsInThread(input: SummaryInput, at: string): Promise<void> {
+  const { chat, store, log, slackChannel, thread } = input;
+  const since = input.since ?? 0;
+  const items = store
+    .itemsInThread(thread.channel, thread.ts, 200)
+    .filter((i) => i.status === 'pending' && i.createdAt >= since);
+  const drafts: Item[] = [];
+  for (const item of items) {
+    const card = item.messageTs ? store.getWebMessage(thread.channel, item.messageTs) : undefined;
+    const blocks = card?.kind === 'blocks' ? (card.data as SlackBlock[]) : undefined;
+    if (!card || !blocks || !isApprovalCard(blocks)) {
+      drafts.push(item);
+      continue;
+    }
+    // Already in Slack (a card updated in place by a later run): its copy follows it there.
+    if (store.webMirror(card.ts)) continue;
+    try {
+      const copy = await chat.postBlocks(slackChannel, at, card.text, blocks);
+      store.saveWebMirror(card.ts, slackChannel, copy);
+    } catch (err) {
+      log.warn(`card ${item.id} not copied under the summary: ${(err as Error).message}`);
+    }
+  }
+  if (!drafts.length) return;
+  const link = (i: Item) => {
+    const title = i.title.replace(/[<>|&]/g, ' ').trim();
+    return input.approvalsUrl ? `<${input.approvalsUrl}#item-${i.id}|${title}>` : title;
+  };
+  const more = drafts.length - DRAFTS_LISTED;
+  const text = [
+    `📝 *${drafts.length} ${drafts.length === 1 ? 'draft waits' : 'drafts wait'} on the Approvals page*`,
+    ...drafts.slice(0, DRAFTS_LISTED).map((i) => `• ${link(i)}`),
+    ...(more > 0 ? [`…and ${more} more`] : []),
+  ].join('\n');
+  await chat
+    .post(slackChannel, at, text)
+    .catch((err: Error) => log.warn(`drafts not listed under the summary: ${err.message}`));
 }

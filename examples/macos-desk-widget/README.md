@@ -46,7 +46,7 @@ Panel position and size: `className` at the top of `mac.jsx` and `agent.jsx`. Re
 | `lib/thermal.swift` | `ProcessInfo.thermalState` (nominal / fair / serious / critical), compiled by `install.sh` into the cache folder |
 | `lib/agent-state.sh` | `curl` of `/glance`, `/attention` and `EXTRA_TILES_URL` (5 s timeout each), as `{name, url, notify, state, attention, extra}` or `{name, url, error}` |
 | `lib/notify.sh` | One notification (`terminal-notifier`, else `osascript`); the text goes in as arguments, never as code |
-| `lib/post-metrics.sh` | `--metrics`: reshapes `mac-stats.sh` output (JavaScript for Automation, no installs) and posts it to `/vmhost/metrics`. LaunchAgent `com.github.tara-agent.vmhost-metrics`, errors in `~/Library/Logs/tara-desk-widget.log` |
+| `lib/post-metrics.sh` | `--metrics`: reshapes `mac-stats.sh` output (JavaScript for Automation, no installs), adds `idleSec` (seconds since keyboard/mouse use, from `ioreg`) and posts it to `/vmhost/metrics`. LaunchAgent `com.github.tara-agent.vmhost-metrics`, errors in `~/Library/Logs/tara-desk-widget.log` |
 
 `/glance` needs no token when `TARA_HTTP_TOKEN` is unset; keep `http.allowFrom` to loopback and your tailnet in that case.
 

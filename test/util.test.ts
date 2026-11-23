@@ -8,7 +8,7 @@ import {
   textBlock,
   toSlackMrkdwn,
 } from '../src/slack/format.js';
-import { KeyedQueue, Semaphore, Throttle } from '../src/util/concurrency.js';
+import { KeyedQueue, Locks, Semaphore, Throttle } from '../src/util/concurrency.js';
 import { FakeChat } from './fakes.js';
 
 describe('defuseBroadcasts', () => {
@@ -160,7 +160,41 @@ describe('Semaphore', () => {
   });
 });
 
+describe('Semaphore and Locks with a signal', () => {
+  it('gives up waiting when the signal aborts, without taking or losing a place', async () => {
+    const sem = new Semaphore(1);
+    const release = await sem.acquire();
+    const stop = new AbortController();
+    const waiting = sem.acquire(stop.signal);
+    stop.abort(new Error('paused'));
+    await expect(waiting).rejects.toThrow('paused');
+    release();
+    expect(sem.busy).toBe(false); // the aborted waiter didn't get the place
+    const again = await sem.acquire();
+    again();
+  });
+
+  it('gives back the locks it took when it gives up on the next one', async () => {
+    const locks = new Locks();
+    const holdB = await locks.acquire(['b']);
+    const stop = new AbortController();
+    const both = locks.acquire(['a', 'b'], stop.signal);
+    await new Promise((r) => setImmediate(r));
+    expect(locks.held(['a'])).toEqual(['a']);
+    stop.abort();
+    await expect(both).rejects.toBeTruthy();
+    expect(locks.held(['a', 'b'])).toEqual(['b']);
+    holdB();
+  });
+});
+
 describe('KeyedQueue', () => {
+  it('forgets a key once its tasks are done', async () => {
+    const q = new KeyedQueue();
+    await Promise.all([q.run('a', async () => {}), q.run('b', async () => {}), q.run('a', async () => {})]);
+    expect(q.keys).toBe(0);
+  });
+
   it('serialises per key and keeps going after a failure', async () => {
     const q = new KeyedQueue();
     const log: string[] = [];

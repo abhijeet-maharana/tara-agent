@@ -36,6 +36,11 @@ export type StreamEvent =
   /** A new text block starts (e.g. after tool calls). */
   | { kind: 'text_start'; parent?: string }
   | { kind: 'rate_limit'; rateLimit: RateLimit }
+  /**
+   * How full the session's context is after one model call of the main conversation (not a sub-agent):
+   * its input, cache read and cache write tokens. The last one of a run is the session's size now.
+   */
+  | { kind: 'context'; tokens: number }
   | {
       kind: 'result';
       isError: boolean;
@@ -149,9 +154,14 @@ export function parseStreamLine(line: string): StreamEvent[] {
         : [];
     case 'assistant': {
       const content = isObject(e.message) && Array.isArray(e.message.content) ? e.message.content : [];
+      const usage = !parent && isObject(e.message) ? parseUsage(e.message.usage) : undefined;
+      const context: StreamEvent[] =
+        usage && usage.input + usage.cacheRead + usage.cacheCreation > 0
+          ? [{ kind: 'context', tokens: usage.input + usage.cacheRead + usage.cacheCreation }]
+          : [];
       return content
         .filter((c): c is Json => isObject(c) && c.type === 'tool_use')
-        .map((c) => {
+        .map((c): StreamEvent => {
           const name = str(c.name) ?? 'tool';
           const input = isObject(c.input) ? c.input : {};
           const file = str(input.file_path) ?? str(input.notebook_path);
@@ -163,7 +173,8 @@ export function parseStreamLine(line: string): StreamEvent[] {
             parent,
             ...(file ? { file } : {}),
           };
-        });
+        })
+        .concat(context);
     }
     case 'user': {
       const content = isObject(e.message) && Array.isArray(e.message.content) ? e.message.content : [];

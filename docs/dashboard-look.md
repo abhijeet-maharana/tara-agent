@@ -21,7 +21,8 @@ One dashboard for everything: a project lists its app's pages in `.tara/config.j
 What the app does:
 - **Works under `/app/<name>/`.** Its assets, API calls, router base and server-side redirects use the prefix (Vite `base: '/app/<name>/'`). Its routes stay at its own root, since tara-agent strips the prefix. APIs that other programs call stay exactly where they are.
 - **Content only:** no sidebar, brand, switcher or ☰ menu of its own. The page fills the frame's width and scrolls by itself.
-- **Links to tara-agent pages** are same-origin: `/approvals?project=<name>` with `target="_top"`, or `window.top.location` from scripts.
+- **Links to tara-agent pages**: `/approvals?project=<name>` with `target="_top"`. From a script, ask the page around the frame: `window.parent.postMessage({type: 'tara:navigate', href: '/approvals?project=<name>'}, '*')` (a path on the dashboard only).
+- **Deciding a card from the app** (a button that also approves the card it just made): `window.parent.postMessage({type: 'tara:decide', id, option: 'Approve', requestId}, '*')`. The dashboard page checks the card is this project's and has that option, asks the person to confirm in its own dialog, decides it, and answers `{type: 'tara:decided', requestId, ok, error}`. With host `http.appPort` the app is on its own origin and this is the only way: its scripts can't call tara-agent's API, so a run that edits the app's pages can't decide cards by itself.
 - **A browser opening the app's port directly** (no `x-tara-prefix`) is redirected to `http://<host>:<tara port>/p/<name><path>`. Only page routes do this; APIs and files are served as usual.
 - **Shows nothing tara-agent already shows**: jobs, failing runs, Run now, approvals, queue, schedule, sessions.
 

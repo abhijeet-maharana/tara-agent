@@ -11,7 +11,7 @@ tara-agent lets people in Slack, and scheduled prompts, make Claude act on a mac
 | Claude reads secrets | The CLI's environment has no Slack tokens or credentials (only `ANTHROPIC_API_KEY` for projects on API billing); with a dedicated user, repo `.env` files and the owner's home are unreadable |
 | Claude edits tara-agent itself or its config | Dedicated user with read-only access to the checkout; config and env file outside its reach |
 | A run needs root (a permission it lacks, a service restart) | It never gets sudo: it asks for a **privileged action** from a root-owned allowlist (below); anything not marked `auto` waits for a person's approval |
-| Claude approves its own drafts (forges a decision) | **Split users** (below): decisions on the dashboard need a cookie key Claude can't read and must come from another device; approved items are sealed with a key Claude can't read, and executors in other processes check the seal |
+| Claude approves its own drafts (forges a decision) | **Split users** (below): decisions on the dashboard need a cookie key Claude can't read and must come from another device; approved items are sealed with a key Claude can't read, and executors in other processes check the seal. The unlock cookie holds a key derived from `TARA_ADMIN_TOKEN`, never the token (browsers send a host's cookies to every port on it) |
 | Another local process drives the bot | The API binds to `127.0.0.1`; set `TARA_HTTP_TOKEN` to require a bearer token; `/internal/*` needs a per-run token that exists only while that run is alive |
 | A file upload leaks something outside the project | `send_file` resolves symlinks and only accepts files inside the project or the temp directory |
 | A website open in your browser drives the local API (CSRF, DNS rebinding) | Writes whose `Origin` is another host are refused; a server bound to loopback answers only to `localhost`/`127.x`/`[::1]` Host names |
@@ -105,9 +105,18 @@ Runs have no sudo, yet some failures need root: a file a sync wrote with a tight
 
 The Code page (`/code`) shows source code, so it is only as private as the dashboard: keep `http.allowFrom` to your own network and set `TARA_HTTP_TOKEN`. It serves only files git lists (never ignored ones), never `.git`, paths outside the repo or symlinks out of it, and hides `code.exclude` globs (`.env*`, keys) even when tracked. Git runs read-only (no optional locks, a private index copy, no hooks, external diff or textconv). Asking about a file starts a Claude run, so it needs the unlock cookie from another device. See [code-view.md](code-view.md).
 
+## Pinned project settings
+
+Runs can edit their repo, `.tara/config.json` included, and some of its settings decide what tara-agent does with its own rights: where approved items and card events go (`approvals`, `reminders`, queue URL executors), the billing and permission mode runs get, who the owner is, which file it reads as the system prompt, what it proxies (`dashboardUrl`). Host `trusted` pins them per repo path, in `/etc/tara-agent/` where runs can't write:
+
+- For a listed project, those keys come from the host entry only; whatever the repo says is ignored (and the Health page lists the keys the repo tried to change). A key the entry leaves out is unset, not taken from the repo.
+- It is keyed by repo path, so renaming the project in its config doesn't get around it.
+- `executorUrls` lists the only URLs its queues may send approved items to; a `queues.json` naming another URL fails to load (its items wait) instead of sending.
+- Changes apply at the next restart (project config isn't hot-reloaded).
+
 ## Project tabs
 
-`/app/<name>/…` proxies to the project's `dashboardUrl`, so a project app shown as tabs is as private as the dashboard: it needs `http.allowFrom` and `TARA_HTTP_TOKEN` like every page. Only projects with `tabs` are proxied, and only to their configured origin (a path like `//other.host/` is refused). tara-agent's bearer token and its `x-tara-admin`/`x-tara-run` headers are never forwarded. The app's server never receives `tara_token` or the `tara_admin` unlock cookie. Its pages, though, run on tara-agent's origin, so their scripts can call tara-agent with your browser's cookies just like tara-agent's own pages. Serve only apps you trust as much as tara-agent itself. Actions that only a person may take keep their own check in the app. The app's port can then stay closed to browsers.
+`/app/<name>/…` proxies to the project's `dashboardUrl`, so a project app shown as tabs is as private as the dashboard: it needs `http.allowFrom` and `TARA_HTTP_TOKEN` like every page. Only projects with `tabs` are proxied, and only to their configured origin (a path like `//other.host/` is refused). tara-agent's bearer token and its `x-tara-admin`/`x-tara-run` headers are never forwarded. The app's server never receives `tara_token` or the `tara_admin` unlock cookie. Without `http.appPort`, its pages run on tara-agent's origin, so their scripts can call tara-agent with your browser's cookies just like tara-agent's own pages; a run that can edit an app's pages could then approve its own cards when you open the tab. Set `http.appPort` (and `tls.appPort` over HTTPS): apps are then served only on that port, another origin, where a write to tara-agent is refused as cross-site. Without it, serve only apps you trust as much as tara-agent itself. Actions that only a person may take keep their own check in the app. The app's port can then stay closed to browsers.
 
 ## Reporting a vulnerability
 

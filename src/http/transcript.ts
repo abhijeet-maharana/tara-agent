@@ -188,6 +188,29 @@ export function readTranscript(
   return jsonl === undefined ? undefined : parseTranscript(jsonl);
 }
 
+/** Context tara-agent puts before a fresh session's message (memory.ts, manager.ts `threadCards`). */
+const CONTEXT_HEADINGS = /^## (Project memory|Cards in this thread)\b/;
+const TITLE_MAX = 80;
+
+/**
+ * What a session is called: the first line of the message its first prompt carries, without what
+ * tara-agent puts around it. A chat's message follows the asker's mention (`<@U1>: …`), after the
+ * project memory and the thread's cards; any other prompt is used from its first line, unless it opens
+ * with that context (the message can't be told apart then: undefined, and the caller names it).
+ */
+export function promptTitle(prompt: string | undefined): string | undefined {
+  if (!prompt) return undefined;
+  const mention = /^<@[^>\s]+>:[ \t]*/m.exec(prompt);
+  const message = mention ? prompt.slice(mention.index + mention[0].length) : prompt;
+  if (!mention && CONTEXT_HEADINGS.test(message.trimStart())) return undefined;
+  const line = message
+    .split('\n')
+    .map((l) => l.trim())
+    .find(Boolean);
+  if (!line) return undefined;
+  return line.length > TITLE_MAX ? `${line.slice(0, TITLE_MAX - 1)}…` : line;
+}
+
 /** The first thing someone asked in a session, without the leading Slack mention. */
 export function firstPrompt(entries: TranscriptEntry[]): string | undefined {
   const first = entries.find((e) => e.kind === 'user');

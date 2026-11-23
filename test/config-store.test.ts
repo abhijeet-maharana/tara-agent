@@ -1,10 +1,10 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
-import { loadHostConfig, loadJobs, loadProject, loadProjects } from '../src/config/load.js';
-import { projectConfigSchema, queueSchema } from '../src/config/schema.js';
+import { loadHostConfig, loadJobs, loadProject, loadProjects, loadQueues } from '../src/config/load.js';
+import { type Project, projectConfigSchema, queueSchema } from '../src/config/schema.js';
 import { Store } from '../src/store/store.js';
 
 function tempDir(): string {
@@ -87,6 +87,88 @@ describe('loadProject', () => {
       })(),
     );
     expect(() => loadProjects(host)).toThrow(/same slackChannel/);
+  });
+
+  it('reads a system prompt file only from inside the repo', () => {
+    const outside = path.join(tempDir(), 'secret.txt');
+    writeFileSync(outside, 'TOKEN=x');
+    const ok = makeProject(
+      { name: 'a', slackChannel: 'C1', systemPromptFile: 'prompt.md' },
+      { 'prompt.md': 'Hi' },
+    );
+    expect(loadProject(ok).systemPrompt).toBe('Hi');
+    const up = makeProject({ name: 'a', slackChannel: 'C1' });
+    writeFileSync(
+      path.join(up, '.tara', 'config.json'),
+      JSON.stringify({ name: 'a', slackChannel: 'C1', systemPromptFile: path.relative(up, outside) }),
+    );
+    expect(() => loadProject(up)).toThrow(/systemPromptFile .* must be a file inside/);
+    const linked = makeProject({ name: 'a', slackChannel: 'C1', systemPromptFile: 'link.md' });
+    symlinkSync(outside, path.join(linked, 'link.md'));
+    expect(() => loadProject(linked)).toThrow(/must be a file inside/);
+    const proc = makeProject({ name: 'a', slackChannel: 'C1', systemPromptFile: '/proc/self/environ' });
+    expect(() => loadProject(proc)).toThrow(/must be a file inside|Cannot read/);
+  });
+
+  it('takes pinned settings from the host config only, keyed by repo path', () => {
+    const dir = makeProject({
+      name: 'renamed',
+      slackChannel: 'C9',
+      billing: 'api',
+      approvals: { hookUrl: 'http://127.0.0.1:9999/steal' },
+      chatModel: 'opus',
+    });
+    const f = path.join(tempDir(), 'c.yaml');
+    writeFileSync(
+      f,
+      `projects:\n  - ${dir}\ntrusted:\n  ${dir}:\n    slackChannel: C1\n    billing: subscription\n    approvals: { hookUrl: "http://127.0.0.1:4001/hook" }\n    executorUrls: ["http://127.0.0.1:4001/send"]\n`,
+    );
+    const [project] = loadProjects(loadHostConfig(f));
+    expect(project?.config).toMatchObject({
+      name: 'renamed',
+      slackChannel: 'C1',
+      billing: 'subscription',
+      approvals: { hookUrl: 'http://127.0.0.1:4001/hook' },
+      chatModel: 'opus',
+    });
+    // A pinned key the host leaves out isn't taken from the repo either.
+    expect(project?.config.owner).toBeUndefined();
+    expect(project?.pinDrift).toEqual(['slackChannel', 'billing', 'approvals']);
+    expect(project?.trusted).toEqual({ executorUrls: ['http://127.0.0.1:4001/send'] });
+
+    const queue = (url: string) =>
+      writeFileSync(
+        path.join(dir, '.tara', 'queues.json'),
+        JSON.stringify({ queues: { email: { executor: { url } } } }),
+      );
+    queue('http://127.0.0.1:4001/send');
+    expect(Object.keys(loadQueues(project as Project))).toEqual(['email']);
+    queue('http://127.0.0.1:8080/mine');
+    expect(() => loadQueues(project as Project)).toThrow(/doesn't list/);
+    expect(() =>
+      loadHostConfig(
+        (() => {
+          const g = path.join(tempDir(), 'g.yaml');
+          writeFileSync(g, `projects: [${dir}]\ntrusted:\n  ${dir}: { chatModel: opus }\n`);
+          return g;
+        })(),
+      ),
+    ).toThrow(/can't be pinned/);
+  });
+
+  it('leaves out a project whose config does not load, when asked to', () => {
+    const good = makeProject({ name: 'a', slackChannel: 'C1' });
+    const bad = tempDir();
+    mkdirSync(path.join(bad, '.tara'));
+    writeFileSync(path.join(bad, '.tara', 'config.json'), '{ not json');
+    const f = path.join(tempDir(), 'c.yaml');
+    writeFileSync(f, `projects:\n  - ${good}\n  - ${bad}\n`);
+    const host = loadHostConfig(f);
+    expect(() => loadProjects(host)).toThrow(/Invalid JSON/);
+    const broken: string[] = [];
+    const loaded = loadProjects(host, (dir) => broken.push(dir));
+    expect(loaded.map((p) => p.config.name)).toEqual(['a']);
+    expect(broken).toEqual([bad]);
   });
 });
 
@@ -253,12 +335,13 @@ describe('Store', () => {
     const db = new DatabaseSync(file);
     const { user_version: v } = db.prepare('PRAGMA user_version').get() as { user_version: number };
     // The database as it was before the upgrade: totals in cost_usd, no session_cost_usd.
-    // (thirteen migrations back: the cost one, day_threads, the health tables, samples and logs, item priority, reminders,
+    // (twenty migrations back: the cost one, day_threads, the health tables, samples and logs, item priority, reminders,
     // reminder tasks, item handoff notes, phone devices, phone battery, dashboard threads, VM host samples, dropping the
-    // phone tables; dropping the reminders table undoes reminders and reminder tasks, and the phone tables are gone already)
+    // phone tables, the capacity columns, card chats, decided keys, item run starts, heartbeat, context size and session choice (which drops the card chats again), the chat inbox; dropping the reminders table undoes reminders and reminder tasks, dropping the
+    // sample tables undoes the capacity columns, and the phone tables are gone already)
     db.exec(
       `DROP TABLE vmhost_samples; DROP TABLE thread_aliases; DROP TABLE web_mirrors; DROP TABLE web_messages; ALTER TABLE items DROP COLUMN handoff; DROP TABLE reminders; ALTER TABLE items DROP COLUMN priority; DROP TABLE log_events; DROP TABLE host_samples; DROP TABLE health_events;
-       DROP TABLE health_state; DROP TABLE day_threads; ALTER TABLE runs DROP COLUMN session_cost_usd; PRAGMA user_version = ${v - 13};`,
+       DROP TABLE health_state; DROP TABLE day_threads; ALTER TABLE runs DROP COLUMN session_cost_usd; DROP TABLE IF EXISTS item_chat; DROP TRIGGER items_decided_key; DROP TABLE decided_keys; ALTER TABLE items DROP COLUMN run_started_at; DROP TABLE heartbeat; ALTER TABLE runs DROP COLUMN context_tokens; ALTER TABLE items DROP COLUMN session_mode; DROP TABLE inbox; PRAGMA user_version = ${v - 20};`,
     );
     const add = db.prepare(
       `INSERT INTO runs (kind, project, session_id, started_at, ended_at, status, cost_usd) VALUES ('chat', 'p', ?, ?, ?, 'ok', ?)`,

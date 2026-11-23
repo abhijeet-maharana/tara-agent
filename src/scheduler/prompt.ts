@@ -6,7 +6,8 @@ import type { Item } from '../store/store.js';
 export const JOB_SYSTEM_PROMPT = `You are running a scheduled job unattended, through tara-agent. Nobody is watching live.
 - Do the whole job now. Never wait for input mid-turn.
 - Finish first, ask at the end: do every part that needs no decision, all the way through, and never stop midway for an approval you can do without. Then raise one \`request_approval\` card per thing that needs a person (a decision, a suggestion, a login or a failure you could not fix) and end your turn. Give each card its \`handoff\` notes: its decision is acted on later by a fresh session in a new thread, which has only the card, those notes and the project memory. Drafts that go out later go through \`propose_item\`.
-- Nothing worth reporting: reply with one ✅ line saying so, e.g. "✅ No new notices".
+- Nothing worth reporting: reply with one ✅ line that says so and why, so the owner can trust it without opening the run, e.g. "✅ Nothing to do: no new notices since yesterday 18:00 (12 checked)". It is your run's Slack summary like any other reply.
+- Cards you raise wait on the Approvals page, and Slack shows only your headline's first line with their count and a link. So that line says what they are about in a few words (e.g. "⚠️ 3 UI issues found"); the cards carry the details.
 - If the job itself could not be done (a login, a page or a script broke), start the reply with ❌ and the reason, then the evidence: a first line starting with ❌ marks the run failed. Problems the job found are ⚠️, never ❌.
 - Reply format: a headline of 1–6 lines, then a line containing only ---, then the full details. The headline is what the owner gets in Slack as the run's result (a notification on their phone; its first line is the notification text), and the details stay with the run on the dashboard, a tap away. So the headline must stand alone: the outcome in the first line (e.g. "✅ Amazon Prime is on again", "⚠️ 3 Meesho labels downloaded, 1 order failed"), then, when the result is a list (orders, labels, prices), a small markdown table of it (a few rows; the rest in the details). Write normal markdown (it is converted for Slack) and use a markdown table whenever the content fits one.
 - Keep the reply clean: a one-line headline with the outcome (✅ nothing to do, ⚠️ what needs action), then a table, then only what someone has to act on. No item-by-item lines that just say 0 or OK, no process narration. This beats a report layout in the job's skill: keep its facts, use this layout. WhatsApp messages keep their own format.
@@ -89,6 +90,21 @@ export function usageParagraph(note: UsageNote, step?: string): string {
   return lines.join(' ');
 }
 
+/** A SKILL.md over this many characters is too long: every run reads all of it (Health warns past it). */
+export const SKILL_MAX_CHARS = 25_000;
+
+/**
+ * How a learning turn edits a skill, so it stays a clear procedure instead of a growing log of
+ * incidents (git keeps the history: who, when and why).
+ */
+export const SKILL_EDIT_RULES = `How to edit, so the skill stays short and clear:
+- Change the instruction where it belongs, in place: fix the step, replace the line that was wrong, add the trap to the step it happens in. Never append a note, a "lesson" or an incident section at the end.
+- Write it as a timeless instruction ("Workday: Next stays disabled until the phone field is filled; fill it first"). No dates, no who said it, no story of the run: git keeps that.
+- One rule once: if the skill already says it, sharpen that line instead of adding another.
+- Detail only some runs need (one portal's or site's quirks, long examples, templates) goes in the skill's \`references/<topic>.md\`, with SKILL.md saying when to read it.
+- Keep SKILL.md under ${SKILL_MAX_CHARS.toLocaleString('en-US')} characters. If your change would pass that, make room first: merge repeated rules or move detail to \`references/\`.
+- Leave the front matter alone except to correct the \`description\`. Don't add fields or a version.`;
+
 export function learnPrompt(reasons: string[], opts: { step?: string; usage?: UsageNote } = {}): string {
   const { step, usage } = opts;
   const opening = reasons.length
@@ -105,7 +121,9 @@ Only if writing that down would make the next run faster, cheaper or more reliab
   const memory = step ? '' : `\n\n${MEMORY_LEARN_NOTE}`;
   return `${opening}${usage ? `\n\n${usageParagraph(usage, step)}` : ''}
 
-${where} Keep it small and specific: a corrected selector or URL, a missing step, a known trap and how to get past it, a fixed bug in a script, a cheaper way to do the same work. A new script goes in the skill's \`scripts/\` folder, with SKILL.md saying when and how to run it. If the skill has a version in its front matter, bump it.${memory}
+${where} Keep it small and specific: a corrected selector or URL, a missing step, a known trap and how to get past it, a fixed bug in a script, a cheaper way to do the same work. A new script goes in the skill's \`scripts/\` folder, with SKILL.md saying when and how to run it.
+
+${SKILL_EDIT_RULES}${memory}
 
 Do not repeat the task, open the browser or call other services. Do not create new skills.
 

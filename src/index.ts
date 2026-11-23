@@ -10,7 +10,7 @@ import { codeReaders } from './code/repo.js';
 import { DEFAULT_HOST_CONFIG, expandHome, loadHostConfig, loadJobs, loadProjects } from './config/load.js';
 import { CiJobs } from './github/actions.js';
 import { PullRequests } from './github/pull-requests.js';
-import { agentChecks, healthSources, jobChecks, machine } from './health/checks.js';
+import { agentChecks, healthSources, jobChecks, machine, oversizedSkills } from './health/checks.js';
 import { claudeLoginReader } from './health/claude-login.js';
 import { LoginReminder } from './health/login-reminder.js';
 import { HealthMonitor } from './health/monitor.js';
@@ -32,7 +32,9 @@ import { openRunThread } from './scheduler/slack-trigger.js';
 import { type Logger, SessionManager } from './sessions/manager.js';
 import { Threads } from './sessions/threads.js';
 import { createSlackGateway } from './slack/app.js';
+import { backupDaily } from './store/backup.js';
 import { Store } from './store/store.js';
+import { zonedClock } from './util/time.js';
 import { deliveryOf, isWebChannel, RoutedChat, WebChat, webChannel, webProject } from './web/chat.js';
 
 /** Where warnings and errors are also kept (the Health page's Logs view), once the store is open. */
@@ -81,9 +83,9 @@ function claudeVersion(bin: string, runAs?: string): string {
   }
 }
 
-function loadAll(configFlag: string | undefined) {
+function loadAll(configFlag: string | undefined, onBroken?: (dir: string, err: Error) => void) {
   const host = loadHostConfig(path.resolve(expandHome(configFlag ?? DEFAULT_HOST_CONFIG)));
-  const projects = loadProjects(host);
+  const projects = loadProjects(host, onBroken);
   return { host, projects };
 }
 
@@ -107,7 +109,20 @@ function renameJobs(configFlag: string | undefined, [project, mapFile]: string[]
 }
 
 async function serve(configFlag: string | undefined) {
-  const { host, projects } = loadAll(configFlag);
+  // A project whose config doesn't load is left out (and shown on the Health page); the rest run.
+  const skipped: Array<{ dir: string; message: string }> = [];
+  // The latest daily copy of the database (set further down), for the Health page.
+  let backupState: { day?: string; error?: string } = {};
+  const { host, projects } = loadAll(configFlag, (dir, err) => {
+    skipped.push({ dir, message: err.message });
+    log.error(`Project ${dir} left out: ${err.message}`);
+  });
+  if (!projects.length) throw new Error('No project config loaded; see the errors above');
+  for (const p of projects)
+    if (p.pinDrift)
+      log.warn(
+        `Project ${p.config.name}: .tara/config.json changes pinned ${p.pinDrift.join(', ')}; host trusted wins`,
+      );
   log.info(`Claude Code: ${claudeVersion(host.claude.bin, host.claude.runAs)}`);
   for (const p of projects) {
     const { name, slackChannel, permissionMode, chatModel, billing } = p.config;
@@ -140,9 +155,16 @@ async function serve(configFlag: string | undefined) {
   // Every labelled run, live, for a running session's page (its steps and Stop).
   const activity = new Activity({ threadUrl });
   // Each run goes through the CLI it names (`harness`): Claude Code, or agy for agy jobs.
-  const run: Runner = activity.wrap((o) =>
-    (o.harness === 'agy' ? runAgy : runClaude)(runAs ? { ...o, runAs } : o),
-  );
+  // CLI processes alive now, of every kind (chat turns, jobs, steps, learning turns): `/health` is idle at 0.
+  let liveRuns = 0;
+  const run: Runner = activity.wrap(async (o) => {
+    liveRuns++;
+    try {
+      return await (o.harness === 'agy' ? runAgy : runClaude)(runAs ? { ...o, runAs } : o);
+    } finally {
+      liveRuns--;
+    }
+  });
   let manager: SessionManager | undefined;
   let bridge: Bridge | undefined;
   const slack = createSlackGateway({
@@ -244,6 +266,7 @@ async function serve(configFlag: string | undefined) {
     threads,
     log,
     threadUrl,
+    approvalsUrl: dashboardUrl ? `${dashboardUrl}/approvals` : undefined,
   });
   manager = new SessionManager({
     projects,
@@ -256,6 +279,7 @@ async function serve(configFlag: string | undefined) {
     bridge,
     log,
     threadUrl,
+    approvalsUrl: dashboardUrl ? `${dashboardUrl}/approvals` : undefined,
   });
   const reminders = new Reminders({
     store,
@@ -349,6 +373,11 @@ async function serve(configFlag: string | undefined) {
                 probeBrowser,
                 vmHost: () => store.lastVmHostSample(),
                 claudeLogin,
+                skippedProjects: () => skipped,
+                dbWrite: () => store.checkWrite(),
+                pinDrift: () =>
+                  projects.flatMap((p) => (p.pinDrift ? [{ project: p.config.name, keys: p.pinDrift }] : [])),
+                backup: () => backupState,
                 timeZone: host.timezone,
                 now: Date.now,
               }),
@@ -357,6 +386,7 @@ async function serve(configFlag: string | undefined) {
               const name = p.config.name;
               return jobChecks({
                 project: p,
+                skills: () => oversizedSkills(p.dir),
                 jobs: () => scheduler.list(name),
                 recent: (id) => store.jobRuns(name, id, 10),
                 latestSlots: (at) => scheduler.latestSlots(name, at),
@@ -408,6 +438,19 @@ async function serve(configFlag: string | undefined) {
   const http = host.http.enabled
     ? await startHttpServer({
         ...host.http,
+        drain: {
+          set: (on) => {
+            scheduler.draining = on;
+            queues.draining = on;
+            log.info(on ? 'Draining for a restart: no new scheduled or queue runs' : 'Drain ended');
+          },
+          state: () => ({ draining: scheduler.draining, liveRuns, queueBatches: queues.busy }),
+        },
+        // The name the dashboard is opened by is always a good Host.
+        hosts: [
+          ...host.http.hosts,
+          URL.canParse(dashboardUrl) ? new URL(dashboardUrl).hostname : 'localhost',
+        ],
         token: process.env.TARA_HTTP_TOKEN || undefined,
         scheduler,
         store,
@@ -449,8 +492,8 @@ async function serve(configFlag: string | undefined) {
   scheduler.start();
   queues.start();
   reminders.start();
-  // After Slack and the scheduler, so the first checks see them running.
-  health?.start();
+  // Chat messages a crash left unanswered: answered now, or their thread is told (SessionManager.recover).
+  void manager.recover().catch((err: Error) => log.error(`recovering chat messages: ${err.message}`));
   // The runs' Claude login: a Slack reminder with the steps, daily from 3 days before it ends.
   const loginReminder = new LoginReminder({
     login: claudeLogin,
@@ -472,7 +515,13 @@ async function serve(configFlag: string | undefined) {
   const sample = () => {
     try {
       const m = machine(host.stateDir, dbFile);
-      store.addHostSample({ at: Date.now(), load: m.load, memUsed: 1 - m.memFree, diskUsed: m.diskUsed });
+      store.addHostSample({
+        at: Date.now(),
+        load: m.load,
+        memUsed: 1 - m.memFree,
+        diskUsed: m.diskUsed,
+        swapUsed: m.swapUsed,
+      });
     } catch (err) {
       log.warn(`Machine sample not stored: ${(err as Error).message}`);
     }
@@ -506,6 +555,28 @@ async function serve(configFlag: string | undefined) {
   };
   prune();
   setInterval(prune, 86_400_000).unref();
+
+  // A checked copy of the database each day (store/backup.ts): at start when today's is missing, then
+  // hourly so a day is never skipped. A failed copy is an error on the Logs page.
+  const backupDir = path.resolve(
+    expandHome(host.backup.dir ?? path.join(host.stateDir as string, 'backups')),
+  );
+  const backup = () => {
+    try {
+      const day = zonedClock(Date.now(), host.timezone).day;
+      const { file, removed } = backupDaily(store, backupDir, host.backup.keep, day);
+      if (file)
+        log.info(`Backed up the state database to ${file}${removed ? `, deleted ${removed} old` : ''}`);
+      backupState = { day };
+    } catch (err) {
+      backupState = { error: (err as Error).message };
+      log.error(`Backing up the state database failed: ${(err as Error).message}`);
+    }
+  };
+  backup();
+  setInterval(backup, 3_600_000).unref();
+  // After Slack, the scheduler and the first backup, so the first checks see them (not "No copy yet").
+  health?.start();
 
   // Stale browser tabs: runs share each Chrome without locks and close their own tabs; this closes
   // what is left (runner/browser-tabs.ts), never a tab a conversation still going may own or a kept one.

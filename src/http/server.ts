@@ -1,4 +1,3 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync, unwatchFile, watchFile } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import {
@@ -9,7 +8,6 @@ import {
   type ServerResponse,
 } from 'node:http';
 import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https';
-import { networkInterfaces } from 'node:os';
 import path from 'node:path';
 import { Cron } from 'croner';
 import { ApprovalError, type Approvals, type ProposeInput } from '../approvals/approvals.js';
@@ -19,7 +17,7 @@ import { loadQueues } from '../config/load.js';
 import type { HostConfig, Project, QueueConfig } from '../config/schema.js';
 import type { HealthMonitor } from '../health/monitor.js';
 import type { Observability } from '../health/observability.js';
-import { parseVmHostSample, VMHOST_KEEP_DAYS, VmHostError } from '../health/vmhost.js';
+import { parseVmHostSample, VMHOST_MAX_QUERY_DAYS, VmHostError } from '../health/vmhost.js';
 import { ReminderError, type Reminders } from '../reminders/reminders.js';
 import type { Activity } from '../runner/activity.js';
 import type { Scheduler } from '../scheduler/scheduler.js';
@@ -27,6 +25,7 @@ import { type IncomingMessage as ChatMessage, type Logger, threadKey } from '../
 import { ITEM_STATUSES, type ItemStatus, type Store } from '../store/store.js';
 import { addDays, dayKey, midnight } from '../util/time.js';
 import { isWebChannel, type WebChat } from '../web/chat.js';
+import { slackSummaryOf } from '../web/summary.js';
 import { allowList } from './access.js';
 import {
   type ApprovalsTab,
@@ -34,6 +33,7 @@ import {
   ITEMS_LIMIT,
   isNotice,
   safeMediaUrl,
+  sessionLink,
   unlockPage,
 } from './approvals.js';
 import type { Attention } from './attention.js';
@@ -49,6 +49,7 @@ import {
   staleWork,
 } from './code.js';
 import {
+  anchor,
   type DashboardContext,
   errorPage,
   type HomeUsage,
@@ -67,6 +68,16 @@ import {
   tabPage,
 } from './dashboard.js';
 import { Glance, type NextRun, type QuietHours } from './glance.js';
+import {
+  ADMIN_COOKIE,
+  ADMIN_COOKIE_ATTRS,
+  adminCookieValue,
+  cookie,
+  crossSite,
+  localAddress,
+  sameSecret,
+  TOKEN_COOKIE,
+} from './guards.js';
 import { healthPage } from './health.js';
 import { logsPage, trendsPage } from './observe.js';
 import { queuePage } from './queue.js';
@@ -92,6 +103,13 @@ export interface HttpOptions {
   now?: () => number;
   /** Who may connect, as CIDR ranges. Unset: anyone who can reach `bind`. */
   allowFrom?: string[];
+  /** Extra Host names accepted when bound beyond loopback (see `trustedHost`). */
+  hosts?: string[];
+  /** Draining before a restart (`POST /drain`), and what still runs, for `/health`'s `idle`. */
+  drain?: {
+    set(on: boolean): void;
+    state(): { draining: boolean; liveRuns: number; queueBatches: number };
+  };
   /**
    * Requests for paths tara-agent doesn't serve are passed through to this URL, e.g. the service that
    * owned the port before (so its callers keep working while they move).
@@ -133,7 +151,9 @@ export interface HttpOptions {
    */
   activity?: Pick<Activity, 'tasks' | 'usage' | 'stop'> & Partial<Pick<Activity, 'subscribe'>>;
   /** A second, HTTPS listener on the same address. The certificate is re-read when its file changes. */
-  tls?: { port: number; cert: string; key: string };
+  tls?: { port: number; cert: string; key: string; appPort?: number };
+  /** Project apps (`/app/<name>/…`) on their own port, so on another origin (see host `http.appPort`). */
+  appPort?: number;
   /** The glance's quiet hours (`GET /glance`, default 23:00–07:00): desk panels hold notifications then. */
   quietHours?: QuietHours;
   /** The Health page (`/health` in a browser) and `GET /health/checks`, `POST /health/check`. */
@@ -237,29 +257,9 @@ async function readJson(req: IncomingMessage, limit = 10_000): Promise<Record<st
  */
 /** Paths tara-agent serves itself; with a fallback, everything else is passed through. */
 const OWN_PATH =
-  /^\/(?:$|(?:health|metrics|reload|attention|jobs|runs|sessions|schedule|approvals|queue|items|reminders|unlock|code|internal|p|app|glance)(?:\/|$))/;
-const TOKEN_COOKIE = 'tara_token';
-const ADMIN_COOKIE = 'tara_admin';
+  /^\/(?:$|(?:health|metrics|reload|drain|attention|jobs|runs|sessions|schedule|approvals|queue|items|reminders|unlock|code|internal|p|app|glance)(?:\/|$))/;
 /** Finished items shown on the Done tab. */
 const DONE_DAYS = 30;
-
-const cookie = (req: IncomingMessage, name: string) =>
-  (req.headers.cookie ?? '')
-    .split(/;\s*/)
-    .find((c) => c.startsWith(`${name}=`))
-    ?.slice(name.length + 1);
-
-const sameSecret = (a: string, b: string) =>
-  timingSafeEqual(createHash('sha256').update(a).digest(), createHash('sha256').update(b).digest());
-
-/** Addresses of this machine: a request from one of them could be the agent itself. */
-function localAddress(address: string | undefined): boolean {
-  const a = (address ?? '').replace(/^::ffff:/, '');
-  if (!a || a === '::1' || a.startsWith('127.')) return true;
-  return Object.values(networkInterfaces()).some((list) =>
-    list?.some((n) => n.address.replace(/^::ffff:/, '') === a),
-  );
-}
 
 const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
 
@@ -328,28 +328,8 @@ export function itemInput(body: Record<string, unknown>): ProposeInput {
   };
 }
 
-const LOOPBACK_HOST = /^(localhost|127(?:\.\d{1,3}){3}|\[::1\])(:\d+)?$/i;
-
-/**
- * Why a request looks like it came from another website, else undefined. A page on any site can make
- * the browser POST to 127.0.0.1 (no token is needed by default), and a DNS-rebinding page can even
- * read the answers. So: a write whose Origin is another host is refused, and a server bound to
- * loopback only answers to loopback Host names. Scripts (curl, the MCP server) send no Origin.
- */
-export function crossSite(req: IncomingMessage, bind: string): string | undefined {
-  const host = req.headers.host ?? '';
-  if (LOOPBACK_HOST.test(bind.includes(':') ? `[${bind}]` : bind) && !LOOPBACK_HOST.test(host))
-    return `unexpected Host "${host.slice(0, 100)}"`;
-  const method = req.method ?? 'GET';
-  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return undefined;
-  const origin = req.headers.origin;
-  if (origin === undefined) return undefined;
-  let from: string | undefined;
-  try {
-    from = new URL(origin).host;
-  } catch {}
-  return from === host ? undefined : `cross-site ${method} from ${origin.slice(0, 100)}`;
-}
+// Kept importable from here (tests and older callers).
+export { adminCookieValue, crossSite, trustedHost } from './guards.js';
 
 export async function startHttpServer(options: HttpOptions): Promise<Server> {
   const now = options.now ?? Date.now;
@@ -573,21 +553,44 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     if (!options.decisionsFromLocal && localAddress(req.socket.remoteAddress))
       throw new HttpError(403, 'Decisions are only taken from another device, not from this machine');
     const given = cookie(req, ADMIN_COOKIE);
-    if (!given || !sameSecret(given, options.adminToken))
+    // The raw token is still taken from a browser unlocked before the cookie held the derived key; any
+    // page it opens swaps it (see `handle`).
+    if (
+      !given ||
+      !(sameSecret(given, adminCookieValue(options.adminToken)) || sameSecret(given, options.adminToken))
+    )
       throw new HttpError(403, 'This browser is not unlocked for decisions: open /unlock');
     return 'dashboard';
   };
 
+  let build: object | undefined;
   const route = async (req: IncomingMessage): Promise<unknown> => {
     const url = new URL(req.url ?? '/', 'http://localhost');
     const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
     const method = req.method ?? 'GET';
 
     if (method === 'GET' && url.pathname === '/health') {
+      // Which code is running: dist/build.json from `npm run build` (src hash and time).
+      build ??= (() => {
+        try {
+          return JSON.parse(readFileSync(new URL('../build.json', import.meta.url), 'utf8')) as object;
+        } catch {
+          return {};
+        }
+      })();
       const jobs = options.projects.flatMap((p) => options.scheduler.list(p));
       const counts = options.health?.snapshot()?.counts;
+      const drain = options.drain?.state();
+      const busyJobs = jobs.filter((j) => j.running).length;
       return {
         ok: true,
+        ...(Object.keys(build).length && { build }),
+        // Safe to restart: no CLI process, no job running or waiting, no queue batch (see POST /drain).
+        ...(drain && {
+          idle: drain.liveRuns === 0 && busyJobs === 0 && drain.queueBatches === 0,
+          draining: drain.draining,
+          liveRuns: drain.liveRuns,
+        }),
         ...(counts && { checks: counts }),
         uptimeSeconds: Math.floor((now() - started) / 1000),
         projects: options.projects,
@@ -597,7 +600,24 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
           running: jobs.filter((j) => j.running && !j.waitingFor).length,
           waiting: jobs.filter((j) => j.waitingFor).length,
         },
+        // CLIs at their usage limit, and when scheduled runs on them start again.
+        limits: Object.fromEntries(
+          Object.entries(options.scheduler.holds?.active() ?? {}).map(([h, t]) => [
+            h,
+            new Date(t).toISOString(),
+          ]),
+        ),
       };
+    }
+    // Before a restart: stop starting scheduled and queue runs, let running work finish, then restart
+    // once `/health` says `idle`. Needs x-tara-admin (the deploy reads it as root, like jarvis-doctor).
+    if (method === 'POST' && url.pathname === '/drain' && options.drain) {
+      const given = req.headers['x-tara-admin'];
+      if (!options.adminToken || typeof given !== 'string' || !sameSecret(given, options.adminToken))
+        throw new HttpError(403, 'Needs the x-tara-admin header with TARA_ADMIN_TOKEN');
+      const body = await readJson(req).catch(() => ({}) as Record<string, unknown>);
+      options.drain.set(body.on !== false);
+      return options.drain.state();
     }
     if (method === 'GET' && url.pathname === '/health/checks' && options.health) {
       return options.health.snapshot() ?? (await options.health.check());
@@ -621,11 +641,19 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       }
       if (method === 'GET') {
         const hours = Math.min(
-          24 * VMHOST_KEEP_DAYS,
+          24 * VMHOST_MAX_QUERY_DAYS,
           Math.max(1, Number(url.searchParams.get('hours')) || 1),
         );
         return { samples: options.store.vmHostSamples(now() - hours * 3_600_000) };
       }
+    }
+    // This machine's own samples (load, memory, disk, swap; every 5 minutes), e.g. for capacity reports.
+    if (method === 'GET' && url.pathname === '/host/metrics') {
+      const hours = Math.min(
+        24 * VMHOST_MAX_QUERY_DAYS,
+        Math.max(1, Number(url.searchParams.get('hours')) || 1),
+      );
+      return { samples: options.store.hostSamples(now() - hours * 3_600_000) };
     }
     if (method === 'GET' && url.pathname === '/jobs') {
       const project = knownProject(url.searchParams.get('project'));
@@ -762,8 +790,9 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         void options.continueThread({ channel, threadTs, ts: threadTs, user: owner ?? 'admin', text });
         return { ok: true, threadKey: session.threadKey };
       }
-      // The session page's reply box: as the project's owner, from an unlocked browser. In a dashboard
-      // thread it shows there and the answer comes there; in a Slack thread the answer comes in Slack.
+      // The session page's reply box: as the project's owner, from an unlocked browser. A session Slack
+      // shows (a Slack thread, or a dashboard run with a Slack summary) gets the message there too, as the
+      // owner, and the answer there (`Approvals.sayFromDashboard`); a dashboard-only one answers here.
       if (method === 'POST' && parts.length === 3 && parts[2] === 'say') {
         human(req);
         if (!options.continueThread) throw new HttpError(404, 'Chat is not running');
@@ -782,9 +811,24 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
           isWebChannel(channel) && options.web
             ? await options.web.post(channel, threadTs, text, user)
             : threadTs;
-        void options
-          .continueThread({ channel, threadTs, ts, user, text })
-          .catch((err: Error) => options.log.warn(`reply in ${session.threadKey}: ${err.message}`));
+        // Slack shows this session too (its own thread, or a dashboard run's summary thread): your
+        // message goes there, as you, and Jarvis answers it there, so Slack never has only the answer.
+        const slackChannel = options.dashboard?.projects.find((p) => p.config.name === session.project)
+          ?.config.slackChannel;
+        const summaryTs =
+          isWebChannel(channel) && slackChannel
+            ? slackSummaryOf(options.store, slackChannel, channel, threadTs)
+            : undefined;
+        const inSlack = !isWebChannel(channel)
+          ? { channel, threadTs }
+          : slackChannel && summaryTs
+            ? { channel: slackChannel, threadTs: summaryTs }
+            : undefined;
+        const said =
+          inSlack && approvals
+            ? approvals.sayFromDashboard(inSlack, text, user)
+            : options.continueThread({ channel, threadTs, ts, user, text });
+        void said.catch((err: Error) => options.log.warn(`reply in ${session.threadKey}: ${err.message}`));
         return { ok: true, threadKey: session.threadKey };
       }
     }
@@ -923,10 +967,12 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
             reply: str(body.reply),
             runNow: body.runNow === true,
             seen: typeof body.seen === 'number' ? body.seen : undefined,
+            session: body.session === 'new' || body.session === 'continue' ? body.session : undefined,
           }),
         };
       }
-      // A note about a waiting card without deciding it: to Jarvis in the card's Slack thread.
+      // A note about a waiting card without deciding it: to Jarvis in the card's thread, whose session
+      // page (`session`) shows the answer live.
       if (method === 'POST' && parts.length === 3 && parts[2] === 'note') {
         const by = human(req);
         const id = parts[1] as string;
@@ -934,8 +980,8 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
           ?.trim()
           .slice(0, 4_000);
         if (!text) throw new HttpError(400, '"text" is required');
-        await approvals.note(id, text, owner(id) ?? by);
-        return { ok: true };
+        const item = await approvals.note(id, text, owner(id) ?? by);
+        return { ok: true, version: item.updatedAt, session: sessionLink(item) };
       }
       if (method === 'POST' && parts.length === 3 && parts[2] === 'withdraw') {
         const body = await readJson(req);
@@ -1399,7 +1445,23 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
           if (gap <= FREQUENT_MS) every.set(`${p}:${id}`, gap);
         }
       const views = jobViews();
+      const live = options.activity
+        ?.tasks()
+        .filter((t) => t.status === 'running')
+        .map((t) => ({
+          kind: t.kind,
+          project: t.project,
+          title: t.title,
+          jobId: t.jobId,
+          // Its session; a job step (a session of its own, no thread) links to its job.
+          href: t.thread
+            ? `/t/${encodeURIComponent(t.thread.channel)}/${encodeURIComponent(t.thread.ts)}`
+            : t.jobId
+              ? `/jobs#${anchor({ project: t.project, id: t.jobId })}`
+              : undefined,
+        }));
       return homePage(ctx, {
+        live,
         quote: pickQuote(loadQuotes(ctx.projects.map((p) => p.dir))),
         models: modelUses(ctx.projects, views, options.dashboard?.models),
         effort: options.dashboard?.models?.effort,
@@ -1475,11 +1537,17 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       const since = (t: ApprovalsTab) => (t === 'done' ? at - DONE_DAYS * 86_400_000 : undefined);
       const list = (t: ApprovalsTab) =>
         options.store.items({ project, statuses: STATUSES[t], since: since(t), limit: ITEMS_LIMIT });
+      const items = list(tab);
       return approvalsPage(ctx, {
         tab,
         project,
         kind: url.searchParams.get('kind') ?? undefined,
-        items: list(tab),
+        items,
+        // Live advice; a card whose message says otherwise by now is edited to match (Slack too).
+        advice:
+          tab === 'waiting' && approvals
+            ? new Map(items.map((i) => [i.id, approvals.syncAdvice(i).choice]))
+            : undefined,
         counts: { waiting: list('waiting').filter((i) => !isNotice(i)).length, done: list('done').length },
         jobNames: jobNames(),
         queues,
@@ -1611,6 +1679,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         view,
         changes.find((c) => c.path === file),
         canDecide(req),
+        url.searchParams.get('view') === 'source' ? 'source' : 'formatted',
       );
     }
     if (parts[2] === 'files') return codeTreePage(ctx, reader.repo, file, await reader.tree(file), changes);
@@ -1634,6 +1703,8 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     base: URL,
     path: string,
     extraHeaders: Record<string, string> = {},
+    /** A script put into every uncompressed HTML page of the answer (the app tab's location reporter). */
+    inject?: string,
   ) => {
     let target: URL | undefined;
     try {
@@ -1668,8 +1739,27 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         },
       },
       (answer) => {
-        res.writeHead(answer.statusCode ?? 502, answer.headers);
-        answer.pipe(res);
+        const html =
+          inject &&
+          /^text\/html/i.test(String(answer.headers['content-type'] ?? '')) &&
+          !answer.headers['content-encoding'];
+        if (!html) {
+          res.writeHead(answer.statusCode ?? 502, answer.headers);
+          answer.pipe(res);
+          return;
+        }
+        const chunks: Buffer[] = [];
+        answer.on('data', (c: Buffer) => chunks.push(c));
+        answer.on('end', () => {
+          const page = Buffer.concat(chunks).toString('utf8');
+          const tag = `<script>${inject}</script>`;
+          const at = page.search(/<head[^>]*>/i);
+          const out = at === -1 ? tag + page : page.replace(/<head[^>]*>/i, (head) => head + tag);
+          const headers = { ...answer.headers };
+          delete headers['content-length'];
+          res.writeHead(answer.statusCode ?? 502, headers);
+          res.end(out);
+        });
       },
     );
     upstream.on('error', (err) => {
@@ -1701,13 +1791,76 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     return true;
   };
 
+  /**
+   * Where a request's page sits and where the project apps are served (`http.appPort`, or
+   * `tls.appPort` over HTTPS): same host name, other port. Undefined app origin: apps stay on this one.
+   */
+  // The ports as bound (a configured 0 means any free port).
+  const bound = { http: options.port, https: options.tls?.port };
+  const origins = (req: IncomingMessage) => {
+    const encrypted = Boolean((req.socket as { encrypted?: boolean }).encrypted);
+    const hostname = (req.headers.host ?? 'localhost').replace(/:\d+$/, '');
+    const scheme = encrypted ? 'https' : 'http';
+    const mainPort = encrypted ? bound.https : bound.http;
+    const appPort = encrypted ? options.tls?.appPort : options.appPort;
+    return {
+      main: `${scheme}://${hostname}:${mainPort}`,
+      app: appPort ? `${scheme}://${hostname}:${appPort}` : undefined,
+    };
+  };
+
+  /** Told to the app tab's parent page on every navigation, so its address and tab follow the app. */
+  const locationReporter = (parent: string) =>
+    `(()=>{if(window.parent===window)return;const post=()=>window.parent.postMessage({type:'tara:location',path:location.pathname,search:location.search,hash:location.hash,title:document.title},${JSON.stringify(parent)});for(const m of['pushState','replaceState']){const o=history[m];history[m]=function(...a){const r=o.apply(this,a);post();return r}}addEventListener('popstate',post);addEventListener('hashchange',post);addEventListener('load',post);post()})()`;
+
+  /**
+   * The app port: only `/app/<name>/…` of tabbed projects, proxied like on the dashboard's port, with the
+   * location reporter in each page. Anything else goes to the dashboard. Nothing of tara-agent's own API
+   * is served here, and its cookies never reach the app.
+   */
+  const handleApp = (req: IncomingMessage, res: ServerResponse) => {
+    if (!allowed(req.socket.remoteAddress)) {
+      res.writeHead(403, { 'content-type': 'text/plain' });
+      res.end('Forbidden: not on the allowed networks');
+      return;
+    }
+    const refused = crossSite(req, options.bind, options.hosts);
+    if (refused) {
+      res.writeHead(403, { 'content-type': 'text/plain' });
+      res.end(`Forbidden: ${refused}`);
+      return;
+    }
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    const { main } = origins(req);
+    const tab = /^\/app\/([a-z0-9][a-z0-9-]*)(\/.*)?$/.exec(url.pathname);
+    const project = tab && tabbed(options.dashboard?.projects ?? []).find((p) => p.config.name === tab[1]);
+    if (!tab || !project) {
+      res.writeHead(302, { location: main + url.pathname + url.search });
+      res.end();
+      return;
+    }
+    if (!tokenHolder(req)) {
+      res.writeHead(401, { 'content-type': 'text/plain' });
+      res.end('Open the dashboard once with ?token=<TARA_HTTP_TOKEN> added to the address.');
+      return;
+    }
+    passThrough(
+      req,
+      res,
+      new URL(project.config.dashboardUrl as string),
+      (tab[2] || '/') + url.search,
+      { 'x-tara-prefix': `/app/${project.config.name}` },
+      locationReporter(main),
+    );
+  };
+
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
     if (!allowed(req.socket.remoteAddress)) {
       res.writeHead(403, { 'content-type': 'text/plain' });
       res.end('Forbidden: not on the allowed networks');
       return;
     }
-    const refused = crossSite(req, options.bind);
+    const refused = crossSite(req, options.bind, options.hosts);
     if (refused) {
       options.log.warn(`refused ${req.method} ${req.url}: ${refused}`);
       res.writeHead(403, { 'content-type': 'text/plain' });
@@ -1720,6 +1873,13 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       return;
     }
     const internalPath = url.pathname.startsWith('/internal/');
+    // A browser still holding the raw admin token in its cookie gets the derived key instead.
+    const adminCookie = cookie(req, ADMIN_COOKIE);
+    if (options.adminToken && adminCookie && sameSecret(adminCookie, options.adminToken))
+      res.setHeader(
+        'set-cookie',
+        `${ADMIN_COOKIE}=${adminCookieValue(options.adminToken)}; ${ADMIN_COOKIE_ATTRS}`,
+      );
     if (options.token && !internalPath && url.searchParams.get('token') === options.token) {
       url.searchParams.delete('token');
       res.writeHead(303, {
@@ -1742,7 +1902,14 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         res.end('Open the dashboard once with ?token=<TARA_HTTP_TOKEN> added to the address.');
         return;
       }
+      const appOrigin = origins(req).app;
       if (tab[1] === 'app') {
+        // With an app port the app lives there, on another origin (old links are sent on).
+        if (appOrigin) {
+          res.writeHead(302, { location: appOrigin + url.pathname + url.search });
+          res.end();
+          return;
+        }
         // The app gets its own cookies, never tara-agent's keys (passThrough strips them).
         passThrough(req, res, new URL(tabProject.config.dashboardUrl as string), (rest || '/') + url.search, {
           'x-tara-prefix': `/app/${name}`,
@@ -1757,7 +1924,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       }
       const ctxTab = pageContext();
       if (req.method === 'GET' && ctxTab)
-        return sendHtml(res, 200, tabPage(ctxTab, tabProject, rest + url.search));
+        return sendHtml(res, 200, tabPage(ctxTab, tabProject, rest + url.search, appOrigin));
     }
     if (req.method === 'POST' && url.pathname === '/unlock' && options.dashboard && tokenHolder(req)) {
       const ctxUnlock = pageContext() as DashboardContext;
@@ -1781,7 +1948,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       }
       res.writeHead(303, {
         location: '/approvals',
-        'set-cookie': `${ADMIN_COOKIE}=${given}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000`,
+        'set-cookie': `${ADMIN_COOKIE}=${adminCookieValue(options.adminToken)}; ${ADMIN_COOKIE_ATTRS}`,
       });
       res.end();
       return;
@@ -1901,6 +2068,18 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     options.port,
     'HTTP API',
   );
+  bound.http = (server.address() as { port: number }).port;
+  const extra: Array<Server | HttpsServer> = [];
+  server.on('close', () => {
+    for (const s of extra) s.close();
+  });
+  if (options.appPort)
+    try {
+      extra.push(await listen(createServer(handleApp), options.appPort, 'Project apps'));
+    } catch (err) {
+      server.close();
+      throw err;
+    }
   const tls = options.tls;
   if (tls) {
     const read = () => ({ cert: readFileSync(tls.cert), key: readFileSync(tls.key) });
@@ -1911,14 +2090,25 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         tls.port,
         'HTTPS',
       );
+      bound.https = (secure.address() as { port: number }).port;
     } catch (err) {
       server.close();
       throw err;
     }
+    let secureApps: HttpsServer | undefined;
+    if (tls.appPort)
+      try {
+        secureApps = await listen(createHttpsServer(read(), handleApp), tls.appPort, 'HTTPS');
+        extra.push(secureApps);
+      } catch (err) {
+        server.close();
+        throw err;
+      }
     // Certificates are renewed in place (`tailscale cert` every month or two): pick up the new one.
     watchFile(tls.cert, { interval: 60_000 }, () => {
       try {
         secure.setSecureContext(read());
+        secureApps?.setSecureContext(read());
         options.log.info('HTTPS: loaded the renewed certificate');
       } catch (err) {
         options.log.warn(`HTTPS: could not load the certificate: ${(err as Error).message}`);

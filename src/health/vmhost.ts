@@ -31,6 +31,8 @@ export interface VmHostSample {
   vmMemBytes?: number;
   /** Power drawn, watts. */
   powerW?: number;
+  /** Seconds since the host's keyboard or mouse was last used: small means someone is at it. */
+  idleSec?: number;
 }
 
 /** The host reports every 5 minutes: silent this long is a warning, then an alert. */
@@ -38,8 +40,8 @@ export const VMHOST_WARN_MS = 15 * 60_000;
 export const VMHOST_BAD_MS = 60 * 60_000;
 /** Swap this large on the host means the VM and the host's own apps don't fit in its RAM. */
 const SWAP_WARN_BYTES = 4 * 1024 ** 3;
-/** Samples kept (and charted on the Trends page). */
-export const VMHOST_KEEP_DAYS = 31;
+/** The most history `GET /vmhost/metrics` returns; samples are kept for host `retentionDays`. */
+export const VMHOST_MAX_QUERY_DAYS = 366;
 
 export class VmHostError extends Error {}
 
@@ -71,6 +73,7 @@ export function parseVmHostSample(body: Record<string, unknown>, at: number): Vm
     vmCpu: num(body.vmCpu, 'vmCpu', 0, 1),
     vmMemBytes: num(body.vmMemBytes, 'vmMemBytes', 0, 2 ** 50),
     powerW: num(body.powerW, 'powerW', 0, 10_000),
+    idleSec: num(body.idleSec, 'idleSec', 0, 10 ** 9),
   };
   for (const k of Object.keys(s) as Array<keyof VmHostSample>) if (s[k] === undefined) delete s[k];
   if (!Object.keys(s).some((k) => k !== 'at' && k !== 'name'))

@@ -1,6 +1,8 @@
+import path from 'node:path';
 import type { Change, CodeRepo, DiffView, FileView, RepoStatus, SearchResult } from '../code/repo.js';
 import { MAX_DIFF_LINES, MAX_FILE_BYTES } from '../code/repo.js';
 import { type DashboardContext, esc, layout, pageHead, relative, section } from './dashboard.js';
+import { markdownDoc } from './markdown-doc.js';
 
 /**
  * The Code page: each repo's uncommitted changes, their diffs, a file browser and search (file
@@ -34,6 +36,14 @@ const CSS = `<style>
 .hit{display:grid;grid-template-columns:44px 1fr;padding:3px 0;border-radius:6px;color:var(--text);text-decoration:none;font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
 .hit:hover{background:var(--card-hover)}.hit i{font-style:normal;text-align:right;padding-right:8px;color:var(--text-dim)}.hit code{background:none;border:0;padding:0;font-size:inherit;white-space:pre-wrap;overflow-wrap:anywhere}
 .hit-file{display:block;margin:10px 0 2px;text-decoration:none}
+.viewtabs{margin:0 0 14px}
+.doc{background:var(--card-bg);border:1px solid var(--border);border-radius:var(--radius);padding:6px 18px 14px;font-size:15px;line-height:1.6;overflow-wrap:anywhere}
+.doc h2,.doc h3,.doc h4,.doc h5,.doc h6{color:var(--text-heading);line-height:1.3;margin:22px 0 8px;scroll-margin-top:90px}
+.doc h2{font-size:21px;padding-bottom:6px;border-bottom:1px solid var(--border)}.doc h3{font-size:17.5px}.doc h4{font-size:15.5px}.doc h5,.doc h6{font-size:14.5px;color:var(--text-dim)}
+.doc p{margin:10px 0}.doc ul.md,.doc ol.md{margin:8px 0;padding-left:24px}.doc li{margin:3px 0}.doc li>ul.md,.doc li>ol.md{margin:3px 0}
+.doc pre.doc-code{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font:12.5px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+.doc code{font-size:.9em}.doc .tbl-wrap{margin:12px 0}
+.doc-meta{margin:12px 0 4px;width:100%;font-size:13.5px}.doc-meta th{width:1%;white-space:nowrap}
 mark{background:var(--amber-dim);color:var(--amber);border-radius:3px;padding:0 1px}
 </style>`;
 
@@ -349,6 +359,33 @@ export function codeTreePage(
   );
 }
 
+/** Files the Code page shows formatted (a document), with the source a tap away. */
+export const isMarkdown = (file: string) => /\.(md|markdown)$/i.test(file);
+
+/**
+ * A relative link in a Markdown file (`references/x.md`, `../README.md#setup`, `/docs/`) as a Code page
+ * URL in the same repo, or undefined when it leaves the repo or isn't a file link (`mailto:`). A
+ * `#heading` alone stays on the page.
+ */
+export function codeLink(repo: Pick<CodeRepo, 'name'>, file: string, href: string): string | undefined {
+  if (href.startsWith('#')) return href;
+  if (/^[a-z][\w+.-]*:/i.test(href)) return undefined;
+  const [target = '', hash] = href.split('#');
+  let to: string;
+  try {
+    to = decodeURIComponent(target);
+  } catch {
+    to = target;
+  }
+  const joined = path.posix.normalize(
+    to.startsWith('/') ? to.slice(1) : path.posix.join(path.posix.dirname(file), to),
+  );
+  if (joined === '..' || joined.startsWith('../')) return undefined;
+  if (joined === '.') return repoUrl(repo as CodeRepo, 'files', '');
+  if (to.endsWith('/')) return repoUrl(repo as CodeRepo, 'files', joined.replace(/\/$/, ''));
+  return `${repoUrl(repo as CodeRepo, 'file', joined)}${hash && isMarkdown(joined) ? `#${hash}` : ''}`;
+}
+
 export function codeFilePage(
   ctx: DashboardContext,
   repo: CodeRepo,
@@ -356,17 +393,35 @@ export function codeFilePage(
   view: FileView,
   change: Change | undefined,
   canAsk: boolean,
+  /** `source`: the lines as they are, even for Markdown (which is shown formatted otherwise). */
+  as: 'formatted' | 'source' = 'formatted',
 ): string {
   const size = view.size < 1024 ? `${view.size} B` : `${Math.round(view.size / 1024)} KB`;
+  const markdown = isMarkdown(file) && view.text !== undefined && !view.binary && !view.tooBig;
+  const formatted = markdown && as === 'formatted';
+  // Markdown: Formatted (a document) or Source (numbered lines, which `#L12` and search hits need).
+  const tabs = markdown
+    ? `<div class="toolbar viewtabs"><div class="chips views">${[
+        ['formatted', 'Formatted', repoUrl(repo, 'file', file)],
+        ['source', 'Source', `${repoUrl(repo, 'file', file)}&view=source`],
+      ]
+        .map(
+          ([key, label, href]) =>
+            `<a class="chip${as === key ? ' on' : ''}" href="${esc(href)}"${as === key ? ' aria-current="page"' : ''}>${label}</a>`,
+        )
+        .join('')}</div></div>`
+    : '';
   const body = view.tooBig
     ? `<p class="empty">Too big to show here (${size}, the limit is ${MAX_FILE_BYTES / 1024} KB).</p>`
     : view.binary
       ? `<p class="empty">Binary file (${size}).</p>`
-      : `<div class="src">${(view.text ?? '')
-          .replace(/\n$/, '')
-          .split('\n')
-          .map((l, i) => `<div id="L${i + 1}"><i>${i + 1}</i><code>${esc(l) || ' '}</code></div>`)
-          .join('')}</div>`;
+      : formatted
+        ? markdownDoc(view.text ?? '', (href) => codeLink(repo, file, href))
+        : `<div class="src">${(view.text ?? '')
+            .replace(/\n$/, '')
+            .split('\n')
+            .map((l, i) => `<div id="L${i + 1}"><i>${i + 1}</i><code>${esc(l) || ' '}</code></div>`)
+            .join('')}</div>`;
   const name = file.split('/').pop() ?? file;
   return layout(
     ctx,
@@ -376,8 +431,13 @@ export function codeFilePage(
       repo,
       file,
       'file',
-    )}${body}${askBox(repo, file, canAsk, 'this file')}`,
-    { script: SCRIPT },
+    )}${tabs}${body}${askBox(repo, file, canAsk, 'this file')}`,
+    // A line link (#L12) is to the source: a formatted page has no lines to land on.
+    {
+      script: formatted
+        ? `${SCRIPT}\nif (/^#L\\d+$/.test(location.hash)) location.replace(${JSON.stringify(`${repoUrl(repo, 'file', file)}&view=source`).replace(/</g, '\\u003c')} + location.hash);`
+        : SCRIPT,
+    },
   );
 }
 
@@ -406,7 +466,7 @@ export function codeSearchPage(
           `<a class="hit-file" href="${repoUrl(repo, 'file', file)}">${pathHtml(file)}</a><div class="hits">${hits
             .map(
               (h) =>
-                `<a class="hit" href="${repoUrl(repo, 'file', file)}#L${h.line}"><i>${h.line}</i><code>${highlight(h.text, query)}</code></a>`,
+                `<a class="hit" href="${repoUrl(repo, 'file', file)}${isMarkdown(file) ? '&view=source' : ''}#L${h.line}"><i>${h.line}</i><code>${highlight(h.text, query)}</code></a>`,
             )
             .join('')}</div>`,
       )

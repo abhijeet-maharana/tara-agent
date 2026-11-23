@@ -9,6 +9,7 @@ import type { RunOptions, RunOutcome } from '../src/runner/run.js';
 import { streamRecipient } from '../src/scheduler/job-runner.js';
 import { Scheduler } from '../src/scheduler/scheduler.js';
 import { findRunJob, parseScheduledRun, SCHEDULE_BY } from '../src/scheduler/slack-trigger.js';
+import { troubleReasons } from '../src/sessions/learn.js';
 import { Threads } from '../src/sessions/threads.js';
 import { type Item, Store } from '../src/store/store.js';
 import { FakeChat, FakeStream, fakeChrome, testHost } from './fakes.js';
@@ -547,17 +548,25 @@ describe('Scheduler', () => {
       await none.scheduler.stop();
     });
 
+    it('counts tool errors as trouble only when there are many, and a good share of the calls', () => {
+      const run = (toolCalls: number) => ({ ...ok('done'), toolCalls });
+      expect(troubleReasons(run(10), 2)).toEqual([]); // a grep that found nothing, twice: normal work
+      expect(troubleReasons(run(40), 6)).toEqual([]); // 15% of a long run
+      expect(troubleReasons(run(12), 5)).toEqual(['5 of 12 tool calls returned errors']);
+      expect(troubleReasons({ ...run(40), status: 'timeout' }, 0)[0]).toMatch(/timed out/);
+    });
+
     it('learns from tool errors in a silent run, with the note in its kept thread', async () => {
       const { chat, calls, scheduler } = setup({
         jobs: [baseJob],
         selfImprove: 'trouble',
-        toolErrors: 2,
+        toolErrors: 5,
         replies: ['', 'SKILL.md: dismiss the cookie banner first'],
       });
       scheduler.start();
       scheduler.trigger('shop', 'sla', 'U1');
       await scheduler.idle();
-      expect(calls[1]?.prompt).toContain('2 tool calls returned errors');
+      expect(calls[1]?.prompt).toContain('5 of 5 tool calls returned errors');
       expect(calls).toHaveLength(2);
       // A silent run keeps its thread, so the lesson's note goes there.
       expect(chat.log.some((l) => l.startsWith('post ts1') && l.includes('🔧'))).toBe(true);
@@ -759,6 +768,179 @@ describe('Scheduler', () => {
     await scheduler.stop();
   });
 
+  it('pauses and resumes a job written in the skill form, which has no id key', async () => {
+    const skillJob = { skill: 'sla-report', cron: '0 * * * *', tz: 'UTC', model: 'haiku' };
+    const { scheduler, project } = setup({ jobs: [skillJob] });
+    const file = path.join(project.dir, '.tara', 'jobs.json');
+    scheduler.start();
+    expect(scheduler.setEnabled('shop', 'sla-report', false)).toBe('ok');
+    expect(JSON.parse(readFileSync(file, 'utf8')).jobs[0]).toEqual({ ...skillJob, enabled: false });
+    expect(scheduler.list('shop')[0]).toMatchObject({ id: 'sla-report', enabled: false });
+    expect(scheduler.setDuration('shop', 'sla-report', 7)).toBe('ok');
+    expect(scheduler.setEnabled('shop', 'sla-report', true)).toBe('ok');
+    expect(JSON.parse(readFileSync(file, 'utf8')).jobs[0]).toEqual({ ...skillJob, durationMinutes: 7 });
+    await scheduler.stop();
+  });
+
+  it('closes a slot when its run is recorded, before the learning turn', async () => {
+    let now = Date.parse('2026-10-25T10:20:00Z');
+    const store = new Store(':memory:', () => now);
+    const a = setup({ jobs: [baseJob], store, now: () => now });
+    a.scheduler.start();
+    await a.scheduler.stop();
+    now = Date.parse('2026-10-25T11:30:00Z');
+    const claim = () => store.slotClaim('shop:sla', Date.parse('2026-10-25T11:00:00Z'))?.status ?? 'none';
+    const seen: string[] = [];
+    const b = setup({
+      jobs: [baseJob],
+      store,
+      now: () => now,
+      selfImprove: 'trouble',
+      replies: ['❌ Broken', 'No lesson'],
+      during: async () => {
+        seen.push(claim());
+      },
+    });
+    b.scheduler.start();
+    await pickUp(b.scheduler, b.chat);
+    expect(b.calls).toHaveLength(2);
+    // A crash during the learning turn would otherwise leave the slot `running`, and run the job again.
+    expect(seen).toEqual(['running', 'failed']);
+    await b.scheduler.stop();
+  });
+
+  it('holds scheduled runs while the usage limit is reached, then runs the latest held slot once', async () => {
+    let now = Date.parse('2026-10-25T10:20:00Z');
+    const store = new Store(':memory:', () => now);
+    const a = setup({ jobs: [baseJob], store, now: () => now });
+    a.scheduler.start();
+    await a.scheduler.stop();
+    now = Date.parse('2026-10-25T11:30:00Z');
+    const b = setup({
+      jobs: [baseJob],
+      store,
+      now: () => now,
+      outcomes: [{ status: 'limit', error: "You've hit your limit · resets 2pm (UTC)" }],
+    });
+    b.scheduler.start();
+    await pickUp(b.scheduler, b.chat);
+    expect(b.calls).toHaveLength(1);
+    expect(b.scheduler.holds.heldUntil('claude')).toBe(Date.parse('2026-10-25T14:00:00Z'));
+
+    // The 12:00 slot comes while the limit holds: kept, no run that would only fail.
+    now = Date.parse('2026-10-25T12:00:00Z');
+    // biome-ignore lint/suspicious/noExplicitAny: firing one slot directly
+    const sched = b.scheduler as any;
+    const entry = sched.entries.get('shop:sla');
+    expect(sched.fire(entry.scheduled, now, 'schedule')).toBe(false);
+    expect(store.slotClaim('shop:sla', now)?.status).toBe('held');
+    expect(b.calls).toHaveLength(1);
+    expect(b.scheduler.enabled('shop', 'sla')).toBe(false); // queue items wait too
+
+    // After the reset, only the latest held slot runs.
+    now = Date.parse('2026-10-25T14:01:00Z');
+    expect(sched.holds.ended()).toEqual(['claude']);
+    b.scheduler.retryHeld('claude');
+    await pickUp(b.scheduler, b.chat);
+    expect(b.calls).toHaveLength(2);
+    expect(store.slotClaim('shop:sla', Date.parse('2026-10-25T12:00:00Z'))?.status).not.toBe('held');
+    expect(store.slotClaim('shop:sla', Date.parse('2026-10-25T11:00:00Z'))?.status).toBe('limit');
+    await b.scheduler.stop();
+  });
+
+  it('gives queue items back when the executor is at the usage limit', async () => {
+    const { scheduler, store } = setup({ jobs: [baseJob] });
+    scheduler.start();
+    scheduler.noteLimit('claude', Date.now() + 3_600_000);
+    const item = store.proposeItem({
+      project: 'shop',
+      kind: 'post',
+      mode: 'queue',
+      title: 'A post',
+      queue: 'q',
+      options: ['Approve'],
+    });
+    expect(await scheduler.runQueue('shop', 'sla', 'q', [item])).toBe('held');
+    await scheduler.stop();
+  });
+
+  it('waits for its lock without a job slot, and a pause while it waits means it never starts', async () => {
+    const { calls, scheduler } = setup({
+      jobs: [
+        { ...baseJob, locks: ['chrome'] },
+        { ...baseJob, id: 'other', name: 'Other' },
+      ],
+    });
+    scheduler.start();
+    // biome-ignore lint/suspicious/noExplicitAny: holding the shared browser lock from outside
+    const sched = scheduler as any;
+    const browser = await sched.locks.acquire(['chrome']);
+    scheduler.trigger('shop', 'sla', 'U1');
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sched.slots.busy).toBe(false); // jobConcurrency 1, still free
+    scheduler.trigger('shop', 'other', 'U1');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(calls).toHaveLength(1); // Other ran while SLA waited for the browser
+    expect(scheduler.setEnabled('shop', 'sla', false)).toBe('ok');
+    browser();
+    await scheduler.idle();
+    expect(calls).toHaveLength(1); // paused while waiting: never started
+    await scheduler.stop();
+  });
+
+  it('skips a scheduled run that waited longer than its maxWaitMinutes', async () => {
+    let now = Date.parse('2026-10-25T10:00:00Z');
+    const { calls, scheduler } = setup({
+      jobs: [{ ...baseJob, locks: ['chrome'], maxWaitMinutes: 30 }],
+      now: () => now,
+    });
+    scheduler.start();
+    // biome-ignore lint/suspicious/noExplicitAny: holding the lock and launching one scheduled run
+    const sched = scheduler as any;
+    const browser = await sched.locks.acquire(['chrome']);
+    const run = sched.launch(sched.entries.get('shop:sla').scheduled, { kind: 'schedule' });
+    now += 45 * 60_000;
+    browser();
+    expect(await run).toBe('aborted');
+    expect(calls).toHaveLength(0);
+    await scheduler.stop();
+  });
+
+  it("keeps a job's steps and report within its run time, with 5 minutes left to report", async () => {
+    const { calls, scheduler } = setup({
+      jobs: [{ ...baseJob, runTimeoutMinutes: 0.0001, steps: [{ name: 'Home' }, { name: 'Cart' }] }],
+      during: () => new Promise((r) => setTimeout(r, 20)),
+    });
+    scheduler.start();
+    scheduler.trigger('shop', 'sla', 'U1');
+    await scheduler.idle();
+    const [home, main] = calls as [RunOptions, RunOptions];
+    expect(calls).toHaveLength(2); // Cart had no time left
+    expect(home.timeoutMs).toBeLessThanOrEqual(6);
+    expect(main.timeoutMs).toBe(5 * 60_000);
+    expect(main.prompt).toContain("### Cart (skipped)\nNot run: the job's run time");
+    await scheduler.stop();
+  });
+
+  it('frees the job slot before its learning turn', async () => {
+    const busy: boolean[] = [];
+    let sched: { slots: { busy: boolean } } | undefined;
+    const ctx = setup({
+      jobs: [baseJob],
+      selfImprove: 'trouble',
+      replies: ['❌ Broken', 'No lesson'],
+      during: async () => {
+        busy.push(sched?.slots.busy ?? true);
+      },
+    });
+    sched = ctx.scheduler as unknown as { slots: { busy: boolean } };
+    ctx.scheduler.start();
+    ctx.scheduler.trigger('shop', 'sla', 'U1');
+    await ctx.scheduler.idle();
+    expect(busy).toEqual([true, false]); // the job held it; its learning turn didn't
+    await ctx.scheduler.stop();
+  });
+
   it('keeps the old schedule and reports an invalid jobs file', async () => {
     const { chat, scheduler, project } = setup({ jobs: [baseJob] });
     scheduler.start();
@@ -802,6 +984,47 @@ describe('HTTP API', () => {
     };
     return { ...ctx, call, close };
   }
+
+  it('drains for a restart: no new scheduled runs, slots left for after it, idle once nothing runs', async () => {
+    const ctx = setup({ jobs: [baseJob] });
+    ctx.scheduler.start();
+    let draining = false;
+    let liveRuns = 1;
+    const server = await startHttpServer({
+      bind: '127.0.0.1',
+      port: 0,
+      scheduler: ctx.scheduler,
+      store: ctx.store,
+      projects: ['shop'],
+      adminToken: 'key',
+      log: { info() {}, warn() {}, error() {} },
+      drain: {
+        set: (on) => {
+          draining = on;
+          ctx.scheduler.draining = on;
+        },
+        state: () => ({ draining, liveRuns, queueBatches: 0 }),
+      },
+    });
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const health = async () =>
+      (await fetch(`${base}/health`).then((r) => r.json())) as Record<string, unknown>;
+    expect(await health()).toMatchObject({ idle: false, draining: false, liveRuns: 1 });
+    expect((await fetch(`${base}/drain`, { method: 'POST' })).status).toBe(403);
+    const drained = await fetch(`${base}/drain`, { method: 'POST', headers: { 'x-tara-admin': 'key' } });
+    expect(await drained.json()).toMatchObject({ draining: true });
+
+    // biome-ignore lint/suspicious/noExplicitAny: firing one slot directly
+    const sched = ctx.scheduler as any;
+    const slot = Date.now() - 1_000;
+    expect(sched.fire(sched.entries.get('shop:sla').scheduled, slot, 'schedule')).toBe(false);
+    expect(ctx.store.slotClaim('shop:sla', slot)?.status).toBe('aborted'); // the restarted process takes it
+    expect(ctx.calls).toHaveLength(0);
+    liveRuns = 0;
+    expect(await health()).toMatchObject({ idle: true, draining: true });
+    server.close();
+    await ctx.scheduler.stop();
+  });
 
   it('lists jobs, runs one and returns its history and output', async () => {
     const { call, close, scheduler } = await api();

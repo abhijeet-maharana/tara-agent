@@ -13,7 +13,7 @@
     "node": ">=22.13"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && node scripts/after-build.mjs",
     "dev": "tsx src/index.ts",
     "start": "node --disable-warning=ExperimentalWarning dist/index.js",
     "typecheck": "tsc --noEmit",

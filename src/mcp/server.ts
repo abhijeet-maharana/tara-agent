@@ -57,8 +57,10 @@ server.registerTool(
       '"done" as well. For a code, OTP or value only they have: buttons for each way they might finish ' +
       '("Done, I entered it" / "Skip"), and say in the details that they can instead reply in the thread ' +
       'with the value for you to enter. After calling it, END YOUR TURN without doing the action. With `handoff` (the ' +
-      'usual case) the decision is acted on by a fresh session in a new thread, from the card, its handoff notes and ' +
-      'the project memory; without it, the answer arrives here as your next message, starting with "USER DECISION".',
+      'usual case) the decision is acted on either by a fresh session in a new thread, from the card, its handoff ' +
+      "notes and the project memory, or by this session continuing (the card advises one from this session's size, " +
+      'and the person can pick the other); without it, the answer arrives here as your next message, starting with ' +
+      '"USER DECISION".',
     inputSchema: {
       title: z
         .string()
@@ -87,7 +89,7 @@ server.registerTool(
         .max(20_000)
         .optional()
         .describe(
-          'Notes for the fresh session that acts on the decision in a new thread, without this conversation: ' +
+          'Notes for a fresh session that may act on the decision in a new thread, without this conversation: ' +
             'what to do for each option, step by step, with every id, URL, file path, number and command it ' +
             'needs, and anything you found that it should know. Shown folded on the Approvals page. Leave it out ' +
             'only when the answer must come back to this very session (an OTP, a login in a browser you have open).',
@@ -101,7 +103,7 @@ server.registerTool(
         `Approval request posted in the Slack thread (buttons: ${options.join(' / ')}). ` +
           'Stop now: end your turn without doing the action. ' +
           (args.handoff?.trim()
-            ? 'A fresh session acts on the decision in a new thread, from the card and its handoff notes.'
+            ? 'The decision is acted on by a fresh session in a new thread (from the card and its handoff notes) or arrives here as your next message, as the card advises or the person picks.'
             : 'The decision arrives as your next message.'),
       );
     } catch (err) {

@@ -11,11 +11,13 @@ import { type LearnRequest, learnFromRun, learnReasons, runUse, typicalRun } fro
 import { type ChatPort, type Logger, threadKey } from '../sessions/manager.js';
 import type { ThreadHold, Threads } from '../sessions/threads.js';
 import { formatDuration, postMarkdown } from '../slack/format.js';
+import { type Incidents, incidentOf } from '../slack/incidents.js';
 import { StreamReply } from '../slack/reply.js';
 import type { Item, RunRecord, Store } from '../store/store.js';
 import { type Locks, type Semaphore, Throttle } from '../util/concurrency.js';
 import { deliveryOf, isWebChannel, streamFor, webChannel, webOf } from '../web/chat.js';
-import { postSummary } from '../web/summary.js';
+import { postSummary, slackSummaryOf } from '../web/summary.js';
+import { type LimitHolds, limitResetAt } from './limits.js';
 import {
   buildDecisionPrompt,
   buildHandoffPrompt,
@@ -36,8 +38,17 @@ export type JobTrigger =
    */
   | { kind: 'schedule'; thread?: { channel: string; ts: string }; byPerson?: boolean }
   | { kind: 'catch-up'; thread?: { channel: string; ts: string }; byPerson?: boolean }
-  /** `thread`: the chat message that asked for the run; the run then happens in its thread. */
-  | { kind: 'manual'; by: string; thread?: { channel: string; ts: string } }
+  /**
+   * `thread`: the chat message that asked for the run; the run then happens in its thread. `replyIn`:
+   * a Slack thread it was asked for in ("run <skill>" as a reply): a dashboard run's result summary
+   * goes there, as a reply, instead of a new channel message.
+   */
+  | {
+      kind: 'manual';
+      by: string;
+      thread?: { channel: string; ts: string };
+      replyIn?: { channel: string; ts: string };
+    }
   /**
    * A decision on the run's approval card: the same session continues in its thread. `channel`: the
    * thread's channel (a dashboard thread's, or a Slack one; unset: the job's Slack channel).
@@ -88,6 +99,14 @@ export interface JobRunnerDeps {
   threadUrl?: (channel: string, ts: string) => string | undefined;
   /** What the run waits for before it starts; called with undefined once it has its slot and locks. */
   onWait?: (waitingFor: JobWait | undefined) => void;
+  /** Usage limits and lost logins: one Slack message per incident instead of one per failed run. */
+  incidents?: Incidents;
+  /** The Approvals page, linked from a summary whose run left cards there. */
+  approvalsUrl?: string;
+  /** Usage limits, host-wide: a run that hits one holds scheduled runs on its CLI until it resets. */
+  holds?: LimitHolds;
+  /** Aborts while the run still waits for its locks or a slot (the job was paused): it then doesn't start. */
+  cancelWait?: AbortSignal;
 }
 
 /** What a run waits for: its thread (a chat turn working in it), a free job slot, or its locks. */
@@ -135,12 +154,21 @@ export async function runJob(
   scheduled: ScheduledJob,
   trigger: JobTrigger,
   signal?: AbortSignal,
+  /**
+   * Called once with the run's outcome as soon as it is recorded, before its learning turns. The scheduler
+   * closes the slot here: a slot still open when the process dies is run again after the restart, and the
+   * job's work (a post, an email) is already done by then.
+   */
+  onDone?: (status: JobStatus, toolCalls?: number) => void,
 ): Promise<JobStatus> {
   const { project, job } = scheduled;
   const { chat, store, log } = deps;
   const now = deps.now ?? Date.now;
   const slackChannel = job.channel ?? project.config.slackChannel;
   const title = `*${job.name}*${triggerLabel(trigger)}`;
+  // "run <skill>" as a reply in a Slack thread: the result summary answers in that thread.
+  const askedIn =
+    trigger.kind === 'manual' && trigger.replyIn?.channel === slackChannel ? trigger.replyIn.ts : undefined;
   const timeoutMs = job.timeoutMinutes * 60_000;
   // Asked for in chat, or running cards that share a Slack thread (a `slack` queue): run inside that
   // thread instead of posting a new channel message.
@@ -181,16 +209,44 @@ export async function runJob(
   deps.onWait?.(inThread ? 'thread' : 'slot');
   if (reactTo) await chat.react(channel, reactTo, 'eyes').catch(() => {});
 
-  // An existing thread may have a chat turn in it: wait for it before taking a slot and locks.
+  const waitStart = now();
+  // An existing thread may have a chat turn in it: wait for it before taking locks and a slot.
   let hold: ThreadHold | undefined = inThread
     ? await deps.threads.enter(threadKey(channel, inThread))
     : undefined;
-  deps.onWait?.('slot');
-  const releaseSlot = await deps.slots.acquire();
-  if (job.locks.length) deps.onWait?.('lock');
-  const releaseLocks = await deps.locks.acquire(job.locks);
+  // Locks first, then a slot: a job waiting for a busy browser doesn't hold one of the few job slots
+  // meanwhile. A slot holder never waits for a lock, so the two can't deadlock.
+  const waitSignal = AbortSignal.any([signal, deps.cancelWait].filter((s): s is AbortSignal => Boolean(s)));
+  let releaseLocks: () => void = () => {};
+  let releaseSlot: () => void = () => {};
+  const notStarted = (why: string): JobStatus => {
+    releaseSlot();
+    releaseLocks();
+    hold?.release();
+    if (reactTo) void chat.unreact(channel, reactTo, 'eyes').catch(() => {});
+    log.info(`[${project.config.name}] job ${job.id} not started: ${why}`);
+    return 'aborted';
+  };
+  try {
+    if (job.locks.length) deps.onWait?.('lock');
+    releaseLocks = await deps.locks.acquire(job.locks, waitSignal);
+    deps.onWait?.('slot');
+    releaseSlot = await deps.slots.acquire(waitSignal);
+  } catch {
+    return notStarted(signal?.aborted ? 'tara-agent is stopping' : 'paused while it waited');
+  }
+  const scheduledRun = trigger.kind === 'schedule' || trigger.kind === 'catch-up';
+  if (scheduledRun && job.maxWaitMinutes && now() - waitStart > job.maxWaitMinutes * 60_000)
+    return notStarted(`waited ${formatDuration(now() - waitStart)}, over its maxWaitMinutes`);
   deps.onWait?.(undefined);
+  // From here a crash may leave a queue item half done; before, it only waited and goes back on restart.
+  if (trigger.kind === 'queue') store.markRunStarted(trigger.items.map((i) => i.id));
   const startedAt = now();
+  // The whole run's time (steps included): see `runTimeoutMinutes`.
+  const runTimeoutMs = (job.runTimeoutMinutes ?? job.timeoutMinutes * (job.steps.length ? 2 : 1)) * 60_000;
+  const deadline = startedAt + runTimeoutMs;
+  /** The main session's time: its own limit, within the run's deadline, but always 5 minutes to report. */
+  const mainTimeoutMs = () => Math.min(timeoutMs, Math.max(5 * 60_000, deadline - now()));
   const lessons: LearnRequest[] = [];
   const record = (status: JobStatus, extra: Partial<RunRecord> = {}) => {
     store.recordRun({
@@ -203,6 +259,7 @@ export async function runJob(
       ...extra,
     });
     log.info(`[${project.config.name}] job ${job.id} ${status} in ${formatDuration(now() - startedAt)}`);
+    onDone?.(status, extra.toolCalls);
     if (reactTo) {
       void chat
         .unreact(channel, reactTo, 'eyes')
@@ -234,6 +291,7 @@ export async function runJob(
           title,
           text: `❌ Could not start: ${(err as Error).message}`,
           link: deps.threadUrl?.(channel, inThread),
+          replyIn: askedIn,
         });
       return record('error', { error: (err as Error).message });
     }
@@ -336,6 +394,7 @@ export async function runJob(
      */
     const summarize = async (text: string, meta?: string) => {
       if (!onDashboard || !web) return;
+      const cards = cardsLeft();
       await postSummary({
         chat,
         store,
@@ -348,8 +407,37 @@ export async function runJob(
         meta,
         link: deps.threadUrl?.(channel, rootTs),
         since: startedAt,
+        cards,
+        approvalsUrl: deps.approvalsUrl,
+        // Asked for in a thread: the answer goes back there, whatever it is. The result of your decision
+        // belongs with the job: a reply under its summary when it went fine. A problem, a failure or new
+        // cards get a message of their own, so they notify.
+        replyIn: askedIn ?? (text.trim().startsWith('✅') && !cards ? followUpOf() : undefined),
       });
     };
+    /**
+     * The Slack summary a follow-up belongs under: the run's own (continuing after a decision), the run
+     * whose card it acts on, or the run that proposed its queue items.
+     */
+    const followUpOf = (): string | undefined => {
+      if (trigger.kind === 'resume') return slackSummaryOf(store, slackChannel, channel, rootTs);
+      if (trigger.kind === 'decision')
+        return slackSummaryOf(store, slackChannel, trigger.from.channel, trigger.from.threadTs);
+      if (trigger.kind === 'queue')
+        for (const item of trigger.items) {
+          const at =
+            item.channel && item.threadTs
+              ? slackSummaryOf(store, slackChannel, item.channel, item.threadTs)
+              : undefined;
+          if (at) return at;
+        }
+      return undefined;
+    };
+    /** Cards this run left waiting on the Approvals page (approvals and drafts). */
+    const cardsLeft = () =>
+      store
+        .itemsInThread(channel, rootTs, 200)
+        .filter((i) => i.status === 'pending' && i.createdAt >= startedAt).length;
     // The latest text block reaches the thread once the next step starts; the final one when the run
     // ends, so the thread always holds Claude's whole reply.
     let block = '';
@@ -384,6 +472,7 @@ export async function runJob(
         folders,
         mcpServers,
         signal: stop,
+        deadline,
         onStep: (i, name) => status.push(`⏳ ${title} · step ${i}/${job.steps.length}: ${name}`),
         fallback,
         onFallback: (note) => {
@@ -432,7 +521,7 @@ export async function runJob(
               model: session.model,
               permissionMode: project.config.permissionMode,
               permissions: job.agyPermissions,
-              timeoutMs,
+              timeoutMs: mainTimeoutMs(),
             })
           : undefined;
       return deps.run({
@@ -482,7 +571,7 @@ export async function runJob(
                     stepsDone?.section,
                   ),
                 ),
-        timeoutMs,
+        timeoutMs: mainTimeoutMs(),
         signal: stop,
         label: {
           project: project.config.name,
@@ -622,6 +711,8 @@ export async function runJob(
       outputTokens: sum(outcome.usage?.output, stepsDone?.usage.output),
       cacheReadTokens: sum(outcome.usage?.cacheRead, stepsDone?.usage.cacheRead),
       cacheCreationTokens: sum(outcome.usage?.cacheCreation, stepsDone?.usage.cacheCreation),
+      // The main session only: what a card it raised would continue in.
+      contextTokens: outcome.contextTokens,
       toolCalls: outcome.toolCalls + (stepsDone?.toolCalls ?? 0),
       rateLimitUtilization: outcome.rateLimit?.utilization,
     };
@@ -632,6 +723,13 @@ export async function runJob(
       .concat(outcome.model ? [outcome.model] : [])
       .join(' · ');
 
+    if (outcome.status === 'limit') {
+      const resetAt = limitResetAt(outcome, deps.host.timezone, now());
+      deps.holds?.hit(harness, resetAt);
+      log.warn(
+        `[${project.config.name}] ${harness} usage limit: scheduled runs on it wait until ${new Date(resetAt).toISOString()}`,
+      );
+    }
     if (outcome.status !== 'ok') {
       const reason =
         outcome.status === 'limit'
@@ -648,7 +746,10 @@ export async function runJob(
       // Not streamed: what Claude wrote before it stopped still goes in the thread, to debug the run.
       if (!live && outcome.text.trim()) await postMarkdown(chat, channel, rootTs, outcome.text);
       // A run a person stopped needs no message; anything else that broke does ("⌛ Timed out after 30m").
-      if (outcome.status !== 'aborted')
+      // A usage limit or a lost login hits every run at once: one message for all of them.
+      const incident = onDashboard && deps.incidents ? incidentOf(outcome, harness) : undefined;
+      if (incident) await deps.incidents?.report(slackChannel, incident, job.name);
+      else if (outcome.status !== 'aborted')
         await summarize(
           reason.replace(/^(\S+ )(\p{Ll})/u, (_, icon: string, c: string) => icon + c.toUpperCase()),
           formatDuration(outcome.durationMs),
@@ -672,6 +773,14 @@ export async function runJob(
           notes: [...fallbackNotes, said],
         });
       else for (const note of [...fallbackNotes, said]) await chat.post(channel, rootTs, note);
+      await deps.incidents?.resolve(harness);
+      // No reply, but cards: they still need you. Asked for in a thread: it says so there.
+      const cards = cardsLeft();
+      if (cards || askedIn)
+        await summarize(
+          cards ? `Left ${cards} ${cards === 1 ? 'card' : 'cards'} for you` : '🔇 Nothing to report',
+          formatDuration(outcome.durationMs),
+        );
       learnIf(undefined, rootTs);
       return record('silent', { ...usage, output: outcome.text });
     }
@@ -694,20 +803,23 @@ export async function runJob(
       for (const note of fallbackNotes) await chat.post(channel, rootTs, note);
       await postMarkdown(chat, channel, rootTs, outcome.text);
     }
-    await summarize(outcome.text, meta);
+    await deps.incidents?.resolve(harness);
+    // Slack gets the time only: steps and model are on the dashboard.
+    await summarize(outcome.text, formatDuration(outcome.durationMs));
     learnIf(failure, rootTs);
     return record(failure ? 'failed' : 'ok', { ...usage, error: failure, output: outcome.text });
   } catch (err) {
     log.error(`[${project.config.name}] job ${job.id} crashed: ${(err as Error).stack ?? err}`);
     return record('error', { error: (err as Error).message });
   } finally {
+    // The job's work is done: its locks and slot go to the next job. Learning turns (up to 5 minutes
+    // each) run after, outside jobConcurrency, still holding the thread they resume.
     releaseLocks();
+    releaseSlot();
     try {
-      // Still inside the job slot, so learning turns count towards jobConcurrency.
       for (const lesson of lessons) await learnFromRun(deps, lesson);
     } finally {
       hold?.release();
-      releaseSlot();
     }
   }
 }

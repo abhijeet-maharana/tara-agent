@@ -27,7 +27,9 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `agy.bin` | `agy` | Antigravity CLI path, for [agy jobs](#agy-jobs). Under `claude.runAs` the run user's install, e.g. `/home/tara/.local/bin/agy` |
 | `stateDir` | `~/.local/state/tara-agent` | SQLite database, and default home of scratch and job data folders |
 | `scratchDays` | `3` | Days after its last use that a session's scratch folder is deleted (see [Files](#files)) |
-| `retentionDays` | `90` | Days of history kept in the state database (min 14). Runs, slot claims and sessions not used since are deleted daily; each job's latest run and all approval cards are kept |
+| `retentionDays` | `90` | Days of history kept in the state database (min 14). Runs, slot claims, sessions not used since, and the machine and VM host samples are deleted daily; each job's latest run is kept. Finished approval cards are kept 60 days (the keys of decided cards for good, so auto-approve never sees an old key as new) |
+| `backup.dir` | `<stateDir>/backups` | Where the daily copy of the state database goes (`tara-YYYY-MM-DD.db`, checked with `quick_check` before it gets its name). Point it at another disk, or copy the folder off the machine (`deploy/pull-backups.sh <ssh host>`, run daily on the other machine), so a failing disk doesn't take the copies with it. The Health page shows a **Database backup** check |
+| `backup.keep` | `7` | Days of copies kept |
 | `streaming` | `true` | Stream replies as a live task card and text. Needs the Slack app's "Agents & AI Apps" feature and the `assistant:write` scope; without them, tara-agent falls back to one edited status message |
 | `browsers` | `[{lock: chrome, cdpUrl: http://127.0.0.1:9222, closeTabs: true, staleMinutes: 30}]` | The shared Chromes runs drive (e.g. one per signed-in identity: its own `--user-data-dir` and `--remote-debugging-port`). `lock` is its name on the Browsers page. Runs share a browser without locks ([shared browsers](#shared-browsers)); with `closeTabs`, tara closes stale tabs every 5 minutes: open over `staleMinutes` and since before every conversation still going in that browser began (a job run, or a chat thread: going while a turn runs and for `staleMinutes` after its last turn), never a kept tab (project `keepTabsUrl`) or the last tab. Point the project's Chrome MCP server (`--browserUrl`) at the same `cdpUrl` |
 | `voice` | unset | Speech-to-text for Slack voice notes that Slack didn't transcribe (it skips short clips and some languages): `url` (an OpenAI-compatible chat completions endpoint whose models take `input_audio`, e.g. Gemini) and `models` (tried in order). Key from `TARA_VOICE_API_KEY`. Unset = Slack's transcript only, and voice notes without one get a "please type it" reply |
@@ -41,8 +43,11 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `privileged.command` | off | Root actions a run may ask for through the root-owned helper `deploy/tara-priv.mjs`, usually `["sudo", "-n", "/usr/local/sbin/tara-priv"]` ([privileged actions](security.md#privileged-actions)) |
 | `http` | `127.0.0.1:4100` | Local API and dashboard (`enabled`, `bind`, `port`, `allowFrom`). Set `TARA_HTTP_TOKEN` to require a bearer token (open a page once with `?token=…` to sign a browser in). The MCP tools need it enabled |
 | `http.allowFrom` | `127.0.0.0/8`, `::1/128` | CIDR ranges allowed to connect. Transcripts hold everything Claude saw, so keep this to a trusted network, e.g. add `100.64.0.0/10` and `fd7a:115c:a1e0::/48` for Tailscale |
+| `http.hosts` | none | Extra host names the dashboard is opened by, when `bind` is beyond localhost. IP addresses, `localhost`, one-word names (`jarvis`), Tailscale names (`*.ts.net`) and the host of `dashboardUrl` always work; a request whose Host is any other name is refused (it stops DNS-rebinding pages). Add a LAN name like `jarvis.home.lan` here |
 | `http.fallback` | none | URL that receives every request tara-agent doesn't serve, passed through unchanged. Useful when taking over a port from another service |
-| `http.tls` | off | Also serve HTTPS on `port` (default `4443`) with `cert` and `key` files, e.g. from `tailscale cert`. The certificate is re-read when its file changes, so renewing it needs no restart |
+| `http.tls` | off | Also serve HTTPS on `port` (default `4443`) with `cert` and `key` files, e.g. from `tailscale cert`. The certificate is re-read when its file changes, so renewing it needs no restart. `tls.appPort`: the HTTPS twin of `http.appPort` |
+| `http.appPort` | off | Serve project apps shown as tabs (`/app/<name>/…`) on this port, another origin than the dashboard, so an app's pages can't use your unlocked browser to decide cards. The frame follows the app's address through a small script the proxy adds to its HTML pages. Old `/app/…` links on the dashboard's port are sent on. An app that decided cards from its own pages (`fetch('/items/<id>/decide')`) can't any more ([project tabs](security.md#project-tabs)) |
+| `trusted` | none | Settings of a project that only the host config may set, keyed by its repo path as listed in `projects`: any of `slackChannel`, `owner`, `permissionMode`, `billing`, `systemPromptFile`, `dashboardUrl`, `healthUrl`, `keepTabsUrl`, `approvals`, `reminders`, plus `executorUrls` (the only URLs its queues may send to). For a listed project those keys come from here only; the repo's values are ignored and shown on the Health page when they differ ([pinned project settings](security.md#pinned-project-settings)) |
 | `http.quietHours` | `23:00`–`07:00` | `{from, to}` in local `HH:MM`, sent in `GET /glance` as `quiet`: desk panels such as the macOS desk widget hold their notifications then |
 | `code` | on, the projects | The Code page: `repos` (`path`, `gitDir`, `title`, `askIn`) and `exclude` globs never shown (default `.env*`, `*.pem`, `*.key`). See [code-view.md](code-view.md) |
 | `attention` | GitHub on, nothing urgent | What needs you (`GET /attention`): `github` (your open PRs and review requests through `gh`, logged in as the user tara-agent runs as) and `urgent` rules that put a failing job in the urgent tier: `{consecutiveFailures: 3}` or `{job: "project/jobId"}` |
@@ -111,7 +116,9 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `fallback` | none | `{harness, model}`: a session whose harness is out of quota or capacity reruns on this one ([fallback](#fallback)) |
 | `mcpServers` | none | The job's own stdio MCP servers by name (`{command, args, env}`), for every session of the job ([steps and MCP servers](#steps-and-mcp-servers)) |
 | `steps` | `[]` | Sessions run one after the other before the main prompt ([steps and MCP servers](#steps-and-mcp-servers)) |
-| `timeoutMinutes` | `30` | Time limit for the run, and for any one command it runs (Claude's Bash timeout is set to it) |
+| `timeoutMinutes` | `30` | Time limit for each session of the run (a step, the main prompt), and for any one command it runs (Claude's Bash timeout is set to it) |
+| `runTimeoutMinutes` | twice `timeoutMinutes` with steps, else `timeoutMinutes` | Time for the whole run, steps included: a session gets no more than what is left (the main session always at least 5 minutes, to report), and a step with no time left is skipped and marked so |
+| `maxWaitMinutes` | none | A scheduled run that waited longer than this for its locks or a job slot is skipped instead of starting late (a morning report at noon). Runs a person asked for always start |
 | `catchUp` | `true` | Run the latest missed slot after downtime |
 | `selfImprove` | project's | Overrides the project's `selfImprove` for this job, e.g. `"trouble"` for a monitor that runs every few minutes |
 | `channel` | project channel | Where the job posts (its thread, or its summary) |
@@ -164,11 +171,13 @@ With `delivery: summary`, a run nobody started from Slack happens in a **dashboa
 
 1. **Start.** A scheduled slot starts the run straight away (no trigger message). Run now, `run_job`, queues, decisions on cards, scheduled tasks and voice or Code-page requests open a dashboard thread too.
 2. **Watch.** The run's session page (Sessions, or the home page's running job) shows its steps and text live, then the whole transcript, the files it sent, and a **Reply** box (an unlocked browser) that continues the session.
-3. **Result in Slack.** When it ends, one top-level message: the reply's headline (the part before `---`; a table there is drawn as one), then the run's name, time and an **Open the run ↗** link (`dashboardUrl`). Files it sent are attached in that message's thread. A run with nothing to report (🔇) or one you stopped posts nothing; a failure, timeout or usage limit posts one line.
-4. **Cards.** A card with buttons (an approval, a permission prompt) is also copied to the channel as its own message, so it still notifies you; a tap there or on the Approvals page decides it, and the copy shows the decision.
-5. **Replies.** A reply in the thread of a summary or a card copy goes to the run's session: Jarvis answers in that Slack thread, with the run's whole context.
+3. **Result in Slack: one summary after every run.** When it ends, one top-level message. Its first line is the headline's status emoji, the run's name and the headline's first line (`⚠️ *UI Review* · 3 UI issues found`, `✅ *Spam Rescue* · Nothing to do: no mail in spam since 18:00`); the rest of the headline (the part before `---`; a table there is drawn as one) follows, then a small line with the time and an **Open the run ↗** link (`dashboardUrl`). Files it sent are attached in that message's thread. A failure or timeout posts one line. A run with no reply (🔇) or one you stopped posts nothing. The job prompt asks every ✅ line to say why.
+4. **Cards go in the summary's thread.** The run's message then shows only its first line, plus `🟡 3 cards wait for you on the Approvals page ↗` (a link to `<dashboardUrl>/approvals`). Each approval card it left follows as a reply in that message's thread, with its buttons: a tap there decides it, and a decision, update or withdrawal on the Approvals page edits the Slack copy too. Drafts (reviewed and edited on the Approvals page) get one reply listing them, each linked to its card. Replies in a thread don't notify, so the channel still gets one message per run. A permission prompt (which blocks its run) is still copied to Slack as its own message, and a tap there decides it.
+5. **After your decision: a reply under the job's summary.** The result of the job continuing after your decision, acting on a card with handoff notes (in its new dashboard thread), or working approved queue items is a **reply in the thread of the job's summary** when it went fine (✅, no new cards), so approving ten cards adds no channel messages. A ⚠️, a failure or new cards get their own message, so they notify. With no summary to go under, it is a message of its own.
+6. **Usage limits and lost logins.** A run stopped by the usage limit, or failing because the CLI's login ran out, doesn't post its own line: the channel gets one message per incident (`⏸ *Claude usage limit reached*` / `🔑 *Claude login failed*` with the fix), edited as more runs hit it (`Skipped (11): …`). It closes once a run on that CLI works again (the message says so) or after 12 hours without a new hit (`src/slack/incidents.ts`).
+7. **Replies.** A reply in the thread of a summary or a permission prompt's copy goes to the run's session: Jarvis answers in that Slack thread, with the run's whole context.
 
-A run asked for in a Slack thread (`run <job name>` there, a `slack` queue's cards) stays in that thread, as before.
+A run asked for as a top-level `run <job name>` message (or a `slack` queue's cards) stays in that message's thread, as before. **Asked for as a reply inside a thread** (under a run's summary, in a chat), it runs on the dashboard and its summary is posted as a reply **in that same thread**, whatever the result (`🔇 Nothing to report` too), so the answer is where you asked. A job on `delivery: thread` still opens its own `Run <name>` message.
 
 ### agy jobs
 
@@ -247,9 +256,10 @@ After a job run or chat turn, tara-agent resumes the same session once and asks 
 | `selfImprove` | When it runs |
 |---|---|
 | `"always"` (default; `true` also means this) | After **every** run that used a tool. A clean run gets a short look back ("what did you have to figure out?"); a run with trouble gets the list of what went wrong |
-| `"trouble"` | Only after a run that failed, timed out, errored, or had 2+ tool calls error |
+| `"trouble"` | Only after a run that failed, timed out or errored, or where 5+ tool calls errored and they were at least a quarter of its calls (a few errors are normal work: a `grep` that finds nothing) |
 | `"off"` (or `false`) | Never |
 
+- **Skills stay short.** The turn edits the instruction where it belongs (fix the step, replace the wrong line, put the trap in its step), never appends notes, writes timeless rules (no dates or who said it: git has that), moves detail only some runs need to `references/<topic>.md`, keeps `SKILL.md` under 25,000 characters (`SKILL_MAX_CHARS`) and leaves the front matter alone except the `description` (no version bumps). Only `name` and `description` in a skill's front matter mean anything to Claude Code. The Health page warns (quietly, no Slack) when a project has skills over the limit (`Skill size` under Jobs).
 - **Steps learn too.** Each Claude step's session gets its own turn under the same rule, told to change only its `### Step: <name>` part (or `### Every step`) and the scripts that step runs. Its note reads `🔧 <job> · step "<name>" learned from this run`.
 - **It sees what the run used**: the session's cost at API prices, tokens, tool calls and minutes, the whole run's when there were steps (and a step's share of it), and the job's usual run: the median of the first run in each thread over the last 14 days, from 3 such runs. A run at 1.5× the usual or more is called out, and Claude is asked what made it expensive; otherwise it is asked for a cheaper path only when it sees one. Coverage and correctness always come first. Runs after a card or for queue items aren't compared.
 - Usage-limit and stopped runs, agy runs, and replies that used no tool never get one.
@@ -295,16 +305,35 @@ Every run gets tara-agent's own MCP server alongside the repo's `.mcp.json` serv
 
 The tools reach tara-agent through the local API with a per-run token, so `http.enabled` must stay on.
 
-### Decisions in a new thread
+### Where a decision is acted on: a new session or the same one
 
-A card raised with `handoff` notes is a complete brief: the card says what is proposed, the notes say how to carry it out (every id, URL, file path, number and command), for a session that never saw the run.
+Every waiting card says where its decision will be acted on, the same on the Approvals page and in Slack: `Upon approval, a new session will be created · large context (140k tokens)` or `Upon approval, this will continue in the existing session · follow-up in a small session (30k tokens, 2 turns)`. The advice comes from the session that raised the card (`src/approvals/session-choice.ts`):
+
+| The session | Advice |
+|---|---|
+| Context at or over 100k tokens (its last model call's input and cache tokens) | New session |
+| 8 or more turns in its thread | New session |
+| Idle for 3 days or more | New session |
+| Otherwise (a follow-up while it is still small) | Continue it |
+| No handoff notes (an OTP, a login in its open browser), or a root action | Continue only |
+| No session to continue (never started, or no thread) | New only |
+
+- **Override it** on the card: on the Approvals page pick *use a new session* / *continue the existing session* before an option; in Slack, the extra button (`Approve · new session` or `Approve · same session`) next to the options. Every Slack button carries its mode, so a tap does what the card said when it was shown.
+- **The advice updates** after each run or turn in the card's thread (its context grew, more turns), and when the Approvals page finds it changed with time: the card's message and its Slack copy are edited, so both always offer the same default. The decision records the mode it used (`items.session_mode`).
+- **Continuing** resumes the session that asked, in its own thread: a job's card resumes as the job (its slot, locks and timeout), a chat's card as the chat.
+
+A card raised with `handoff` notes is a complete brief: the card says what is proposed, the notes say how to carry it out (every id, URL, file path, number and command), for a session that never saw the run. In a **new session**:
 
 - **On a decision**, tara opens a new `Run <Job>` thread (a chat's card: `Run <Kind>`, e.g. `Run Decision`) and starts a **fresh session** there with the project memory, the card, its notes and the decision. A job's card runs as the job (its slot, locks, timeout, effort, and its [handoff](#handoff) harness when approved); a chat's card, or one whose job is gone, runs as a chat.
 - **Both threads link to each other**: the old one gets `➡️ Your decision on "<title>" continues in a new thread`, the new one starts with `📝 <title> · earlier thread`.
 - **If the notes leave something out**, the new session is told where the earlier thread and its session transcript are, to read only the part it needs. A job's new session keeps the earlier run's scratch folder, so screenshots and downloads are still at the paths in the notes.
 - **A plain no** (Reject, Skip, … with no note) starts nothing: the card shows it, and later runs see it under recent decisions in the project memory. A no with a note starts a run that does what the note asks.
-- **Cards without notes** work as before: the decision resumes the session that asked. Runs leave the notes out only when the answer must reach that very session (an OTP, a login in a browser it has open). Privileged cards always resume.
-- The Slack card says a decision continues in a new thread; the Approvals page shows the notes folded under the card.
+- **Cards without notes** always resume the session that asked. Runs leave the notes out only when the answer must reach that very session (an OTP, a login in a browser it has open). Privileged cards always resume.
+- The Approvals page shows the notes folded under the card.
+
+**Writing in a session on the dashboard shows in Slack too.** The session page's reply box posts your message in the session's Slack thread (or, for a dashboard run, under its Slack summary) as you, through `SLACK_USER_TOKEN` (`From @you on the dashboard: …`; over 500 characters it is cut, with the rest on the dashboard), and Jarvis answers there. Without a user token, or if Slack doesn't deliver it within 2 minutes, a bot line `💬 From the dashboard: …` shows it and Jarvis answers that. A session only the dashboard has stays there.
+
+**A card has no chat of its own.** *Open session ↗* on a card opens the session behind it (`/t/<channel>/<ts>`), live while it runs, with a box to write to Jarvis. **Ask…** → **Send** on a card sends a note to that session without deciding (a card no run raised gets its `Run <Kind>` thread first) and then opens the session page, where the answer streams in.
 
 ### Project memory
 
@@ -401,14 +430,16 @@ For scripts and dashboards on the same host (`127.0.0.1:4100` by default).
 
 | Call | Does |
 |---|---|
-| `GET /health` | Uptime, job counts and the Health page's `checks` counts (`ok`, `warn`, `bad`) |
+| `GET /health` | `build` (`source`: a hash of the code it was built from, `builtAt`), uptime, job counts and the Health page's `checks` counts (`ok`, `warn`, `bad`); `idle` (no CLI process, job or queue batch: safe to restart), `draining`, `liveRuns`; `limits` (CLIs at their usage limit, with when scheduled runs on them start again) |
+| `POST /drain` | Before a restart: `{on: true}` (default) stops starting scheduled and queue runs (slots that come up are left for the restarted process) and lets running work finish; restart once `/health` says `idle`. `{on: false}` undoes it. Needs `x-tara-admin` |
 | `GET /health/checks` | The latest checks: `checks` (`key`, `group`, `name`, `status`, `detail`, `since`, `outages`), `sources`, `counts`, `checkedAt` |
 | `POST /health/check` | Check everything now; returns `counts` |
 | `GET /metrics` | Prometheus text: health check status, runs, cost and tokens of the last 24 hours by project, kind and result, each job's last run, failure streak and pause state, running runs, the usage window, the machine. Behind the bearer token like the rest |
 | `GET /attention` | What needs you, most pressing first: `items` (`tier` urgent / waiting / later, `kind`, `title`, `project`, `url`) and `notes` for sources that couldn't be read |
 | `GET /glance` | One read for a desk panel: `needs` (urgent and waiting counts, top 3), `approvals` (per project, oldest first), `running` (with each run's latest step), `recent`, `next` (3 runs today), `usage`, `quiet` (`http.quietHours`). `/attention` is read again when the last read is over a minute old. Read by [`examples/macos-desk-widget`](../examples/macos-desk-widget) |
-| `POST /vmhost/metrics` | The VM host's own figures, when tara-agent runs in a VM: `{name?, cpuTemp?, thermal?, cpu?, memUsed?, swapBytes?, pressure?, vmCpu?, vmMemBytes?, powerW?}` (shares 0–1, `thermal` nominal / fair / serious / critical, `pressure` normal / warn / critical). Sent every 5 min by [`examples/macos-desk-widget`](../examples/macos-desk-widget) `install.sh --metrics`; shown on the Health page (a **VM host** group: reports, heat, memory; and Trends charts). Kept 31 days |
-| `GET /vmhost/metrics?hours=1` | Its reports over the last hours |
+| `POST /vmhost/metrics` | The VM host's own figures, when tara-agent runs in a VM: `{name?, cpuTemp?, thermal?, cpu?, memUsed?, swapBytes?, pressure?, vmCpu?, vmMemBytes?, powerW?, idleSec?}` (shares 0–1, `thermal` nominal / fair / serious / critical, `pressure` normal / warn / critical, `idleSec` seconds since the host's keyboard or mouse was used). Sent every 5 min by [`examples/macos-desk-widget`](../examples/macos-desk-widget) `install.sh --metrics`; shown on the Health page (a **VM host** group: reports, heat, memory; and Trends charts). Kept `retentionDays` |
+| `GET /vmhost/metrics?hours=1` | Its reports over the last hours (up to 366 days) |
+| `GET /host/metrics?hours=1` | This machine's own samples (every 5 min: `load`, `memUsed`, `diskUsed`, `swapUsed` incl. zram), kept `retentionDays`, e.g. for capacity reports |
 | `GET /jobs?project=<name>` | Jobs with next run, last status and error; `&upcoming=7` adds start times for the next 7 days |
 | `POST /jobs/<project>/<id>/run` `{"by": "who"}` | Run a job now |
 | `POST /jobs/<project>/<id>/pause` | Set `"enabled": false` in `jobs.json` and reload |

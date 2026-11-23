@@ -74,6 +74,14 @@ describe('project memory', () => {
 
   it('is kept by the learning turn of a main session, not of a step', () => {
     expect(learnPrompt([])).toContain('.tara/memory.md');
+    // Skills are edited in place, kept short, never given dated notes or a version.
+    for (const prompt of [learnPrompt([]), learnPrompt(['boom'], { step: 'fetch' })]) {
+      expect(prompt).toContain('Never append a note');
+      expect(prompt).toContain('No dates, no who said it');
+      expect(prompt).toContain('under 25,000 characters');
+      expect(prompt).toContain('references/<topic>.md');
+      expect(prompt).not.toContain('bump it');
+    }
     expect(learnPrompt([], { step: 'fetch' })).not.toContain('.tara/memory.md');
   });
 });

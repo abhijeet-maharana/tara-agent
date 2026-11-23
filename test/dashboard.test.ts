@@ -23,7 +23,7 @@ import {
 } from '../src/http/dashboard.js';
 import { queuePage } from '../src/http/queue.js';
 import { crossSite, startHttpServer } from '../src/http/server.js';
-import { firstPrompt, parseTranscript, transcriptPath } from '../src/http/transcript.js';
+import { firstPrompt, parseTranscript, promptTitle, transcriptPath } from '../src/http/transcript.js';
 import type { Scheduler } from '../src/scheduler/scheduler.js';
 import { type Item, Store, type StoredRun } from '../src/store/store.js';
 
@@ -315,8 +315,23 @@ describe('crossSite', () => {
     expect(crossSite(req('POST', { host: 'x:1', origin: 'null' }), '0.0.0.0')).toMatch(/cross-site/);
     expect(crossSite(req('GET', { host: 'evil.example:4100' }), '127.0.0.1')).toMatch(/unexpected Host/);
     expect(crossSite(req('GET', { host: 'localhost:4100' }), '127.0.0.1')).toBeUndefined();
-    // Bound to every interface: any Host (a LAN or tailnet name), still no cross-site writes.
-    expect(crossSite(req('GET', { host: 'box.tailnet:4100' }), '0.0.0.0')).toBeUndefined();
+    // Bound to every address: names a website can't take over pass, a rebinding page's own domain doesn't.
+    for (const host of [
+      'jarvis:4000',
+      '100.101.102.103:4000',
+      '[fd7a::1]:4443',
+      'desk.example.ts.net',
+      'localhost',
+    ])
+      expect(crossSite(req('POST', { host }), '0.0.0.0')).toBeUndefined();
+    expect(crossSite(req('POST', { host: 'evil.example:4000' }), '0.0.0.0')).toMatch(/unexpected Host/);
+    expect(crossSite(req('GET', { host: 'rebind.attacker.com:4000' }), '0.0.0.0')).toMatch(/unexpected Host/);
+    expect(
+      crossSite(req('GET', { host: 'jarvis.home.lan:4000' }), '0.0.0.0', ['jarvis.home.lan']),
+    ).toBeUndefined();
+    // Any other dotted name must be listed in `http.hosts`.
+    expect(crossSite(req('GET', { host: 'box.tailnet:4100' }), '0.0.0.0')).toMatch(/unexpected Host/);
+    expect(crossSite(req('GET', { host: 'box.tailnet:4100' }), '0.0.0.0', ['box.tailnet'])).toBeUndefined();
   });
 });
 
@@ -390,6 +405,88 @@ describe('fallback pass-through', () => {
 });
 
 describe('project tabs', () => {
+  it('serves project apps on their own port, so their pages cannot decide cards with your cookie', async () => {
+    const { createServer } = await import('node:http');
+    const seen: { url?: string; cookie?: string }[] = [];
+    const upstream = createServer((req, res) => {
+      seen.push({ url: req.url, cookie: req.headers.cookie });
+      res.writeHead(200, { 'content-type': 'text/html', 'content-length': '40' });
+      res.end('<html><head><title>Posted</title></head>');
+    });
+    await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', r));
+    const free = createServer();
+    await new Promise<void>((r) => free.listen(0, '127.0.0.1', r));
+    const appPort = (free.address() as AddressInfo).port;
+    await new Promise((r) => free.close(r));
+    const server = await startHttpServer({
+      bind: '127.0.0.1',
+      port: 0,
+      appPort,
+      adminToken: 'key',
+      decisionsFromLocal: true,
+      scheduler: { list: () => [] } as unknown as Scheduler,
+      store: new Store(':memory:'),
+      projects: ['shop'],
+      log: { info() {}, warn() {}, error() {} },
+      dashboard: {
+        projects: [
+          {
+            dir: '/srv/shop',
+            config: {
+              name: 'shop',
+              slackChannel: 'C1',
+              permissionMode: 'default',
+              chatModel: 'opus',
+              allowedTools: [],
+              allowedUsers: [],
+              billing: 'subscription',
+              selfImprove: 'trouble',
+              dashboardUrl: `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`,
+              tabs: [{ path: '/posted', label: 'Posted' }],
+            },
+          },
+        ],
+        timeZone: 'UTC',
+        agentName: 'Jarvis',
+      },
+    });
+    const mainPort = (server.address() as AddressInfo).port;
+    const base = `http://127.0.0.1:${mainPort}`;
+    const apps = `http://127.0.0.1:${appPort}`;
+
+    const page = await fetch(`${base}/p/shop/posted`, { headers: { accept: 'text/html' } }).then((r) =>
+      r.text(),
+    );
+    expect(page).toContain(`src="${apps}/app/shop/posted"`);
+    expect(page).toContain(`data-origin="${apps}"`);
+    // Old links to the app on the dashboard's port go on to the app port.
+    const old = await fetch(`${base}/app/shop/posted?x=1`, { redirect: 'manual' });
+    expect(old.headers.get('location')).toBe(`${apps}/app/shop/posted?x=1`);
+
+    // The app port proxies the app, without tara's cookies, and adds the location reporter to pages.
+    const app = await fetch(`${apps}/app/shop/posted`, { headers: { cookie: 'tara_admin=v1.x; board=1' } });
+    const body = await app.text();
+    expect(body).toContain('<head><script>');
+    expect(body).toContain(`tara:location`);
+    expect(body).toContain(JSON.stringify(base));
+    expect(body).toContain('<title>Posted</title>');
+    expect(seen.at(-1)).toEqual({ url: '/posted', cookie: 'board=1' });
+    // Nothing of tara itself is served there.
+    const api = await fetch(`${apps}/items/abc/decide`, { method: 'POST', redirect: 'manual' });
+    expect(api.status).toBe(302);
+    expect(api.headers.get('location')).toBe(`${base}/items/abc/decide`);
+    // A page on the app port calling the dashboard is another origin: refused before any decision.
+    const forged = await fetch(`${base}/items/abc/decide`, {
+      method: 'POST',
+      headers: { origin: apps, cookie: 'tara_admin=key' },
+      body: '{}',
+    });
+    expect(forged.status).toBe(403);
+    expect(await forged.text()).toMatch(/cross-site/);
+    server.close();
+    upstream.close();
+  });
+
   it('lists project pages in the sidebar, frames them on /p/ and proxies /app/ to the project app', async () => {
     const { createServer } = await import('node:http');
     const seen: { url?: string; prefix?: string; cookie?: string; body: string }[] = [];
@@ -562,6 +659,41 @@ describe('home page', () => {
     expect(page).toContain(
       '⏳ Waiting to start: <a href="/jobs#job-shop-blog" title="waiting for a free job slot">BLOG</a>',
     );
+  });
+
+  it('lists every run working now in "Running now": jobs, chats, learning turns', () => {
+    const base = {
+      jobs: [job('ga4', { running: true, liveSessionId: 'live-1' }), job('daily', { running: true })],
+      latest: [],
+      quietRuns: 0,
+      pending: [],
+      uptimeSeconds: 0,
+      now: NOW,
+    };
+    const live = homePage(ctx, {
+      ...base,
+      live: [
+        { kind: 'job', project: 'shop', title: 'GA4', jobId: 'ga4', href: '/t/web-shop/1.1' },
+        {
+          kind: 'chat',
+          project: 'shop',
+          title: 'let’s plan next week linkedin & x post\nmore',
+          href: '/t/C1/2.2',
+        },
+        { kind: 'learn', project: 'shop', title: 'Learning from This conversation', href: '/t/C1/3.3' },
+      ],
+    });
+    expect(live).toContain(
+      '● Running now: <a href="/t/web-shop/1.1">⏱ GA4</a>, <a href="/t/C1/2.2">💬 let’s plan next week linkedin &amp; x post</a>, <a href="/t/C1/3.3">📝 Learning from This conversation</a>, <a href="/jobs#job-shop-daily">⏱ DAILY</a></b>',
+    );
+    // A reply being answered while no job runs: not "Nothing running".
+    const chatOnly = homePage(ctx, {
+      ...base,
+      jobs: [],
+      live: [{ kind: 'chat', project: 'shop', title: 'hello' }],
+    });
+    expect(chatOnly).toContain('● Running now: <span>💬 hello</span>');
+    expect(homePage(ctx, { ...base, jobs: [], live: [] })).toContain('○ Nothing running');
   });
 
   it('keeps frequent jobs out of "Coming up" and shows usage', () => {
@@ -1262,5 +1394,36 @@ describe('page scripts', () => {
     expect(
       parses(homePage(ctx, { jobs: [], latest: [], quietRuns: 0, pending: [], uptimeSeconds: 0, now: NOW })),
     ).toBeGreaterThan(0);
+  });
+});
+
+describe('session titles', () => {
+  it('names a chat after its message, not the project memory or cards tara puts before it', () => {
+    const prompt = [
+      '## Project memory',
+      'From `.tara/memory.md`, kept by earlier runs. Trust it, but check anything that may have changed since:',
+      '',
+      '## Posting',
+      '- LinkedIn on Tuesdays',
+      '',
+      '### Recent decisions on cards',
+      '22 Nov · application · "80 · CINC Systems · Staff Applied AI Engineer": Skip',
+      '',
+      '## Cards in this thread',
+      '- Draft post (item 7, post, pending)',
+      '',
+      '<@U095Z4AK2TB>: let’s plan next week linkedin & x post',
+      '',
+      'Your folders:',
+      '- Scratch folder: /tmp/x',
+    ].join('\n');
+    expect(promptTitle(prompt)).toBe('let’s plan next week linkedin & x post');
+  });
+
+  it('uses the first line of any other prompt, cut to fit, and gives up on bare context', () => {
+    expect(promptTitle('check the redis health\n\nYour folders:\n- Scratch')).toBe('check the redis health');
+    expect(promptTitle(`<@U1>: ${'x'.repeat(100)}`)).toBe(`${'x'.repeat(79)}…`);
+    expect(promptTitle('## Project memory\n- notes\n\nRun the job')).toBeUndefined();
+    expect(promptTitle(undefined)).toBeUndefined();
   });
 });

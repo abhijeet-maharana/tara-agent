@@ -104,7 +104,7 @@ export const BRIDGE_PROMPT = `Slack tools (tara MCP server):
   - a suggestion worth acting on: approving it means you do it.
   - something only a person can do (a login, an OTP, a captcha, a call, a failure you could not fix): say exactly what, with options like "Done, continue" / "Skip".
   No card for OK or FYI news: that stays in your reply.
-  Give every card \`handoff\` notes: the decision is then acted on by a fresh session in a new thread, which has only the card, those notes and the project memory, not this conversation. Write them for someone who wasn't here: what to do on each option, with every id, URL, file path, number and command it needs. Leave \`handoff\` out only when the answer must come back to this very session (an OTP or a login in a browser you have open): it then arrives here as your next message, starting with "USER DECISION".
+  Give every card \`handoff\` notes: the decision may be acted on by a fresh session in a new thread (the usual choice once this session is large or long), which has only the card, those notes and the project memory, not this conversation; otherwise this session continues with it. Write them for someone who wasn't here: what to do on each option, with every id, URL, file path, number and command it needs. Leave \`handoff\` out only when the answer must come back to this very session (an OTP or a login in a browser you have open): it then arrives here as your next message, starting with "USER DECISION".
 - Drafts that should go out later (messages, emails, applications, posts) go through \`propose_item\` with the queue that sends them: one card each, approved or edited on the Approvals page, then run at the queue's time. Never send them yourself.
 - Close a waiting card yourself with \`withdraw_card\` (its id from \`list_items\`, and why) whenever it no longer needs the person: they did it themselves, the role or post is gone, it is a duplicate, or a newer card replaces it. No approval is needed to close a card. Never ask them to tap a button just to clear it, and never leave a card they cannot act on.
 - To share a screenshot, PDF, CSV or image, save it inside the project (e.g. .scratch/) and call \`send_file\`.`;
@@ -618,16 +618,21 @@ export class Bridge {
 
   private async approvalTapped(tap: ButtonTap): Promise<void> {
     const item = this.deps.store.getItem(tap.value);
-    const option = item?.options[Number(tap.actionId.split(':')[2])];
+    // `tara:approval:<option>[:<new|continue>]`: the button says where the decision is acted on.
+    const [, , index, mode] = tap.actionId.split(':');
+    const option = item?.options[Number(index)];
     if (!item || !option) return;
+    const session = mode === 'new' || mode === 'continue' ? mode : undefined;
     if (!this.allowed(item.project, tap.user)) {
       this.deps.log.warn(`[${item.project}] approval tap by ${tap.user} ignored (not in allowedUsers)`);
       return;
     }
-    await this.deps.approvals.decide(item.id, { option, by: tap.user, via: 'slack' }).catch((err: Error) => {
-      // Already decided (a double tap, or the dashboard first): nothing to do.
-      if (!(err instanceof ApprovalError && err.status === 409)) throw err;
-    });
+    await this.deps.approvals
+      .decide(item.id, { option, by: tap.user, via: 'slack', session })
+      .catch((err: Error) => {
+        // Already decided (a double tap, or the dashboard first): nothing to do.
+        if (!(err instanceof ApprovalError && err.status === 409)) throw err;
+      });
   }
 
   private async permissionTapped(tap: ButtonTap): Promise<void> {

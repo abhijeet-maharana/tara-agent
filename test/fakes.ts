@@ -64,7 +64,7 @@ export function testHost(overrides: Partial<HostConfig> = {}): HostConfig {
     ...hostConfigSchema.parse({ projects: ['/repo'], timezone: 'UTC' }),
     stateDir: '/tmp',
     statusIntervalSeconds: 0,
-    http: { enabled: false, bind: '127.0.0.1', port: 0, allowFrom: ['127.0.0.0/8'] },
+    http: { enabled: false, bind: '127.0.0.1', port: 0, allowFrom: ['127.0.0.0/8'], hosts: [] },
     // Never touch a real Chrome on :9222 (the suite may run on the host that has one).
     browsers: [{ cdpUrl: 'http://127.0.0.1:9', lock: 'chrome', closeTabs: false, staleMinutes: 30 }],
     ...overrides,

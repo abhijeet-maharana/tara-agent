@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { hostname } from 'node:os';
 import path from 'node:path';
 import { Cron } from 'croner';
 import type { Bridge } from '../bridge/bridge.js';
@@ -14,10 +15,12 @@ import type {
 import type { Runner } from '../runner/run.js';
 import type { ChatPort, Logger } from '../sessions/manager.js';
 import { Threads } from '../sessions/threads.js';
+import { Incidents } from '../slack/incidents.js';
 import type { Item, Store } from '../store/store.js';
 import { Locks, Semaphore } from '../util/concurrency.js';
-import { deliveryOf, webOf } from '../web/chat.js';
+import { type Delivery, deliveryOf, webOf } from '../web/chat.js';
 import { type JobStatus, type JobTrigger, type JobWait, runJob } from './job-runner.js';
+import { HELD_RETRY_MS, LimitHolds } from './limits.js';
 import type { DecidedCard } from './prompt.js';
 import { runName, SCHEDULE_BY, type ScheduledKind, scheduledRunText } from './slack-trigger.js';
 
@@ -52,6 +55,8 @@ export interface JobInfo {
   durationMinutes?: number;
   /** Named locks it holds while running (e.g. a browser's). */
   locks?: string[];
+  /** Where its unattended runs happen: the dashboard with a Slack summary, or a Slack thread. */
+  delivery?: Delivery;
   nextRun?: Date;
   lastStatus?: string;
   lastRunAt?: Date;
@@ -64,17 +69,21 @@ export interface JobControl {
   /**
    * Runs a job now; with `thread`, inside that chat message's thread. `by` = SCHEDULE_BY: the bot
    * saw its own trigger message, and the run is that scheduled slot (once; 'unknown' otherwise).
+   * `replyIn`: the Slack thread it was asked for in, where its result summary then goes.
    */
   trigger(
     project: string,
     id: string,
     by: string,
     thread?: { channel: string; ts: string },
+    opts?: { replyIn?: { channel: string; ts: string } },
   ): 'started' | 'unknown' | 'running';
   /** A job's `agyPermissions`, for a thread reply that continues its agy session. */
   agyPermissions?(project: string, id: string): AgyPermissions | undefined;
   /** A job's own `effort`, for a thread reply that continues its session. */
   effort?(project: string, id: string): string | undefined;
+  /** A chat hit the usage limit of `harness`: scheduled runs on it wait until `resetAt`. */
+  noteLimit?(harness: string, resetAt: number): void;
 }
 
 export interface SchedulerDeps {
@@ -96,6 +105,8 @@ export interface SchedulerDeps {
   pickupTimeoutMs?: number;
   /** A Slack thread's link, once Slack is connected. */
   threadUrl?: (channel: string, ts: string) => string | undefined;
+  /** The dashboard's Approvals page, linked from summaries of runs that left cards. */
+  approvalsUrl?: string;
 }
 
 interface Entry {
@@ -113,6 +124,8 @@ export class Scheduler implements JobControl {
   private readonly running = new Set<string>();
   /** Where each busy job is: waiting for something, or started at a time. */
   private readonly stages = new Map<string, { waitingFor?: JobWait; startedAt?: number }>();
+  /** Cancels a launched run while it still waits for its locks or a slot (Pause). */
+  private readonly waitCancels = new Map<string, AbortController>();
   /** Slots whose trigger message is posted in Slack, waiting for the bot to pick it up. */
   private readonly pending = new Map<string, { slot: number; kind: ScheduledKind; byPerson: boolean }>();
   /** Watchdogs of posted triggers, cleared on stop. */
@@ -123,6 +136,15 @@ export class Scheduler implements JobControl {
   private readonly slots: Semaphore;
   private readonly locks = new Locks();
   private readonly threads: Threads;
+  /** Usage limits and lost logins, one Slack message each for all the runs they fail. */
+  private readonly incidents: Incidents;
+  /** CLIs at their usage limit: scheduled runs on them wait (slots kept as `held`) until it resets. */
+  readonly holds: LimitHolds;
+  /**
+   * Draining before a restart: scheduled slots that come up start nothing and are left `aborted`, so the
+   * restarted process catches them up; running jobs finish.
+   */
+  draining = false;
   private readonly controller = new AbortController();
   private readonly inflight = new Set<Promise<unknown>>();
   private readonly now: () => number;
@@ -135,12 +157,23 @@ export class Scheduler implements JobControl {
     this.threads = deps.threads ?? new Threads();
     this.now = deps.now ?? Date.now;
     this.startedAt = this.now();
+    this.holds = new LimitHolds(this.now);
+    this.incidents = new Incidents({
+      chat: deps.chat,
+      log: deps.log,
+      host: hostname(),
+      runAs: deps.host.claude.runAs,
+      now: this.now,
+    });
   }
 
   /** Loads every project's jobs, runs missed slots, and starts watching the job files. */
   start(): void {
     for (const project of this.deps.projects) this.reload(project, { catchUp: true });
-    this.poller = setInterval(() => this.checkFiles(), this.deps.reloadIntervalMs ?? 30_000);
+    this.poller = setInterval(() => {
+      this.checkFiles();
+      if (!this.draining) for (const harness of this.holds.ended()) this.retryHeld(harness);
+    }, this.deps.reloadIntervalMs ?? 30_000);
     this.poller.unref();
   }
 
@@ -192,7 +225,7 @@ export class Scheduler implements JobControl {
   list(project: string): JobInfo[] {
     return [...this.entries.values()]
       .filter((e) => e.scheduled.project.config.name === project)
-      .map(({ scheduled: { job }, cron }) => {
+      .map(({ scheduled: { job, project: owner }, cron }) => {
         const last = this.deps.store.lastJobRun(project, job.id);
         const key = jobKey(project, job.id);
         const stage = this.running.has(key) ? this.stages.get(key) : undefined;
@@ -224,6 +257,7 @@ export class Scheduler implements JobControl {
           fallback: job.fallback,
           durationMinutes: job.durationMinutes,
           locks: job.locks,
+          delivery: deliveryOf(this.deps.host, owner, job),
           nextRun: cron?.nextRun() ?? undefined,
           lastStatus: last?.status,
           lastRunAt: last ? new Date(last.startedAt) : undefined,
@@ -236,7 +270,41 @@ export class Scheduler implements JobControl {
   /** Re-reads every project's job file now (normally polled every 30 s). */
   /** Whether a job exists and is on (not paused). */
   enabled(project: string, id: string): boolean {
-    return this.entries.get(jobKey(project, id))?.scheduled.job.enabled === true;
+    const job = this.entries.get(jobKey(project, id))?.scheduled.job;
+    return job?.enabled === true && this.heldUntil(job) === undefined;
+  }
+
+  noteLimit(harness: string, resetAt: number): void {
+    this.holds.hit(harness, resetAt);
+  }
+
+  /** When a job may run again, while every CLI it could run on is at its usage limit. */
+  heldUntil(job: Pick<JobConfig, 'harness' | 'fallback'>): number | undefined {
+    const own = this.holds.heldUntil(job.harness ?? 'claude');
+    if (own === undefined) return undefined;
+    if (!job.fallback) return own;
+    const other = this.holds.heldUntil(job.fallback.harness);
+    return other === undefined ? undefined : Math.min(own, other);
+  }
+
+  /**
+   * A usage limit on `harness` has reset: the latest slot of each of its jobs that was held (or hit the
+   * limit), when no later slot has run and it is under a day old, runs now, once.
+   */
+  retryHeld(harness: string): void {
+    let retried = 0;
+    for (const { scheduled } of this.entries.values()) {
+      const { project, job } = scheduled;
+      if (!job.enabled || !job.cron || (job.harness ?? 'claude') !== harness) continue;
+      const key = jobKey(project.config.name, job.id);
+      const last = this.deps.store.latestClaim(key);
+      if (!last || (last.status !== 'held' && last.status !== 'limit')) continue;
+      if (this.now() - last.slot > HELD_RETRY_MS || this.heldUntil(job) !== undefined) continue;
+      if (this.fire(scheduled, last.slot, 'catch-up', true)) retried++;
+    }
+    this.deps.log.info(
+      `${harness} usage limit reset: ${retried} held ${retried === 1 ? 'job runs' : 'jobs run'} now`,
+    );
   }
 
   reloadAll(): void {
@@ -248,6 +316,8 @@ export class Scheduler implements JobControl {
    * of truth) and reloads that project so the change takes effect at once.
    */
   setEnabled(project: string, id: string, enabled: boolean): 'ok' | 'unknown' {
+    // A paused job's run that is still waiting in line doesn't start; one already started finishes.
+    if (!enabled) this.waitCancels.get(jobKey(project, id))?.abort();
     return this.editJob(project, id, (job) => {
       // A missing `enabled` means on, so resuming removes the key: a pause + resume leaves the file as it was.
       const changed = enabled ? 'enabled' in job : job.enabled !== false;
@@ -270,16 +340,17 @@ export class Scheduler implements JobControl {
   private editJob(
     project: string,
     id: string,
-    edit: (job: { id?: string; enabled?: boolean; durationMinutes?: number }) => boolean,
+    edit: (job: { id?: string; skill?: string; enabled?: boolean; durationMinutes?: number }) => boolean,
   ): 'ok' | 'unknown' {
     const owner = this.deps.projects.find((p) => p.config.name === project);
     if (!owner) return 'unknown';
     const file = path.join(owner.dir, JOBS_FILE);
     if (!existsSync(file)) return 'unknown';
     const doc = JSON.parse(readFileSync(file, 'utf8')) as {
-      jobs?: Array<{ id?: string; enabled?: boolean; durationMinutes?: number }>;
+      jobs?: Array<{ id?: string; skill?: string; enabled?: boolean; durationMinutes?: number }>;
     };
-    const job = doc.jobs?.find((j) => j.id === id);
+    // A `skill` job has no `id` key in the file: its skill is its id.
+    const job = doc.jobs?.find((j) => (j.id ?? j.skill) === id);
     if (!job) return 'unknown';
     if (edit(job)) {
       // Written the way these files are kept (2-space JSON), so nothing else in them changes.
@@ -316,6 +387,7 @@ export class Scheduler implements JobControl {
     id: string,
     by: string,
     thread?: { channel: string; ts: string },
+    opts: { replyIn?: { channel: string; ts: string } } = {},
   ): 'started' | 'unknown' | 'running' {
     const key = jobKey(project, id);
     const entry = this.entries.get(key);
@@ -341,7 +413,7 @@ export class Scheduler implements JobControl {
     }
     if (!entry) return 'unknown';
     if (this.running.has(key)) return 'running';
-    this.launch(entry.scheduled, { kind: 'manual', by, thread });
+    this.launch(entry.scheduled, { kind: 'manual', by, thread, replyIn: opts.replyIn });
     return 'started';
   }
 
@@ -411,20 +483,39 @@ export class Scheduler implements JobControl {
    * still running or the slot was already claimed. A slot whose message never comes back stays
    * claimed as `running`, so the next start catches it up.
    */
-  private fire(scheduled: ScheduledJob, slot: number, kind: ScheduledKind): void {
+  private fire(scheduled: ScheduledJob, slot: number, kind: ScheduledKind, retakeHeld = false): boolean {
     const { project, job } = scheduled;
     const key = jobKey(project.config.name, job.id);
     if (this.running.has(key)) {
       this.deps.log.warn(`[${key}] still running; skipped slot ${new Date(slot).toISOString()}`);
-      return;
+      return false;
     }
-    if (!this.deps.store.claimSlot(key, slot, this.startedAt)) return;
+    if (this.draining) {
+      if (this.deps.store.claimSlot(key, slot, this.startedAt)) {
+        this.deps.store.finishSlot(key, slot, 'aborted');
+        this.deps.log.info(
+          `[${key}] draining for a restart; slot ${new Date(slot).toISOString()} left for after it`,
+        );
+      }
+      return false;
+    }
+    const held = this.heldUntil(job);
+    if (held !== undefined) {
+      // At the usage limit: no run that would only fail. The slot is kept and runs after the reset.
+      if (this.deps.store.claimSlot(key, slot, this.startedAt)) {
+        this.deps.store.finishSlot(key, slot, 'held');
+        this.deps.log.info(`[${key}] held until ${new Date(held).toISOString()} (usage limit)`);
+      }
+      return false;
+    }
+    if (!this.deps.store.claimSlot(key, slot, this.startedAt, retakeHeld ? ['held', 'limit'] : []))
+      return false;
     const { chat } = this.deps;
     // `delivery: summary`: no trigger message; the run starts here, on the dashboard, and Slack gets
     // only its result.
     if (webOf(chat) && deliveryOf(this.deps.host, project, job) === 'summary') {
       this.launch(scheduled, { kind }, (status) => this.deps.store.finishSlot(key, slot, status));
-      return;
+      return true;
     }
     const channel = project.config.slackChannel;
     const words = project.config.words;
@@ -456,6 +547,7 @@ export class Scheduler implements JobControl {
         this.deps.store.finishSlot(key, slot, 'aborted');
       },
     );
+    return true;
   }
 
   /**
@@ -502,9 +594,29 @@ export class Scheduler implements JobControl {
     return this.whenFree(project, id, { kind: 'decision', ...r });
   }
 
-  /** Runs a job with approved queue items in its prompt; resolves when the run has ended. */
-  async runQueue(project: string, id: string, queue: string, items: Item[]): Promise<JobStatus | 'unknown'> {
-    return this.whenFree(project, id, { kind: 'queue', queue, items });
+  /**
+   * Runs a queue's executor job on its items. `held`: nothing ran (its CLI is at the usage limit, or the
+   * run hit it before any tool call), so the items can wait for the reset instead of failing.
+   */
+  async runQueue(
+    project: string,
+    id: string,
+    queue: string,
+    items: Item[],
+  ): Promise<JobStatus | 'unknown' | 'held' | 'not-started'> {
+    const key = jobKey(project, id);
+    while (this.running.has(key)) await new Promise((r) => setTimeout(r, 2_000));
+    const entry = this.entries.get(key);
+    if (!entry) return 'unknown';
+    if (this.heldUntil(entry.scheduled.job) !== undefined) return 'held';
+    let toolCalls: number | undefined;
+    const status = await this.launch(entry.scheduled, { kind: 'queue', queue, items }, (_, calls) => {
+      toolCalls = calls;
+    });
+    // Nothing ran: hit the limit before any tool call, or paused (or stopped) while it waited in line.
+    if (!toolCalls && status === 'limit') return 'held';
+    if (toolCalls === undefined && status === 'aborted') return 'not-started';
+    return status;
   }
 
   private async whenFree(project: string, id: string, trigger: JobTrigger): Promise<JobStatus | 'unknown'> {
@@ -525,11 +637,21 @@ export class Scheduler implements JobControl {
   private launch(
     scheduled: ScheduledJob,
     trigger: JobTrigger,
-    done?: (status: JobStatus | 'stopped') => void,
+    done?: (status: JobStatus | 'stopped', toolCalls?: number) => void,
   ): Promise<JobStatus> {
     const key = jobKey(scheduled.project.config.name, scheduled.job.id);
     this.running.add(key);
+    const cancelWait = new AbortController();
+    this.waitCancels.set(key, cancelWait);
     let result: JobStatus = 'error';
+    let closed = false;
+    // Only a shutdown's `aborted` leaves the slot open to be claimed again after the restart; a run a
+    // person stopped ("stop" in its thread, Stop on the dashboard) stays stopped.
+    const close = (status: JobStatus, toolCalls?: number) => {
+      if (closed) return;
+      closed = true;
+      done?.(status === 'aborted' && !this.controller.signal.aborted ? 'stopped' : status, toolCalls);
+    };
     const named = {
       ...scheduled,
       runName: runName(
@@ -553,22 +675,27 @@ export class Scheduler implements JobControl {
         newSessionId: this.deps.newSessionId,
         now: this.deps.now,
         threadUrl: this.deps.threadUrl,
+        incidents: this.incidents,
+        approvalsUrl: this.deps.approvalsUrl,
+        holds: this.holds,
+        cancelWait: cancelWait.signal,
         onWait: (waitingFor) => this.stages.set(key, waitingFor ? { waitingFor } : { startedAt: this.now() }),
       },
       named,
       trigger,
       this.controller.signal,
+      // The slot closes when the run is recorded, not after its learning turns (up to 5 minutes more).
+      close,
     )
       .then((status) => {
         result = status;
-        // Only a shutdown's `aborted` leaves the slot open to be claimed again after the restart; a run a
-        // person stopped ("stop" in its thread, Stop on the dashboard) stays stopped.
-        done?.(status === 'aborted' && !this.controller.signal.aborted ? 'stopped' : status);
+        close(status);
       })
       .catch((err: Error) => this.deps.log.error(`[${key}] ${err.message}`))
       .finally(() => {
         this.running.delete(key);
         this.stages.delete(key);
+        if (this.waitCancels.get(key) === cancelWait) this.waitCancels.delete(key);
         this.inflight.delete(task);
       });
     this.inflight.add(task);

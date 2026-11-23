@@ -190,6 +190,23 @@ describe('approvals', () => {
     ]);
   });
 
+  it('passes the session a button names on to the decision', async () => {
+    const { bridge, approvals, ctx } = setup();
+    const { token } = openRun(bridge, ctx);
+    await bridge.requestApproval(token, { title: 'T', details: 'D' });
+    const seen: unknown[] = [];
+    const decide = approvals.decide.bind(approvals);
+    approvals.decide = async (id, d) => {
+      seen.push(d.session);
+      return decide(id, d);
+    };
+    const tap = { value: 'id1', user: 'U1', channel: 'C1', messageTs: 'ts1' };
+    await bridge.handleButton({ ...tap, actionId: 'tara:approval:0:new' });
+    await bridge.handleButton({ ...tap, actionId: 'tara:approval:1:continue' });
+    await bridge.handleButton({ ...tap, actionId: 'tara:approval:0' });
+    expect(seen).toEqual(['new', 'continue', undefined]);
+  });
+
   it('posts a long proposal in full before the buttons', async () => {
     const { chat, bridge, ctx } = setup();
     const { token } = openRun(bridge, ctx);

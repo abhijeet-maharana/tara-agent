@@ -12,7 +12,9 @@ HOST_NAME="Mac"
 TARA_URL="${TARA_URL%/}"
 
 stats="$("$DIR/lib/mac-stats.sh")" || exit 1
-payload="$(osascript -l JavaScript - "$stats" "$HOST_NAME" <<'JXA'
+# Seconds since the keyboard or mouse was last used (HIDIdleTime is in nanoseconds).
+idle="$(ioreg -c IOHIDSystem | awk '/HIDIdleTime/ { print int($NF / 1000000000); exit }')"
+payload="$(osascript -l JavaScript - "$stats" "$HOST_NAME" "$idle" <<'JXA'
 function run(argv) {
   const d = JSON.parse(argv[0]);
   const m = d.macmon || {};
@@ -29,6 +31,7 @@ function run(argv) {
     vmCpu: vm ? Math.min(1, vm.cpu / 100 / d.ncpu) : undefined,
     vmMemBytes: vm ? vm.rssKb * 1024 : undefined,
     powerW: m.sys_power || m.all_power,
+    idleSec: argv[2] === '' ? undefined : Number(argv[2]),
   };
   return JSON.stringify(out);
 }

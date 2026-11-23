@@ -1,3 +1,4 @@
+import type { SessionChoice } from '../approvals/session-choice.js';
 import type { QueueConfig } from '../config/schema.js';
 import { nextRun } from '../scheduler/queues.js';
 import type { Item } from '../store/store.js';
@@ -35,6 +36,18 @@ export interface ApprovalsData {
   now: number;
   /** Job names by `project:jobId`, so a card says which job raised it. */
   jobNames?: Map<string, string>;
+  /** Each waiting card's advice on where its decision is acted on (a new session or the same one), by id. */
+  advice?: Map<string, SessionChoice | undefined>;
+}
+
+/**
+ * The page of the session a card belongs to (`/t/<channel>/<ts>`): its conversation, live while it
+ * runs, with a box to write in. Cards link there instead of holding a chat of their own.
+ */
+export function sessionLink(item: Pick<Item, 'channel' | 'threadTs'>): string | undefined {
+  return item.channel && item.threadTs
+    ? `/t/${encodeURIComponent(item.channel)}/${encodeURIComponent(item.threadTs)}`
+    : undefined;
 }
 
 /** Most items a tab lists (and counts). */
@@ -99,13 +112,14 @@ const editedFields = (c) => {
   });
   return out;
 };
-const decide = async (c, option, runNow) => {
+const decide = async (c, option, runNow, session) => {
   const reply = c.querySelector('[data-reply]')?.value.trim() || undefined;
   if (option === 'Revise' && !reply) { c.classList.add('open'); c.querySelector('[data-reply]').focus(); return toast('Say what to change, then press Revise again'); }
   const was = [...c.querySelectorAll('button')].map((b) => b.disabled);
   c.querySelectorAll('button').forEach((b) => (b.disabled = true));
   try {
-    const r = await post('/items/' + c.dataset.item + '/decide', { option, fields: editedFields(c), reply, runNow: Boolean(runNow), seen: Number(c.dataset.version) });
+    const mode = session || c.querySelector('[data-session]:checked')?.value || undefined;
+    const r = await post('/items/' + c.dataset.item + '/decide', { option, fields: editedFields(c), reply, runNow: Boolean(runNow), seen: Number(c.dataset.version), session: mode });
     if (option === 'Revise') {
       // The card keeps waiting: it shows the request until Jarvis's new version replaces it.
       if (r.item?.updatedAt) c.dataset.version = r.item.updatedAt;
@@ -127,23 +141,21 @@ const decide = async (c, option, runNow) => {
 document.addEventListener('click', async (e) => {
   const b = e.target.closest('button');
   if (!b) return;
-  if (b.dataset.decide) return decide(card(b), b.dataset.decide, b.dataset.now);
+  if (b.dataset.decide) return decide(card(b), b.dataset.decide, b.dataset.now, b.dataset.mode);
   if (b.dataset.fold !== undefined) { const c = card(b); const open = c.classList.toggle('open'); b.setAttribute('aria-expanded', open); return; }
   if (b.dataset.expand !== undefined) { const body = card(b).querySelector('.body'); body.classList.toggle('open'); b.textContent = body.classList.contains('open') ? 'Show less' : 'Show all'; return; }
   if (b.dataset.openNote !== undefined) { const c = card(b); c.classList.add('open'); c.querySelector('[data-fold]')?.setAttribute('aria-expanded', 'true'); c.querySelector('[data-reply]').focus(); return; }
-  // A note without a decision: to Jarvis in the card's Slack thread; the card keeps waiting.
+  // A note without a decision: to Jarvis in the card's session, whose page then shows the answer live.
+  // The card keeps waiting here.
   if (b.dataset.note !== undefined) {
     const c = card(b), box = c.querySelector('[data-reply]'), text = box.value.trim();
     if (!text) { box.focus(); return toast('Write the note first'); }
     b.disabled = true;
     try {
-      await post('/items/' + c.dataset.item + '/note', { text });
+      const r = await post('/items/' + c.dataset.item + '/note', { text });
       box.value = '';
-      const sent = document.createElement('div');
-      sent.className = 'sent-note';
-      sent.textContent = '📝 Sent: ' + text;
-      c.querySelector('.reply').before(sent);
-      toast("Sent to Jarvis. The answer comes in the card's Slack thread.");
+      if (r.session) { location.href = r.session; return; }
+      toast('Sent to Jarvis. The answer comes in the thread of this card.');
     } catch (err) { toast(err.message, { error: true }); }
     b.disabled = false;
     return;
@@ -199,7 +211,8 @@ const CSS = `<style>
 .checks{list-style:none;margin:10px 0 0;padding:0;display:grid;gap:4px;font-size:13px}
 .checks li::before{content:'⚠ ';}.checks li.bad{color:var(--red)}.checks li.warn{color:var(--amber)}
 .reply{margin-top:10px}.reply textarea{width:100%;min-width:0;min-height:60px}.reply .actions{margin-top:8px;align-items:center}.reply .hint{font-size:12.5px}
-.sent-note{font-size:13px;color:var(--text-dim);margin-top:8px;overflow-wrap:anywhere}
+.advice{margin-top:10px;font-size:13px;color:var(--text-dim);display:flex;gap:6px 14px;flex-wrap:wrap;align-items:center}
+.advice b{color:var(--text)}.advice label{display:inline-flex;gap:5px;align-items:center;cursor:pointer}
 .item .actions{margin-top:12px}.pick{width:18px;height:18px;accent-color:var(--accent)}
 .revising{color:var(--amber);font-size:13px;margin-top:8px}
 .why{color:var(--red);font-size:13px;margin-top:10px;line-height:1.4}
@@ -271,6 +284,24 @@ function expiresSoon(ctx: DashboardContext, item: Item, now: number): string {
   return at - now < DAY_MS ? `<span class="tag bad">expires ${esc(relative(at, now))}</span>` : '';
 }
 
+/**
+ * Where a decision is acted on: the advice and why, and (when the card can do both) a choice to use the
+ * other one. Picked before an option; the default is the advice, which Slack's card shows too.
+ */
+function adviceHtml(id: string, choice: SessionChoice | undefined, canDecide: boolean): string {
+  if (!choice) return '';
+  const text = (mode: SessionChoice['mode']) =>
+    mode === 'new' ? 'a new session will be created' : 'continues in the existing session';
+  const line = `<span>Upon approval, <b>${text(choice.mode)}</b> · ${esc(choice.why)}</span>`;
+  if (!choice.alternative || !canDecide) return `<div class="advice">${line}</div>`;
+  const radio = (mode: SessionChoice['mode'], label: string) =>
+    `<label><input type="radio" data-session name="session-${esc(id)}" value="${mode}"${mode === choice.mode ? ' checked' : ''}> ${label}</label>`;
+  return `<div class="advice">${line}${radio(choice.mode, 'as advised')}${radio(
+    choice.alternative,
+    choice.alternative === 'new' ? 'use a new session' : 'continue the existing session',
+  )}</div>`;
+}
+
 function waitingCard(
   ctx: DashboardContext,
   item: Item,
@@ -283,6 +314,8 @@ function waitingCard(
   const source = item.source ? (data.jobNames?.get(`${item.project}:${item.source}`) ?? item.source) : '';
   const expiry = expiresSoon(ctx, item, data.now);
   const long = (item.body?.length ?? 0) > 700;
+  const advice = data.advice?.get(item.id);
+  const session = sessionLink(item);
   const buttons = data.canDecide
     ? [
         ...item.options.map((o, i) => {
@@ -293,9 +326,14 @@ function waitingCard(
         item.mode === 'queue' && item.options[0]
           ? `<button type="button" class="btn quiet" data-decide="${esc(item.options[0])}" data-now="1"${blocking ? ' disabled' : ''} title="Skip the window and run as soon as the queue is free">${esc(item.options[0])} &amp; run now</button>`
           : '',
-        `<button type="button" class="btn ${blocking ? 'ghost' : 'quiet'}" data-open-note>${blocking ? 'Fix it…' : item.mode === 'queue' ? 'Revise or note…' : 'Note…'}</button>`,
+        `<button type="button" class="btn ${blocking ? 'ghost' : 'quiet'}" data-open-note>${blocking ? 'Fix it…' : item.mode === 'queue' ? 'Revise or ask…' : 'Ask…'}</button>`,
+        session
+          ? `<a class="btn quiet" href="${esc(session)}" title="The conversation behind this card, live: watch it and write to Jarvis there">Open session ↗</a>`
+          : '',
       ].join('')
-    : '';
+    : session
+      ? `<a class="btn quiet" href="${esc(session)}">Open session ↗</a>`
+      : '';
   // Why an option is off, next to it: the checks alone sit inside the folded card.
   const why = blocking
     ? `<div class="why">⛔ ${item.options[0] ? `${esc(item.options[0])} is off: ` : ''}${esc(blockers.join('; '))}.${
@@ -321,7 +359,7 @@ function waitingCard(
 ${item.body ? `<div class="body${long ? ' long' : ''}">${md(item.body)}</div>${long ? '<button type="button" class="btn quiet expand" data-expand>Show all</button>' : ''}` : ''}
 ${
   item.handoff
-    ? `<details class="handoff"><summary>Handoff notes · a decision is acted on in a new thread</summary><div class="body">${md(item.handoff)}</div></details>`
+    ? `<details class="handoff"><summary>Handoff notes · what a new session gets to act on it</summary><div class="body">${md(item.handoff)}</div></details>`
     : ''
 }
 ${mediaHtml(item)}
@@ -334,15 +372,15 @@ ${
         item.mode === 'queue'
           ? 'What should change (Revise: Jarvis makes a new version), or a question for Jarvis (Send)'
           : 'A note or question for Jarvis'
-      }"></textarea><div class="actions"><button type="button" class="btn ghost" data-note title="Jarvis answers in the card's Slack thread; the card keeps waiting">Send</button>${
+      }"></textarea><div class="actions"><button type="button" class="btn ghost" data-note title="Goes to Jarvis in the card's session, which then opens; the card keeps waiting">Send</button>${
         item.mode === 'queue'
           ? '<button type="button" class="btn ghost" data-decide="Revise">Revise</button>'
           : ''
-      }<span class="dim hint">Send asks Jarvis without deciding. Or pick an option: the note goes with your decision.</span></div></div>`
+      }<span class="dim hint">Send asks Jarvis without deciding and opens the session to see the answer live. Or pick an option: the note goes with your decision.</span></div></div>`
     : ''
 }
 </div>
-${why}${buttons ? `<div class="actions">${buttons}</div>` : ''}</article>`;
+${why}${adviceHtml(item.id, advice, data.canDecide)}${buttons ? `<div class="actions">${buttons}</div>` : ''}</article>`;
 }
 
 function doneRow(ctx: DashboardContext, item: Item, data: ApprovalsData, multi: boolean): string {

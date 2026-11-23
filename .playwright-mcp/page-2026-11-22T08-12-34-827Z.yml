@@ -1,0 +1,91 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e2]:
+    - complementary [ref=e3]:
+      - generic [ref=e4]:
+        - generic [aria-hidden] [ref=e5]: J
+        - generic [ref=e6]: Jarvis
+      - navigation [ref=e7]:
+        - link "Home" [ref=e8] [cursor=pointer]:
+          - /url: /
+          - generic [aria-hidden] [ref=e9]: 🏠
+        - link "Approvals 9" [ref=e11] [cursor=pointer]:
+          - /url: /approvals
+          - generic [aria-hidden] [ref=e12]: ✅
+          - generic [ref=e13]: Approvals
+          - generic "9 waiting for a decision" [ref=e14]: "9"
+        - link "Queue" [ref=e15] [cursor=pointer]:
+          - /url: /queue
+          - generic [aria-hidden] [ref=e16]: 📤
+        - link "Jobs 12" [ref=e18] [cursor=pointer]:
+          - /url: /jobs
+          - generic [aria-hidden] [ref=e19]: ⏱️
+          - generic [ref=e20]: Jobs
+          - generic "12 failing jobs" [ref=e21]: "12"
+        - link "Sessions" [ref=e22] [cursor=pointer]:
+          - /url: /sessions
+          - generic [aria-hidden] [ref=e23]: 💬
+        - link "Reminders" [ref=e25] [cursor=pointer]:
+          - /url: /reminders
+          - generic [aria-hidden] [ref=e26]: ⏰
+        - link "Code" [ref=e28] [cursor=pointer]:
+          - /url: /code
+          - generic [aria-hidden] [ref=e29]: 📝
+        - link "Browsers" [ref=e31] [cursor=pointer]:
+          - /url: /browsers
+          - generic [aria-hidden] [ref=e32]: 🌐
+        - link "Health 1" [ref=e34] [cursor=pointer]:
+          - /url: /health
+          - generic [aria-hidden] [ref=e35]: ❤️
+          - generic [ref=e36]: Health
+          - generic "1 health problems" [ref=e37]: "1"
+        - generic [ref=e38]: Abtara
+        - link "Posted" [ref=e39] [cursor=pointer]:
+          - /url: /p/abtara/posted
+          - generic [aria-hidden] [ref=e40]: 📣
+        - link "Media" [ref=e42] [cursor=pointer]:
+          - /url: /p/abtara/media
+          - generic [aria-hidden] [ref=e43]: 🖼️
+        - link "System" [ref=e45] [cursor=pointer]:
+          - /url: /p/abtara/system
+          - generic [aria-hidden] [ref=e46]: 🩺
+        - link "Links" [ref=e48] [cursor=pointer]:
+          - /url: /p/abtara/links
+          - generic [aria-hidden] [ref=e49]: 🔗
+        - generic [ref=e51]: Job Search
+        - link "Pipeline" [ref=e52] [cursor=pointer]:
+          - /url: /p/remote-job/pipeline
+          - generic [aria-hidden] [ref=e53]: 📈
+        - link "Apply by hand" [ref=e55] [cursor=pointer]:
+          - /url: /p/remote-job/apply-by-hand
+          - generic [aria-hidden] [ref=e56]: ✋
+        - link "Social" [ref=e58] [cursor=pointer]:
+          - /url: /p/remote-job/posted
+          - generic [aria-hidden] [ref=e59]: 📣
+        - link "Scouts" [ref=e61] [cursor=pointer]:
+          - /url: /p/remote-job/scouts
+          - generic [aria-hidden] [ref=e62]: 🔭
+        - link "Settings" [ref=e64] [cursor=pointer]:
+          - /url: /p/remote-job/settings
+          - generic [aria-hidden] [ref=e65]: ⚙️
+        - link "Mock" [ref=e67] [cursor=pointer]:
+          - /url: /p/remote-job/mock
+          - generic [aria-hidden] [ref=e68]: 🎙️
+        - generic [ref=e70]: Personal
+        - link "Investment" [ref=e71] [cursor=pointer]:
+          - /url: /p/personal/investment-tracker/
+          - generic [aria-hidden] [ref=e72]: 📈
+        - link "Weight" [ref=e74] [cursor=pointer]:
+          - /url: /p/personal/weight-tracker/
+          - generic [aria-hidden] [ref=e75]: ⚖️
+        - link "Friend Loan" [ref=e77] [cursor=pointer]:
+          - /url: /p/personal/friend-loan/
+          - generic [aria-hidden] [ref=e78]: 🤝
+      - link "Updated 1:42 pm ↻" [ref=e81] [cursor=pointer]:
+        - /url: ""
+    - main [ref=e82]:
+      - iframe [ref=e83]:
+        - generic [ref=f1e2]:
+          - main [ref=f1e3]:
+            - generic [ref=f1e4]: Loading…
+          - status
+  - status

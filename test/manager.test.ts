@@ -265,6 +265,63 @@ describe('SessionManager', () => {
     expect(chat.texts().filter((t) => t.startsWith('<@'))).toHaveLength(1);
   });
 
+  it('keeps a message in the store until its turn ends, marked once the turn starts', async () => {
+    const { store, manager } = setup();
+    let seen: ReturnType<Store['inbox']> = [];
+    const original = store.startInbox.bind(store);
+    store.startInbox = (id) => {
+      original(id);
+      seen = store.inbox();
+    };
+    await manager.handle(msg('hello', { mentionWhenDone: 'UOWNER' }));
+    expect(seen).toEqual([
+      expect.objectContaining({
+        channel: 'C1',
+        threadTs: '100.1',
+        text: 'hello',
+        mention: 'UOWNER',
+        files: 0,
+      }),
+    ]);
+    expect(seen[0]?.startedAt).toBeDefined();
+    expect(store.inbox()).toEqual([]);
+  });
+
+  it('after a crash, answers what was waiting and says what was interrupted or is too old', async () => {
+    const { chat, store, calls, manager } = setup();
+    const add = (text: string, ts: string, extra: { files?: number } = {}) =>
+      store.addInbox({ channel: 'C1', threadTs: ts, ts, user: 'U1', text, files: extra.files ?? 0 });
+    add('plan next week', '300.1');
+    store.startInbox(add('send the report\nwith details', '301.1'));
+    add('here is the photo', '302.1', { files: 1 });
+    await manager.recover();
+    // The waiting one ran, once.
+    expect(calls.map((c) => c.prompt)).toEqual([expect.stringContaining('<@U1>: plan next week')]);
+    expect(chat.posts).toContainEqual(
+      expect.objectContaining({
+        thread: '300.1',
+        text: expect.stringContaining('↩️ Picking up your message “plan next week”'),
+      }),
+    );
+    // The interrupted one is not run again.
+    expect(chat.posts).toContainEqual(
+      expect.objectContaining({
+        thread: '301.1',
+        text: expect.stringContaining('restarted while I was working on “send the report”'),
+      }),
+    );
+    expect(chat.posts).toContainEqual(
+      expect.objectContaining({
+        thread: '302.1',
+        text: expect.stringContaining('was lost in a restart with its files'),
+      }),
+    );
+    expect(store.inbox()).toEqual([]);
+    // Nothing left: a second start does nothing.
+    await manager.recover();
+    expect(calls).toHaveLength(1);
+  });
+
   it('explains permission denials', async () => {
     const { chat, manager } = setup({ outcomes: [ok({ permissionDenials: ['Bash', 'WebFetch'] })] });
     await manager.handle(msg('run tests'));
@@ -306,6 +363,13 @@ describe('SessionManager', () => {
       expect(sys(learn)).toBe(sys(turn));
       expect(learn.prompt).toContain('it ended with an error: boom');
       expect(learn.env).toEqual(turn.env);
+      // Labelled, so it shows as running (Home, the session page) in the thread it learns from.
+      expect(learn.label).toEqual({
+        project: 'shop',
+        kind: 'learn',
+        title: 'Learning from This conversation',
+        thread: turn.label?.thread,
+      });
       expect(next.prompt).toBe('<@U1>: next');
       expect(chat.texts()).toContain(
         '🔧 This conversation learned from this run (it ended with an error: boom):\n.claude/skills/x/SKILL.md: new login step',
@@ -561,7 +625,7 @@ describe('"Run <id>" triggers', () => {
   it('is a normal run request when a person types it and no slot is waiting', async () => {
     const { started, calls, manager } = withSlot(false);
     await manager.handle(msg('Run find-jobs', { user: 'U1' }));
-    expect(started.at(-1)).toEqual(['shop', 'find-jobs', 'U1', { channel: 'C1', ts: '100.1' }]);
+    expect(started.at(-1)).toEqual(['shop', 'find-jobs', 'U1', { channel: 'C1', ts: '100.1' }, undefined]);
     expect(calls).toHaveLength(0);
 
     // The bot's own message with no slot waiting (a redelivery) starts nothing.

@@ -41,7 +41,8 @@ export interface RunOptions {
 /** What a run is for. Runs without one (e.g. learning after a session) aren't shown on Command. */
 export interface RunLabel {
   project: string;
-  kind: 'chat' | 'job' | 'ask';
+  /** `learn`: the follow-up turn after a run that improves its skill (`selfImprove`). */
+  kind: 'chat' | 'job' | 'ask' | 'learn';
   /** One short line: the message, the job's name, the question. */
   title: string;
   /** The Slack thread it works in. */
@@ -61,6 +62,8 @@ export interface RunOutcome {
   numTurns?: number;
   toolCalls: number;
   usage?: TokenUsage;
+  /** The session's context size when the run ended (tokens of its last model call), when the CLI says. */
+  contextTokens?: number;
   rateLimit?: RateLimit;
   permissionDenials: string[];
   error?: string;
@@ -237,6 +240,7 @@ export const runClaude: Runner = async (options) => {
   let result: Extract<StreamEvent, { kind: 'result' }> | undefined;
   let init: Extract<StreamEvent, { kind: 'init' }> | undefined;
   let rateLimit: RateLimit | undefined;
+  let contextTokens: number | undefined;
   let toolCalls = 0;
 
   const prompt = options.systemPrompt ? systemPromptFile(options.systemPrompt, options.runAs) : undefined;
@@ -255,6 +259,7 @@ export const runClaude: Runner = async (options) => {
       if (event.kind === 'init') init = event;
       else if (event.kind === 'tool') toolCalls++;
       else if (event.kind === 'rate_limit') rateLimit = event.rateLimit;
+      else if (event.kind === 'context') contextTokens = event.tokens;
       else if (event.kind === 'result') result = event;
       emit(options, event);
     }
@@ -272,6 +277,7 @@ export const runClaude: Runner = async (options) => {
     numTurns: result?.numTurns,
     toolCalls,
     usage: result?.usage,
+    contextTokens,
     rateLimit,
     permissionDenials: result?.permissionDenials ?? [],
   };

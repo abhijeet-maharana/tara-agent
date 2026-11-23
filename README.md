@@ -106,7 +106,7 @@ No commands to remember: just write.
 | Any message | Starts a session in the project repo; replies in the thread continue it. A new top-level message starts fresh |
 | A reply while it's working | Waits, and is read as soon as the current work finishes (the thread says so). This includes a scheduled job's thread |
 | `stop` (or `cancel`) | Stops whatever is running in the thread, a chat turn or a job. Only the word on its own; "stop the ads" is a normal message |
-| `run <job name>` | Runs a job now, in your message's thread. A job id or a skill the job uses works too (`run google-analytics`); several matches get buttons |
+| `run <job name>` | Runs a job now, in your message's thread. As a reply inside a thread (e.g. under a run's summary), the job runs on the dashboard and its result is posted back in that thread. A job id or a skill the job uses works too (`run google-analytics`); several matches get buttons |
 | "Which jobs run today?" | Claude answers with its `list_jobs` tool |
 | "Remind me on the 19th of every month to file GSTR-3B" | Claude sets it with `set_reminder`; tara-agent posts it on time with no Claude run. "What reminders do I have?" and "cancel that one" work too |
 

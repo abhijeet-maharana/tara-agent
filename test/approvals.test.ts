@@ -222,6 +222,63 @@ describe('proposing and deciding', () => {
     expect(item.checks).toEqual([{ text: 'Mentions a competitor', blocking: true }]);
   });
 
+  it("keeps the proposer's checks when a person edits a field; only the field checks are redone", async () => {
+    const fetchFake = (async (_url: string, init: RequestInit) => {
+      const note = JSON.parse(String(init.body)).fields.note as string;
+      return new Response(
+        JSON.stringify({ checks: note.includes('typo') ? [{ text: 'Spelling', blocking: false }] : [] }),
+      );
+    }) as unknown as typeof fetch;
+    const { project, approvals } = setup({
+      fetch: fetchFake,
+      project: makeProject({ approvals: { validateUrl: 'http://board/validate' } }),
+    });
+    const item = await approvals.propose(project, {
+      kind: 'x',
+      title: 'T',
+      queue: 'linkedin',
+      fields: [note('a typo')],
+      checks: [{ text: 'Recipient opted out', blocking: true }],
+    });
+    expect(item.checks.map((c) => c.text)).toEqual(['Recipient opted out', 'Spelling']);
+    await expect(
+      approvals.decide(item.id, { option: 'Approve', by: 'U1', via: 'dashboard', fields: { note: 'fixed' } }),
+    ).rejects.toMatchObject({ status: 409, message: expect.stringContaining('Recipient opted out') });
+  });
+
+  it('refuses edits made on a version the run replaced while the checks ran', async () => {
+    let reproposed = false;
+    let again: () => Promise<unknown> = async () => {};
+    const fetchFake = (async () => {
+      if (!reproposed) {
+        reproposed = true;
+        await again();
+      }
+      return new Response(JSON.stringify({ checks: [] }));
+    }) as unknown as typeof fetch;
+    let t = 1_000;
+    const { project, approvals, store } = setup({
+      fetch: fetchFake,
+      now: () => (t += 1_000),
+      project: makeProject({ approvals: { validateUrl: 'http://board/validate' } }),
+    });
+    const card = { kind: 'x', key: 'k1', title: 'Old', queue: 'linkedin', fields: [note('hi')] };
+    reproposed = true; // the first proposal's own check
+    const item = await approvals.propose(project, card);
+    reproposed = false;
+    again = () => approvals.propose(project, { ...card, title: 'New and different' });
+    await expect(
+      approvals.decide(item.id, {
+        option: 'Approve',
+        by: 'U1',
+        via: 'dashboard',
+        seen: item.updatedAt,
+        fields: { note: 'edited' },
+      }),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(store.getItem(item.id)).toMatchObject({ status: 'pending', title: 'New and different' });
+  });
+
   it('Revise on a draft keeps it waiting and asks Jarvis in its thread; a paused job continues as the job', async () => {
     const { project, approvals, chats, jobs, store } = setup();
     const draft = await approvals.propose(
@@ -376,6 +433,37 @@ describe('auto-approved cards', () => {
     approve = true;
     const refreshed = await approvals.propose(project, app('application:7'));
     expect(refreshed).toMatchObject({ id: first.id, status: 'approved', decidedBy: 'auto' });
+  });
+
+  it('approves only one of two proposals of the same key that arrive together', async () => {
+    let calls = 0;
+    const fetchFake = (async () => {
+      calls++;
+      await new Promise((r) => setTimeout(r, 5));
+      return new Response(JSON.stringify({ approve: true, reason: 'fine' }));
+    }) as unknown as typeof fetch;
+    const { project, store, approvals } = setup({ fetch: fetchFake, autoApprove: RULE });
+    const [a, b] = await Promise.all([
+      approvals.propose(project, app('application:9')),
+      approvals.propose(project, app('application:9')),
+    ]);
+    expect(calls).toBe(2);
+    expect([a.status, b.status].sort()).toEqual(['approved', 'pending']);
+    expect(store.items({ project: 'shop', statuses: ['approved'] })).toHaveLength(1);
+  });
+
+  it('remembers a decided key after retention deletes its card', async () => {
+    let now = Date.parse('2026-10-01T00:00:00Z');
+    const yes = answer(true);
+    const { project, store, approvals } = setup({ fetch: yes.fetchFake, autoApprove: RULE, now: () => now });
+    const item = await approvals.propose(project, app('application:8'));
+    store.startItems([item.id]);
+    store.finishItem(item.id, 'failed', 'captcha');
+    now += 61 * 86_400_000;
+    store.expireItems(0);
+    expect(store.getItem(item.id)).toBeUndefined();
+    expect((await approvals.propose(project, app('application:8'))).status).toBe('pending');
+    expect(yes.asked).toHaveLength(1);
   });
 
   it('leaves the card to a person on a no, without the host rule or the flag, or with any check', async () => {
@@ -593,6 +681,87 @@ describe('queue worker', () => {
     await worker.tick();
     expect(runs).toHaveLength(2);
     expect(store.items({ statuses: ['approved'] }).map((i) => i.title)).toEqual(['Lead 4']);
+  });
+
+  it('after a restart, puts back items whose run never started and fails the ones it started on', async () => {
+    const { project, store, approvals } = setup();
+    const ids: string[] = [];
+    for (const n of [1, 2]) {
+      const i = await approvals.propose(project, {
+        kind: 'note',
+        title: `Lead ${n}`,
+        queue: 'linkedin',
+        fields: [note('hi')],
+      });
+      await approvals.decide(i.id, { option: 'Approve', by: 'U1', via: 'dashboard' });
+      ids.push(i.id);
+    }
+    store.startItems(ids);
+    store.markRunStarted([ids[0] as string]); // its run started; Lead 2 was still waiting for it
+    const worker = new QueueWorker({
+      projects: [project],
+      store,
+      log: silent,
+      timeZone: 'UTC',
+      jobs: { enabled: () => false, runQueue: async () => 'ok' },
+    });
+    worker.start();
+    worker.stop();
+    expect(store.getItem(ids[0] as string)?.status).toBe('failed');
+    expect(store.getItem(ids[1] as string)).toMatchObject({ status: 'approved', startedAt: undefined });
+  });
+
+  it('gives items back, not failed, when the executor never ran because of a usage limit', async () => {
+    const now = TUE_9_UTC;
+    const { project, store, approvals } = setup({ now: () => now });
+    const worker = new QueueWorker({
+      projects: [project],
+      store,
+      log: silent,
+      timeZone: 'UTC',
+      now: () => now,
+      jobs: { enabled: () => true, runQueue: async () => 'held' },
+    });
+    const i = await approvals.propose(project, {
+      kind: 'note',
+      title: 'Lead 1',
+      queue: 'linkedin',
+      window: 'EU',
+      fields: [note('hi')],
+    });
+    await approvals.decide(i.id, { option: 'Approve', by: 'U1', via: 'dashboard' });
+    await worker.tick();
+    await worker.idle();
+    expect(store.getItem(i.id)).toMatchObject({
+      status: 'approved',
+      result: 'Waiting for the usage limit to reset',
+    });
+    expect(store.items({ statuses: ['failed'] })).toEqual([]);
+  });
+
+  it('gives items back when the executor was paused before its run started', async () => {
+    const now = TUE_9_UTC;
+    const { project, store, approvals } = setup({ now: () => now });
+    const worker = new QueueWorker({
+      projects: [project],
+      store,
+      log: silent,
+      timeZone: 'UTC',
+      now: () => now,
+      jobs: { enabled: () => true, runQueue: async () => 'not-started' },
+    });
+    const i = await approvals.propose(project, {
+      kind: 'note',
+      title: 'Lead 1',
+      queue: 'linkedin',
+      window: 'EU',
+      fields: [note('hi')],
+    });
+    await approvals.decide(i.id, { option: 'Approve', by: 'U1', via: 'dashboard' });
+    await worker.tick();
+    await worker.idle();
+    expect(store.getItem(i.id)?.status).toBe('approved');
+    expect(store.getItem(i.id)?.result).toMatch(/paused/);
   });
 
   it('runs one item per slot, taking turns between kinds, and posts it sealed to a URL executor', async () => {
@@ -927,6 +1096,71 @@ describe('decisions over HTTP', () => {
     expect(JSON.stringify(chat.updates.at(-1)?.blocks)).toContain('Reply to 2');
   });
 
+  it("the session page's reply box shows your message in Slack wherever Slack shows the session", async () => {
+    const { project, store, chat, approvals, chats } = setup();
+    const direct: IncomingMessage[] = [];
+    const posted: string[] = [];
+    const server = await startHttpServer({
+      bind: '127.0.0.1',
+      port: 0,
+      scheduler: { list: () => [] } as unknown as Scheduler,
+      store,
+      approvals,
+      projects: ['shop'],
+      log: silent,
+      adminToken: 'key',
+      decisionsFromLocal: true,
+      dashboard: { projects: [project], timeZone: 'UTC', agentName: 'Jarvis' },
+      continueThread: async (m) => void direct.push(m),
+      web: {
+        post: async (_c: string, _t: string, text: string) => {
+          posted.push(text);
+          return 'w.9';
+        },
+      } as never,
+    });
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const session = (threadKey: string, sessionId: string) =>
+      store.saveSession({ threadKey, project: 'shop', sessionId, model: 'opus', started: true });
+    session('C1:700.1', 'slack-chat');
+    session('web-shop:800.1', 'dash-run');
+    session('web-shop:850.1', 'dash-only');
+    store.saveThreadAlias('C1:900.1', 'web-shop:800.1'); // the run's Slack summary
+    const say = (id: string, text: string) =>
+      fetch(`${base}/sessions/${id}/say`, {
+        method: 'POST',
+        headers: { cookie: 'tara_admin=key' },
+        body: JSON.stringify({ text }),
+      });
+    const wait = () => new Promise((r) => setTimeout(r, 10));
+
+    // A Slack thread's session: the message shows in that thread, and Jarvis answers that line.
+    expect((await say('slack-chat', 'no voice-agent-eval')).status).toBe(200);
+    await wait();
+    expect(chat.posts).toContainEqual(
+      expect.objectContaining({ thread: '700.1', text: '💬 *From the dashboard:* no voice-agent-eval' }),
+    );
+    expect(chats.at(-1)).toMatchObject({ channel: 'C1', threadTs: '700.1', text: 'no voice-agent-eval' });
+
+    // A dashboard run with a Slack summary: under the summary, which leads to the run's session.
+    expect((await say('dash-run', 'and the X posts?')).status).toBe(200);
+    await wait();
+    expect(posted).toEqual(['and the X posts?']);
+    expect(chats.at(-1)).toMatchObject({ channel: 'C1', threadTs: '900.1', text: 'and the X posts?' });
+    expect(chat.posts.at(-1)).toMatchObject({
+      thread: '900.1',
+      text: '💬 *From the dashboard:* and the X posts?',
+    });
+
+    // Only on the dashboard: answered there, nothing in Slack.
+    const before = chat.posts.length;
+    expect((await say('dash-only', 'hello')).status).toBe(200);
+    await wait();
+    expect(direct).toEqual([expect.objectContaining({ channel: 'web-shop', threadTs: '850.1', ts: 'w.9' })]);
+    expect(chat.posts).toHaveLength(before);
+    server.close();
+  });
+
   it('takes a note on a waiting card without deciding it: shown in its thread, sent to Jarvis there', async () => {
     const { project, store, chat, approvals, chats } = setup();
     const server = await startHttpServer({
@@ -970,12 +1204,18 @@ describe('decisions over HTTP', () => {
     expect(chats.at(-1)?.text).toContain('Which portal?');
     expect(store.getItem(item.id)?.status).toBe('pending');
 
-    // The card shows the note box with Send, and Note… opens it.
+    // The answer comes in the card's session, which the page opens: the note's reply says where.
+    const sent = (await send('And the password?').then((r) => r.json())) as { session?: string };
+    expect(sent.session).toBe(`/t/C1/${encodeURIComponent(thread as string)}`);
+    expect((await fetch(`${base}/items/${item.id}/chat`)).status).toBe(404);
+
+    // The card links to its session; it holds no chat of its own.
     const page = await fetch(`${base}/approvals`, {
       headers: { accept: 'text/html', cookie: 'tara_admin=key' },
     }).then((r) => r.text());
-    expect(page).toContain('data-open-note>Note…</button>');
+    expect(page).toContain('Open session ↗');
     expect(page).toContain('data-note title=');
+    expect(page).not.toContain('data-chat');
 
     await approvals.decide(item.id, { option: 'Done', by: 'U1', via: 'slack' });
     expect((await send('Too late')).status).toBe(409);
@@ -1069,6 +1309,14 @@ describe('decisions over HTTP', () => {
     });
     expect(unlock.status).toBe(303);
     const cookie = (unlock.headers.get('set-cookie') ?? '').split(';')[0] as string;
+    // The cookie holds a key derived from the token, never the token (cookies reach every port).
+    expect(cookie).toMatch(/^tara_admin=v1\./);
+    expect(cookie).not.toContain('open-sesame');
+    // A browser unlocked before still holds the token: its next page swaps it for the derived key.
+    const old = await fetch(`${base}/approvals`, {
+      headers: { accept: 'text/html', cookie: 'tara_admin=open-sesame' },
+    });
+    expect((old.headers.get('set-cookie') ?? '').split(';')[0]).toBe(cookie);
 
     const page = await fetch(`${base}/approvals`, { headers: { accept: 'text/html', cookie } }).then((r) =>
       r.text(),
@@ -1578,6 +1826,47 @@ describe('Approvals page messages go through Slack (as the person)', () => {
     expect(chats).toHaveLength(0);
   });
 
+  it('shows a message typed on the dashboard in Slack as the person, and Jarvis answers it from there', async () => {
+    const { approvals, chats, asUser, delivered } = setupAsUser({ deliver: true });
+    await approvals.sayFromDashboard(
+      { channel: 'C1', threadTs: '700.1' },
+      'no voice-agent-eval; research views first',
+      'U1',
+    );
+    expect(asUser).toEqual([
+      {
+        thread: '700.1',
+        text: '*From <@U1> on the dashboard:* no voice-agent-eval; research views first',
+        ts: 'user.1',
+      },
+    ]);
+    // Slack delivered it: Jarvis gets the full text, as a reply in that thread; nothing went directly.
+    expect(delivered[0]?.text).toBe('no voice-agent-eval; research views first');
+    await wait(40);
+    expect(chats).toHaveLength(0);
+  });
+
+  it('cuts a long dashboard message in Slack, never what Jarvis gets', async () => {
+    const { approvals, asUser, delivered } = setupAsUser({ deliver: true });
+    const long = `${'word '.repeat(150)}end`;
+    await approvals.sayFromDashboard({ channel: 'C1', threadTs: '700.1' }, long, 'U1');
+    expect(asUser[0]?.text).toMatch(/… _\(the rest on the dashboard\)_$/);
+    expect(asUser[0]?.text.length).toBeLessThan(600);
+    expect(delivered[0]?.text).toBe(long);
+  });
+
+  it('without a user token, a bot line shows the dashboard message and Jarvis answers that line', async () => {
+    const { chat, approvals, chats } = setup();
+    await approvals.sayFromDashboard({ channel: 'C1', threadTs: '700.1' }, 'plan the week', 'U1');
+    await wait(5);
+    const line = chat.posts.find((p) => p.text === '💬 *From the dashboard:* plan the week');
+    expect(line?.thread).toBe('700.1');
+    // The reply is that line, so a dashboard run's summary thread leads to the run's session.
+    expect(chats).toEqual([
+      expect.objectContaining({ channel: 'C1', threadTs: '700.1', ts: line?.ts, text: 'plan the week' }),
+    ]);
+  });
+
   it('sends a note directly when Slack never delivers it, once', async () => {
     const { project, store, approvals, chats } = setupAsUser();
     const item = await card(approvals, project);
@@ -1652,7 +1941,12 @@ describe('a decision on a card with handoff notes acts in a new thread', () => {
       { project, channel: 'C1', threadTs: '91.1' },
       { title: 'T', details: 'D', handoff: 'notes' },
     );
-    expect(JSON.stringify(chat.blockPosts[0]?.blocks)).toContain('acted on in a new thread');
+    // No session in that thread to continue: a new one is the only way, and the card says why.
+    const text = JSON.stringify(chat.blockPosts[0]?.blocks);
+    expect(text).toContain('Upon approval, a new session will be created');
+    expect(text).toContain('no session to continue');
+    expect(text).toContain('tara:approval:0:new');
+    expect(text).not.toContain('same session');
   });
 
   it('acts on a chat card (or one whose job is gone) as a chat in a new Run thread, linking both threads', async () => {
@@ -1672,8 +1966,11 @@ describe('a decision on a card with handoff notes acts in a new thread', () => {
         handoff: 'PDF at .scratch/inv7.pdf, email ap@acme.test',
       },
     );
-    await approvals.decide(ask.id, { option: 'Approve', by: 'U1', via: 'slack' });
+    // A small session would continue; the person picked a new one instead.
+    expect(store.getItem(ask.id)?.session).toBe('continue');
+    await approvals.decide(ask.id, { option: 'Approve', by: 'U1', via: 'slack', session: 'new' });
     await approvals.settled();
+    expect(store.getItem(ask.id)?.session).toBe('new');
     const run = chat.posts.find((p) => p.thread === '' && p.text === 'Run Decision');
     expect(run).toBeDefined();
     expect(chat.posts).toContainEqual(

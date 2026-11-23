@@ -13,8 +13,13 @@ import type { ChatPort, Logger } from './manager.js';
  * system prompt, tools and model, so the prompt cache still applies.
  */
 
-/** Tool calls that returned an error in one run before it counts as trouble worth learning from. */
-export const TOOL_ERROR_TROUBLE = 2;
+/**
+ * Tool calls that returned an error in one run before it counts as trouble worth learning from, and the
+ * share of the run's calls they must be. A few errors are normal work (a `grep` that finds nothing, a
+ * missing file checked for): at 2, nearly every run "had trouble" and its skill got rewritten each time.
+ */
+export const TOOL_ERROR_TROUBLE = 5;
+export const TOOL_ERROR_SHARE = 0.25;
 const LEARN_TIMEOUT_MS = 5 * 60_000;
 
 /**
@@ -28,7 +33,8 @@ export function troubleReasons(outcome: RunOutcome, toolErrors: number, failure?
   if (outcome.status === 'error' && !/no conversation found/i.test(outcome.error ?? ''))
     reasons.push(`it ended with an error: ${(outcome.error ?? 'unknown').slice(0, 300)}`);
   if (failure) reasons.push(`it reported a failure: ${failure.split('\n')[0]?.slice(0, 300)}`);
-  if (toolErrors >= TOOL_ERROR_TROUBLE) reasons.push(`${toolErrors} tool calls returned errors`);
+  if (toolErrors >= TOOL_ERROR_TROUBLE && toolErrors >= outcome.toolCalls * TOOL_ERROR_SHARE)
+    reasons.push(`${toolErrors} of ${Math.max(outcome.toolCalls, toolErrors)} tool calls returned errors`);
   return reasons;
 }
 
@@ -189,6 +195,14 @@ export async function learnFromRun(deps: LearnDeps, req: LearnRequest): Promise<
       prompt: learnPrompt(req.reasons, { step: req.step, usage: req.usage }),
       mcpServers: req.mcpServers,
       timeoutMs: LEARN_TIMEOUT_MS,
+      // Shown as running like any run (Home, the session page), in the thread of the run it learns from.
+      label: {
+        project: req.project.config.name,
+        kind: 'learn',
+        title: `Learning from ${req.label.replace(/[*_`]/g, '')}`,
+        ...(req.threadTs && { thread: { channel: req.channel, ts: req.threadTs } }),
+        ...(req.jobId && { jobId: req.jobId }),
+      },
       onEvent: (event) => {
         if (event.kind === 'tool') calls.push({ name: event.name, file: event.file });
       },

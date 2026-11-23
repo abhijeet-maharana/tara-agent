@@ -10,7 +10,7 @@ See what changed in your repos from a phone: each repo's uncommitted changes, th
 | `/code/<repo>` | The changed files: **M** modified, **A** added, **D** deleted, **N** new and not added to git, **!** conflict; staged changes are marked in the tooltip. Grouped by folder (first two folders), closed when there are more than 30 changes |
 | `/code/<repo>/diff?path=` | The change against the last commit (staged and unstaged together), line numbers, wrapped for a phone. A new file shows as all added lines. First 2,000 lines |
 | `/code/<repo>/files?path=` | A folder: subfolders, files, and which of them changed |
-| `/code/<repo>/file?path=` | A file with line numbers (up to 512 KB; binary files are named, not shown); `#L12` jumps to line 12 |
+| `/code/<repo>/file?path=` | A file with line numbers (up to 512 KB; binary files are named, not shown); `#L12` jumps to line 12. **Markdown** (`.md`, `.markdown`) shows **formatted** by default: frontmatter as a table, headings, paragraphs, nested and numbered lists, tables, code blocks; relative links open in the Code page (never outside the repo); raw HTML shows as text. **Source** (`&view=source`) is the numbered lines; a `#L12` link and search hits open it |
 | `/code?q=`, `/code/<repo>?q=` | **Search** every repo (box on `/code`) or one (box on its page and folders): file names containing the text, and lines containing it (case-insensitive, literal, 5 per file, 200 in all), each linked to its line. Binary files are skipped |
 
 The same paths answer JSON (`Accept: application/json`) for tools. `GET /code` returns every repo's status.

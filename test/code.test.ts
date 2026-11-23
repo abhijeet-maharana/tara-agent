@@ -214,7 +214,11 @@ describe('Code pages and API', () => {
     expect(diff).toContain('<div class="add"><i>3</i><code>+const c = 4;</code></div>');
     expect(diff).toContain('Unlock this browser'); // no approvals cookie: no Ask box
     expect(await (await page('/code/shop/files?path=src')).text()).toContain('gone.ts');
-    expect(await (await page('/code/shop/file?path=README.md')).text()).toContain('# Shop');
+    // Markdown opens formatted; its source is one switch away.
+    expect(await (await page('/code/shop/file?path=README.md')).text()).toContain('<h2 id="shop">Shop</h2>');
+    expect(await (await page('/code/shop/file?path=README.md&view=source')).text()).toContain(
+      '<code># Shop</code>',
+    );
     expect((await page('/code/shop/file?path=..%2Fsecret.txt')).status).toBe(400);
   });
 

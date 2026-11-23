@@ -103,6 +103,13 @@ export class QueueWorker {
   }
 
   start(): void {
+    const back = this.deps.store.restoreUnstarted(
+      'tara-agent restarted before its run started; queued again',
+    );
+    if (back.length)
+      this.deps.log.info(
+        `${back.length} queued ${back.length === 1 ? 'item' : 'items'} put back after a restart`,
+      );
     const stuck = this.deps.store.failRunning(
       'tara-agent restarted while this item was running; check before running it again',
     );
@@ -119,6 +126,14 @@ export class QueueWorker {
     if (this.timer) clearInterval(this.timer);
   }
 
+  /** Draining before a restart: no new batch starts; running ones finish. */
+  draining = false;
+
+  /** Queue batches running now. */
+  get busy(): number {
+    return this.running.size;
+  }
+
   queues(project: Project): Record<string, QueueConfig> {
     try {
       return (this.deps.queues ?? loadQueues)(project);
@@ -130,6 +145,7 @@ export class QueueWorker {
 
   /** One pass over every queue: start what is due. Exposed for tests. */
   async tick(): Promise<void> {
+    if (this.draining) return;
     const now = this.now();
     for (const project of this.deps.projects) {
       const days = project.config.approvals?.expireDays ?? 7;
@@ -248,6 +264,17 @@ export class QueueWorker {
     log.info(`[${p}] queue ${name}: running ${ids.length} ${ids.length === 1 ? 'item' : 'items'}`);
     if ('job' in queue.executor) {
       const status = await this.deps.jobs.runQueue(p, queue.executor.job, name, items);
+      if (status === 'held' || status === 'not-started') {
+        // Nothing ran (the executor's CLI is at its usage limit, or the job was paused while its run
+        // waited): the items go back and wait.
+        const note =
+          status === 'held'
+            ? 'Waiting for the usage limit to reset'
+            : `Not sent: ${queue.executor.job} was paused (or stopped) before it started`;
+        for (const id of ids) store.deferItem(id, this.now(), note);
+        log.info(`[${p}] queue ${name}: ${ids.length} put back (${note})`);
+        return;
+      }
       const reason =
         status === 'unknown'
           ? `No job "${queue.executor.job}" in ${p}`
@@ -259,6 +286,7 @@ export class QueueWorker {
     const { url } = queue.executor;
     for (const item of items) {
       try {
+        store.markRunStarted([item.id]);
         const res = await (this.deps.fetch ?? fetch)(url, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },

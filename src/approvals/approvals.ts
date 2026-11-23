@@ -12,15 +12,17 @@ import {
   threadKey,
 } from '../sessions/manager.js';
 import { hasTable, MARKDOWN_MAX, postMarkdown, textBlock, toSlackMrkdwn } from '../slack/format.js';
-import type { Item, ItemCheck, ItemField, ItemMedia, Store } from '../store/store.js';
+import type { Item, ItemCheck, ItemField, ItemMedia, SessionMode, Store } from '../store/store.js';
 import { isWebChannel, webChannel } from '../web/chat.js';
 import { sealItem } from './seal.js';
+import { choiceLine, type SessionChoice, sessionChoice } from './session-choice.js';
 
 /**
  * Approval items: the cards on the Approvals page (and, for a paused run, in its Slack thread).
- *   resume  a run stopped for a decision (`request_approval`). With handoff notes, the answer starts a
- *           fresh session in a new `Run` thread (the job's, or a chat's); without, it continues that
- *           run. A project server can ask too (`ask`): the answer then starts the agent in the card's thread
+ *   resume  a run stopped for a decision (`request_approval`). The answer either continues that run's
+ *           session or (with handoff notes) starts a fresh one in a new `Run` thread (the job's, or a
+ *           chat's): the card advises one (session-choice.ts) and a person can pick the other. A project
+ *           server can ask too (`ask`): the answer then starts the agent in the card's thread
  *   queue   a draft (`propose_item`) that, once approved, runs later through one of the project's
  *           queues (scheduler/queues.ts)
  * Decisions come from Slack taps and from the dashboard (human-only, see http/server.ts) and both
@@ -46,6 +48,8 @@ export const NOTICE_KIND = 'notice';
 /** Cards for root actions (`request_privileged`): approving one runs its action, then the run continues. */
 export const PRIVILEGED_KIND = 'privileged';
 const SECTION_MAX = 2_800;
+/** How much of a message typed on the dashboard Slack shows (Slack stays short; the dashboard has it all). */
+const SAID_MAX = 500;
 
 /** What a run proposes for later (`propose_item`). */
 export interface ProposeInput {
@@ -85,6 +89,11 @@ export interface Decision {
   reply?: string;
   /** Run as soon as the queue is free, ignoring its windows and slots. */
   runNow?: boolean;
+  /**
+   * Where the decision is acted on, when the person picked it (the card's other option, or its advice
+   * as shown). Unset: the advice the card shows. One the card can't use is ignored.
+   */
+  session?: SessionMode;
   /**
    * The card's `updatedAt` as the person saw it. A run can re-propose a pending card with the same key
    * and new content; if it changed since, the decision is refused instead of approving unseen content.
@@ -156,6 +165,101 @@ export class Approvals {
 
   constructor(private readonly deps: ApprovalsDeps) {
     this.now = deps.now ?? Date.now;
+    // A run or turn ended in a thread: its waiting cards' advice may have changed (bigger context, more turns).
+    deps.store.onRun((key) => {
+      void this.refreshAdvice(key).catch((err: Error) =>
+        deps.log.warn(`${key}: card advice not refreshed: ${err.message}`),
+      );
+    });
+  }
+
+  /**
+   * A waiting card's advice on where its decision is acted on (a new session or the same one), from
+   * the session of its thread as it is now. Undefined for cards without that choice.
+   */
+  choiceFor(item: Item): SessionChoice | undefined {
+    const { store } = this.deps;
+    const key = item.threadTs ? threadKey(item.channel ?? '', item.threadTs) : undefined;
+    return sessionChoice(
+      item,
+      key ? store.getSession(key) : undefined,
+      key ? store.threadState(key) : undefined,
+      this.now(),
+      { rootAction: item.kind === PRIVILEGED_KIND },
+    );
+  }
+
+  /**
+   * Recomputes the advice of the waiting cards in a thread once a run there has ended, and edits the
+   * cards (the dashboard message and its Slack copy) when it changed, so both show the same.
+   */
+  async refreshAdvice(key: string): Promise<void> {
+    const { store } = this.deps;
+    const at = key.indexOf(':');
+    if (at < 1) return;
+    const cards = store
+      .itemsInThread(key.slice(0, at), key.slice(at + 1), 200)
+      .filter((i) => i.status === 'pending' && i.mode === 'resume');
+    for (const item of cards) await this.syncAdvice(item).done;
+  }
+
+  /**
+   * A waiting card's advice as it is now (the Approvals page shows this). When it differs from what the
+   * card's message says (the session went idle since, say), the message and its Slack copy are edited
+   * too (`done`), so the page and Slack always offer the same default.
+   */
+  syncAdvice(item: Item): { choice: SessionChoice | undefined; done: Promise<void> } {
+    const { store, chat, log } = this.deps;
+    const choice = this.choiceFor(item);
+    if (item.status !== 'pending' || choice?.mode === item.session)
+      return { choice, done: Promise.resolve() };
+    store.setItemSession(item.id, choice?.mode);
+    if (!item.channel || !item.messageTs || item.kind === PRIVILEGED_KIND)
+      return { choice, done: Promise.resolve() };
+    const blocks = this.cardBlocks({ ...item, session: choice?.mode }, cardDetails(item.body ?? ''), choice);
+    const done = chat
+      .update(item.channel, item.messageTs, `Approval needed: ${item.title}`, blocks)
+      .catch((err: Error) => log.warn(`could not update card ${item.id}: ${err.message}`));
+    return { choice, done };
+  }
+
+  /**
+   * A waiting card's Block Kit message, the same on the dashboard and in Slack: its text, one button
+   * per option (each carrying where it is acted on), the card's other session as one more button
+   * ("Approve · new session"), and a line with the advice and why.
+   */
+  private cardBlocks(item: Item, details: string, choice: SessionChoice | undefined): SlackBlock[] {
+    const mode = choice?.mode;
+    const buttons = item.options.map((option, i) => ({
+      type: 'button',
+      text: { type: 'plain_text', text: option },
+      action_id: `tara:approval:${i}${mode ? `:${mode}` : ''}`,
+      value: item.id,
+      ...(i === 0 ? { style: 'primary' } : NEGATIVE.test(option) ? { style: 'danger' } : {}),
+    }));
+    const other = choice?.alternative;
+    const first = item.options[0];
+    if (other && first && !NEGATIVE.test(first))
+      buttons.splice(1, 0, {
+        type: 'button',
+        text: {
+          type: 'plain_text',
+          text: `${first.slice(0, 40)} · ${other === 'new' ? 'new session' : 'same session'}`,
+        },
+        action_id: `tara:approval:0:${other}`,
+        value: item.id,
+      });
+    const where = choice ? choiceLine(choice) : 'A decision continues the conversation that asked.';
+    return [
+      textBlock(`**🟡 Approval needed: ${item.title}**\n${details}`, SECTION_MAX + 200),
+      { type: 'actions', elements: buttons },
+      {
+        type: 'context',
+        elements: [
+          { type: 'mrkdwn', text: `${where}. Or decide on the Approvals page, or reply in this thread.` },
+        ],
+      },
+    ];
   }
 
   project(name: string): Project {
@@ -177,7 +281,7 @@ export class Approvals {
       kind?: string;
       key?: string;
       fields?: ItemField[];
-      /** Notes for the fresh session that acts on the decision in a new thread. */
+      /** Notes for a fresh session that may act on the decision in a new thread (`session: 'new'`). */
       handoff?: string;
     },
   ): Promise<{ id: string; options: string[] }> {
@@ -216,30 +320,9 @@ export class Approvals {
         ? `${details.slice(0, max - 200)}…\n_Full text on the Approvals page._`
         : '_Full proposal above._';
     }
-    const blocks: SlackBlock[] = [
-      textBlock(`**🟡 Approval needed: ${title}**\n${details}`, SECTION_MAX + 200),
-      {
-        type: 'actions',
-        elements: options.map((option, i) => ({
-          type: 'button',
-          text: { type: 'plain_text', text: option },
-          action_id: `tara:approval:${i}`,
-          value: item.id,
-          ...(i === 0 ? { style: 'primary' } : NEGATIVE.test(option) ? { style: 'danger' } : {}),
-        })),
-      },
-      {
-        type: 'context',
-        elements: [
-          {
-            type: 'mrkdwn',
-            text: item.handoff
-              ? 'Or decide on the Approvals page. A decision is acted on in a new thread; a reply here goes to this run.'
-              : 'Or decide on the Approvals page, or reply in this thread.',
-          },
-        ],
-      },
-    ];
+    const choice = this.choiceFor(item);
+    this.deps.store.setItemSession(item.id, choice?.mode);
+    const blocks = this.cardBlocks({ ...item, session: choice?.mode }, details, choice);
     if (refresh) {
       await this.deps.chat
         .update(refresh.channel, refresh.ts, `Approval needed: ${title}`, blocks)
@@ -365,8 +448,12 @@ export class Approvals {
       priority: input.priority,
     });
     const options = proposed.options;
+    // Asked again here, with no await since: another proposal of the same key may have been approved
+    // while this one waited for its checks and the project's answer, and it must not go out twice.
     const item =
-      auto && !NEGATIVE.test(options[0] as string)
+      auto &&
+      !NEGATIVE.test(options[0] as string) &&
+      !this.deps.store.hasDecidedKey(project.config.name, input.key as string)
         ? (this.deps.store.decideItem(proposed.id, {
             status: 'approved',
             decision: options[0] as string,
@@ -531,17 +618,25 @@ export class Approvals {
     if (revise && !d.reply?.trim()) throw new ApprovalError(400, 'Say what to change');
 
     if (d.fields && Object.keys(d.fields).length) {
+      const before = item;
       const fields = item.fields.map((f) =>
         f.readOnly || !(f.key in (d.fields as object))
           ? f
           : cleanField({ ...f, value: (d.fields as Record<string, string | string[]>)[f.key] as string }),
       );
-      const kept = item.checks.filter((c) => c.text.startsWith('Note:'));
-      item =
-        store.updateItemFields(id, fields, [
-          ...kept,
-          ...(await this.checks(project, item.kind, item.key, fields)),
-        ]) ?? item;
+      // The edit is checked again; only the old checks of the fields are dropped. What the proposer said
+      // (⛔ "recipient opted out", say) stays: editing a typo doesn't clear it.
+      const [stale, fresh] = await Promise.all([
+        this.checks(project, item.kind, item.key, item.fields),
+        this.checks(project, item.kind, item.key, fields),
+      ]);
+      const kept = item.checks.filter((c) => !stale.some((s) => s.text === c.text));
+      // The checks took a moment: a run may have re-proposed this card meanwhile (new title or body).
+      // The edits were made on what the person saw, so they only go on that version.
+      const current = store.getItem(id);
+      if (current?.status !== 'pending' || current.updatedAt !== before.updatedAt)
+        throw new ApprovalError(409, 'This card changed since you opened it. Reload and check it again.');
+      item = store.updateItemFields(id, fields, [...kept, ...fresh]) ?? item;
     }
 
     const when = this.clock();
@@ -566,6 +661,11 @@ export class Approvals {
       throw new ApprovalError(409, `Fix this first: ${blocking.map((c) => c.text).join('; ')}`);
     // An approved root action runs first (approved → running → done/failed), then its run continues.
     const action = runs && item.mode === 'resume' ? privilegedAction(item) : undefined;
+    // Where it is acted on: what the person picked, else the advice the card showed them, else today's.
+    const choice = this.choiceFor(item);
+    const usable = (m?: SessionMode) =>
+      m && (m === choice?.mode || m === choice?.alternative) ? m : undefined;
+    const session = usable(d.session) ?? usable(item.session) ?? choice?.mode;
     // A paused run's card is finished once decided (the run gets the answer); a draft waits in its queue.
     const decided = store.decideItem(id, {
       status: negative
@@ -582,6 +682,10 @@ export class Approvals {
       runNow: d.runNow && runs,
     });
     if (!decided) throw new ApprovalError(409, 'Already decided');
+    if (session !== decided.session) {
+      store.setItemSession(id, session);
+      decided.session = session;
+    }
 
     if (decided.channel && decided.messageTs) {
       const who = d.via === 'slack' ? `by <@${d.by}>` : 'on the Approvals page';
@@ -591,7 +695,16 @@ export class Approvals {
           {
             type: 'context',
             elements: [
-              { type: 'mrkdwn', text: `${negative ? '❌' : '✅'} *${d.option}*, chosen ${who} at ${when}` },
+              {
+                type: 'mrkdwn',
+                text: `${negative ? '❌' : '✅'} *${d.option}*, chosen ${who} at ${when}${
+                  session && (!negative || d.reply?.trim())
+                    ? session === 'new'
+                      ? ' · acted on in a new session'
+                      : ' · continues in the same session'
+                    : ''
+                }`,
+              },
             ],
           },
         ])
@@ -613,9 +726,9 @@ export class Approvals {
       };
       const visible = (who: string) =>
         `*From ${who} on the Approvals page:* ${negative ? '❌' : '✅'} ${d.option} on "${decided.title}"${d.reply?.trim() ? `\n${d.reply.trim()}` : ''}`;
-      // With handoff notes a fresh session acts on it in a new thread. A plain "no" needs no run: the
+      // A new session acts on it in a new thread (from the handoff notes). A plain "no" needs no run: the
       // card shows it, and later runs see it in the project memory's recent decisions.
-      if (decided.handoff && !action) {
+      if (session === 'new' && !action) {
         if (!negative || d.reply?.trim())
           this.handOff(
             decided,
@@ -760,10 +873,34 @@ export class Approvals {
 
   /**
    * A note or question about a waiting card, from the Approvals page, without deciding it. It shows in
-   * the card's Slack thread as the owner's reply and goes to Jarvis there, who answers in the thread;
-   * the card keeps waiting. (A note typed before picking an option still goes with that decision.)
+   * the card's thread as the owner's reply and goes to Jarvis there, who answers in that session (the
+   * page then opens it, live); the card keeps waiting. (A note typed before picking an option still goes with that decision.)
    * See `toThread` for when it is posted as the person and Slack starts the chat.
    */
+  /**
+   * A message typed on a session's dashboard page, for a session Slack shows too: a Slack thread's, or a
+   * dashboard run's Slack summary thread (`at`). It is posted there as the person (SLACK_USER_TOKEN),
+   * your words, cut only past `SAID_MAX` with a pointer to the dashboard, and Slack hands it to Jarvis
+   * like a reply typed there (the full text). Without a user token, or if Slack doesn't deliver it in
+   * time, a bot line shows it and it goes to Jarvis directly. Either way Slack has the question and the
+   * answer, never the answer alone.
+   */
+  async sayFromDashboard(
+    at: { channel: string; threadTs: string },
+    text: string,
+    user: string,
+  ): Promise<void> {
+    const shown =
+      text.length > SAID_MAX ? `${text.slice(0, SAID_MAX).trimEnd()}… _(the rest on the dashboard)_` : text;
+    await this.toThread({ channel: at.channel, threadTs: at.threadTs, ts: at.threadTs, user }, text, {
+      fromPage: true,
+      always: true,
+      background: true,
+      visible: (who) => `*From ${who} on the dashboard:* ${shown}`,
+      shown: `💬 *From the dashboard:* ${shown}`,
+    });
+  }
+
   async note(id: string, text: string, by: string): Promise<Item> {
     const item = this.deps.store.getItem(id);
     if (!item) throw new ApprovalError(404, 'No such item');
@@ -787,7 +924,8 @@ export class Approvals {
         background: true,
       },
     );
-    return item;
+    // With the thread it went to (a card no run raised has one now): the page opens its session.
+    return this.deps.store.getItem(id) ?? item;
   }
 
   /**
@@ -1052,10 +1190,12 @@ export class Approvals {
         log.warn(`${key}: not posted as the user (${(err as Error).message}); sending it directly`);
       }
     }
-    if (opts.shown) await chat.post(msg.channel, msg.threadTs, opts.shown);
+    // The line that shows it is the message Jarvis answers (its ts), like a reply typed there: in a
+    // dashboard run's Slack summary thread that is what leads to the run's session.
+    const shownTs = opts.shown ? await chat.post(msg.channel, msg.threadTs, opts.shown) : undefined;
     // In a dashboard thread nobody watches the answer come in: it is posted in Slack when it ends.
     const summary = isWebChannel(msg.channel) ? (msg.summary ?? this.cardTitle(msg)) : undefined;
-    const turn = this.onChat?.({ ...msg, text, mentionWhenDone: mention, summary });
+    const turn = this.onChat?.({ ...msg, ts: shownTs ?? msg.ts, text, mentionWhenDone: mention, summary });
     if (!opts.background) return turn;
     turn?.catch((err: Error) => log.error(`${key}: ${err.message}`));
   }
@@ -1113,6 +1253,12 @@ export class Approvals {
 }
 
 /** The action a privileged card runs when approved (none for "run this yourself" cards). */
+/** A card's text as its message shows it: in full when it fits, else cut with a pointer to the page. */
+function cardDetails(body: string): string {
+  const max = hasTable(body) ? MARKDOWN_MAX : SECTION_MAX;
+  return body.length > max ? `${body.slice(0, max - 200)}…\n_Full text on the Approvals page._` : body;
+}
+
 function privilegedAction(item: Item): { id: string; args: Record<string, string> } | undefined {
   if (item.kind !== PRIVILEGED_KIND) return undefined;
   const value = (key: string) => {

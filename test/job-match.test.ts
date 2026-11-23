@@ -91,7 +91,7 @@ describe('matchJob', () => {
 });
 
 describe('"run <job name>" in chat', () => {
-  function setup() {
+  function setup(extra: Partial<JobInfo> = {}) {
     const chat = new FakeChat('bot.');
     const triggered: unknown[][] = [];
     const runs: unknown[] = [];
@@ -127,7 +127,7 @@ describe('"run <job name>" in chat', () => {
         };
       },
       jobs: {
-        list: () => [...jobs, job('paused-job', 'Paused Job', false)],
+        list: () => [...jobs.map((j) => ({ ...j, ...extra })), job('paused-job', 'Paused Job', false)],
         // Like the scheduler: a "schedule" start only runs a slot that is waiting, and none is.
         trigger: (...args: unknown[]) => {
           if (args[2] === 'schedule') return 'unknown';
@@ -150,16 +150,26 @@ describe('"run <job name>" in chat', () => {
     const { chat, manager, triggered, runs } = setup();
     await manager.handle(msg('Run Weekly Production Redis Health Audit'));
     expect(triggered).toEqual([
-      ['shop', 'weekly-production-redis-health-audit', 'U1', { channel: 'C1', ts: '100.1' }],
+      ['shop', 'weekly-production-redis-health-audit', 'U1', { channel: 'C1', ts: '100.1' }, undefined],
     ]);
     expect(runs).toHaveLength(0);
     expect(chat.posts).toHaveLength(0); // the job itself reports in this thread
   });
 
-  it('inside an existing conversation, runs it in its own message and says so', async () => {
+  it('inside an existing conversation, runs it on the dashboard and answers in this thread', async () => {
     const { chat, manager, triggered } = setup();
     await manager.handle({ ...msg('run redis audit', '50.1'), ts: '100.2' });
     expect(triggered[0]?.[3]).toBeUndefined();
+    expect(triggered[0]?.[4]).toEqual({ replyIn: { channel: 'C1', ts: '50.1' } });
+    expect(chat.texts()).toEqual([
+      '▶️ Started *Weekly Production Redis Health Audit*. Its result comes in this thread; the run itself is on the dashboard.',
+    ]);
+  });
+
+  it('a job that runs in Slack threads (`delivery: thread`) still opens its own message', async () => {
+    const { chat, manager, triggered } = setup({ delivery: 'thread' });
+    await manager.handle({ ...msg('run redis audit', '50.1'), ts: '100.2' });
+    expect(triggered[0]?.[4]).toBeUndefined();
     expect(chat.texts()).toEqual([
       '▶️ Started *Weekly Production Redis Health Audit*. It posts its own message in this channel.',
     ]);
@@ -184,7 +194,9 @@ describe('"run <job name>" in chat', () => {
       threadTs: '100.1',
     });
     expect(chat.updates[0]?.text).toBe('▶️ Amazon Order SLA Report');
-    expect(triggered).toEqual([['shop', 'amazon-order-sla-report', 'U2', { channel: 'C1', ts: '100.1' }]]);
+    expect(triggered).toEqual([
+      ['shop', 'amazon-order-sla-report', 'U2', { channel: 'C1', ts: '100.1' }, undefined],
+    ]);
   });
 
   it('refuses paused jobs and hands everything else to Claude', async () => {

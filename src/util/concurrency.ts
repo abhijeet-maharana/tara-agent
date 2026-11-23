@@ -9,9 +9,25 @@ export class Semaphore {
     return this.active >= this.limit;
   }
 
-  async acquire(): Promise<() => void> {
+  /** Waits for a place; with `signal`, gives up (rejects) when it aborts while still waiting. */
+  async acquire(signal?: AbortSignal): Promise<() => void> {
+    signal?.throwIfAborted();
     if (this.active < this.limit) this.active++;
-    else await new Promise<void>((resolve) => this.waiting.push(resolve)); // slot handed over by release()
+    else
+      await new Promise<void>((resolve, reject) => {
+        // The place is handed over by release().
+        const take = () => {
+          signal?.removeEventListener('abort', give);
+          resolve();
+        };
+        const give = () => {
+          const at = this.waiting.indexOf(take);
+          if (at !== -1) this.waiting.splice(at, 1);
+          reject(signal?.reason ?? new Error('aborted'));
+        };
+        this.waiting.push(take);
+        signal?.addEventListener('abort', give, { once: true });
+      });
     let released = false;
     return () => {
       if (released) return;
@@ -39,17 +55,21 @@ export class KeyedQueue {
       const left = this.size(key) - 1;
       if (left === 0) {
         this.sizes.delete(key);
-        if (this.tails.get(key) === next) this.tails.delete(key);
+        // The stored tail is `next.catch(…)`: compare with it, or no key would ever be removed.
+        if (this.tails.get(key) === tail) this.tails.delete(key);
       } else {
         this.sizes.set(key, left);
       }
     });
     // Later tasks wait for this one to settle, whether it failed or not.
-    this.tails.set(
-      key,
-      next.catch(() => {}),
-    );
+    const tail = next.catch(() => {});
+    this.tails.set(key, tail);
     return next;
+  }
+
+  /** Keys with tasks queued or running (for tests: none are kept once their tasks are done). */
+  get keys(): number {
+    return this.tails.size;
   }
 }
 
@@ -113,18 +133,25 @@ export class Locks {
     return names.filter((n) => this.locks.get(n)?.busy);
   }
 
-  async acquire(names: string[]): Promise<() => void> {
+  /** Takes every lock in `names`; with `signal`, gives back what it took and rejects when it aborts. */
+  async acquire(names: string[], signal?: AbortSignal): Promise<() => void> {
     const releases: Array<() => void> = [];
-    for (const name of [...new Set(names)].sort()) {
-      let lock = this.locks.get(name);
-      if (!lock) {
-        lock = new Semaphore(1);
-        this.locks.set(name, lock);
-      }
-      releases.push(await lock.acquire());
-    }
-    return () => {
+    const releaseAll = () => {
       for (const release of releases.reverse()) release();
     };
+    try {
+      for (const name of [...new Set(names)].sort()) {
+        let lock = this.locks.get(name);
+        if (!lock) {
+          lock = new Semaphore(1);
+          this.locks.set(name, lock);
+        }
+        releases.push(await lock.acquire(signal));
+      }
+    } catch (err) {
+      releaseAll();
+      throw err;
+    }
+    return releaseAll;
   }
 }

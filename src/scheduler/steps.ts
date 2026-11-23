@@ -66,6 +66,8 @@ export interface StepsInput {
   folders: RunFolders;
   mcpServers?: Record<string, McpServer>;
   signal: AbortSignal;
+  /** The whole run's deadline (ms): no step runs past it. */
+  deadline?: number;
   /** Called as each step starts (1-based), for the status line. */
   onStep?: (index: number, name: string) => void;
   /** Where a step goes when `harness` is out of quota or capacity; the steps after it start there. */
@@ -122,8 +124,16 @@ export async function runSteps(input: StepsInput): Promise<StepsResult> {
 
   for (const [i, step] of job.steps.entries()) {
     if (input.signal.aborted) break;
+    // The job's whole-run deadline: a step gets no more than what is left of it.
+    const left = (input.deadline ?? Number.POSITIVE_INFINITY) - Date.now();
+    if (left <= 0) {
+      parts.push(
+        `### ${step.name} (skipped)\nNot run: the job's run time (runTimeoutMinutes) was used up by the steps before it.`,
+      );
+      continue;
+    }
     input.onStep?.(i + 1, step.name);
-    const timeoutMs = (step.timeoutMinutes ?? job.timeoutMinutes) * 60_000;
+    const timeoutMs = Math.min((step.timeoutMinutes ?? job.timeoutMinutes) * 60_000, left);
     const effort = step.effort ?? job.effort ?? host.claude.effort;
     const allowedTools = job.allowedTools ?? project.config.allowedTools;
     const prompt = `${stepInstructions(job, step)}\n\n${foldersNote(input.folders)}`;
