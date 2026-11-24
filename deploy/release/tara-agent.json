@@ -1,0 +1,16 @@
+{
+  "services": {
+    "tara-agent": {
+      "copy": [
+        { "from": "src/", "to": "src/", "exclude": [".DS_Store"] },
+        { "from": "scripts/", "to": "scripts/", "exclude": [".DS_Store"] },
+        { "from": "package.json", "to": "package.json" },
+        { "from": "package-lock.json", "to": "package-lock.json" },
+        { "from": "tsconfig.json", "to": "tsconfig.json" },
+        { "from": "tsconfig.build.json", "to": "tsconfig.build.json" }
+      ],
+      "install": ["."],
+      "build": ["build"]
+    }
+  }
+}

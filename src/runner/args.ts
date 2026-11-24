@@ -25,6 +25,8 @@ export interface ClaudeArgsInput {
   permissionPrompts?: boolean;
   /** Emit text as it is written (`stream_event` deltas), for live streaming into Slack. */
   partialMessages?: boolean;
+  /** `--max-budget-usd`: the CLI stops the run once it has spent this much (job `budgetUsd`). */
+  maxBudgetUsd?: number;
 }
 
 /** Arguments for one headless turn. The prompt goes to stdin and the system prompt in a file (runClaude). */
@@ -34,6 +36,7 @@ export function buildClaudeArgs(input: ClaudeArgsInput): string[] {
   args.push('--permission-mode', input.permissionMode);
   if (input.model) args.push('--model', input.model);
   if (input.effort) args.push('--effort', input.effort);
+  if (input.maxBudgetUsd) args.push('--max-budget-usd', String(input.maxBudgetUsd));
   args.push(input.resume ? '--resume' : '--session-id', input.sessionId);
   if (input.mcpConfig) {
     args.push('--mcp-config', input.mcpConfig);

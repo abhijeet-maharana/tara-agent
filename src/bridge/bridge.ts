@@ -29,6 +29,7 @@ import {
   type PullRequests,
   type StartedPullRequest,
 } from '../github/pull-requests.js';
+import { dataCall } from '../http/data.js';
 import type { Privileged } from '../privileged/privileged.js';
 import { ReminderError, type ReminderInput, type Reminders } from '../reminders/reminders.js';
 import { describeTool } from '../runner/stream.js';
@@ -73,6 +74,19 @@ interface PendingPermission {
   result?: PermissionResult;
   waiters: Array<(r: PermissionResult) => void>;
   timer: NodeJS.Timeout;
+}
+
+/** One `data_*` tool call (`Bridge.data`). */
+export interface DataOp {
+  action: 'tables' | 'sql' | 'rows' | 'get' | 'upsert' | 'patch';
+  table?: unknown;
+  key?: unknown;
+  sql?: unknown;
+  params?: unknown;
+  row?: unknown;
+  fields?: unknown;
+  limit?: number;
+  offset?: number;
 }
 
 export class BridgeError extends Error {
@@ -193,6 +207,7 @@ export class Bridge {
             TARA_JOB_TOOLS: ctx.kind === 'chat' && this.jobs ? '1' : '0',
             TARA_REMINDER_TOOLS: this.reminders ? '1' : '0',
             TARA_GITHUB_TOOLS: this.deps.pullRequests?.has(ctx.project.config.name) ? '1' : '0',
+            TARA_DATA_TOOLS: ctx.project.config.dataUrl ? '1' : '0',
           },
         },
       },
@@ -415,6 +430,63 @@ export class Bridge {
   startPullRequest(token: string | undefined, input: { branch: string }): Promise<StartedPullRequest> {
     const ctx = this.run(token);
     return this.pullRequest(() => this.deps.pullRequests?.start(ctx.project.config.name, input.branch));
+  }
+
+  /**
+   * One call on the run's own project database, through the project's data API (`dataUrl`; the `data_*`
+   * tools). The run never learns the URL and can't reach another project's data; the project's API
+   * applies its own table rules (only `agentWritable` tables take writes). Writes are logged.
+   */
+  async data(token: string | undefined, op: DataOp): Promise<unknown> {
+    const ctx = this.run(token);
+    const base = ctx.project.config.dataUrl;
+    if (!base) throw new BridgeError(404, 'This project has no data API (dataUrl)');
+    const table = (name: unknown) => {
+      if (typeof name !== 'string' || !/^[a-z_][a-z0-9_]*$/.test(name))
+        throw new BridgeError(400, '"table" must be a plain table name (data_tables lists them)');
+      return `/${name}`;
+    };
+    const key = (k: unknown) => {
+      if (typeof k !== 'string' || !k) throw new BridgeError(400, '"key" is required');
+      return `/${encodeURIComponent(k)}`;
+    };
+    const object = (v: unknown, name: string) => {
+      if (!v || typeof v !== 'object' || Array.isArray(v))
+        throw new BridgeError(400, `"${name}" must be an object`);
+      return v;
+    };
+    const call = (path: string, init?: { method?: string; body?: unknown }) =>
+      dataCall(base, path, init).catch((err: Error) => {
+        throw new BridgeError(400, err.message);
+      });
+    const where = `${ctx.project.config.name}${ctx.jobId ? `/${ctx.jobId}` : ''}`;
+    switch (op.action) {
+      case 'tables':
+        return call('/tables');
+      case 'sql':
+        return call('/sql', { method: 'POST', body: { sql: op.sql, params: op.params ?? [] } });
+      case 'rows': {
+        const q = new URLSearchParams({ limit: String(op.limit ?? 50), offset: String(op.offset ?? 0) });
+        return call(`${table(op.table)}?${q}`);
+      }
+      case 'get':
+        return call(`${table(op.table)}${key(op.key)}`);
+      case 'upsert': {
+        const row = await call(table(op.table), { method: 'POST', body: object(op.row, 'row') });
+        this.deps.log.info(`[${where}] data: upsert ${op.table}`);
+        return row;
+      }
+      case 'patch': {
+        const row = await call(`${table(op.table)}${key(op.key)}`, {
+          method: 'PATCH',
+          body: object(op.fields, 'fields'),
+        });
+        this.deps.log.info(`[${where}] data: patch ${op.table} ${op.key}`);
+        return row;
+      }
+      default:
+        throw new BridgeError(400, 'Unknown data action');
+    }
   }
 
   /** Commits the workspace and opens or updates the PR (`open_pull_request`). */

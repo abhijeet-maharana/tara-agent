@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly tara-backup
+
+[Timer]
+OnCalendar=*-*-* 01:40:00
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

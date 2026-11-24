@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { Project } from '../src/config/schema.js';
-import { memoryBlock } from '../src/memory/memory.js';
+import { memoryBlock, oversizedMemory } from '../src/memory/memory.js';
 import { learnPrompt } from '../src/scheduler/prompt.js';
 import { Store } from '../src/store/store.js';
 
@@ -83,5 +83,19 @@ describe('project memory', () => {
       expect(prompt).not.toContain('bump it');
     }
     expect(learnPrompt([], { step: 'fetch' })).not.toContain('.tara/memory.md');
+  });
+});
+
+describe('oversizedMemory', () => {
+  it('reports a memory file over 150 lines or 12k characters', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'tara-mem-'));
+    expect(oversizedMemory(dir)).toBeUndefined(); // no file
+    mkdirSync(path.join(dir, '.tara'));
+    writeFileSync(path.join(dir, '.tara', 'memory.md'), '- fact\n'.repeat(100));
+    expect(oversizedMemory(dir)).toBeUndefined();
+    writeFileSync(path.join(dir, '.tara', 'memory.md'), '- fact\n'.repeat(151));
+    expect(oversizedMemory(dir)).toEqual({ lines: 151, chars: 151 * 7 - 1 });
+    writeFileSync(path.join(dir, '.tara', 'memory.md'), `- ${'x'.repeat(12_001)}`);
+    expect(oversizedMemory(dir)?.chars).toBe(12_003);
   });
 });

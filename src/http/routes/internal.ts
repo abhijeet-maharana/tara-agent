@@ -1,4 +1,4 @@
-import type { Bridge } from '../../bridge/bridge.js';
+import type { Bridge, DataOp } from '../../bridge/bridge.js';
 import { HttpError, readJson, str } from '../io.js';
 import { type Route, type RouteRequest, route } from '../router.js';
 import { ITEM_BODY_LIMIT, itemInput } from './items.js';
@@ -25,6 +25,7 @@ const required = (v: unknown, name: string) => {
  *   POST /internal/withdraw            {id, reason?}  closes a waiting card of the run's project
  *   POST /internal/reminder            {text, cron? | at?, notify?, task?, title?}; GET /internal/reminders;
  *   POST /internal/reminder-cancel     {id}
+ *   POST /internal/data                {action: tables|sql|rows|get|upsert|patch, table?, key?, sql?, params?, row?, fields?, limit?, offset?}
  */
 export function internalRoutes(bridge: Bridge): Route<unknown>[] {
   const token = ({ req }: RouteRequest) => req.headers['x-tara-run'] as string | undefined;
@@ -145,5 +146,22 @@ export function internalRoutes(bridge: Bridge): Route<unknown>[] {
     ),
     route('GET /internal/reminders', (r) => ({ reminders: bridge.listReminders(token(r)) })),
     post('reminder-cancel', (body, t) => bridge.cancelReminder(t, required(body.id, 'id'))),
+    post(
+      'data',
+      async (body, t) => ({
+        result: await bridge.data(t, {
+          action: body.action as DataOp['action'],
+          table: body.table,
+          key: body.key,
+          sql: body.sql,
+          params: body.params,
+          row: body.row,
+          fields: body.fields,
+          limit: typeof body.limit === 'number' ? Math.min(Math.max(1, body.limit), 1000) : undefined,
+          offset: typeof body.offset === 'number' ? Math.max(0, body.offset) : undefined,
+        }),
+      }),
+      ITEM_BODY_LIMIT,
+    ),
   ];
 }

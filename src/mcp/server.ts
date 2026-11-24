@@ -12,6 +12,8 @@
  *   start_pull_request, open_pull_request   a GitHub PR from a workspace (host `github` projects only)
  *   read_ci_job       a GitHub Actions job: failed steps and log excerpt (read-only; host `github` projects only)
  *   set_reminder, list_reminders, cancel_reminder   reminders posted in the channel (no run)
+ *   data_tables, data_query, data_rows, data_get, data_upsert, data_patch   the project's own database
+ *                     (projects with a `dataUrl`)
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -21,6 +23,9 @@ const API = process.env.TARA_API ?? 'http://127.0.0.1:4100';
 const TOKEN = process.env.TARA_RUN_TOKEN ?? '';
 const PERMISSION_PROMPTS = process.env.TARA_PERMISSION_PROMPTS === '1';
 const GITHUB_TOOLS = process.env.TARA_GITHUB_TOOLS === '1';
+const DATA_TOOLS = process.env.TARA_DATA_TOOLS === '1';
+/** A tool answer longer than this is cut (rows are summarised by count). */
+const DATA_MAX_CHARS = 60_000;
 /** Fetching or pushing a big repo can take minutes. */
 const GITHUB_TIMEOUT_MS = 10 * 60_000;
 /** Longest a permission prompt can wait in total (tara-agent itself denies after 10 minutes). */
@@ -645,6 +650,107 @@ if (PERMISSION_PROMPTS) {
         return deny(`Permission prompt failed: ${(err as Error).message}`);
       }
     },
+  );
+}
+
+if (DATA_TOOLS) {
+  const table = z
+    .string()
+    .regex(/^[a-z_][a-z0-9_]*$/)
+    .describe('Table name, as data_tables lists it');
+  const key = z
+    .string()
+    .min(1)
+    .describe("The row's primary key; for a composite key, its parts joined with '|' (e.g. \"jobs|123\")");
+  const data = async (body: object) => {
+    try {
+      const { result } = await api<{ result: unknown }>('/internal/data', body);
+      const out = JSON.stringify(result, null, 1);
+      return text(
+        out.length > DATA_MAX_CHARS
+          ? `${out.slice(0, DATA_MAX_CHARS)}\n… (cut at ${DATA_MAX_CHARS} characters: ask for fewer rows or columns)`
+          : out,
+      );
+    } catch (err) {
+      return text(`Data call failed: ${(err as Error).message}`, true);
+    }
+  };
+  server.registerTool(
+    'data_tables',
+    {
+      title: "List the project's data tables",
+      description:
+        "The project's own database (where its jobs keep records, instead of JSON files): every table with what it holds, " +
+        'its row count, its columns (key ones marked) and whether agents may write it (`agentWritable`). Start here.',
+      inputSchema: {},
+    },
+    () => data({ action: 'tables' }),
+  );
+  server.registerTool(
+    'data_query',
+    {
+      title: 'Read the project data with SQL',
+      description:
+        'One read-only SQLite query (SELECT or WITH, one statement, up to 1000 rows) on the project database. ' +
+        'Use ? placeholders with `params` for values. JSON columns named `data` come back parsed; filter them ' +
+        "with json_extract(data, '$.field').",
+      inputSchema: {
+        sql: z.string().min(1).max(10_000),
+        params: z.array(z.union([z.string(), z.number(), z.boolean(), z.null()])).optional(),
+      },
+    },
+    (args) => data({ action: 'sql', ...args }),
+  );
+  server.registerTool(
+    'data_rows',
+    {
+      title: 'Read rows of a table',
+      description: 'Rows of one table, newest first (by updated_at when it has one), `limit` at a time.',
+      inputSchema: {
+        table,
+        limit: z.number().int().min(1).max(1000).optional().describe('Default 50'),
+        offset: z.number().int().min(0).optional(),
+      },
+    },
+    (args) => data({ action: 'rows', ...args }),
+  );
+  server.registerTool(
+    'data_get',
+    {
+      title: 'Read one row',
+      description: 'One row by its primary key.',
+      inputSchema: { table, key },
+    },
+    (args) => data({ action: 'get', ...args }),
+  );
+  server.registerTool(
+    'data_upsert',
+    {
+      title: 'Add or replace a row',
+      description:
+        'Insert a row, or update the row with the same key (columns left out keep their value). Only tables ' +
+        'marked agentWritable; created_at and updated_at are set for you. Object values are stored as JSON.',
+      inputSchema: {
+        table,
+        row: z.record(z.string(), z.unknown()).describe('column: value, including every key column'),
+      },
+    },
+    (args) => data({ action: 'upsert', ...args }),
+  );
+  server.registerTool(
+    'data_patch',
+    {
+      title: 'Change some fields of a row',
+      description:
+        'Update the given fields of one row (agentWritable tables only). An object for the `data` column is ' +
+        'merged into the stored one: only the keys you give change, and a key set to null is removed.',
+      inputSchema: {
+        table,
+        key,
+        fields: z.record(z.string(), z.unknown()).describe('column: new value'),
+      },
+    },
+    (args) => data({ action: 'patch', ...args }),
   );
 }
 

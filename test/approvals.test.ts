@@ -631,7 +631,7 @@ describe('queue worker', () => {
     expect(nextWindowStart(eu, 'UTC', Date.parse('2026-10-26T09:00:00Z'))).toBe(TUE_9_UTC);
   });
 
-  it('runs approved items in their window, in batches, within the daily cap; unreported ones fail', async () => {
+  it('runs approved items in their window, in batches, within the daily cap; unreported ones are uncertain', async () => {
     let now = TUE_9_UTC - 3_600_000; // window not open yet
     const { project, store, approvals } = setup({ now: () => now });
     const runs: Item[][] = [];
@@ -668,9 +668,10 @@ describe('queue worker', () => {
     await worker.idle();
     expect(runs.map((b) => b.map((i) => i.title))).toEqual([['Lead 1', 'Lead 2']]);
     expect(store.items({ statuses: ['done'] }).map((i) => i.title)).toEqual(['Lead 1']);
-    expect(store.items({ statuses: ['failed'] })[0]).toMatchObject({
+    // Its run ran but never reported it: maybe sent, so it is never run again on its own.
+    expect(store.items({ statuses: ['uncertain'] })[0]).toMatchObject({
       title: 'Lead 2',
-      result: expect.stringContaining('without reporting'),
+      result: expect.stringContaining('without reporting this item: it may or may not have gone out'),
     });
 
     now += 60_000;
@@ -683,7 +684,7 @@ describe('queue worker', () => {
     expect(store.items({ statuses: ['approved'] }).map((i) => i.title)).toEqual(['Lead 4']);
   });
 
-  it('after a restart, puts back items whose run never started and fails the ones it started on', async () => {
+  it('after a restart, puts back items whose run never started and marks the ones it started on uncertain', async () => {
     const { project, store, approvals } = setup();
     const ids: string[] = [];
     for (const n of [1, 2]) {
@@ -707,8 +708,39 @@ describe('queue worker', () => {
     });
     worker.start();
     worker.stop();
-    expect(store.getItem(ids[0] as string)?.status).toBe('failed');
+    expect(store.getItem(ids[0] as string)?.status).toBe('uncertain');
     expect(store.getItem(ids[1] as string)).toMatchObject({ status: 'approved', startedAt: undefined });
+  });
+
+  it('settles an uncertain item: it went out, send it again, or drop it; nothing else can be settled', async () => {
+    const { project, store, approvals } = setup();
+    const ids: string[] = [];
+    for (const n of [1, 2, 3]) {
+      const i = await approvals.propose(project, {
+        kind: 'note',
+        title: `Lead ${n}`,
+        queue: 'linkedin',
+        fields: [note('hi')],
+      });
+      await approvals.decide(i.id, { option: 'Approve', by: 'U1', via: 'dashboard' });
+      ids.push(i.id);
+    }
+    store.startItems(ids);
+    store.markRunStarted(ids);
+    expect(store.markUncertain('the run stopped').map((i) => i.status)).toEqual([
+      'uncertain',
+      'uncertain',
+      'uncertain',
+    ]);
+    const [a, b, c] = ids as [string, string, string];
+    expect(approvals.resolve(a, 'sent', 'U1')).toMatchObject({
+      status: 'done',
+      result: 'Marked as sent by U1',
+    });
+    expect(approvals.resolve(b, 'retry', 'U1')).toMatchObject({ status: 'approved', startedAt: undefined });
+    expect(approvals.resolve(c, 'drop', 'U1')).toMatchObject({ status: 'failed' });
+    // Settled once; a waiting card is not uncertain.
+    expect(() => approvals.resolve(a, 'retry', 'U1')).toThrow(/Only an item marked uncertain/);
   });
 
   it('gives items back, not failed, when the executor never ran because of a usage limit', async () => {

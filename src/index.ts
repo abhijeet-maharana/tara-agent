@@ -4,6 +4,7 @@ import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { loadAll, startAgent } from './agent.js';
 import { DEFAULT_HOST_CONFIG, expandHome, loadHostConfig, loadJobs } from './config/load.js';
+import { doctor, formatDoctor } from './doctor.js';
 import { redact } from './runner/activity.js';
 import type { Logger } from './sessions/manager.js';
 import { Store } from './store/store.js';
@@ -32,6 +33,8 @@ const log: Logger = {
 const USAGE = `Usage:
   tara-agent [--config <file>]               run the gateway
   tara-agent validate [--config <file>]      check host, project and job config, then exit
+  tara-agent doctor [--config <file>]        check everything: config, skills, required services and the
+                                             running tara-agent's health checks (exit 1 when any is red)
   tara-agent rename-jobs <project> <map.json> [--config <file>]
                                              move run history, cards and slot claims from old job ids
                                              to new ones ({"old-id": "new-id"}); stop the service first`;
@@ -44,6 +47,13 @@ function validate(configFlag: string | undefined): void {
     log.info(`✓ ${p.config.name} (${p.dir}): ${enabled}/${jobs.length} jobs enabled`);
   }
   log.info(`✓ config OK (timezone ${host.timezone}, jobConcurrency ${host.jobConcurrency})`);
+}
+
+async function runDoctor(configFlag: string | undefined): Promise<void> {
+  const { host, projects } = loadAll(configFlag);
+  const { text, code } = formatDoctor(await doctor({ host, projects, jobs: loadJobs }));
+  console.log(text);
+  process.exitCode = code;
 }
 
 function renameJobs(configFlag: string | undefined, [project, mapFile]: string[]): void {
@@ -92,13 +102,14 @@ async function serve(configFlag: string | undefined) {
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
   if (command === '--help' || command === 'help') return void log.info(USAGE);
-  const args = command === 'validate' || command === 'rename-jobs' ? rest : process.argv.slice(2);
+  const args = ['validate', 'doctor', 'rename-jobs'].includes(command ?? '') ? rest : process.argv.slice(2);
   const { values, positionals } = parseArgs({
     args,
     options: { config: { type: 'string', short: 'c' } },
     allowPositionals: command === 'rename-jobs',
   });
   if (command === 'validate') return validate(values.config);
+  if (command === 'doctor') return runDoctor(values.config);
   if (command === 'rename-jobs') return renameJobs(values.config, positionals);
   await serve(values.config);
 }

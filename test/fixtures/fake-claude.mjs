@@ -63,6 +63,20 @@ process.stdin.on('end', () => {
       });
       process.exitCode = 1;
       break;
+    case 'budget':
+      // What the real CLI prints when --max-budget-usd stops a run (claude 2.1.331).
+      out({ type: 'system', subtype: 'init', session_id: sid, model: 'm' });
+      out({
+        type: 'result',
+        subtype: 'error_max_budget_usd',
+        is_error: true,
+        total_cost_usd: 2.31,
+        session_id: sid,
+        errors: ['Reached maximum budget ($2)'],
+        permission_denials: [],
+      });
+      process.exitCode = 1;
+      break;
     case 'denied':
       out({ type: 'system', subtype: 'init', session_id: sid, model: 'm' });
       out({

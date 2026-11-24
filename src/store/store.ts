@@ -526,6 +526,9 @@ export const ITEM_STATUSES = [
   'pending',
   'approved',
   'running',
+  // Its run started but never said how it went (a crash, a restart, a run that ended without a
+  // report): it may or may not have gone out, so it is never run again on its own. A person says.
+  'uncertain',
   'done',
   'failed',
   'rejected',
@@ -1770,6 +1773,52 @@ export class Store {
       (i) => !ids || ids.includes(i.id),
     );
     return running.map((i) => this.finishItem(i.id, 'failed', reason)).filter((i): i is Item => Boolean(i));
+  }
+
+  /**
+   * Running items nobody reported, whose run had started: maybe sent, maybe not. Marked `uncertain`
+   * (never run again on their own) for a person to settle (`resolveUncertain`). Returns them.
+   */
+  markUncertain(reason: string, ids?: string[]): Item[] {
+    if (ids && !ids.length) return [];
+    const t = this.now();
+    const out: Item[] = [];
+    for (const i of this.items({ statuses: ['running'], limit: 1000 })) {
+      if (ids && !ids.includes(i.id)) continue;
+      const r = this.db
+        .prepare(
+          "UPDATE items SET status = 'uncertain', result = ?, finished_at = ?, updated_at = ? WHERE id = ? AND status = 'running'",
+        )
+        .run(reason.slice(0, 4_000), t, t, i.id);
+      if (r.changes > 0) out.push(this.getItem(i.id) as Item);
+    }
+    return out;
+  }
+
+  /**
+   * A person settles an uncertain item: it went out (`done`), send it again (back to `approved`, at
+   * the front of nothing: its queue's next turn), or drop it (`failed`).
+   */
+  resolveUncertain(id: string, outcome: 'sent' | 'retry' | 'drop', by: string): Item | undefined {
+    const t = this.now();
+    const note = {
+      sent: `Marked as sent by ${by}`,
+      retry: `Queued again by ${by} (it had not gone out)`,
+      drop: `Dropped by ${by} (not sent)`,
+    }[outcome];
+    const r =
+      outcome === 'retry'
+        ? this.db
+            .prepare(
+              "UPDATE items SET status = 'approved', started_at = NULL, finished_at = NULL, run_started_at = NULL, run_after = ?, result = ?, updated_at = ? WHERE id = ? AND status = 'uncertain'",
+            )
+            .run(t, note, t, id)
+        : this.db
+            .prepare(
+              "UPDATE items SET status = ?, result = ?, updated_at = ? WHERE id = ? AND status = 'uncertain'",
+            )
+            .run(outcome === 'sent' ? 'done' : 'failed', note, t, id);
+    return r.changes > 0 ? this.getItem(id) : undefined;
   }
 
   cancelItem(id: string, by: string): Item | undefined {

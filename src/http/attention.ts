@@ -105,7 +105,7 @@ export async function gatherAttention(src: AttentionSources): Promise<Attention>
       tier: 'waiting',
       kind: 'approval',
       project: a.project,
-      title: `Approval waiting: ${a.title}`,
+      title: a.status === 'uncertain' ? `Did it go out? ${a.title}` : `Approval waiting: ${a.title}`,
       url: '/approvals',
       at: a.createdAt,
     });

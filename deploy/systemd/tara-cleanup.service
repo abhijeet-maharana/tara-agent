@@ -1,0 +1,17 @@
+# Weekly housekeeping (deploy/host/tara-cleanup.mjs): deletes only what /etc/tara-agent/cleanup.json names.
+# Install:
+#   sudo install -o root -g root -m 755 deploy/host/tara-cleanup.mjs /usr/local/sbin/tara-cleanup
+#   sudo cp deploy/systemd/tara-cleanup.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now tara-cleanup.timer
+# Try it first: sudo tara-cleanup --dry-run. Last result: /var/lib/tara-cleanup/status.json.
+# No PrivateTmp: rules may name leftovers in the real /tmp.
+[Unit]
+Description=tara-cleanup: weekly housekeeping
+
+[Service]
+Type=oneshot
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/node --no-warnings /usr/local/sbin/tara-cleanup
+TimeoutStartSec=30min
+Nice=10
+IOSchedulingClass=idle

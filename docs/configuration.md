@@ -30,6 +30,7 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `retentionDays` | `90` | Days of history kept in the state database (min 14). Runs, slot claims, sessions not used since, and the machine and VM host samples are deleted daily; each job's latest run is kept. Finished approval cards are kept 60 days (the keys of decided cards for good, so auto-approve never sees an old key as new) |
 | `backup.dir` | `<stateDir>/backups` | Where the daily copy of the state database goes (`tara-YYYY-MM-DD.db`, checked with `quick_check` before it gets its name). Point it at another disk, or copy the folder off the machine (`deploy/pull-backups.sh <ssh host>`, run daily on the other machine), so a failing disk doesn't take the copies with it. The Health page shows a **Database backup** check |
 | `backup.keep` | `7` | Days of copies kept |
+| `backup.offsite` | unset | The off-site backup's status file (`statusFile`), plus `maxAgeHours` (30: red after that without a good backup) and `restoreTestDays` (35: amber after that without a passed restore test). Shows **Off-site backup** and **Restore test** on the Health page. See [`backups.md`](backups.md) |
 | `streaming` | `true` | Stream replies as a live task card and text. Needs the Slack app's "Agents & AI Apps" feature and the `assistant:write` scope; without them, tara-agent falls back to one edited status message |
 | `browsers` | `[{lock: chrome, cdpUrl: http://127.0.0.1:9222, closeTabs: true, staleMinutes: 30}]` | The shared Chromes runs drive (e.g. one per signed-in identity: its own `--user-data-dir` and `--remote-debugging-port`). `lock` is its name on the Browsers page. Runs share a browser without locks ([shared browsers](#shared-browsers)); with `closeTabs`, tara closes stale tabs every 5 minutes: open over `staleMinutes` and since before every conversation still going in that browser began (a job run, or a chat thread: going while a turn runs and for `staleMinutes` after its last turn), never a kept tab (project `keepTabsUrl`) or the last tab. Point the project's Chrome MCP server (`--browserUrl`) at the same `cdpUrl` |
 | `voice` | unset | Speech-to-text for Slack voice notes that Slack didn't transcribe (it skips short clips and some languages): `url` (an OpenAI-compatible chat completions endpoint whose models take `input_audio`, e.g. Gemini) and `models` (tried in order). Key from `TARA_VOICE_API_KEY`. Unset = Slack's transcript only, and voice notes without one get a "please type it" reply |
@@ -74,6 +75,7 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `jobDataDir` | `<stateDir>/job-data/<name>` | Parent of per-job data folders, relative to the repo |
 | `selfImprove` | `"always"` | After every run (`always`), only runs with trouble (`trouble`), or never (`off`), let Claude fix the skill it followed (see [Self-improvement](#self-improvement)) |
 | `healthUrl` | none | The project's own checks for the Health page: GET returns `{checks: [{name, ok, warn?, detail, group?, link?}]}` (also bare, or under `result`). Without it, `dashboardUrl` is only checked for an answer |
+| `dataUrl` | none | The project's data API (`packages/kit` `DataApi`, e.g. `http://127.0.0.1:4002/api/db`): its own database's tables, rows and read-only SQL on the dashboard's **Data** tab (sidebar 🗄️); an unlocked browser can edit and add rows of `agentWritable` tables there. Runs of the project get `data_*` tools for the same API. Pinnable in host `trusted` |
 | `keepTabsUrl` | none | Tabs tara never closes as stale (host `browsers`): GET returns a JSON list of `{url}` or URL strings, bare or under `result`, matched without query or fragment. For a page a person must finish, such as a form stopped at a captcha. If it doesn't answer, no tab in that browser is closed |
 | `words` | none | How skill-name words are written in job names: `{"linkedin": "LinkedIn", "sla": "SLA"}`; other words are capitalised |
 | `approvals.validateUrl` | none | Asked for extra checks on every proposed or edited draft (see [Queues](#queues)) |
@@ -126,6 +128,19 @@ Every setting tara-agent reads, plus the job conventions, approval tools, queues
 | `env` | `{}` | Extra environment for Claude and the scripts it runs (`~/` expanded), merged over the file-level `env` |
 | `durationMinutes` | none | Typical run time: the Jobs Timeline plans with it (change it on the job's card in Jobs → List) |
 | `enabled` | `true` | `false` keeps the job listed but never scheduled |
+| `gate` | none | A command run before the model (see [Gate, requires and budget](#gate-requires-and-budget)). No output: the run ends `skipped`, no model session |
+| `requires` | none | URLs that must answer before the run (a browser, a project server). Down: the run ends `blocked`, no model session |
+| `budgetUsd` | none | Stop the main session once it has spent this many dollars (`--max-budget-usd`); the run ends `over-budget`. A runaway guard, not a quota |
+
+### Gate, requires and budget
+
+Three checks that keep a run from starting a model session it doesn't need, or from running away. All are optional; a job without them runs as before.
+
+- **`gate`**: a shell command (`sh -c`, in the repo, as the run user, with the job's environment and `$TARA_JOB_DATA`) that tara-agent runs **before** a scheduled, catch-up or Run now run. Exit 0 with no output, or with only one line starting `Skipping` (the reason, e.g. `Skipping: no new mail`), means nothing to do: the run ends `skipped` with no model session; a scheduled one posts nothing, Run now says "✅ Nothing to do". Any output (or a non-zero exit, or a timeout after the job's `timeoutMinutes`) starts the run as usual, with what the gate printed in the prompt under `## Gate output` (its first 128,000 characters, with a line saying when the rest was cut) and an instruction not to run it again; a failing gate's error is there too, to fix or report. The skill's `### Before you start` then says to work from the gate output instead of running the check itself. Queue runs and continued sessions don't run the gate.
+- **`requires`**: URLs that must answer (any status below 500, within 6 s) before a scheduled, catch-up, Run now or queue run starts. When one doesn't, the run ends `blocked` with no model session. Slack hears once per streak (a Run now always says why), and a queue's items go back to the queue, to try again in 15 minutes: nothing was sent. `blocked` counts as a failure on the Jobs page and in the Health page's failing-run checks.
+- **`budgetUsd`**: passed to Claude as `--max-budget-usd` for the main session. The CLI checks it between turns, so a run may go a little over; it then ends `over-budget` (💸 on the status line and in the summary). Unset, nothing is limited.
+
+`tara-agent doctor` lists every job's `requires` that doesn't answer right now.
 
 ### Job instructions
 
@@ -260,6 +275,7 @@ After a job run or chat turn, tara-agent resumes the same session once and asks 
 | `"off"` (or `false`) | Never |
 
 - **Skills stay short.** The turn edits the instruction where it belongs (fix the step, replace the wrong line, put the trap in its step), never appends notes, writes timeless rules (no dates or who said it: git has that), moves detail only some runs need to `references/<topic>.md`, keeps `SKILL.md` under 25,000 characters (`SKILL_MAX_CHARS`) and leaves the front matter alone except the `description` (no version bumps). Only `name` and `description` in a skill's front matter mean anything to Claude Code. The Health page warns (quietly, no Slack) when a project has skills over the limit (`Skill size` under Jobs).
+- **Shared skills.** A skill used by several projects (e.g. a humanizer) is vendored: the same folder in each project's `.agents/skills/`, with a `SHARED` file in it. Lines of `SHARED` that name a file of the skill (e.g. `voice-samples.md`) are that project's own. `tara-agent doctor` warns when the other files differ between projects, so a fix a learning turn made in one copy gets ported to the others.
 - **Steps learn too.** Each Claude step's session gets its own turn under the same rule, told to change only its `### Step: <name>` part (or `### Every step`) and the scripts that step runs. Its note reads `🔧 <job> · step "<name>" learned from this run`.
 - **It sees what the run used**: the session's cost at API prices, tokens, tool calls and minutes, the whole run's when there were steps (and a step's share of it), and the job's usual run: the median of the first run in each thread over the last 14 days, from 3 such runs. A run at 1.5× the usual or more is called out, and Claude is asked what made it expensive; otherwise it is asked for a cheaper path only when it sees one. Coverage and correctness always come first. Runs after a card or for queue items aren't compared.
 - Usage-limit and stopped runs, agy runs, and replies that used no tool never get one.
@@ -341,6 +357,7 @@ A card raised with `handoff` notes is a complete brief: the card says what is pr
 
 - **Written by learning turns** ([self-improvement](#self-improvement)) after each run of a main session: one short line per fact under a `## ` heading per topic, dated when it changes, replaced when it is no longer true, under about 150 lines.
 - **Read by every fresh session** in its first prompt, as `## Project memory`: a job run, a run acting on a decision, a [handoff](#handoff) session, and the first message of a chat. Continued sessions already have it. Over 12,000 characters, the rest is left for the session to read.
+- **Health warns** (quietly, row "Project memory") when the file is over 150 lines or 12,000 characters: the part past the limit never reaches a session. Move what it says into skills or docs where it belongs, drop facts no longer true, and keep an archive file next to it if old detail matters.
 - **Recent decisions** come with it, straight from the store: what people chose on the project's cards in the last 14 days (up to 15, newest first, with their notes), without notices or auto-approvals. So a turned-down idea isn't raised again.
 
 ## Queues
@@ -372,7 +389,7 @@ Approved drafts are sent through queues declared in `<repo>/.tara/queues.json`:
 | `{ "url": "…" }` | One POST `{item}` per item. Answer `{status: "done" \| "failed", result}`, or `{status: "later", result, retryAt?}` to retry later |
 | `{ "external": true }` | The project's own server runs approved items and reports with `POST /items/<id>/report` |
 
-An item that is never reported ends as failed and is not retried, so nothing goes out twice.
+An item whose run started but never reported it (a restart mid-send, a run that ended without `finish_item`) ends **`uncertain`**, not failed: it may have gone out. It is never run again on its own; the Approvals page lists it first under **Did these go out?** (and Home shows it) with **It went out** (done), **It didn't: send again** (back in its queue) and **Drop it** (failed), so nothing goes out twice.
 
 **Decisions**
 

@@ -21,6 +21,7 @@ import {
   type MonitorDeps,
   parseProjectChecks,
 } from '../src/health/monitor.js';
+import { readOffsiteStatus } from '../src/health/offsite.js';
 import { gatherAttention } from '../src/http/attention.js';
 import { startHttpServer } from '../src/http/server.js';
 import type { Task } from '../src/runner/activity.js';
@@ -296,6 +297,20 @@ describe('jobChecks', () => {
     ]);
   });
 
+  it('warns, quietly, about a project memory too long for a session to get', () => {
+    const c = jobChecks(deps({ memory: () => ({ lines: 196, chars: 39_278 }) }));
+    expect(c.find((x) => x.key === 'jobs:shop:memory')).toMatchObject({
+      status: 'warn',
+      quiet: true,
+      detail: expect.stringMatching(
+        /^\.tara\/memory\.md is 196 lines, 39k characters: a new session gets only the first 12k/,
+      ),
+    });
+    expect(jobChecks(deps({ memory: () => undefined })).some((x) => x.key === 'jobs:shop:memory')).toBe(
+      false,
+    );
+  });
+
   it('warns, quietly, about skills too long for every run to read', () => {
     const many = Array.from({ length: 7 }, (_, i) => ({ name: `skill-${i}`, chars: 140_000 - i * 10_000 }));
     const rows = jobChecks(deps({ skills: () => many }));
@@ -383,6 +398,40 @@ describe('jobChecks', () => {
       }),
     );
     expect(young).toHaveLength(1); // added after that slot: not missed
+  });
+
+  it('warns about a run a restart stopped until a later run makes up for it', () => {
+    const slot = Date.parse('2026-11-13T09:00:00Z');
+    const aborted = () => ({ status: 'aborted', claimedAt: slot });
+    expect(jobChecks(deps({ slotClaim: aborted }))[0]?.detail).toBe('The 09:00 run was stopped by a restart');
+    const failedAgain = jobChecks(
+      deps({
+        slotClaim: aborted,
+        recent: () => [run('failed', slot + 120_000, { startedAt: slot + 60_000 })],
+      }),
+    );
+    expect(failedAgain.some((c) => c.detail === 'The 09:00 run was stopped by a restart')).toBe(true);
+    const madeUp = jobChecks(
+      deps({
+        slotClaim: aborted,
+        recent: () => [run('skipped', slot + 120_000, { startedAt: slot + 60_000 })],
+      }),
+    );
+    expect(madeUp.some((c) => c.key === 'jobs:shop:slot:sync')).toBe(false);
+  });
+
+  it('warns about a skipped slot, but not one whose gate found nothing to do', () => {
+    const slot = Date.parse('2026-11-13T09:00:00Z');
+    const skipped = () => ({ status: 'skipped', claimedAt: slot });
+    const paused = jobChecks(deps({ slotClaim: skipped }));
+    expect(paused[0]?.detail).toBe('Skipped 09:00: paused, or the run before was still going');
+    // A run from an earlier slot doesn't count.
+    const older = jobChecks(deps({ slotClaim: skipped, recent: () => [run('skipped', slot - 86_400_000)] }));
+    expect(older[0]?.detail).toMatch(/^Skipped 09:00/);
+    const gated = jobChecks(
+      deps({ slotClaim: skipped, recent: () => [run('skipped', slot + 1_000, { startedAt: slot })] }),
+    );
+    expect(gated).toEqual([expect.objectContaining({ key: 'jobs:shop:summary', status: 'ok' })]);
   });
 
   it("reports a jobs file that didn't load", () => {
@@ -548,6 +597,64 @@ describe('agentChecks', () => {
       ),
     );
     expect(c['Claude runs']).toEqual(['bad', 'The last 3 runs ended in an error: Not logged in']);
+  });
+
+  it('reads the off-site backup status: green, failed, stale, unread, and the restore test', async () => {
+    const options = { maxAgeHours: 30, restoreTestDays: 35 };
+    const iso = (hoursAgo: number) => new Date(now - hoursAgo * 3_600_000).toISOString();
+    const good = {
+      at: iso(8),
+      ok: true,
+      archive: { bytes: 260e6, key: 'tara-backup/host/x.tar.gz.age' },
+      items: [{ ok: true }, { ok: true }, { skipped: 'weekly' }],
+    };
+    const check = async (status: object) =>
+      byName(await agentChecks(deps({ offsite: () => ({ status, options }) })));
+
+    const fine = await check({
+      lastRun: good,
+      lastGood: good,
+      restoreTest: { at: iso(48), ok: true, message: '9 items' },
+    });
+    expect(fine['Off-site backup']).toEqual([
+      'ok',
+      '8h ago · 260 MB · 2 items checked, encrypted and uploaded',
+    ]);
+    expect(fine['Restore test']).toEqual(['ok', 'Passed 2d ago: 9 items']);
+
+    const failed = await check({
+      lastRun: { at: iso(2), ok: false, error: 'aws s3 cp: denied' },
+      lastGood: good,
+    });
+    expect(failed['Off-site backup']).toEqual([
+      'bad',
+      'The last backup (2h ago) failed: aws s3 cp: denied · last good one 8h ago',
+    ]);
+    expect(failed['Restore test']).toEqual(['warn', 'Never tested: run deploy/backup/restore-test.sh']);
+
+    const stale = await check({
+      lastRun: { ...good, at: iso(50) },
+      lastGood: { ...good, at: iso(50) },
+      restoreTest: { at: iso(40 * 24), ok: true },
+    });
+    expect(stale['Off-site backup']).toEqual(['bad', 'No backup for 2d 2h']);
+    expect(stale['Restore test']?.[0]).toBe('warn');
+
+    const broken = await check({
+      lastRun: good,
+      lastGood: good,
+      restoreTest: { at: iso(1), ok: false, message: 'row counts differ' },
+    });
+    expect(broken['Restore test']).toEqual(['bad', 'Failed 1h ago: row counts differ']);
+
+    expect((await check({ error: 'No status yet at /x' }))['Off-site backup']).toEqual([
+      'warn',
+      'No status yet at /x',
+    ]);
+    expect(readOffsiteStatus('/nonexistent/status.json')).toEqual({
+      error: 'No status yet at /nonexistent/status.json',
+    });
+    expect(byName(await agentChecks(deps()))['Off-site backup']).toBeUndefined();
   });
 
   it('checks each Chrome', async () => {

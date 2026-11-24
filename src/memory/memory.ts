@@ -16,7 +16,9 @@ import type { Item, ItemStatus, Store } from '../store/store.js';
 
 export const MEMORY_FILE = path.join('.tara', 'memory.md');
 /** More than this many characters of the file are left for the session to read itself. */
-const MEMORY_MAX = 12_000;
+export const MEMORY_MAX = 12_000;
+/** Learning turns are asked to keep the file under about this many lines (`MEMORY_LEARN_NOTE`). */
+export const MEMORY_MAX_LINES = 150;
 const DECISION_DAYS = 14;
 const DECISION_MAX = 15;
 const DECIDED: ItemStatus[] = ['done', 'rejected', 'approved', 'running', 'failed', 'cancelled'];
@@ -88,9 +90,21 @@ export function memoryBlock(
 }
 
 /** What a learning turn is told about the memory file (see `learnPrompt`). */
-export const MEMORY_LEARN_NOTE = `Separately, facts worth keeping for later runs go in the project memory file \`${MEMORY_FILE}\` (create it if missing). Every new session starts with it, including the one that acts on an approval card in a new thread, so it is how the next run knows what this one learned. Worth keeping: what was decided or done and when, the person's preferences, the state of work still in progress (with ids and links), and facts about this project that turned out to be true. Not how to do a task (that goes in the skill), and not what the repo or a skill already says. One short line per fact, under a \`## \` heading per topic, with the date for anything that changes. Replace a fact that is no longer true instead of adding to it, and keep the file under about 150 lines.`;
+export const MEMORY_LEARN_NOTE = `Separately, facts worth keeping for later runs go in the project memory file \`${MEMORY_FILE}\` (create it if missing). Every new session starts with it, including the one that acts on an approval card in a new thread, so it is how the next run knows what this one learned. Worth keeping: what was decided or done and when, the person's preferences, the state of work still in progress (with ids and links), and facts about this project that turned out to be true. Not how to do a task (that goes in the skill), and not what the repo or a skill already says. One short line per fact, under a \`## \` heading per topic, with the date for anything that changes. Replace a fact that is no longer true instead of adding to it, and keep the file under about ${MEMORY_MAX_LINES} lines and ${MEMORY_MAX / 1000}k characters: only that much reaches the next session.`;
 
 const oneLine = (s: string, max: number) => {
   const t = s.replace(/\s+/g, ' ').trim();
   return t.length > max ? `${t.slice(0, max - 1)}…` : t;
 };
+
+/** The memory file's size when it is over what a session gets (`MEMORY_MAX`) or the line limit; else undefined. */
+export function oversizedMemory(dir: string): { lines: number; chars: number } | undefined {
+  let text: string;
+  try {
+    text = readFileSync(path.join(dir, MEMORY_FILE), 'utf8').trim();
+  } catch {
+    return undefined;
+  }
+  const lines = text ? text.split('\n').length : 0;
+  return text.length > MEMORY_MAX || lines > MEMORY_MAX_LINES ? { lines, chars: text.length } : undefined;
+}

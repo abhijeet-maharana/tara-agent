@@ -10,6 +10,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -17,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { describe, expect, it } from 'vitest';
+import { DataApi, openDb } from '../packages/kit/src/index.js';
 import { Approvals } from '../src/approvals/approvals.js';
 import {
   Bridge,
@@ -92,6 +94,97 @@ function openRun(bridge: Bridge, ctx: RunContext) {
   const config = JSON.parse(readFileSync(handle.mcpConfigPath, 'utf8'));
   return { handle, token: config.mcpServers.tara.env.TARA_RUN_TOKEN as string, config };
 }
+
+/** A project service with the kit's data API at /api/db (one agent-writable table, one service-only). */
+async function dataService(): Promise<{ url: string; close: () => void }> {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tara-bridge-data-'));
+  const mig = path.join(dir, 'm');
+  mkdirSync(mig);
+  writeFileSync(
+    path.join(mig, '001-init.sql'),
+    `CREATE TABLE leads (id TEXT PRIMARY KEY, status TEXT, data TEXT, updated_at TEXT);
+     CREATE TABLE seen (id TEXT PRIMARY KEY);
+     INSERT INTO leads VALUES ('a1', 'new', '{"x":1}', '2026-11-01');`,
+  );
+  const api = new DataApi(openDb({ file: path.join(dir, 'p.db'), migrationsDir: mig }), {
+    leads: { agentWritable: true, about: 'Leads' },
+    seen: { agentWritable: false, about: 'Seen' },
+  });
+  const server = createServer(async (req, res) => {
+    let raw = '';
+    for await (const c of req) raw += c;
+    const u = new URL(req.url ?? '/', 'http://x');
+    const out = api.handle({
+      method: req.method ?? 'GET',
+      path: u.pathname.replace(/^\/api\/db/, ''),
+      query: Object.fromEntries(u.searchParams),
+      body: raw ? JSON.parse(raw) : undefined,
+    });
+    res.writeHead(out.status, { 'content-type': 'application/json' }).end(JSON.stringify(out.body));
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  return {
+    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/db`,
+    close: () => server.close(),
+  };
+}
+
+describe('Bridge data tools', () => {
+  it("reads and writes the run's own project data through its data API, within the table rules", async () => {
+    const service = await dataService();
+    try {
+      const { bridge, ctx } = setup(project({ dataUrl: service.url }));
+      const { token, config } = openRun(bridge, ctx);
+      expect(config.mcpServers.tara.env.TARA_DATA_TOOLS).toBe('1');
+      const tables = (await bridge.data(token, { action: 'tables' })) as Array<{ name: string }>;
+      expect(tables.map((t) => t.name)).toEqual(['leads', 'seen']);
+      expect(await bridge.data(token, { action: 'sql', sql: 'select id, status from leads' })).toEqual({
+        rows: [{ id: 'a1', status: 'new' }],
+        truncated: false,
+      });
+      expect(
+        await bridge.data(token, {
+          action: 'patch',
+          table: 'leads',
+          key: 'a1',
+          fields: { status: 'sent', data: { y: 2 } },
+        }),
+      ).toMatchObject({
+        status: 'sent',
+        data: { x: 1, y: 2 },
+      });
+      expect(
+        await bridge.data(token, { action: 'upsert', table: 'leads', row: { id: 'a2', status: 'new' } }),
+      ).toMatchObject({ id: 'a2' });
+      expect(await bridge.data(token, { action: 'get', table: 'leads', key: 'a2' })).toMatchObject({
+        status: 'new',
+      });
+      expect(await bridge.data(token, { action: 'rows', table: 'leads', limit: 1 })).toMatchObject({
+        limit: 1,
+      });
+      // The project's rules and plain names hold.
+      await expect(bridge.data(token, { action: 'upsert', table: 'seen', row: { id: 's' } })).rejects.toThrow(
+        /written by the project's service only/,
+      );
+      await expect(bridge.data(token, { action: 'get', table: '../../etc', key: 'x' })).rejects.toThrow(
+        /plain table name/,
+      );
+      await expect(bridge.data(token, { action: 'sql', sql: 'delete from leads' })).rejects.toThrow(
+        /Only SELECT/,
+      );
+      await expect(bridge.data('nope', { action: 'tables' })).rejects.toThrow(/Unknown or finished run/);
+    } finally {
+      service.close();
+    }
+  });
+
+  it('offers no data tools to a project without a data API', async () => {
+    const { bridge, ctx } = setup();
+    const { token, config } = openRun(bridge, ctx);
+    expect(config.mcpServers.tara.env.TARA_DATA_TOOLS).toBe('0');
+    await expect(bridge.data(token, { action: 'tables' })).rejects.toThrow(/no data API/);
+  });
+});
 
 describe('Bridge reminders', () => {
   it("sets, lists and cancels the run's own project reminders, and offers the tools only when reminders are on", () => {

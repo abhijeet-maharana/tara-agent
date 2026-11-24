@@ -1,0 +1,41 @@
+# Claude Code Remote Control server for one project folder, run as the run user (tara), not the
+# owner's login user. Remote Control sessions skip permission prompts (bypassPermissions), so they
+# must run as a user without sudo or docker: the same user tara-agent's runs use.
+#
+# One instance per project. The instance name (after the @) is the session name prefix; the folder
+# comes from /etc/tara-agent/remote-control/<name>.env:
+#   PROJECT_DIR=/path/to/the/project
+#
+# Install:
+#   sudo install -m 644 deploy/systemd/claude-remote@.service /etc/systemd/system/
+#   sudo install -d -m 755 /etc/tara-agent/remote-control
+#   echo 'PROJECT_DIR=/path/to/project' | sudo tee /etc/tara-agent/remote-control/<name>.env
+#   sudo systemctl daemon-reload && sudo systemctl enable --now claude-remote@<name>.service
+# The run user must be logged in to Claude (`claude auth login`) and trust the folder
+# (projects["<dir>"].hasTrustDialogAccepted in ~/.claude.json). Logs: journalctl -u claude-remote@<name>
+[Unit]
+Description=Claude Code Remote Control server (%i, as the run user)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=tara
+Group=tara
+# Group-writable files, so the repo owner and the run user can both edit what the other creates.
+UMask=0002
+EnvironmentFile=/etc/tara-agent/remote-control/%i.env
+Environment=HOME=/home/tara
+Environment=CLAUDE_CONFIG_DIR=/home/tara/.claude
+Environment=PATH=/home/tara/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/sh -c 'cd "$PROJECT_DIR" && exec claude remote-control --permission-mode bypassPermissions --spawn same-dir --name %i --remote-control-session-name-prefix %i'
+Restart=always
+RestartSec=15
+StandardOutput=null
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

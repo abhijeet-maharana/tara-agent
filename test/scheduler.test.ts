@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import type { HostConfig, Project, SelfImprove } from '../src/config/schema.js';
 import { startHttpServer } from '../src/http/server.js';
 import type { RunOptions, RunOutcome } from '../src/runner/run.js';
+import type { GateRunner } from '../src/scheduler/gate.js';
 import { streamRecipient } from '../src/scheduler/job-runner.js';
 import { Scheduler } from '../src/scheduler/scheduler.js';
 import { findRunJob, parseScheduledRun, SCHEDULE_BY } from '../src/scheduler/slack-trigger.js';
@@ -80,6 +81,10 @@ function setup(opts: {
   costs?: number[];
   /** How each model run ends, in call order, where it isn't a plain success (e.g. agy out of quota). */
   outcomes?: Array<Partial<RunOutcome> | undefined>;
+  /** Runs job gates (default: the real one, `sh -c` here). */
+  gate?: GateRunner;
+  /** Whether a `requires` URL answers. */
+  probe?: (url: string) => Promise<boolean>;
 }) {
   const chat = new FakeChat('ts');
   chat.stream = opts.stream;
@@ -106,6 +111,8 @@ function setup(opts: {
     now: opts.now,
     newSessionId: () => 'sid',
     pickupTimeoutMs: opts.pickupTimeoutMs,
+    gate: opts.gate,
+    probe: opts.probe,
     run: async (o) => {
       calls.push(o);
       await opts.during?.();
@@ -846,6 +853,120 @@ describe('Scheduler', () => {
     expect(store.slotClaim('shop:sla', Date.parse('2026-10-25T12:00:00Z'))?.status).not.toBe('held');
     expect(store.slotClaim('shop:sla', Date.parse('2026-10-25T11:00:00Z'))?.status).toBe('limit');
     await b.scheduler.stop();
+  });
+
+  it('runs no model when the gate finds nothing to do: scheduled quietly, Run now says so', async () => {
+    // A missed slot, caught up through its Slack trigger: a scheduled run.
+    const { chat, calls, scheduler, store } = missedSlot({}, { gate: 'true' });
+    await pickUp(scheduler, chat);
+    expect(calls).toHaveLength(0);
+    expect(chat.posts.filter((p) => p.text.includes('Nothing to do'))).toHaveLength(0);
+    expect(store.lastJobRun('shop', 'sla')).toMatchObject({ status: 'skipped', costUsd: 0 });
+    expect(scheduler.list('shop')[0]).toMatchObject({ lastStatus: 'skipped' });
+
+    scheduler.trigger('shop', 'sla', 'U1');
+    await scheduler.idle();
+    expect(calls).toHaveLength(0);
+    expect(chat.posts.at(-1)?.text).toContain('✅ Nothing to do: the gate found no work');
+    await scheduler.stop();
+  });
+
+  it('takes one `Skipping` line from the gate as nothing to do, with that line as the reason', async () => {
+    const { calls, scheduler, store } = setup({
+      jobs: [{ ...baseJob, gate: 'echo "Skipping: no new mail since 08:58"' }],
+    });
+    scheduler.start();
+    scheduler.trigger('shop', 'sla', 'U1');
+    await scheduler.idle();
+    expect(calls).toHaveLength(0);
+    expect(store.lastJobRun('shop', 'sla')).toMatchObject({
+      status: 'skipped',
+      output: '✅ Skipping: no new mail since 08:58',
+    });
+    // A Skipping line followed by more is work: the model runs.
+    const more = setup({ jobs: [{ ...baseJob, gate: 'echo "Skipping one"; echo "but 2 new leads"' }] });
+    more.scheduler.start();
+    more.scheduler.trigger('shop', 'sla', 'U1');
+    await more.scheduler.idle();
+    expect(more.calls).toHaveLength(1);
+    await scheduler.stop();
+    await more.scheduler.stop();
+  });
+
+  it("gives the model the gate's output, and a failing gate's error to fix or report", async () => {
+    const { calls, scheduler } = setup({
+      jobs: [{ ...baseJob, gate: 'echo "2 new leads"; echo "lead-a"' }],
+    });
+    scheduler.start();
+    scheduler.trigger('shop', 'sla', 'U1');
+    await scheduler.idle();
+    expect(calls).toHaveLength(1);
+    const prompt = calls[0]?.prompt ?? '';
+    expect(prompt).toContain('## Gate output');
+    expect(prompt).toContain("don't run the gate again");
+    expect(prompt).toContain('2 new leads\nlead-a');
+    // Before the job's own instructions.
+    expect(prompt.indexOf('## Gate output')).toBeLessThan(prompt.indexOf('Run the job'));
+
+    const broken = setup({ jobs: [{ ...baseJob, gate: 'echo nope >&2; exit 3' }] });
+    broken.scheduler.start();
+    broken.scheduler.trigger('shop', 'sla', 'U1');
+    await broken.scheduler.idle();
+    expect(broken.calls[0]?.prompt).toContain('exited with code 3');
+    expect(broken.calls[0]?.prompt).toContain('nope');
+    await scheduler.stop();
+    await broken.scheduler.stop();
+  });
+
+  it('blocks a run whose required service is down: no model, one notice per streak, queue items wait', async () => {
+    let up = false;
+    const { chat, calls, scheduler, store } = missedSlot(
+      { probe: async () => up },
+      { requires: ['http://127.0.0.1:9/health'] },
+    );
+    await pickUp(scheduler, chat);
+    expect(calls).toHaveLength(0);
+    expect(store.lastJobRun('shop', 'sla')).toMatchObject({
+      status: 'blocked',
+      error: 'Blocked, not answering: http://127.0.0.1:9/health',
+    });
+    const notices = () => chat.posts.filter((p) => p.text.includes('⛔ Blocked')).length;
+    expect(notices()).toBe(1);
+
+    // Blocked again: no second notice. A queue's item goes back to wait, not failed.
+    const item = store.proposeItem({
+      project: 'shop',
+      kind: 'post',
+      mode: 'queue',
+      title: 'A post',
+      queue: 'q',
+      options: ['Approve'],
+    });
+    store.decideItem(item.id, { status: 'approved', decision: 'Approve', by: 'U1' });
+    store.startItems([item.id]);
+    await scheduler.runQueue('shop', 'sla', 'q', [store.getItem(item.id) as Item]);
+    expect(notices()).toBe(1);
+    expect(store.getItem(item.id)).toMatchObject({ status: 'approved' });
+    expect(store.getItem(item.id)?.result).toContain('Waiting: not answering');
+
+    up = true;
+    scheduler.trigger('shop', 'sla', 'U1');
+    await scheduler.idle();
+    expect(calls).toHaveLength(1);
+    await scheduler.stop();
+  });
+
+  it("passes the job's budget to the CLI and reports a run stopped at it", async () => {
+    const { calls, scheduler, store } = setup({
+      jobs: [{ ...baseJob, budgetUsd: 2 }],
+      outcomes: [{ status: 'over-budget', error: 'Stopped at its budget: $2.31 spent', costUsd: 2.31 }],
+    });
+    scheduler.start();
+    scheduler.trigger('shop', 'sla', 'U1');
+    await scheduler.idle();
+    expect(calls[0]?.args).toEqual(expect.arrayContaining(['--max-budget-usd', '2']));
+    expect(store.lastJobRun('shop', 'sla')).toMatchObject({ status: 'over-budget' });
+    await scheduler.stop();
   });
 
   it('gives queue items back when the executor is at the usage limit', async () => {

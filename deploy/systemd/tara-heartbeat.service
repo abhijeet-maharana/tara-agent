@@ -1,0 +1,14 @@
+# The host's own service check (deploy/host/tara-heartbeat.mjs), every 5 minutes, outside tara-agent.
+# Install:
+#   sudo install -o root -g root -m 755 deploy/host/tara-heartbeat.mjs /usr/local/sbin/tara-heartbeat
+#   sudo cp deploy/systemd/tara-heartbeat.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now tara-heartbeat.timer
+# Config: /etc/tara-agent/heartbeat.json (examples/heartbeat.json). Try it: sudo tara-heartbeat --dry-run
+[Unit]
+Description=tara-heartbeat: local service check
+
+[Service]
+Type=oneshot
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/node --no-warnings /usr/local/sbin/tara-heartbeat
+TimeoutStartSec=2min

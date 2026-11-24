@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Monthly tara-backup restore test on a Mac (deploy/backup/restore-test.sh). Copy to
+  ~/Library/LaunchAgents/, replace HOST, REPO and HOME_DIR, then:
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.tara-agent.restore-test.plist
+  Run now: launchctl kickstart gui/$(id -u)/dev.tara-agent.restore-test
+  Needs age, node and curl on PATH, and the age key in ~/.config/tara-backup/age-key.txt.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.tara-agent.restore-test</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>REPO/deploy/backup/restore-test.sh</string>
+    <string>HOST</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Day</key>
+    <integer>1</integer>
+    <key>Hour</key>
+    <integer>11</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>HOME_DIR/Library/Logs/tara-restore-test.log</string>
+  <key>StandardErrorPath</key>
+  <string>HOME_DIR/Library/Logs/tara-restore-test.log</string>
+</dict>
+</plist>

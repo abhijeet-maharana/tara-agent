@@ -17,6 +17,14 @@ import type { Item, RunRecord, Store } from '../store/store.js';
 import { type Locks, type Semaphore, Throttle } from '../util/concurrency.js';
 import { deliveryOf, isWebChannel, streamFor, webChannel, webOf } from '../web/chat.js';
 import { postSummary, slackSummaryOf } from '../web/summary.js';
+import {
+  type GateRunner,
+  gateRunner,
+  gateSaysSkip,
+  gateSection,
+  missingServices,
+  skipReason,
+} from './gate.js';
 import { type LimitHolds, limitResetAt } from './limits.js';
 import {
   buildDecisionPrompt,
@@ -76,10 +84,27 @@ const REACTIONS: Record<JobStatus, string> = {
   timeout: 'hourglass',
   limit: 'double_vertical_bar',
   aborted: 'black_square_for_stop',
+  skipped: 'white_check_mark',
+  blocked: 'no_entry',
+  'over-budget': 'moneybag',
 };
 
-/** How a run ended; stored on the slot claim and in the run log. */
-export type JobStatus = 'ok' | 'silent' | 'failed' | 'error' | 'timeout' | 'limit' | 'aborted';
+/**
+ * How a run ended; stored on the slot claim and in the run log. Without a model session: `skipped` (the
+ * job's gate found nothing to do) and `blocked` (a service in its `requires` didn't answer).
+ * `over-budget`: the model session was stopped at the job's `budgetUsd`.
+ */
+export type JobStatus =
+  | 'ok'
+  | 'silent'
+  | 'failed'
+  | 'error'
+  | 'timeout'
+  | 'limit'
+  | 'aborted'
+  | 'skipped'
+  | 'blocked'
+  | 'over-budget';
 
 export interface JobRunnerDeps {
   host: HostConfig;
@@ -107,6 +132,10 @@ export interface JobRunnerDeps {
   holds?: LimitHolds;
   /** Aborts while the run still waits for its locks or a slot (the job was paused): it then doesn't start. */
   cancelWait?: AbortSignal;
+  /** Runs a job's `gate` (as the run user on a host with `claude.runAs`). */
+  gate?: GateRunner;
+  /** Whether a `requires` URL answers (tests). */
+  probe?: (url: string) => Promise<boolean>;
 }
 
 /** What a run waits for: its thread (a chat turn working in it), a free job slot, or its locks. */
@@ -294,6 +323,64 @@ export async function runJob(
           replyIn: askedIn,
         });
       return record('error', { error: (err as Error).message });
+    }
+
+    /** A run that ends before its model session: one line in its thread, and the Slack summary. */
+    const notice = async (text: string) => {
+      await postMain(`${text} · ${title}`);
+      if (web && inThread && onDashboard)
+        await postSummary({
+          chat,
+          store,
+          web,
+          log,
+          slackChannel,
+          thread: { channel, ts: inThread },
+          title,
+          text,
+          link: deps.threadUrl?.(channel, inThread),
+          replyIn: askedIn,
+        });
+    };
+    // Before any model session: the services the job needs (`requires`), then its `gate`.
+    const newRun =
+      trigger.kind === 'schedule' ||
+      trigger.kind === 'catch-up' ||
+      trigger.kind === 'manual' ||
+      trigger.kind === 'queue';
+    if (newRun && job.requires?.length) {
+      const missing = await missingServices(job.requires, deps.probe);
+      if (missing.length) {
+        const why = `not answering: ${missing.join(', ')}`;
+        // A queue's items wait for the next try instead of failing: nothing was sent.
+        if (trigger.kind === 'queue')
+          for (const item of trigger.items) store.deferItem(item.id, now() + 15 * 60_000, `Waiting: ${why}`);
+        // One message per streak (a person asking always hears why).
+        const before = store.lastJobRun(project.config.name, job.id);
+        if (before?.status !== 'blocked' || trigger.kind === 'manual') await notice(`⛔ Blocked, ${why}`);
+        return record('blocked', { error: `Blocked, ${why}` });
+      }
+    }
+    let gateText: string | undefined;
+    if (
+      job.gate &&
+      (trigger.kind === 'schedule' || trigger.kind === 'catch-up' || trigger.kind === 'manual')
+    ) {
+      const result = await (deps.gate ?? gateRunner())({
+        command: job.gate,
+        cwd: project.dir,
+        env,
+        timeoutMs,
+        signal,
+      });
+      if (signal?.aborted) return record('aborted');
+      if (gateSaysSkip(result)) {
+        const said = skipReason(result);
+        // Scheduled: nothing posted. A person who pressed Run now hears it.
+        if (trigger.kind === 'manual') await notice(said);
+        return record('skipped', { output: said, costUsd: 0 });
+      }
+      gateText = gateSection(job.gate, result);
     }
 
     // The status line (⏳ with the current step → ✅ / ❌) is the first reply in the run's thread.
@@ -538,6 +625,7 @@ export async function runJob(
             allowedTools,
             mcpConfig: bridged?.mcpConfigPath,
             partialMessages: Boolean(live),
+            maxBudgetUsd: job.budgetUsd,
           }),
         agy: agy && { mcpConfig: bridged?.mcpConfigPath, settings: agy.settings },
         mcpServers,
@@ -568,7 +656,7 @@ export async function runJob(
                     job,
                     folders,
                     trigger.kind === 'queue' ? trigger.items : undefined,
-                    stepsDone?.section,
+                    [gateText, stepsDone?.section].filter(Boolean).join('\n\n') || undefined,
                   ),
                 ),
         timeoutMs: mainTimeoutMs(),
@@ -738,7 +826,9 @@ export async function runJob(
             ? `⌛ timed out after ${formatDuration(outcome.durationMs)}`
             : outcome.status === 'aborted'
               ? '⏹ stopped'
-              : `❌ failed: ${(outcome.error ?? 'unknown error').slice(0, 500)}`;
+              : outcome.status === 'over-budget'
+                ? `💸 ${(outcome.error ?? 'stopped at its budget').replace(/^Stopped/, 'stopped')}`
+                : `❌ failed: ${(outcome.error ?? 'unknown error').slice(0, 500)}`;
       await chat.update(channel, statusTs, `${title} · ${reason}`);
       flushBlock();
       await live?.finish({ summary: reason, ok: false, answer: '', notes: fallbackNotes });

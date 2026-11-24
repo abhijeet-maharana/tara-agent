@@ -1,0 +1,22 @@
+{
+  "bootGraceSeconds": 300,
+  "http": [
+    { "name": "tara-agent (4000)", "url": "http://127.0.0.1:4000/health" },
+    { "name": "Shop API (4010)", "url": "http://127.0.0.1:4010/health" },
+    {
+      "name": "Chrome (9222)",
+      "url": "http://127.0.0.1:9222/json/version",
+      "message": "Chrome CDP (9222) not answering: browser jobs will fail"
+    }
+  ],
+  "files": [
+    {
+      "name": "Off-site backup",
+      "path": "/var/lib/tara-backup/status.json",
+      "jsonTime": "lastGood.at",
+      "maxAgeHours": 30
+    }
+  ],
+  "diskPercent": 90,
+  "memoryPercent": 92
+}

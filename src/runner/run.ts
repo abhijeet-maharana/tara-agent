@@ -50,7 +50,7 @@ export interface RunLabel {
   jobId?: string;
 }
 
-export type RunStatus = 'ok' | 'error' | 'timeout' | 'limit' | 'aborted';
+export type RunStatus = 'ok' | 'error' | 'timeout' | 'limit' | 'aborted' | 'over-budget';
 
 export interface RunOutcome {
   status: RunStatus;
@@ -295,6 +295,10 @@ export const runClaude: Runner = async (options) => {
   } else if (rateLimit?.status === 'rejected' || (result?.isError && LIMIT_TEXT.test(result.text))) {
     status = 'limit';
     error = result?.text || 'Claude usage limit reached';
+  } else if (result?.subtype === 'error_max_budget_usd') {
+    // The job's `budgetUsd` (--max-budget-usd): the CLI stopped between turns.
+    status = 'over-budget';
+    error = `Stopped at its budget: $${(result.costUsd ?? 0).toFixed(2)} spent`;
   } else if (result && !result.isError && exit.code === 0) {
     status = 'ok';
   } else {

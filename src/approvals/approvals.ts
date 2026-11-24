@@ -827,6 +827,21 @@ export class Approvals {
       );
   }
 
+  /**
+   * A person settles an `uncertain` item (its run never said whether it went out): `sent` (done),
+   * `retry` (back in its queue) or `drop` (failed).
+   */
+  resolve(id: string, outcome: 'sent' | 'retry' | 'drop', by: string): Item {
+    const item = this.deps.store.resolveUncertain(id, outcome, by);
+    if (!item) throw new ApprovalError(409, 'Only an item marked uncertain can be settled this way');
+    this.closeMessage(
+      item,
+      { sent: '✅ Marked as sent', retry: '🔁 Queued again', drop: '➖ Dropped, not sent' }[outcome],
+    );
+    this.notify(item, 'decided');
+    return item;
+  }
+
   cancel(id: string, by: string): Item {
     const item = this.deps.store.cancelItem(id, by);
     if (!item) throw new ApprovalError(409, 'Only waiting or scheduled items can be cancelled');

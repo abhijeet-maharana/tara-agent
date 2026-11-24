@@ -1,0 +1,27 @@
+{
+  "host": "myhost",
+  "localDir": "/var/backups/tara-backup",
+  "keepLocal": 7,
+  "statusFile": "/var/lib/tara-backup/status.json",
+  "recipients": ["age1examplepublickeyreplacewithyourownfromagekeygen0000000000000000000000"],
+  "remote": {
+    "bucket": "my-backups",
+    "prefix": "tara-backup/myhost/",
+    "endpoint": "https://<account id>.r2.cloudflarestorage.com",
+    "envFile": "/etc/tara-agent/backup.env",
+    "keepDays": 30,
+    "minKeep": 7
+  },
+  "items": [
+    { "name": "tara-agent/tara.db", "sqlite": "/var/lib/tara-agent/state/tara.db" },
+    { "name": "app/big.sqlite", "sqlite": "/srv/app/big.sqlite", "every": "week" },
+    { "name": "etc/tara-agent", "path": "/etc/tara-agent" },
+    { "name": "etc/tara-agent.env", "path": "/etc/tara-agent.env" },
+    {
+      "name": "browser/profile",
+      "path": "/home/me/.chrome-profile",
+      "exclude": ["*Cache*", "*cache*", "*.log", "*Singleton*", "*.lock"],
+      "optional": true
+    }
+  ]
+}

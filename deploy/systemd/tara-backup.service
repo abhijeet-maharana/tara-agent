@@ -1,0 +1,21 @@
+# Nightly off-site backup (deploy/backup/tara-backup.mjs), run as root from its root-owned copy.
+# Install:
+#   sudo install -o root -g root -m 755 deploy/backup/tara-backup.mjs /usr/local/sbin/tara-backup
+#   sudo cp deploy/systemd/tara-backup.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now tara-backup.timer
+# Config: /etc/tara-agent/backup.json (examples/backup.json). Run now: sudo systemctl start tara-backup;
+# logs: journalctl -u tara-backup; result: sudo tara-backup status (tara-agent's Health page shows it).
+[Unit]
+Description=tara-backup: checked, encrypted off-site backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/root
+ExecStart=/usr/bin/node --no-warnings /usr/local/sbin/tara-backup run
+TimeoutStartSec=1h
+Nice=10
+IOSchedulingClass=idle
+PrivateTmp=true

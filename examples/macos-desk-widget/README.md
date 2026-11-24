@@ -31,7 +31,7 @@ Then set `TARA_URL` in `config.local.sh` (git-ignored) to where the dashboard li
 | `VM_LABEL` | `VM` | Name of the VM row (any Apple Virtualization, UTM, QEMU, Parallels or VMware process) |
 | `AGENT_NAME` | `tara` | Agent panel title |
 | `EXTRA_TILES_URL` | empty | A URL returning more tiles for the agent panel: `{"tiles": [{"label", "items": [{"text", "level": "ok\|warn\|bad\|info", "title"?}]}]}`. Read every 30 s with a 5 s timeout; a failure just hides them |
-| `NOTIFY` | `1` | `0` turns the notifications off |
+| `NOTIFY` | `1` | `0` turns the notifications off (including the "agent is not answering" alert from `lib/post-metrics.sh`: after 10 minutes without an answer, and again when it is back) |
 | `HOST_NAME` | `Mac` | How this Mac is named in tara-agent when it reports (`--metrics`) |
 
 Panel position and size: `className` at the top of `mac.jsx` and `agent.jsx`. Refresh: `refreshFrequency` (5 s Mac, 30 s agent). Quiet hours (🌙 and held notifications): tara-agent's `http.quietHours`.

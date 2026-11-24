@@ -13,9 +13,11 @@ import { claudeLoginReader } from './health/claude-login.js';
 import { LoginReminder } from './health/login-reminder.js';
 import { HealthMonitor } from './health/monitor.js';
 import { Observability } from './health/observability.js';
+import { readOffsiteStatus } from './health/offsite.js';
 import { gatherAttention, githubPullRequests } from './http/attention.js';
 import { probeBrowser, projectBrowser } from './http/browser-usage.js';
 import { startHttpServer } from './http/server.js';
+import { oversizedMemory } from './memory/memory.js';
 import { Privileged } from './privileged/privileged.js';
 import { Reminders } from './reminders/reminders.js';
 import { Activity } from './runner/activity.js';
@@ -24,6 +26,7 @@ import { resolveRunAs } from './runner/as-user.js';
 import { Conversations, TabSweeper } from './runner/browser-tabs.js';
 import { type Runner, runClaude } from './runner/run.js';
 import { sweepScratch } from './runner/workspace.js';
+import { gateRunner } from './scheduler/gate.js';
 import { QueueWorker } from './scheduler/queues.js';
 import { Scheduler } from './scheduler/scheduler.js';
 import { openRunThread } from './scheduler/slack-trigger.js';
@@ -245,6 +248,7 @@ export async function startAgent(opts: AgentOptions): Promise<Agent> {
     log,
     threadUrl,
     approvalsUrl: dashboardUrl ? `${dashboardUrl}/approvals` : undefined,
+    gate: gateRunner(runAs),
   });
   manager = new SessionManager({
     projects,
@@ -311,7 +315,7 @@ export async function startAgent(opts: AgentOptions): Promise<Agent> {
   const pullRequests = host.attention.github ? githubPullRequests() : undefined;
   const attention = () =>
     gatherAttention({
-      approvals: () => store.items({ statuses: ['pending'], limit: 500 }),
+      approvals: () => store.items({ statuses: ['pending', 'uncertain'], limit: 500 }),
       permissions: () => bridge?.pendingPermissions() ?? [],
       jobs: () =>
         projects.flatMap(({ config: { name } }) =>
@@ -356,6 +360,12 @@ export async function startAgent(opts: AgentOptions): Promise<Agent> {
                 pinDrift: () =>
                   projects.flatMap((p) => (p.pinDrift ? [{ project: p.config.name, keys: p.pinDrift }] : [])),
                 backup: () => backupState,
+                offsite: host.backup.offsite
+                  ? () => {
+                      const o = host.backup.offsite as NonNullable<typeof host.backup.offsite>;
+                      return { status: readOffsiteStatus(o.statusFile), options: o };
+                    }
+                  : undefined,
                 timeZone: host.timezone,
                 now: Date.now,
               }),
@@ -365,6 +375,7 @@ export async function startAgent(opts: AgentOptions): Promise<Agent> {
               return jobChecks({
                 project: p,
                 skills: () => oversizedSkills(p.dir),
+                memory: () => oversizedMemory(p.dir),
                 jobs: () => scheduler.list(name),
                 recent: (id) => store.jobRuns(name, id, 10),
                 latestSlots: (at) => scheduler.latestSlots(name, at),

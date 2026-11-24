@@ -19,6 +19,7 @@ import { Incidents } from '../slack/incidents.js';
 import type { Item, Store } from '../store/store.js';
 import { Locks, Semaphore } from '../util/concurrency.js';
 import { type Delivery, deliveryOf, webOf } from '../web/chat.js';
+import type { GateRunner } from './gate.js';
 import { type JobStatus, type JobTrigger, type JobWait, runJob } from './job-runner.js';
 import { HELD_RETRY_MS, LimitHolds } from './limits.js';
 import type { DecidedCard } from './prompt.js';
@@ -107,6 +108,10 @@ export interface SchedulerDeps {
   threadUrl?: (channel: string, ts: string) => string | undefined;
   /** The dashboard's Approvals page, linked from summaries of runs that left cards. */
   approvalsUrl?: string;
+  /** Runs a job's `gate` (as the run user on a host with `claude.runAs`). */
+  gate?: GateRunner;
+  /** Whether a job's `requires` URL answers (tests). */
+  probe?: (url: string) => Promise<boolean>;
 }
 
 interface Entry {
@@ -679,6 +684,8 @@ export class Scheduler implements JobControl {
         approvalsUrl: this.deps.approvalsUrl,
         holds: this.holds,
         cancelWait: cancelWait.signal,
+        gate: this.deps.gate,
+        probe: this.deps.probe,
         onWait: (waitingFor) => this.stages.set(key, waitingFor ? { waitingFor } : { startedAt: this.now() }),
       },
       named,

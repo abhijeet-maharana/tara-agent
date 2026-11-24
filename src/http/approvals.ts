@@ -97,6 +97,7 @@ const STATUS_TONE: Record<string, string> = {
   approved: '',
   running: '',
   failed: 'bad',
+  uncertain: 'warn',
   rejected: 'dim',
   expired: 'dim',
   cancelled: 'dim',
@@ -158,6 +159,12 @@ document.addEventListener('click', async (e) => {
       toast('Sent to Jarvis. The answer comes in the thread of this card.');
     } catch (err) { toast(err.message, { error: true }); }
     b.disabled = false;
+    return;
+  }
+  if (b.dataset.resolve) {
+    const c = card(b);
+    b.disabled = true;
+    try { await post('/items/' + c.dataset.item + '/resolve', { outcome: b.dataset.resolve }); toast(b.dataset.done); reload(); } catch (err) { toast(err.message, { error: true }); b.disabled = false; }
     return;
   }
   if (b.dataset.cancel) {
@@ -383,6 +390,20 @@ ${
 ${why}${adviceHtml(item.id, advice, data.canDecide)}${buttons ? `<div class="actions">${buttons}</div>` : ''}</article>`;
 }
 
+/** A send whose run never said whether it went out: what it was, why it is unsure, and three answers. */
+function uncertainCard(ctx: DashboardContext, item: Item, data: ApprovalsData, multi: boolean): string {
+  const btn = (outcome: string, label: string, done: string, cls = 'ghost') =>
+    `<button type="button" class="btn ${cls}" data-resolve="${outcome}" data-done="${esc(done)}">${esc(label)}</button>`;
+  return `<article class="card" data-item="${esc(item.id)}"><div class="row"><span class="dot warn"></span><span class="grow"><span class="title">${esc(item.title)}</span>
+<span class="meta">${multi ? projectTag(ctx, item.project) : ''}<span class="tag warn">uncertain</span><span>${esc(kindLabel(item.kind))}</span><span>${esc(
+    relative(item.finishedAt ?? item.updatedAt, data.now),
+  )}</span></span>${item.result ? `<div class="result">${esc(item.result.slice(0, 400))}</div>` : ''}</span></div>${
+    data.canDecide
+      ? `<div class="actions">${btn('sent', 'It went out', 'Marked as sent', '')}${btn('retry', "It didn't: send again", 'Queued again')}${btn('drop', 'Drop it', 'Dropped')}</div>`
+      : ''
+  }</article>`;
+}
+
 function doneRow(ctx: DashboardContext, item: Item, data: ApprovalsData, multi: boolean): string {
   return `<div class="row"><span class="dot ${STATUS_TONE[item.status] === 'ok' ? 'ok' : STATUS_TONE[item.status] === 'bad' ? 'bad' : 'dim'}"></span><span class="grow"><span class="title">${esc(item.title)}</span>
 <span class="meta">${multi ? projectTag(ctx, item.project) : ''}<span class="tag ${STATUS_TONE[item.status] ?? 'dim'}">${esc(item.status)}</span><span>${esc(
@@ -442,11 +463,14 @@ export function approvalsPage(ctx: DashboardContext, data: ApprovalsData): strin
             : ''
         }`
       : '';
-  const shown = data.kind ? data.items.filter((i) => i.kind === data.kind) : data.items;
+  let shown = data.kind ? data.items.filter((i) => i.kind === data.kind) : data.items;
 
   let body: string;
   if (data.tab === 'waiting') {
     const oldest = (a: Item, b: Item) => a.createdAt - b.createdAt;
+    // Sends whose run never said how it went: first, they may have gone out.
+    const unsure = shown.filter((i) => i.status === 'uncertain');
+    shown = shown.filter((i) => i.status !== 'uncertain');
     // Only a card or two on screen (a filter): open them.
     const openAll = shown.length <= 2;
     const cards = (items: Item[]) => items.map((i) => waitingCard(ctx, i, data, multi, openAll)).join('');
@@ -463,6 +487,13 @@ export function approvalsPage(ctx: DashboardContext, data: ApprovalsData): strin
     const notices = shown.filter((i) => i.mode !== 'queue' && isNotice(i)).sort(oldest);
     const seen = notices[0]?.options[0];
     body = [
+      unsure.length
+        ? `<div data-group>${section(
+            'Did these go out?',
+            unsure.map((i) => uncertainCard(ctx, i, data, multi)).join(''),
+            { sub: `${unsure.length} · their run stopped before saying; never sent again on its own` },
+          )}</div>`
+        : '',
       questions.length
         ? `<div data-group>${section('Needs your answer', cards(questions), {
             sub: `${questions.length} · paused runs first, then the oldest`,

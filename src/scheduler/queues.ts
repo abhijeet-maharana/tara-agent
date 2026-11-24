@@ -110,13 +110,13 @@ export class QueueWorker {
       this.deps.log.info(
         `${back.length} queued ${back.length === 1 ? 'item' : 'items'} put back after a restart`,
       );
-    const stuck = this.deps.store.failRunning(
-      'tara-agent restarted while this item was running; check before running it again',
+    const stuck = this.deps.store.markUncertain(
+      'tara-agent restarted while this item was running: it may or may not have gone out. Check, then say which on the Approvals page.',
     );
     for (const item of stuck) this.deps.onFinished?.(item);
     if (stuck.length)
       this.deps.log.warn(
-        `${stuck.length} running ${stuck.length === 1 ? 'item' : 'items'} marked failed after a restart`,
+        `${stuck.length} running ${stuck.length === 1 ? 'item' : 'items'} marked uncertain after a restart`,
       );
     this.timer = setInterval(() => void this.tick(), TICK_MS);
     this.timer.unref();
@@ -275,11 +275,15 @@ export class QueueWorker {
         log.info(`[${p}] queue ${name}: ${ids.length} put back (${note})`);
         return;
       }
-      const reason =
+      // Nothing ran: failed. A run that ran but never reported: maybe sent, so a person settles it.
+      const settled =
         status === 'unknown'
-          ? `No job "${queue.executor.job}" in ${p}`
-          : `The ${queue.executor.job} run ended (${status}) without reporting this item`;
-      for (const item of store.failRunning(reason, ids)) this.deps.onFinished?.(item);
+          ? store.failRunning(`No job "${queue.executor.job}" in ${p}`, ids)
+          : store.markUncertain(
+              `The ${queue.executor.job} run ended (${status}) without reporting this item: it may or may not have gone out. Check, then say which on the Approvals page.`,
+              ids,
+            );
+      for (const item of settled) this.deps.onFinished?.(item);
       return;
     }
     if (!('url' in queue.executor)) return;

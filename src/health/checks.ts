@@ -3,6 +3,7 @@ import { cpus, freemem, loadavg, totalmem } from 'node:os';
 import path from 'node:path';
 import type { HostConfig, Project } from '../config/schema.js';
 import type { BrowserStatus } from '../http/browser-usage.js';
+import { MEMORY_MAX, MEMORY_MAX_LINES } from '../memory/memory.js';
 import type { Task } from '../runner/activity.js';
 import type { RateLimit } from '../runner/stream.js';
 import { SKILL_MAX_CHARS } from '../scheduler/prompt.js';
@@ -10,10 +11,11 @@ import type { JobInfo } from '../scheduler/scheduler.js';
 import type { RunStat, StoredRun } from '../store/store.js';
 import type { ClaudeLogin } from './claude-login.js';
 import { ago, type Check, type HealthSource, type HealthStatus, parseProjectChecks } from './monitor.js';
+import { type OffsiteOptions, type OffsiteStatus, offsiteChecks } from './offsite.js';
 import { type VmHostSample, vmHostChecks } from './vmhost.js';
 
 /** Run results that count as failures (as on the dashboard). */
-const FAILED = ['failed', 'error', 'timeout', 'limit'];
+const FAILED = ['failed', 'error', 'timeout', 'limit', 'blocked', 'over-budget'];
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 /** Days before the Claude login ends that it shows amber (the Slack reminder starts then too). */
@@ -69,6 +71,8 @@ export interface AgentDeps {
   pinDrift?: () => Array<{ project: string; keys: string[] }>;
   /** The daily database copy (store/backup.ts): the local day of the latest good one, or the last error. */
   backup?: () => { day?: string; error?: string };
+  /** The off-site backup's status file (src/health/offsite.ts), read now; undefined = not set up. */
+  offsite?: () => { status: OffsiteStatus | { error: string }; options: OffsiteOptions } | undefined;
   timeZone: string;
   now: () => number;
   /** Tests: stand-ins for the machine's figures. */
@@ -181,6 +185,10 @@ export async function agentChecks(d: AgentDeps): Promise<Check[]> {
         backup.day ? `Latest copy is from ${backup.day}` : 'No copy yet',
       );
   }
+
+  const offsite = d.offsite?.();
+  if (offsite)
+    for (const c of offsiteChecks(offsite.status, offsite.options, at)) add(c.id, c.name, c.status, c.detail);
 
   // Claude runs: the CLI failing outright (not a job reporting ❌) shows as `error` runs in a row.
   const runs = d.runsSince(at - 6 * HOUR).sort((a, b) => b.endedAt - a.endedAt);
@@ -330,6 +338,8 @@ export interface JobsDeps {
   project: Project;
   /** Its skills over the size limit (`oversizedSkills`); unset: not checked. */
   skills?: () => Array<{ name: string; chars: number }>;
+  /** Its `.tara/memory.md` when over the limit (`oversizedMemory`); unset: not checked. */
+  memory?: () => { lines: number; chars: number } | undefined;
   jobs: () => JobInfo[];
   recent: (jobId: string) => StoredRun[];
   latestSlots: (at: number) => Array<{ id: string; key: string; slot: number; firstSeen: number }>;
@@ -410,10 +420,16 @@ export function jobChecks(d: JobsDeps): Check[] {
         );
     } else if (claim.status === 'running' && !job.running && at - claim.claimedAt > 30 * 60_000)
       add('warn', `Started at ${when} but never finished (lost in a restart?)`);
-    else if (claim.status === 'skipped')
-      add('warn', `Skipped ${when}: paused, or the run before was still going`, true);
-    else if (claim.status === 'aborted') add('warn', `The ${when} run was stopped by a restart`, true);
-    else if (claim.status === 'held')
+    else if (claim.status === 'skipped') {
+      // The slot's status is the run's: a gate that found nothing to do also ends `skipped`, and that
+      // run is recorded. Only a slot with no run of its own was skipped by a pause or a busy job.
+      const gated = d.recent(s.id).some((r) => r.status === 'skipped' && r.startedAt >= s.slot);
+      if (!gated) add('warn', `Skipped ${when}: paused, or the run before was still going`, true);
+    } else if (claim.status === 'aborted') {
+      // Made up for by a later run (Run now, or the next slot): nothing is missing any more.
+      const madeUp = d.recent(s.id).some((r) => r.startedAt > claim.claimedAt && !FAILED.includes(r.status));
+      if (!madeUp) add('warn', `The ${when} run was stopped by a restart`, true);
+    } else if (claim.status === 'held')
       add('warn', `Held at ${when}: usage limit reached; it runs once the limit resets`, true);
   }
 
@@ -431,6 +447,18 @@ export function jobChecks(d: JobsDeps): Check[] {
       quiet: true, // a slow problem: the page shows it, Slack doesn't need to
     });
   }
+
+  const mem = d.memory?.();
+  if (mem)
+    out.push({
+      key: key('memory'),
+      project,
+      group,
+      name: 'Project memory',
+      status: 'warn',
+      detail: `.tara/memory.md is ${mem.lines} lines, ${Math.round(mem.chars / 1000)}k characters: a new session gets only the first ${MEMORY_MAX / 1000}k, so the rest is never read. Tidy it: drop what skills or the repo already say and facts no longer true (keep under ${MEMORY_MAX_LINES} lines)`,
+      quiet: true,
+    });
 
   const enabled = jobs.filter((j) => j.enabled);
   const ran = enabled.filter((j) => j.lastRunAt && at - j.lastRunAt.getTime() < 24 * HOUR).length;

@@ -1,0 +1,31 @@
+{
+  "services": {
+    "tara-agent": {
+      "base": "/opt/tara-agent",
+      "seedFrom": "/srv/tara-agent",
+      "unit": "tara-agent.service",
+      "health": "http://127.0.0.1:4000/health",
+      "healthExpect": "\"ok\":true",
+      "healthSeconds": 90,
+      "drain": {
+        "url": "http://127.0.0.1:4000",
+        "tokenFile": "/etc/tara-agent.env",
+        "tokenVar": "TARA_ADMIN_TOKEN",
+        "waitSeconds": 1800
+      }
+    },
+    "shop-api": {
+      "base": "/home/me/.local/share/shop-api",
+      "unit": "shop-api.service",
+      "health": "http://127.0.0.1:4010/health",
+      "healthSeconds": 120,
+      "keep": 5,
+      "links": { "shop/api/data": "/srv/shop/data" },
+      "waitFor": {
+        "url": "http://127.0.0.1:4000/jobs?project=shop",
+        "absent": "\"running\":true",
+        "seconds": 1800
+      }
+    }
+  }
+}

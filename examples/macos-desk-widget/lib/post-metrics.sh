@@ -1,6 +1,9 @@
 #!/bin/bash
 # Reports this Mac's figures to tara-agent (POST /vmhost/metrics), for a Mac that runs tara-agent's VM.
 # Run every 5 minutes by the LaunchAgent that `install.sh --metrics` sets up; safe to run by hand.
+# Also the "agent is off" alert: when tara-agent doesn't answer twice in a row (10 minutes), a macOS
+# notification says so (and whether the VM process is running at all), and another when it is back.
+# NOTIFY="0" in config.local.sh turns the notifications off.
 # Reuses the Mac panel's numbers (mac-stats.sh) and reshapes them with JavaScript for Automation,
 # which every Mac has, so nothing needs installing.
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
@@ -8,6 +11,8 @@ DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
 TARA_URL="http://localhost:4000"
 TARA_KEYCHAIN_SERVICE=""
 HOST_NAME="Mac"
+AGENT_NAME="tara-agent"
+NOTIFY="1"
 [ -f "$DIR/config.local.sh" ] && . "$DIR/config.local.sh"
 TARA_URL="${TARA_URL%/}"
 
@@ -43,4 +48,26 @@ if [ -n "$TARA_KEYCHAIN_SERVICE" ]; then
   token="$(security find-generic-password -s "$TARA_KEYCHAIN_SERVICE" -w 2>/dev/null)"
   [ -n "$token" ] && auth=(-H "Authorization: Bearer $token")
 fi
-curl -sS -f -m 10 "${auth[@]}" -H 'content-type: application/json' --data "$payload" "$TARA_URL/vmhost/metrics" >/dev/null
+STATE="${TARA_DESK_STATE:-$HOME/Library/Caches/tara-desk}"
+mkdir -p "$STATE"
+fails_file="$STATE/agent-not-answering"
+alert() { [ "$NOTIFY" = "1" ] && "$DIR/lib/notify.sh" "$1" "$2" "$TARA_URL"; }
+
+if curl -sS -f -m 10 "${auth[@]}" -H 'content-type: application/json' --data "$payload" "$TARA_URL/vmhost/metrics" >/dev/null; then
+  n=$(cat "$fails_file" 2>/dev/null || echo 0)
+  [ "$n" -ge 2 ] && alert "$AGENT_NAME is back" "Answering again at $TARA_URL"
+  rm -f "$fails_file"
+else
+  n=$(( $(cat "$fails_file" 2>/dev/null || echo 0) + 1 ))
+  echo "$n" > "$fails_file"
+  if [ "$n" -eq 2 ]; then
+    # A Mac running the VM: is the VM process there at all?
+    if pgrep -f 'com.apple.Virtualization.VirtualMachine' >/dev/null 2>&1; then
+      vm="The VM is running, so tara-agent or the network inside it is stuck"
+    else
+      vm="No VM is running on this Mac: start it"
+    fi
+    alert "$AGENT_NAME is not answering" "No answer from $TARA_URL for 10 minutes. $vm."
+  fi
+  exit 1
+fi

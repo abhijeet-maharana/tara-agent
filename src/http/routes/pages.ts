@@ -29,6 +29,7 @@ import {
   sessionPage,
   sessionsPage,
 } from '../dashboard.js';
+import { type DataPageView, type DataTable, dataCall, dataPage, editPage, withData } from '../data.js';
 import { healthPage } from '../health.js';
 import { DAY_MS } from '../io.js';
 import { logsPage, trendsPage } from '../observe.js';
@@ -180,12 +181,14 @@ export function pageRoutes(c: ServerContext): PageRoute[] {
       })),
       // Each job's latest run that did something, so a job that ran three times doesn't fill the list.
       latest: runs
-        .filter((run) => run.status !== 'silent')
+        .filter((run) => run.status !== 'silent' && run.status !== 'skipped')
         .filter(
           (run, i, all) => all.findIndex((x) => x.project === run.project && x.jobId === run.jobId) === i,
         )
         .slice(0, 8),
-      quietRuns: runs.filter((run) => run.status === 'silent' && run.startedAt >= at - DAY_MS).length,
+      quietRuns: runs.filter(
+        (run) => (run.status === 'silent' || run.status === 'skipped') && run.startedAt >= at - DAY_MS,
+      ).length,
       pending: approvals ? store.items({ statuses: ['pending'], limit: ITEMS_LIMIT }) : [],
       usage: c.usageNow(at),
       health: health
@@ -217,7 +220,7 @@ export function pageRoutes(c: ServerContext): PageRoute[] {
     const project = projectParam(url, ctx);
     const tab: ApprovalsTab = url.searchParams.get('tab') === 'done' ? 'done' : 'waiting';
     const STATUSES: Record<ApprovalsTab, ItemStatus[]> = {
-      waiting: ['pending'],
+      waiting: ['pending', 'uncertain'],
       done: ['done', 'failed', 'rejected', 'expired', 'cancelled'],
     };
     const since = (t: ApprovalsTab) => (t === 'done' ? at - DONE_DAYS * DAY_MS : undefined);
@@ -422,6 +425,84 @@ export function pageRoutes(c: ServerContext): PageRoute[] {
         ]
       : []),
     ...(browsers ? [route('GET /browsers', (_r, ctx) => browsersView(ctx, browsers))] : []),
+    route('GET /data', ({ url, req }, ctx) => dataView(undefined, url, ctx, c.canDecide(req))),
+    route('GET /data/:project', ({ url, params, req }, ctx) =>
+      dataView(params.project, url, ctx, c.canDecide(req)),
+    ),
+    route('GET /data/:project/edit', async ({ url, params, req }, ctx) => {
+      const p = withData(ctx.projects).find((x) => x.config.name === params.project);
+      if (!p?.config.dataUrl) return errorPage(ctx, 404);
+      try {
+        const tables = (await dataCall(p.config.dataUrl, '/tables')) as DataTable[];
+        const table = tables.find((t) => t.name === url.searchParams.get('table'));
+        if (!table) return errorPage(ctx, 404, 'No such table.');
+        const key = url.searchParams.get('key') ?? undefined;
+        const values =
+          key === undefined
+            ? {}
+            : ((await dataCall(
+                p.config.dataUrl,
+                `/${encodeURIComponent(table.name)}/${encodeURIComponent(key)}`,
+              )) as Record<string, unknown>);
+        return editPage(ctx, { project: p.config.name, table, key, values, canEdit: c.canDecide(req) });
+      } catch (err) {
+        return errorPage(ctx, 500, (err as Error).message);
+      }
+    }),
     ...codePages(),
   ];
+}
+
+/** Rows per page of a table on the Data tab. */
+const DATA_PAGE = 50;
+
+/** The Data tab for one project (the first with a `dataUrl` when none is named). */
+async function dataView(
+  name: string | undefined,
+  url: URL,
+  ctx: DashboardContext,
+  canEdit: boolean,
+): Promise<string> {
+  const list = withData(ctx.projects);
+  const p = name ? list.find((x) => x.config.name === name) : list[0];
+  if (!p?.config.dataUrl)
+    return errorPage(ctx, 404, 'No project here has a data API (`dataUrl` in .tara/config.json).');
+  const base = p.config.dataUrl;
+  const offset = Math.max(0, Number.parseInt(url.searchParams.get('offset') ?? '0', 10) || 0);
+  const view: DataPageView = {
+    project: p.config.name,
+    projects: list.map((x) => ({ name: x.config.name, title: x.config.title ?? x.config.name })),
+    tables: [],
+    offset,
+    pageSize: DATA_PAGE,
+    canEdit,
+    saved: url.searchParams.get('saved') ?? undefined,
+  };
+  try {
+    view.tables = (await dataCall(base, '/tables')) as DataTable[];
+  } catch (err) {
+    view.error = `The data API at ${base} did not answer: ${(err as Error).message}`;
+    return dataPage(ctx, view);
+  }
+  const table = url.searchParams.get('table') ?? undefined;
+  view.table = view.tables.some((t) => t.name === table) ? table : undefined;
+  const sql = url.searchParams.get('sql')?.trim();
+  try {
+    if (sql) {
+      view.sql = sql;
+      view.result = (await dataCall(base, '/sql', {
+        method: 'POST',
+        body: { sql },
+      })) as DataPageView['result'];
+    } else if (view.table) {
+      const got = (await dataCall(
+        base,
+        `/${encodeURIComponent(view.table)}?limit=${DATA_PAGE}&offset=${offset}`,
+      )) as { rows: Array<Record<string, unknown>> };
+      view.rows = got.rows;
+    }
+  } catch (err) {
+    view.error = (err as Error).message;
+  }
+  return dataPage(ctx, view);
 }

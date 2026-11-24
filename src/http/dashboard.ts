@@ -31,6 +31,8 @@ export interface DashboardContext {
   browsers?: boolean;
   /** The Reminders page is on. */
   reminders?: boolean;
+  /** A project has a data API (`dataUrl`): the Data page is on. */
+  data?: boolean;
   /** Red checks on the Health page, for its sidebar badge; undefined when the page is off. */
   unhealthy?: number;
 }
@@ -72,7 +74,7 @@ export function jobWeeks(runs: StoredRun[]): Map<string, JobWeek> {
     // run, which the schedule doesn't plan for. So each thread counts once, by its first run.
     const firsts = new Map<string, StoredRun>();
     for (const r of [...list].sort((a, b) => a.startedAt - b.startedAt))
-      if (r.status !== 'silent') {
+      if (r.status !== 'silent' && r.status !== 'skipped') {
         const thread = r.threadKey ?? `run:${r.id}`;
         if (!firsts.has(thread)) firsts.set(thread, r);
       }
@@ -341,8 +343,11 @@ export function relative(ms: number | Date | undefined, now: number): string {
       : `${Math.round(ago / 1440)}d ago`;
 }
 
-/** Run statuses that count as a failure. `silent` means the pre-run script found nothing to do. */
-export const FAILED = ['failed', 'error', 'timeout', 'limit'];
+/**
+ * Run statuses that count as a failure. `silent`: the run found nothing to report; `skipped`: the job's
+ * gate found nothing to do, so no model ran.
+ */
+export const FAILED = ['failed', 'error', 'timeout', 'limit', 'blocked', 'over-budget'];
 const RUN_LABEL: Record<string, string> = {
   ok: 'did work',
   silent: 'nothing to do',
@@ -351,6 +356,9 @@ const RUN_LABEL: Record<string, string> = {
   timeout: 'timed out',
   limit: 'usage limit',
   aborted: 'stopped',
+  skipped: 'nothing to do',
+  blocked: 'blocked',
+  'over-budget': 'over budget',
 };
 const runTone = (status: string) => (FAILED.includes(status) ? 'bad' : status === 'ok' ? 'ok' : 'dim');
 export const runTag = (status?: string) =>
@@ -728,6 +736,7 @@ export type Page =
   | 'Reminders'
   | 'Code'
   | 'Browsers'
+  | 'Data'
   | 'Health'
   | '';
 
@@ -771,6 +780,7 @@ export function layout(
       ...(ctx.reminders ? ([['/reminders', 'Reminders', '⏰', 0, '']] as const) : []),
       ...(ctx.code ? ([['/code', 'Code', '📝', 0, '']] as const) : []),
       ...(ctx.browsers ? ([['/browsers', 'Browsers', '🌐', 0, '']] as const) : []),
+      ...(ctx.data ? ([['/data', 'Data', '🗄️', 0, '']] as const) : []),
       ...(ctx.unhealthy !== undefined
         ? ([['/health', 'Health', '❤️', ctx.unhealthy, 'health problems']] as const)
         : []),
@@ -1335,7 +1345,7 @@ ${section(
   'Reply',
   run.output
     ? `<div class="msg">${md(run.output)}</div>`
-    : `<div class="empty">${run.status === 'silent' ? 'The check before the run found nothing to do, so Claude did not run.' : 'No reply recorded.'}</div>`,
+    : `<div class="empty">${run.status === 'silent' || run.status === 'skipped' ? 'The check before the run found nothing to do, so Claude did not run.' : 'No reply recorded.'}</div>`,
 )}
 ${run.scriptOutput ? `<details><summary>What the check before the run found</summary><pre>${esc(run.scriptOutput)}</pre></details>` : ''}`,
   );

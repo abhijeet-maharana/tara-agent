@@ -113,6 +113,7 @@ Runs can edit their repo, `.tara/config.json` included, and some of its settings
 - It is keyed by repo path, so renaming the project in its config doesn't get around it.
 - `executorUrls` lists the only URLs its queues may send approved items to; a `queues.json` naming another URL fails to load (its items wait) instead of sending.
 - Changes apply at the next restart (project config isn't hot-reloaded).
+- Keep a pinned key in one place: the host entry. A copy in the repo's config is ignored and only drifts (the Health page lists keys the repo sets to something else, including keys the entry leaves unset).
 
 ## Project tabs
 

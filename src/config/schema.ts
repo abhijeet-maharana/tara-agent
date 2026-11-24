@@ -28,6 +28,7 @@ export const PINNED_PROJECT_KEYS = [
   'systemPromptFile',
   'dashboardUrl',
   'healthUrl',
+  'dataUrl',
   'keepTabsUrl',
   'approvals',
   'reminders',
@@ -187,7 +188,21 @@ export const hostConfigSchema = z.object({
    * the copies with it. `keep` is how many days of copies stay.
    */
   backup: z
-    .object({ dir: z.string().optional(), keep: z.number().int().min(1).default(7) })
+    .object({
+      dir: z.string().optional(),
+      keep: z.number().int().min(1).default(7),
+      /**
+       * The off-site backup (deploy/backup/tara-backup.mjs): the status file it writes. Shows as the
+       * "Off-site backup" and "Restore test" checks on the Health page. Unset = no such checks.
+       */
+      offsite: z
+        .object({
+          statusFile: z.string(),
+          maxAgeHours: z.number().positive().default(30),
+          restoreTestDays: z.number().positive().default(35),
+        })
+        .optional(),
+    })
     .default({ keep: 7 }),
   /**
    * Stream replies into Slack threads as Claude writes them, with a live task card (needs the Slack
@@ -444,6 +459,11 @@ export const projectConfigSchema = z.object({
    */
   healthUrl: z.string().url().optional(),
   /**
+   * The project's data API (`@tara-agent/kit` `DataApi`, e.g. `http://127.0.0.1:4002/api/db`): its own
+   * database's tables, rows and read-only SQL, shown on the dashboard's Data tab.
+   */
+  dataUrl: z.string().url().optional(),
+  /**
    * Pages of the project's app (`dashboardUrl`) listed in tara-agent's sidebar, in order. Each opens at
    * `/p/<name><path>`, with the app proxied from `/app/<name>/`. The first is the project's landing page.
    */
@@ -627,6 +647,28 @@ export const jobSchema = z
     env: z.record(z.string(), z.string()).default({}),
     allowedTools: z.array(z.string()).optional(),
     enabled: z.boolean().default(true),
+    /**
+     * A command tara-agent runs (`sh -c`, in the repo, as the run user, with the job's environment)
+     * before a scheduled, catch-up or Run now run starts the model. Exit 0 with no output (or only one
+     * line starting `Skipping`, the reason): nothing to do, the run ends `skipped` without a model
+     * session (and without a Slack message when scheduled). It gets the job's `timeoutMinutes`.
+     * Any output, or a non-zero exit, starts the run as usual with what it printed in the prompt
+     * (`## Gate output`), so the skill works from it instead of running the check again.
+     */
+    gate: z.string().min(1).optional(),
+    /**
+     * Services the job needs, as URLs that must answer (any status below 500) before a run starts,
+     * e.g. a browser's `http://127.0.0.1:9222/json/version` or a project server's `/health`. When one
+     * doesn't, the run ends `blocked` without a model session; Slack hears once per streak, and a
+     * queue's items go back to wait for the next try.
+     */
+    requires: z.array(z.string().url()).optional(),
+    /**
+     * Claude jobs: stop a run that has spent this many US dollars (`--max-budget-usd`; checked between
+     * turns, so a run may go a little over). The run ends `over-budget`. A guard against a runaway
+     * run, not a quota: unset, nothing is limited.
+     */
+    budgetUsd: z.number().positive().optional(),
   })
   .refine((j) => j.skills.length > 0, {
     message: 'a job needs a skill: its instructions are the skill\'s "## Job: <id>" section',

@@ -1,0 +1,9 @@
+{
+  "protected": ["/srv/shop/records", "/home/me/.chrome-profile"],
+  "rules": [
+    { "name": "Screenshots", "dir": "/srv/shop/logs/screenshots", "olderThanDays": 30 },
+    { "name": "Downloads", "dir": "/home/me/Downloads", "olderThanDays": 30 },
+    { "name": "Render leftovers in /tmp", "dir": "/tmp", "match": "render-bundle-*", "olderThanDays": 2 }
+  ],
+  "dockerDanglingImages": true
+}

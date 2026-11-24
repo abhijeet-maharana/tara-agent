@@ -11,6 +11,8 @@ tara-agent runs on your own server around the clock. It runs scheduled jobs, ans
 **Always on**
 - **Scheduled jobs.** Cron jobs per project, run day and night. A job can run a cheap script first and only wake the agent when there is something to do.
 - **Survives restarts.** Sessions, approvals and schedules are stored locally. Missed jobs catch up after downtime, and no job slot runs twice.
+- **No work, no model.** A job's `gate` runs a cheap check before Claude starts: nothing to do ends the run as `skipped`, at no cost. `requires` lists services that must answer first (else `blocked`, one notice), and `budgetUsd` stops a runaway run.
+- **Never sends twice.** An approved item whose run crashed mid-send becomes `uncertain` and waits for you to say whether it went out, instead of being sent again.
 - **Learns from every run.** After each run, the agent looks back once and fixes the instructions it followed (a wrong selector, a missing step, a trap to avoid). Set `selfImprove: "trouble"` to learn only from runs that went wrong.
 
 **Human in the loop**
@@ -25,6 +27,9 @@ tara-agent runs on your own server around the clock. It runs scheduled jobs, ans
 
 **See everything**
 - **Web dashboard.** What's running, what needs you, failing jobs, the day's schedule, full transcripts of every run, and your repos' uncommitted changes. Works on a phone.
+- **`tara-agent doctor`.** One command checks the config, every job's skill, required services, shared skills and the running agent's health checks.
+- **Project services and data.** `packages/kit` gives a project's own server its SQLite database with migrations, a data API (shown on the dashboard's **Data** tab and used by agents' data tools), a tara-agent client and HTTP access rules.
+- **Deploys, backups, host checks.** `deploy/` holds release folders with automatic rollback, encrypted off-site backups with a monthly restore test, and a heartbeat and cleanup for the host.
 - **Mac desk widget.** A desktop panel with what needs you, approvals, running and next, next to the Mac's own temperature, memory and load ([`examples/macos-desk-widget`](examples/macos-desk-widget)).
 
 ## How it works
@@ -143,8 +148,12 @@ Full threat model: [`docs/security.md`](docs/security.md).
 |---|---|
 | [`docs/configuration.md`](docs/configuration.md) | Every setting: host, project, jobs, files, approvals, queues, local API |
 | [`docs/security.md`](docs/security.md) | Threat model, dedicated user, split users, privileged actions |
+| [`docs/host.md`](docs/host.md) | Host tools: heartbeat, cleanup, "host is off" alert |
+| [`docs/deploy.md`](docs/deploy.md) | Deploying tara-agent and project services with automatic rollback |
+| [`docs/backups.md`](docs/backups.md) | Daily copy, encrypted off-site backup, restore test |
 | [`docs/architecture.md`](docs/architecture.md) | Modules and how a chat turn, job and approval flow |
 | [`docs/code-view.md`](docs/code-view.md) | The Code page |
+| [`packages/kit/README.md`](packages/kit/README.md) | Shared code for a project's own service: database, data API, tara client, access rules |
 | [`docs/dashboard-look.md`](docs/dashboard-look.md) | Reusing the dashboard style in your own project dashboards |
 | [`CHANGELOG.md`](CHANGELOG.md), [`CONTRIBUTING.md`](CONTRIBUTING.md) | Changes and how to contribute |
 

@@ -298,6 +298,11 @@ describe('runClaude', () => {
     expect(o.rateLimit?.resetsAt).toBe(1792924200);
   });
 
+  it('reports a run stopped at its budget as over-budget', async () => {
+    const o = await run('budget').outcome;
+    expect(o).toMatchObject({ status: 'over-budget', error: 'Stopped at its budget: $2.31 spent' });
+  });
+
   it('collects unique permission denials', async () => {
     const o = await run('denied').outcome;
     expect(o).toMatchObject({ status: 'ok', permissionDenials: ['Bash'] });

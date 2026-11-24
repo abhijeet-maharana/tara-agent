@@ -216,6 +216,15 @@ export function itemRoutes(c: ServerContext, approvals: Approvals): Route<unknow
         throw new HttpError(400, '"status" must be done, failed or waiting');
       return { item: approvals.report(params.id ?? '', status, str(body.result)) };
     }),
+    // An `uncertain` item (its run never said whether it went out): what a person found.
+    route('POST /items/:id/resolve', async ({ req, params }) => {
+      const id = params.id ?? '';
+      const by = decider(req, id);
+      const outcome = (await readJson(req)).outcome;
+      if (outcome !== 'sent' && outcome !== 'retry' && outcome !== 'drop')
+        throw new HttpError(400, '"outcome" must be sent, retry or drop');
+      return { item: approvals.resolve(id, outcome, by) };
+    }),
     route('POST /items/:id/cancel', ({ req, params }) => ({
       item: approvals.cancel(params.id ?? '', decider(req, params.id ?? '')),
     })),

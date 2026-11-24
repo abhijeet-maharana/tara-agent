@@ -6,13 +6,13 @@ import type { HealthEvent, HealthStatus, RunStat } from '../store/store.js';
  */
 
 const DAY = 86_400_000;
-const FAILED = ['failed', 'error', 'timeout', 'limit'];
+const FAILED = ['failed', 'error', 'timeout', 'limit', 'blocked', 'over-budget'];
 
 export type RunResult = 'worked' | 'quiet' | 'failed' | 'stopped';
 
 /** How a run ended, in the dashboard's words: did work, nothing to do, failed, stopped. */
 export function runResult(status: string): RunResult {
-  if (status === 'silent') return 'quiet';
+  if (status === 'silent' || status === 'skipped') return 'quiet';
   if (FAILED.includes(status)) return 'failed';
   if (status === 'aborted') return 'stopped';
   return 'worked';
@@ -163,7 +163,7 @@ export function jobTrends(runs: RunStat[], now: number): JobTrend[] {
       jobId,
       runs: list.length,
       failed: failedRuns.length,
-      quiet: list.filter((r) => r.status === 'silent').length,
+      quiet: list.filter((r) => runResult(r.status) === 'quiet').length,
       failRate: failedRuns.length / list.length,
       p50: quantile(all, 0.5),
       p95: quantile(all, 0.95),

@@ -20,6 +20,7 @@ import { unlockPage } from './approvals.js';
 import type { Attention } from './attention.js';
 import { serverContext } from './context.js';
 import { type DashboardContext, errorPage, type HostModels, tabPage } from './dashboard.js';
+import { editPage, saveEdit, withData } from './data.js';
 import { Glance, type QuietHours } from './glance.js';
 import {
   ADMIN_COOKIE,
@@ -334,6 +335,48 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     res.end();
   };
 
+  /** `POST /data/<project>/edit`: saves the Data tab's edit form, then back to the table. */
+  const saveDataEdit = async (
+    req: IncomingMessage,
+    res: ServerResponse,
+    ctx: DashboardContext,
+    name: string,
+  ) => {
+    const project = withData(ctx.projects).find((p) => p.config.name === name);
+    if (!project?.config.dataUrl) return sendHtml(res, 404, errorPage(ctx, 404));
+    const form = new URLSearchParams(await readBody(req, 512_000).catch(() => ''));
+    const table = form.get('_table') ?? '';
+    try {
+      c.human(req);
+    } catch (err) {
+      return sendHtml(res, 403, errorPage(ctx, 404, (err as Error).message));
+    }
+    const result = await saveEdit(project.config.dataUrl, form);
+    if (result.ok) {
+      options.log.info(
+        `data: ${name}/${table} ${result.key} ${result.changed ? 'saved' : 'unchanged'} from the dashboard`,
+      );
+      const q = new URLSearchParams({
+        table,
+        saved: result.changed ? result.key : `${result.key} (nothing changed)`,
+      });
+      return redirect(res, 303, `/data/${encodeURIComponent(name)}?${q}`);
+    }
+    if (!result.table) return sendHtml(res, 400, errorPage(ctx, 404, result.error));
+    sendHtml(
+      res,
+      400,
+      editPage(ctx, {
+        project: name,
+        table: result.table,
+        key: result.key,
+        values: result.values,
+        canEdit: true,
+        error: result.error,
+      }),
+    );
+  };
+
   /** A file a dashboard run sent (`send_file`), from its session page. */
   const webFile = async (req: IncomingMessage, res: ServerResponse, id: number) => {
     const m = tokenHolder(req) ? options.store.webMessageById(id) : undefined;
@@ -385,6 +428,12 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     if (req.method === 'POST' && url.pathname === '/unlock' && tokenHolder(req)) {
       const ctx = c.pageContext();
       if (ctx) return unlock(req, res, ctx);
+    }
+    // The Data tab's edit form: a person (unlocked browser) changes a row through the project's data API.
+    const dataEdit = /^\/data\/([^/]+)\/edit$/.exec(url.pathname);
+    if (req.method === 'POST' && dataEdit && tokenHolder(req)) {
+      const ctx = c.pageContext();
+      if (ctx) return saveDataEdit(req, res, ctx, decodeURIComponent(dataEdit[1] as string));
     }
     // Approved items moved from the Approvals page's Scheduled tab to the Queue page.
     if (

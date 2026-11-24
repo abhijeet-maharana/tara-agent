@@ -330,6 +330,7 @@ export function serverContext(options: HttpOptions) {
       code: Boolean(options.code),
       browsers: Boolean(options.browsers),
       reminders: Boolean(options.reminders),
+      data: dash.projects.some((p) => p.config.dataUrl),
       unhealthy: options.health ? redChecks().length : undefined,
     };
   };
