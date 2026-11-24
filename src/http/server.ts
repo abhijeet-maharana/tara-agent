@@ -1,73 +1,26 @@
 import { readFileSync, unwatchFile, watchFile } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import {
-  createServer,
-  request as httpRequest,
-  type IncomingMessage,
-  type Server,
-  type ServerResponse,
-} from 'node:http';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https';
 import path from 'node:path';
-import { Cron } from 'croner';
-import { ApprovalError, type Approvals, type ProposeInput } from '../approvals/approvals.js';
+import { ApprovalError, type Approvals } from '../approvals/approvals.js';
 import { type Bridge, BridgeError } from '../bridge/bridge.js';
-import { CodeError, type CodeRepo, MIN_QUERY, type RepoReader } from '../code/repo.js';
-import { loadQueues } from '../config/load.js';
+import { CodeError, type CodeRepo, type RepoReader } from '../code/repo.js';
 import type { HostConfig, Project, QueueConfig } from '../config/schema.js';
 import type { HealthMonitor } from '../health/monitor.js';
 import type { Observability } from '../health/observability.js';
-import { parseVmHostSample, VMHOST_MAX_QUERY_DAYS, VmHostError } from '../health/vmhost.js';
 import { ReminderError, type Reminders } from '../reminders/reminders.js';
 import type { Activity } from '../runner/activity.js';
 import type { Scheduler } from '../scheduler/scheduler.js';
-import { type IncomingMessage as ChatMessage, type Logger, threadKey } from '../sessions/manager.js';
-import { ITEM_STATUSES, type ItemStatus, type Store } from '../store/store.js';
-import { addDays, dayKey, midnight } from '../util/time.js';
-import { isWebChannel, type WebChat } from '../web/chat.js';
-import { slackSummaryOf } from '../web/summary.js';
+import type { IncomingMessage as ChatMessage, Logger } from '../sessions/manager.js';
+import type { Store } from '../store/store.js';
+import type { WebChat } from '../web/chat.js';
 import { allowList } from './access.js';
-import {
-  type ApprovalsTab,
-  approvalsPage,
-  ITEMS_LIMIT,
-  isNotice,
-  safeMediaUrl,
-  sessionLink,
-  unlockPage,
-} from './approvals.js';
+import { unlockPage } from './approvals.js';
 import type { Attention } from './attention.js';
-import { probeBrowser, projectNeeds, SiteScanner } from './browser-usage.js';
-import { browsersPage } from './browsers.js';
-import {
-  codeDiffPage,
-  codeFilePage,
-  codeHomePage,
-  codeRepoPage,
-  codeSearchPage,
-  codeTreePage,
-  staleWork,
-} from './code.js';
-import {
-  anchor,
-  type DashboardContext,
-  errorPage,
-  type HomeUsage,
-  type HostModels,
-  homePage,
-  type JobView,
-  jobState,
-  jobsPage,
-  jobWeeks,
-  modelUses,
-  runPage,
-  type StaleRepo,
-  sessionPage,
-  sessionsPage,
-  tabbed,
-  tabPage,
-} from './dashboard.js';
-import { Glance, type NextRun, type QuietHours } from './glance.js';
+import { serverContext } from './context.js';
+import { type DashboardContext, errorPage, type HostModels, tabPage } from './dashboard.js';
+import { Glance, type QuietHours } from './glance.js';
 import {
   ADMIN_COOKIE,
   ADMIN_COOKIE_ATTRS,
@@ -78,16 +31,17 @@ import {
   sameSecret,
   TOKEN_COOKIE,
 } from './guards.js';
-import { healthPage } from './health.js';
-import { logsPage, trendsPage } from './observe.js';
-import { queuePage } from './queue.js';
-import { loadQuotes, pickQuote } from './quotes.js';
-import { remindersPage } from './reminders-page.js';
-import { isDayKey, MAX_RUNS_PER_DAY, type PlanJob, planDay, schedulePage } from './schedule.js';
-import { firstPromptOf, readTranscript } from './transcript.js';
-
-/** Sessions per page of the Sessions list. */
-const SESSIONS_PAGE = 50;
+import { HttpError, pathParts, readBody, redirect, sendHtml, sendJson, sendText } from './io.js';
+import { locationReporter, passThrough } from './proxy.js';
+import { match, type Route } from './router.js';
+import { codeRoutes } from './routes/code.js';
+import { internalRoutes } from './routes/internal.js';
+import { itemRoutes } from './routes/items.js';
+import { jobRoutes } from './routes/jobs.js';
+import { pageRoutes } from './routes/pages.js';
+import { reminderRoutes } from './routes/reminders.js';
+import { sessionRoutes } from './routes/sessions.js';
+import { systemRoutes } from './routes/system.js';
 
 export interface HttpOptions {
   bind: string;
@@ -175,1619 +129,105 @@ export interface HttpOptions {
   };
 }
 
-class HttpError extends Error {
-  constructor(
-    readonly status: number,
-    message: string,
-  ) {
-    super(message);
-  }
-}
-
-const iso = (d?: Date) => d?.toISOString() ?? null;
-/** Runs per job shown on the dashboard (recent-runs strip and history). */
-const RECENT_RUNS = 10;
-const DAY_MS = 86_400_000;
-/** The Browsers page looks at this many days of transcripts. */
-const BROWSER_DAYS = 30;
-/** Jobs that start this often or more are left out of the home page's "Coming up" list. */
-const FREQUENT_MS = 30 * 60_000;
-/** Most start times `GET /jobs?upcoming=` returns per job. */
-const MAX_UPCOMING = 60;
-
-async function readBody(req: IncomingMessage, limit: number): Promise<string> {
-  let body = '';
-  for await (const chunk of req) {
-    body += chunk;
-    if (body.length > limit) throw new HttpError(413, 'Body too large');
-  }
-  return body;
-}
-
-async function readJson(req: IncomingMessage, limit = 10_000): Promise<Record<string, unknown>> {
-  const body = await readBody(req, limit);
-  if (!body.trim()) return {};
-  try {
-    const json: unknown = JSON.parse(body);
-    return typeof json === 'object' && json !== null ? (json as Record<string, unknown>) : {};
-  } catch {
-    throw new HttpError(400, 'Body is not JSON');
-  }
-}
-
 /**
- * Local control API for other tools on the same host (dashboards, boards, scripts):
- *   GET  /health
- *   GET  /jobs?project=<name>[&upcoming=<days>]   with `upcoming`, each job's start times over the next days
- *   POST /jobs/<project>/<id>/run      {"by": "who asked"}
- *   POST /jobs/<project>/<id>/pause    flips `enabled` off in the repo's .tara/jobs.json → {ok, enabled}
- *   POST /jobs/<project>/<id>/resume   flips it back on, effective at once
- *   POST /jobs/<project>/<id>/duration {"minutes": 20} sets `durationMinutes` in the jobs file
- *   GET  /jobs/<project>/<id>/runs?limit=15
- *   GET  /runs?limit=30                latest job runs of every project (no outputs)
- *   GET  /runs/<id>
- *   GET  /sessions?project=<name>&limit=30   latest sessions with their last run
- *   GET  /sessions/<id>/transcript     the conversation as JSON (prompts, replies, tool calls and results)
- *   POST /sessions/<id>/message        {text} continues that session's thread as its owner; needs the
- *                                      header `x-tara-admin: <TARA_ADMIN_TOKEN>` (for a person's own Claude
- *                                      fixing a run, never for runs)
- *   POST /vmhost/metrics               {name?, cpuTemp?, thermal?, cpu?, memUsed?, swapBytes?, pressure?, vmCpu?,
- *                                      vmMemBytes?, powerW?} the VM host's own figures (src/health/vmhost.ts)
- *   GET  /vmhost/metrics?hours=1       its reports over the last hours
- *   POST /reload                       re-read every .tara/jobs.json now
- *   GET  /reminders?project=<name>     reminders still to come, soonest first
- *   POST /reminders/<project>          {text, cron? | at?, notify?, task?, title?, by?} → the reminder
- *   POST /reminders/<project>/<id>/cancel
- *   GET  /schedule?day=YYYY-MM-DD&project=<name>   one day's planned runs, overlaps and free windows
- *   GET  /schedule/conflicts?days=7    overlapping and back-to-back jobs over the next days
- *   GET  /code                         each repo's branch, last commit and uncommitted changes
- *   GET  /code/<repo>                  one repo's changes; /diff?path=, /file?path=, /files?path= (a folder)
- *   GET  /code?q=, /code/<repo>?q=     search file names and text (every repo, or one)
- *   POST /code/<repo>/ask              {path, question} asks in Slack; needs the unlocked browser
- * and, for tara's own MCP server (header `x-tara-run: <run token>`):
- *   POST /internal/approval            {title, details, options?, kind?, handoff?}
- *   POST /internal/file                {path, comment?}
- *   POST /internal/privileged          {action, args?, reason} | {command, reason} → {ran, ok, result} | {id}
- *   POST /internal/permission          {tool_name, input}  → {id}
- *   GET  /internal/permission/<id>?wait=45                 → {decision | null}
- *   GET  /internal/jobs, POST /internal/run-job {id}        (chat turns only)
- *   POST /internal/withdraw            {id, reason?}  closes a waiting card of the run's project
- *   POST /internal/reminder            {text, cron? | at?, notify?, task?, title?}; GET /internal/reminders;
- *   POST /internal/reminder-cancel     {id}
+ * tara-agent's HTTP server: the local API for other tools on the same host (dashboards, boards,
+ * scripts), `/internal/*` for tara's own MCP server, the dashboard's pages, and project apps in tabs.
+ * The routes live in `routes/` (each file lists its paths): system (health, drain, metrics), jobs (jobs,
+ * runs, queues, schedule), sessions, items (approval cards), reminders, code, internal, and pages (HTML).
+ * This file is the front door: who may connect, tokens and cookies, the fallback and app proxies.
  */
 /** Paths tara-agent serves itself; with a fallback, everything else is passed through. */
 const OWN_PATH =
   /^\/(?:$|(?:health|metrics|reload|drain|attention|jobs|runs|sessions|schedule|approvals|queue|items|reminders|unlock|code|internal|p|app|glance)(?:\/|$))/;
-/** Finished items shown on the Done tab. */
-const DONE_DAYS = 30;
-
-const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
-
-/** Approval items carry drafts (emails, posts), so they may be bigger than other requests. */
-const ITEM_BODY_LIMIT = 200_000;
-const PERMISSION_BODY_LIMIT = 5_000_000;
-/** Enough for a job application form: the note, every question and the resume. */
-const MAX_FIELDS = 40;
-
-const arr = (v: unknown) => (Array.isArray(v) ? v : []);
-
-/** Checks a proposed item from the API or a run; returns the input or throws 400. */
-export function itemInput(body: Record<string, unknown>): ProposeInput {
-  const need = (v: unknown, name: string) => {
-    const s = str(v);
-    if (!s) throw new HttpError(400, `"${name}" is required`);
-    return s;
-  };
-  const runAfter =
-    typeof body.runAfter === 'number'
-      ? body.runAfter
-      : str(body.runAfter)
-        ? Date.parse(body.runAfter as string)
-        : undefined;
-  if (Number.isNaN(runAfter)) throw new HttpError(400, '"runAfter" must be a time');
-  if (body.priority !== undefined && body.priority !== null && !Number.isFinite(body.priority))
-    throw new HttpError(400, '"priority" must be a number');
-  return {
-    kind: need(body.kind, 'kind').slice(0, 40),
-    key: str(body.key)?.slice(0, 120),
-    title: need(body.title, 'title'),
-    body: str(body.body)?.slice(0, 8_000),
-    queue: need(body.queue, 'queue'),
-    window: str(body.window),
-    runAfter,
-    priority: typeof body.priority === 'number' ? body.priority : undefined,
-    options: arr(body.options).filter((o): o is string => typeof o === 'string'),
-    fields: arr(body.fields)
-      .slice(0, MAX_FIELDS)
-      .map((f: Record<string, unknown>) => ({
-        key: need(f?.key, 'fields[].key'),
-        label: str(f?.label) ?? String(f?.key),
-        type: f?.type === 'text' || f?.type === 'list' ? f.type : 'textarea',
-        value: Array.isArray(f?.value) ? (f.value as unknown[]).map(String) : String(f?.value ?? ''),
-        maxLength: typeof f?.maxLength === 'number' ? f.maxLength : undefined,
-        required: f?.required === true || undefined,
-        readOnly: f?.readOnly === true || undefined,
-      })),
-    checks: arr(body.checks)
-      .slice(0, 20)
-      .map((c: Record<string, unknown>) => ({ text: String(c?.text ?? ''), blocking: c?.blocking === true })),
-    media: arr(body.media)
-      .slice(0, 20)
-      .map((m: Record<string, unknown>) => {
-        const url = need(m?.url, 'media[].url');
-        const poster = str(m?.poster);
-        if (!safeMediaUrl(url) || (poster && !safeMediaUrl(poster)))
-          throw new HttpError(400, 'media[].url and poster must be http(s) URLs or paths starting with /');
-        return {
-          type: m?.type === 'video' || m?.type === 'file' ? (m.type as 'video' | 'file') : ('image' as const),
-          url,
-          caption: str(m?.caption),
-          poster,
-        };
-      }),
-  };
-}
 
 // Kept importable from here (tests and older callers).
 export { adminCookieValue, crossSite, trustedHost } from './guards.js';
+export { itemInput } from './routes/items.js';
+
+/** Errors that carry their own HTTP status. */
+const statusOf = (err: unknown) =>
+  err instanceof HttpError ||
+  err instanceof BridgeError ||
+  err instanceof ApprovalError ||
+  err instanceof ReminderError ||
+  err instanceof CodeError
+    ? err.status
+    : 500;
+
+/** Runs the route for this request; `undefined` as `found` when none matches. */
+async function dispatch<T, X>(
+  routes: readonly Route<T, X>[],
+  req: IncomingMessage,
+  url: URL,
+  extra: X,
+): Promise<{ found: boolean; value?: T }> {
+  const method = req.method ?? 'GET';
+  const parts = pathParts(url.pathname);
+  const hit = match(routes, method, parts);
+  if (!hit) return { found: false };
+  return { found: true, value: await hit.route.run({ req, method, url, parts, params: hit.params }, extra) };
+}
 
 export async function startHttpServer(options: HttpOptions): Promise<Server> {
-  const now = options.now ?? Date.now;
-  const started = now();
-  /**
-   * How much of Claude's usage window is used: what the CLI reported last in this process, else the
-   * latest run's figure from the last 5 hours (one window), so a restart doesn't blank it. The 7-day
-   * window comes only from this process's reports (runs don't store it).
-   */
-  const usageNow = (at: number): HomeUsage | undefined => {
-    const live = options.activity?.usage();
-    const ms = (t?: number) => (t ? t * (t < 1e12 ? 1000 : 1) : undefined);
-    const seven = live?.windows?.seven_day;
-    const weekResets = ms(seven?.resetsAt);
-    const week =
-      seven?.utilization !== undefined && (!weekResets || weekResets > at)
-        ? { share: seven.utilization, ...(weekResets && { resetsAt: weekResets }) }
-        : undefined;
-    if (live?.utilization !== undefined) {
-      const resetsAt = ms(live.resetsAt);
-      if (!resetsAt || resetsAt > at)
-        return { share: live.utilization, window: live.window, resetsAt, ...(week && { week }) };
-    }
-    const last = options.store
-      .runsSince(at - 5 * 3_600_000)
-      .filter((r) => r.rateLimitUtilization !== undefined)
-      .at(-1);
-    return last
-      ? { share: last.rateLimitUtilization as number, asOf: last.endedAt, ...(week && { week }) }
-      : undefined;
-  };
-  const timeZone = options.dashboard?.timeZone ?? 'UTC';
-  const projectTitle = (name: string) =>
-    options.dashboard?.projects.find((p) => p.config.name === name)?.config.title ?? name;
-  /** The next few scheduled runs today, leaving out jobs that start every half hour or more often. */
-  const nextUp = (at: number): NextRun[] =>
-    options.projects
-      .flatMap((p) => {
-        const jobs = new Map(options.scheduler.list(p).map((j) => [j.id, j]));
-        return options.scheduler.plannedRuns(p, at, at + DAY_MS, 2).flatMap(({ id, starts }) => {
-          const [first, second = Number.POSITIVE_INFINITY] = starts;
-          const job = jobs.get(id);
-          if (first === undefined || !job || second - first <= FREQUENT_MS) return [];
-          return [{ project: projectTitle(p), name: job.name, at: first }];
-        });
-      })
-      .sort((a, b) => a.at - b.at)
-      .slice(0, 3);
+  const c = serverContext(options);
+  const { now } = c;
   // The glance for desk panels (GET /glance).
   const glance = new Glance({
     attention: options.attention,
     pending: () => (options.approvals ? options.store.items({ statuses: ['pending'], limit: 200 }) : []),
     tasks: options.activity && (() => options.activity?.tasks() ?? []),
-    next: nextUp,
-    usage: usageNow,
-    projectTitle,
-    timeZone,
+    next: c.nextUp,
+    usage: c.usageNow,
+    projectTitle: c.projectTitle,
+    timeZone: c.timeZone,
     quietHours: options.quietHours,
     now,
     log: options.log,
   });
-  const knownProject = (name: string | null) => {
-    if (!name || !options.projects.includes(name))
-      throw new HttpError(404, `Unknown project "${name ?? ''}"`);
-    return name;
-  };
 
-  /** A session's transcript: from its project's folder, or (thread cleared) whichever project has it. */
-  const transcript = (id: string, dir?: string) => {
-    const dirs = dir ? [dir] : (options.dashboard?.projects ?? []).map((p) => p.dir);
-    for (const d of dirs) {
-      const entries = readTranscript(d, id, undefined, options.readAs);
-      if (entries) return entries;
-    }
-    return undefined;
-  };
-
-  /** First messages of sessions, for the Sessions list: a session's first prompt never changes. */
-  const previews = new Map<string, string>();
-  const preview = (project: string, sessionId: string) => {
-    const known = previews.get(sessionId);
-    if (known !== undefined) return known;
-    const dir = options.dashboard?.projects.find((p) => p.config.name === project)?.dir;
-    const found = dir ? firstPromptOf(dir, sessionId, undefined, options.readAs) : undefined;
-    if (found !== undefined) {
-      if (previews.size >= 5000) previews.clear(); // transcripts are kept 14 days: far fewer sessions
-      previews.set(sessionId, found);
-    }
-    return found;
-  };
-
-  /** The queues each job is the executor of, so the jobs page can tell queue jobs from on-demand ones. */
-  const queueExecutors = (name: string): Map<string, string[]> => {
-    const byJob = new Map<string, string[]>();
-    const project = options.dashboard?.projects.find((x) => x.config.name === name);
-    if (!project) return byJob;
-    let configs: Record<string, QueueConfig>;
-    try {
-      configs = (options.queueConfig ?? loadQueues)(project);
-    } catch {
-      return byJob;
-    }
-    for (const [queue, q] of Object.entries(configs))
-      if ('job' in q.executor) byJob.set(q.executor.job, [...(byJob.get(q.executor.job) ?? []), queue]);
-    return byJob;
-  };
-
-  /**
-   * A project's queue slots in [start, end) as planned runs of the queue's job: a queue with `slots`
-   * runs its executor job at each one when something is approved (its own items or those of a queue
-   * that `fills` it). Queues with windows, or run elsewhere, have no fixed times to draw.
-   */
-  const queueSlots = (name: string, start: number, end: number): PlanJob[] => {
-    const project = options.dashboard?.projects.find((x) => x.config.name === name);
-    if (!project) return [];
-    let configs: Record<string, QueueConfig>;
-    try {
-      configs = (options.queueConfig ?? loadQueues)(project);
-    } catch {
-      return [];
-    }
-    const info = new Map(options.scheduler.list(name).map((j) => [j.id, j]));
-    const approved = options.store.items({ project: name, statuses: ['approved'], limit: 1000 });
-    return Object.entries(configs).flatMap(([queue, q]): PlanJob[] => {
-      if (!q.slots || q.fills || !('job' in q.executor)) return [];
-      const id = q.executor.job;
-      const clock = new Cron(q.slots, { timezone: q.tz ?? timeZone, paused: true });
-      const starts: number[] = [];
-      for (
-        let next = clock.nextRun(new Date(start - 1));
-        next && next.getTime() < end;
-        next = clock.nextRun(next)
-      ) {
-        starts.push(next.getTime());
-        if (starts.length > MAX_RUNS_PER_DAY) break;
-      }
-      const waiting = approved.filter(
-        (i) => i.queue === queue || configs[i.queue ?? '']?.fills === queue,
-      ).length;
-      return starts.length
-        ? [
-            {
-              project: name,
-              id,
-              name: info.get(id)?.name ?? id,
-              durationMinutes: info.get(id)?.durationMinutes,
-              starts,
-              queue,
-              waiting,
-            },
-          ]
-        : [];
-    });
-  };
-
-  /** One calendar day of every (or one) project's planned runs, matched with the runs that happened. */
-  const dayPlan = (day: string, project?: string) => {
-    const start = midnight(day, timeZone);
-    const end = midnight(addDays(day, 1), timeZone);
-    const names = project ? [project] : options.projects;
-    const jobs: PlanJob[] = names.flatMap((p) => {
-      const info = new Map(options.scheduler.list(p).map((j) => [j.id, j]));
-      return options.scheduler.plannedRuns(p, start, end, MAX_RUNS_PER_DAY).map(({ id, starts }) => ({
-        project: p,
-        id,
-        name: info.get(id)?.name ?? id,
-        durationMinutes: info.get(id)?.durationMinutes,
-        starts,
-      }));
-    });
-    return planDay(
-      [...jobs, ...names.flatMap((p) => queueSlots(p, start, end))],
-      options.store.runsSince(start - 3_600_000).filter((r) => r.kind === 'job'),
-      start,
-      end,
-    );
-  };
-
-  /** The session a running job works in (from its live task's thread), for a link to its transcript. */
-  /**
-   * The session a started job works in: its running Claude run, else (finishing up, e.g. its learning
-   * turn) the latest one since it started.
-   */
-  const liveJobSession = (project: string, jobId: string, since?: Date) => {
-    const task = options.activity
-      ?.tasks()
-      .find(
-        (t) =>
-          t.kind === 'job' &&
-          t.project === project &&
-          t.jobId === jobId &&
-          (t.status === 'running' || (since !== undefined && t.startedAt >= since.getTime())),
-      );
-    return task?.thread
-      ? options.store.getSession(threadKey(task.thread.channel, task.thread.ts))?.sessionId
-      : undefined;
-  };
-
-  /** The task working in a session's thread now, else the latest finished one there (newest first). */
-  const liveTask = (sessionId: string) => {
-    const key = options.store.sessionsOverview({ sessionId, limit: 1 })[0]?.threadKey;
-    if (!key) return undefined;
-    return options.activity
-      ?.tasks()
-      .find((t) => t.thread && threadKey(t.thread.channel, t.thread.ts) === key);
-  };
-
-  const approvals = options.approvals;
-  /** The owner of an item's project: who a dashboard decision is recorded as. */
-  const owner = (id: string) => {
-    const item = options.store.getItem(id);
-    return options.dashboard?.projects.find((p) => p.config.name === item?.project)?.config.owner;
-  };
-  /**
-   * Decisions need a person: the browser's approvals cookie, from another device. The agent runs on
-   * this machine as another user, so it can neither read the key nor call from outside.
-   */
-  const human = (req: IncomingMessage): string => {
-    if (!options.adminToken)
-      throw new HttpError(403, 'Deciding on the dashboard is off: set TARA_ADMIN_TOKEN');
-    if (!options.decisionsFromLocal && localAddress(req.socket.remoteAddress))
-      throw new HttpError(403, 'Decisions are only taken from another device, not from this machine');
-    const given = cookie(req, ADMIN_COOKIE);
-    // The raw token is still taken from a browser unlocked before the cookie held the derived key; any
-    // page it opens swaps it (see `handle`).
-    if (
-      !given ||
-      !(sameSecret(given, adminCookieValue(options.adminToken)) || sameSecret(given, options.adminToken))
-    )
-      throw new HttpError(403, 'This browser is not unlocked for decisions: open /unlock');
-    return 'dashboard';
-  };
-
-  let build: object | undefined;
-  const route = async (req: IncomingMessage): Promise<unknown> => {
-    const url = new URL(req.url ?? '/', 'http://localhost');
-    const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
-    const method = req.method ?? 'GET';
-
-    if (method === 'GET' && url.pathname === '/health') {
-      // Which code is running: dist/build.json from `npm run build` (src hash and time).
-      build ??= (() => {
-        try {
-          return JSON.parse(readFileSync(new URL('../build.json', import.meta.url), 'utf8')) as object;
-        } catch {
-          return {};
-        }
-      })();
-      const jobs = options.projects.flatMap((p) => options.scheduler.list(p));
-      const counts = options.health?.snapshot()?.counts;
-      const drain = options.drain?.state();
-      const busyJobs = jobs.filter((j) => j.running).length;
-      return {
-        ok: true,
-        ...(Object.keys(build).length && { build }),
-        // Safe to restart: no CLI process, no job running or waiting, no queue batch (see POST /drain).
-        ...(drain && {
-          idle: drain.liveRuns === 0 && busyJobs === 0 && drain.queueBatches === 0,
-          draining: drain.draining,
-          liveRuns: drain.liveRuns,
-        }),
-        ...(counts && { checks: counts }),
-        uptimeSeconds: Math.floor((now() - started) / 1000),
-        projects: options.projects,
-        jobs: {
-          total: jobs.length,
-          enabled: jobs.filter((j) => j.enabled).length,
-          running: jobs.filter((j) => j.running && !j.waitingFor).length,
-          waiting: jobs.filter((j) => j.waitingFor).length,
-        },
-        // CLIs at their usage limit, and when scheduled runs on them start again.
-        limits: Object.fromEntries(
-          Object.entries(options.scheduler.holds?.active() ?? {}).map(([h, t]) => [
-            h,
-            new Date(t).toISOString(),
-          ]),
-        ),
-      };
-    }
-    // Before a restart: stop starting scheduled and queue runs, let running work finish, then restart
-    // once `/health` says `idle`. Needs x-tara-admin (the deploy reads it as root, like jarvis-doctor).
-    if (method === 'POST' && url.pathname === '/drain' && options.drain) {
-      const given = req.headers['x-tara-admin'];
-      if (!options.adminToken || typeof given !== 'string' || !sameSecret(given, options.adminToken))
-        throw new HttpError(403, 'Needs the x-tara-admin header with TARA_ADMIN_TOKEN');
-      const body = await readJson(req).catch(() => ({}) as Record<string, unknown>);
-      options.drain.set(body.on !== false);
-      return options.drain.state();
-    }
-    if (method === 'GET' && url.pathname === '/health/checks' && options.health) {
-      return options.health.snapshot() ?? (await options.health.check());
-    }
-    if (method === 'POST' && url.pathname === '/health/check' && options.health) {
-      const { counts, checkedAt } = await options.health.check();
-      return { counts, checkedAt };
-    }
-    if (method === 'GET' && url.pathname === '/attention' && options.attention) {
-      return options.attention();
-    }
-    if (url.pathname === '/vmhost/metrics') {
-      if (method === 'POST') {
-        try {
-          options.store.addVmHostSample(parseVmHostSample(await readJson(req, 4_000), now()));
-        } catch (err) {
-          if (err instanceof VmHostError) throw new HttpError(400, err.message);
-          throw err;
-        }
-        return { ok: true };
-      }
-      if (method === 'GET') {
-        const hours = Math.min(
-          24 * VMHOST_MAX_QUERY_DAYS,
-          Math.max(1, Number(url.searchParams.get('hours')) || 1),
-        );
-        return { samples: options.store.vmHostSamples(now() - hours * 3_600_000) };
-      }
-    }
-    // This machine's own samples (load, memory, disk, swap; every 5 minutes), e.g. for capacity reports.
-    if (method === 'GET' && url.pathname === '/host/metrics') {
-      const hours = Math.min(
-        24 * VMHOST_MAX_QUERY_DAYS,
-        Math.max(1, Number(url.searchParams.get('hours')) || 1),
-      );
-      return { samples: options.store.hostSamples(now() - hours * 3_600_000) };
-    }
-    if (method === 'GET' && url.pathname === '/jobs') {
-      const project = knownProject(url.searchParams.get('project'));
-      // `upcoming=<days>` adds each job's start times over the next days (for planning views).
-      const days = Math.min(31, Math.max(0, Number(url.searchParams.get('upcoming')) || 0));
-      const upcoming = days
-        ? new Map(
-            options.scheduler
-              .plannedRuns(project, now(), now() + days * 86_400_000, MAX_UPCOMING)
-              .map(({ id, starts }) => [
-                id,
-                starts.slice(0, MAX_UPCOMING).map((t) => new Date(t).toISOString()),
-              ]),
-          )
-        : undefined;
-      return {
-        jobs: options.scheduler.list(project).map((j) => ({
-          ...j,
-          nextRun: iso(j.nextRun),
-          lastRunAt: iso(j.lastRunAt),
-          ...(upcoming && { upcoming: upcoming.get(j.id) ?? [] }),
-        })),
-      };
-    }
-    if (parts[0] === 'reminders' && options.reminders) {
-      const reminders = options.reminders;
-      if (method === 'GET' && parts.length === 1)
-        return { reminders: reminders.list(knownProject(url.searchParams.get('project'))) };
-      if (method === 'POST' && parts.length === 2) {
-        const body = await readJson(req);
-        return reminders.add(knownProject(parts[1] ?? ''), {
-          text: str(body.text) ?? '',
-          cron: str(body.cron),
-          at: typeof body.at === 'number' ? body.at : str(body.at),
-          notify: body.notify === true,
-          task: body.task === true,
-          title: str(body.title),
-          by: str(body.by)?.slice(0, 60) ?? 'api',
-        });
-      }
-      if (method === 'POST' && parts.length === 4 && parts[3] === 'cancel') {
-        const project = knownProject(parts[1] ?? '');
-        if (!reminders.cancel(project, parts[2] ?? ''))
-          throw new HttpError(404, `No reminder "${parts[2]}" to come`);
-        return { ok: true };
-      }
-    }
-    if (method === 'POST' && url.pathname === '/reload') {
-      options.scheduler.reloadAll();
-      return { ok: true };
-    }
-    if (parts[0] === 'jobs' && parts.length === 4) {
-      const [, projectName = '', id = '', action] = parts;
-      const project = knownProject(projectName);
-      if (method === 'POST' && action === 'run') {
-        const body = await readJson(req);
-        const by = typeof body.by === 'string' && body.by.trim() ? body.by.trim().slice(0, 60) : 'api';
-        const result = options.scheduler.trigger(project, id, by);
-        if (result === 'unknown') throw new HttpError(404, `No job "${id}" in ${project}`);
-        return { result };
-      }
-      if (method === 'POST' && (action === 'pause' || action === 'resume')) {
-        const enabled = action === 'resume';
-        if (options.scheduler.setEnabled(project, id, enabled) === 'unknown')
-          throw new HttpError(404, `No job "${id}" in ${project}`);
-        return { ok: true, enabled };
-      }
-      if (method === 'POST' && action === 'duration') {
-        const minutes = Number((await readJson(req)).minutes);
-        if (!Number.isInteger(minutes) || minutes < 1 || minutes > 600)
-          throw new HttpError(400, '"minutes" must be a whole number from 1 to 600');
-        if (options.scheduler.setDuration(project, id, minutes) === 'unknown')
-          throw new HttpError(404, `No job "${id}" in ${project}`);
-        return { ok: true, minutes };
-      }
-      if (method === 'GET' && action === 'runs') {
-        const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 15));
-        return {
-          runs: options.store.jobRuns(project, id, limit).map(({ output, scriptOutput, ...run }) => ({
-            ...run,
-            hasOutput: Boolean(output || scriptOutput),
-          })),
-        };
-      }
-    }
-    if (method === 'GET' && parts[0] === 'runs' && parts.length === 1) {
-      const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit')) || 30));
-      return {
-        runs: options.store.recentJobRuns(limit).map(({ output, scriptOutput, ...run }) => ({
-          ...run,
-          hasOutput: Boolean(output || scriptOutput),
-        })),
-      };
-    }
-    if (parts[0] === 'sessions') {
-      if (method === 'GET' && parts.length === 1) {
-        const project = url.searchParams.get('project')
-          ? knownProject(url.searchParams.get('project'))
-          : undefined;
-        const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit')) || 30));
-        return { sessions: options.store.sessionsOverview({ project, limit }) };
-      }
-      const id = parts[1] as string;
-      if (method === 'GET' && parts.length === 3 && parts[2] === 'transcript') {
-        const entries = transcript(id);
-        if (!entries) throw new HttpError(404, 'No transcript for this session on this host');
-        return { sessionId: id, entries };
-      }
-      if (method === 'GET' && parts.length === 3 && parts[2] === 'live') {
-        const task = liveTask(id);
-        return { running: task?.status === 'running', task: task ?? null };
-      }
-      // The session page's Stop: ends the run as "stop" in its Slack thread would.
-      if (method === 'POST' && parts.length === 3 && parts[2] === 'stop') {
-        human(req);
-        const task = liveTask(id);
-        if (task?.status !== 'running' || !options.activity?.stop(task.id))
-          throw new HttpError(409, 'Nothing is running in this session');
-        return { ok: true };
-      }
-      if (method === 'POST' && parts.length === 3 && parts[2] === 'message') {
-        const given = req.headers['x-tara-admin'];
-        if (!options.adminToken || typeof given !== 'string' || !sameSecret(given, options.adminToken))
-          throw new HttpError(403, 'Needs the x-tara-admin header with TARA_ADMIN_TOKEN');
-        if (!options.continueThread) throw new HttpError(404, 'Chat is not running');
-        const body = await readJson(req);
-        const text = str(body.text)?.trim();
-        if (!text) throw new HttpError(400, '"text" is required');
-        const session = options.store.sessionsOverview({ sessionId: id, limit: 1 })[0];
-        const [channel, threadTs] = session?.threadKey.split(':') ?? [];
-        if (!session || !channel || !threadTs) throw new HttpError(404, 'No thread for this session');
-        const owner = options.dashboard?.projects.find((p) => p.config.name === session.project)?.config
-          .owner;
-        void options.continueThread({ channel, threadTs, ts: threadTs, user: owner ?? 'admin', text });
-        return { ok: true, threadKey: session.threadKey };
-      }
-      // The session page's reply box: as the project's owner, from an unlocked browser. A session Slack
-      // shows (a Slack thread, or a dashboard run with a Slack summary) gets the message there too, as the
-      // owner, and the answer there (`Approvals.sayFromDashboard`); a dashboard-only one answers here.
-      if (method === 'POST' && parts.length === 3 && parts[2] === 'say') {
-        human(req);
-        if (!options.continueThread) throw new HttpError(404, 'Chat is not running');
-        const body = await readJson(req);
-        const text = str(body.text)?.trim().slice(0, 20_000);
-        if (!text) throw new HttpError(400, '"text" is required');
-        const session = options.store.sessionsOverview({ sessionId: id, limit: 1 })[0];
-        const at = session?.threadKey.indexOf(':') ?? -1;
-        if (!session || at < 1) throw new HttpError(404, 'No thread for this session');
-        const channel = session.threadKey.slice(0, at);
-        const threadTs = session.threadKey.slice(at + 1);
-        const owner = options.dashboard?.projects.find((p) => p.config.name === session.project)?.config
-          .owner;
-        const user = owner ?? 'dashboard';
-        const ts =
-          isWebChannel(channel) && options.web
-            ? await options.web.post(channel, threadTs, text, user)
-            : threadTs;
-        // Slack shows this session too (its own thread, or a dashboard run's summary thread): your
-        // message goes there, as you, and Jarvis answers it there, so Slack never has only the answer.
-        const slackChannel = options.dashboard?.projects.find((p) => p.config.name === session.project)
-          ?.config.slackChannel;
-        const summaryTs =
-          isWebChannel(channel) && slackChannel
-            ? slackSummaryOf(options.store, slackChannel, channel, threadTs)
-            : undefined;
-        const inSlack = !isWebChannel(channel)
-          ? { channel, threadTs }
-          : slackChannel && summaryTs
-            ? { channel: slackChannel, threadTs: summaryTs }
-            : undefined;
-        const said =
-          inSlack && approvals
-            ? approvals.sayFromDashboard(inSlack, text, user)
-            : options.continueThread({ channel, threadTs, ts, user, text });
-        void said.catch((err: Error) => options.log.warn(`reply in ${session.threadKey}: ${err.message}`));
-        return { ok: true, threadKey: session.threadKey };
-      }
-    }
-    if (method === 'GET' && parts[0] === 'runs' && parts.length === 2) {
-      const run = options.store.getRun(Number(parts[1]));
-      if (!run) throw new HttpError(404, 'No such run');
-      return { run };
-    }
-    if (method === 'GET' && parts[0] === 'queues' && parts.length === 1) {
-      // A project's queues for its own pages (a content calendar): the next slot times and the kind
-      // that went last (slot queues take turns between kinds).
-      const name = knownProject(url.searchParams.get('project'));
-      const project = options.dashboard?.projects.find((x) => x.config.name === name);
-      if (!project) throw new HttpError(404, 'No such project');
-      const upcoming = Math.min(30, Number(url.searchParams.get('upcoming')) || 10);
-      const configs = (options.queueConfig ?? loadQueues)(project);
-      return {
-        queues: Object.entries(configs).map(([queue, q]) => ({
-          name: queue,
-          executor: 'job' in q.executor ? 'job' : 'url' in q.executor ? 'url' : 'external',
-          slots: q.slots,
-          alternate: q.alternate,
-          fills: q.fills,
-          windows: q.windows,
-          nextSlots: q.slots
-            ? new Cron(q.slots, { timezone: q.tz ?? timeZone, paused: true })
-                .nextRuns(upcoming)
-                .map((d) => d.getTime())
-            : [],
-          lastKind: options.store.lastQueueStart(name, queue)?.kind ?? null,
-        })),
-      };
-    }
-    if (parts[0] === 'items' && approvals) {
-      if (method === 'GET' && parts.length === 1) {
-        const project = url.searchParams.get('project')
-          ? knownProject(url.searchParams.get('project'))
-          : undefined;
-        const statuses = (url.searchParams.get('status') ?? '')
-          .split(',')
-          .filter((x): x is ItemStatus => (ITEM_STATUSES as readonly string[]).includes(x));
-        const since = Number(url.searchParams.get('since')) || undefined;
-        return {
-          items: options.store.items({
-            project,
-            kind: url.searchParams.get('kind') ?? undefined,
-            statuses: statuses.length ? statuses : undefined,
-            since,
-            limit: Math.min(500, Number(url.searchParams.get('limit')) || 200),
-          }),
-        };
-      }
-      if (method === 'POST' && parts.length === 1) {
-        // A project server proposing a draft (e.g. the next follow-up). Proposing is harmless: it still
-        // needs a person to approve it, unless the host's `autoApprove` lets the project's own server
-        // say no person is needed (approvals.ts askAutoApprove).
-        const body = await readJson(req, ITEM_BODY_LIMIT);
-        const project = approvals.project(knownProject(str(body.project) ?? null));
-        const input = { ...itemInput(body), autoApprove: body.autoApprove === true };
-        // `thread`: the TARA_THREAD of the run the server works for; the card goes in that run's thread.
-        const thread = approvals.runThread(project, str(body.thread));
-        return {
-          item: await approvals.propose(project, input, {
-            source: str(body.source),
-            channel: thread?.channel,
-            threadTs: thread?.threadTs,
-          }),
-        };
-      }
-      if (method === 'POST' && parts.length === 2 && parts[1] === 'ask') {
-        // A project server asking a person outside any run (a login expired, a send bounced). It only
-        // asks: whatever the person picks goes to the agent in the card's thread.
-        const body = await readJson(req);
-        const project = approvals.project(knownProject(str(body.project) ?? null));
-        const title = str(body.title);
-        if (!title) throw new HttpError(400, '"title" is required');
-        return {
-          item: await approvals.ask(
-            project,
-            {
-              title,
-              details: str(body.details) ?? '',
-              options: arr(body.options).filter((o): o is string => typeof o === 'string'),
-              kind: str(body.kind)?.slice(0, 40),
-              key: str(body.key)?.slice(0, 120),
-            },
-            approvals.runThread(project, str(body.thread)),
-          ),
-        };
-      }
-      if (method === 'GET' && parts.length === 2) {
-        const item = options.store.getItem(parts[1] as string);
-        if (!item) throw new HttpError(404, 'No such item');
-        return { item };
-      }
-      if (method === 'POST' && parts.length === 2 && parts[1] === 'bulk') {
-        const by = human(req);
-        const body = await readJson(req);
-        const ids = Array.isArray(body.ids)
-          ? body.ids.filter((i): i is string => typeof i === 'string').slice(0, 200)
-          : [];
-        const option = str(body.option);
-        if (!option) throw new HttpError(400, '"option" is required');
-        const seen = body.seen && typeof body.seen === 'object' ? (body.seen as Record<string, unknown>) : {};
-        const decided: string[] = [];
-        const failed: Array<{ id: string; error: string }> = [];
-        for (const id of ids) {
-          try {
-            await approvals.decide(id, {
-              option,
-              by: owner(id) ?? by,
-              via: 'dashboard',
-              seen: typeof seen[id] === 'number' ? seen[id] : undefined,
-            });
-            decided.push(id);
-          } catch (err) {
-            failed.push({ id, error: (err as Error).message });
-          }
-        }
-        return { decided, failed };
-      }
-      if (method === 'POST' && parts.length === 3 && parts[2] === 'decide') {
-        const by = human(req);
-        const id = parts[1] as string;
-        const body = await readJson(req, ITEM_BODY_LIMIT);
-        const fields =
-          body.fields && typeof body.fields === 'object'
-            ? (body.fields as Record<string, string | string[]>)
-            : undefined;
-        return {
-          item: await approvals.decide(id, {
-            option: str(body.option) ?? '',
-            by: owner(id) ?? by,
-            via: 'dashboard',
-            fields,
-            reply: str(body.reply),
-            runNow: body.runNow === true,
-            seen: typeof body.seen === 'number' ? body.seen : undefined,
-            session: body.session === 'new' || body.session === 'continue' ? body.session : undefined,
-          }),
-        };
-      }
-      // A note about a waiting card without deciding it: to Jarvis in the card's thread, whose session
-      // page (`session`) shows the answer live.
-      if (method === 'POST' && parts.length === 3 && parts[2] === 'note') {
-        const by = human(req);
-        const id = parts[1] as string;
-        const text = str((await readJson(req)).text)
-          ?.trim()
-          .slice(0, 4_000);
-        if (!text) throw new HttpError(400, '"text" is required');
-        const item = await approvals.note(id, text, owner(id) ?? by);
-        return { ok: true, version: item.updatedAt, session: sessionLink(item) };
-      }
-      if (method === 'POST' && parts.length === 3 && parts[2] === 'withdraw') {
-        const body = await readJson(req);
-        return { item: approvals.withdraw(parts[1] as string, str(body.reason)) };
-      }
-      if (method === 'POST' && parts.length === 3 && parts[2] === 'report') {
-        // A project server reporting an item it runs itself (an `external` queue). Not a decision: the
-        // item was approved by a person already, and the project acts on its own records.
-        const body = await readJson(req);
-        const status = body.status;
-        if (status !== 'done' && status !== 'failed' && status !== 'waiting')
-          throw new HttpError(400, '"status" must be done, failed or waiting');
-        return { item: approvals.report(parts[1] as string, status, str(body.result)) };
-      }
-      if (method === 'POST' && parts.length === 3 && parts[2] === 'cancel') {
-        const by = human(req);
-        return { item: approvals.cancel(parts[1] as string, owner(parts[1] as string) ?? by) };
-      }
-      if (method === 'POST' && parts.length === 3 && parts[2] === 'move') {
-        human(req);
-        const to = (await readJson(req)).to;
-        if (
-          !(typeof to === 'number' && Number.isInteger(to) && to >= 0) &&
-          to !== 'up' &&
-          to !== 'down' &&
-          to !== 'top' &&
-          to !== 'bottom'
-        )
-          throw new HttpError(400, '"to" must be up, down, top, bottom or a place (0 is first)');
-        return { item: approvals.move(parts[1] as string, to) };
-      }
-    }
-    if (method === 'GET' && parts[0] === 'schedule' && parts.length === 1) {
-      const project = url.searchParams.get('project')
-        ? knownProject(url.searchParams.get('project'))
-        : undefined;
-      const day = url.searchParams.get('day');
-      return dayPlan(isDayKey(day) ? day : dayKey(now(), timeZone), project);
-    }
-    if (method === 'GET' && parts[0] === 'schedule' && parts[1] === 'conflicts' && parts.length === 2) {
-      const days = Math.min(31, Math.max(1, Number(url.searchParams.get('days')) || 7));
-      const today = dayKey(now(), timeZone);
-      return {
-        days: Array.from({ length: days }, (_, i) => {
-          const day = addDays(today, i);
-          const plan = dayPlan(day);
-          const slot = ({ project, id, name, start, minutes }: (typeof plan.slots)[number]) => ({
-            project,
-            id,
-            name,
-            start: new Date(start).toISOString(),
-            minutes,
-          });
-          return {
-            day,
-            runs: plan.slots.length,
-            overlaps: plan.overlaps.map(({ a, b }) => ({ a: slot(a), b: slot(b) })),
-            tight: plan.tight.map(({ a, b, gapMinutes }) => ({ a: slot(a), b: slot(b), gapMinutes })),
-            free: plan.free.map((f) => ({
-              start: new Date(f.start).toISOString(),
-              end: new Date(f.end).toISOString(),
-            })),
-          };
-        }),
-      };
-    }
-    if (parts[0] === 'code' && options.code) {
-      const query = url.searchParams.get('q');
-      if (method === 'GET' && parts.length === 1 && query !== null)
-        return { results: await searchAll(query) };
-      if (method === 'GET' && parts.length === 1)
-        return {
-          repos: await Promise.all(
-            options.code.readers.map(async (r) => ({
-              name: r.repo.name,
-              title: r.repo.title,
-              ...(await r.status()),
-            })),
-          ),
-        };
-      const reader = codeReader(parts[1]);
-      const file = url.searchParams.get('path') ?? '';
-      if (method === 'GET' && parts.length === 2 && query !== null) return reader.search(query);
-      if (method === 'GET' && parts.length === 2) return reader.status();
-      if (method === 'GET' && parts[2] === 'diff' && parts.length === 3) return reader.diff(file);
-      if (method === 'GET' && parts[2] === 'file' && parts.length === 3) return reader.read(file);
-      if (method === 'GET' && parts[2] === 'files' && parts.length === 3) return reader.tree(file);
-      if (method === 'POST' && parts[2] === 'ask' && parts.length === 3) {
-        human(req);
-        const ask = options.code.ask;
-        if (!ask || !reader.repo.askIn) throw new HttpError(404, 'Asking is off for this repo');
-        const body = await readJson(req);
-        const question = str(body.question)?.slice(0, 4_000);
-        if (!question) throw new HttpError(400, '"question" is required');
-        const target = str(body.path) ?? '';
-        const change = (await reader.status()).changes.find((c) => c.path === target);
-        // The diff goes to Claude only: the thread shows the question.
-        const diff = change ? (await reader.diff(target)).text.split('\n').slice(0, 400).join('\n') : '';
-        const where = target ? `\`${target}\` in ${reader.repo.title}` : reader.repo.title;
-        // About the whole repo: the list of what changed (Claude reads the diffs itself, read-only).
-        if (!target) {
-          const all = (await reader.status()).changes;
-          const lines = all
-            .slice(0, 300)
-            .map((c) => `${c.state.padEnd(9)} ${c.path} (+${c.added} −${c.removed})`)
-            .join('\n');
-          return ask(
-            reader.repo,
-            `📄 ${reader.repo.title}: ${question}`,
-            `${question}\n\nAbout the uncommitted changes in the repo ${reader.repo.dir} (${all.length} files${
-              all.length > 300 ? ', the first 300 listed' : ''
-            }; run \`git diff\` there to read them). Only read and answer: don't commit, stage or change files.\n\`\`\`\n${lines}\n\`\`\``,
-          );
-        }
-        return ask(
-          reader.repo,
-          `📄 ${where}: ${question}`,
-          `${question}\n\nAbout ${target ? `the file \`${path.join(reader.repo.dir, target)}\`` : `the repo ${reader.repo.dir}`}${
-            change
-              ? `, which has an uncommitted change (${change.state}). The diff against the last commit:\n\`\`\`diff\n${diff}\n\`\`\``
-              : '.'
-          }`,
-        );
-      }
-    }
-    throw new HttpError(404, 'Not found');
-  };
-
-  /** One search over every repo; a repo that fails says why instead of failing the rest. */
-  const searchAll = async (query: string) => {
-    if (query.trim().length < MIN_QUERY)
-      throw new CodeError(400, `Search for at least ${MIN_QUERY} characters`);
-    return Promise.all(
-      (options.code?.readers ?? []).map((r) =>
-        r.search(query).then(
-          (result) => ({ repo: r.repo, result }),
-          (err: Error) => ({ repo: r.repo, error: err.message.split('\n')[0] }),
-        ),
-      ),
-    );
-  };
-
-  const codeReader = (name: string | undefined) => {
-    const reader = options.code?.readers.find((r) => r.repo.name === name);
-    if (!reader) throw new HttpError(404, `Unknown repo "${name ?? ''}"`);
-    return reader;
-  };
-
-  const internal = async (req: IncomingMessage): Promise<unknown> => {
-    const bridge = options.bridge;
-    if (!bridge) throw new HttpError(404, 'MCP bridge is not enabled');
-    const url = new URL(req.url ?? '/', 'http://localhost');
-    const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
-    const token = req.headers['x-tara-run'] as string | undefined;
-    const required = (v: unknown, name: string) => {
-      if (typeof v !== 'string' || !v.trim()) throw new HttpError(400, `"${name}" is required`);
-      return v;
-    };
-    if (req.method === 'POST' && parts[1] === 'approval' && parts.length === 2) {
-      // Long details are split into several Slack messages, so they may be long here too.
-      const body = await readJson(req, ITEM_BODY_LIMIT);
-      const options = Array.isArray(body.options)
-        ? body.options.filter((o) => typeof o === 'string')
-        : undefined;
-      return bridge.requestApproval(token, {
-        title: required(body.title, 'title'),
-        details: required(body.details, 'details'),
-        options,
-        kind: str(body.kind)?.slice(0, 40),
-        handoff: str(body.handoff)?.slice(0, 20_000),
-      });
-    }
-    if (req.method === 'POST' && parts[1] === 'privileged' && parts.length === 2) {
-      const body = await readJson(req);
-      const args =
-        body.args && typeof body.args === 'object' && !Array.isArray(body.args)
-          ? Object.fromEntries(Object.entries(body.args).map(([k, v]) => [k, String(v)]))
-          : undefined;
-      return bridge.requestPrivileged(token, {
-        action: str(body.action),
-        args,
-        command: str(body.command),
-        reason: required(body.reason, 'reason'),
-        title: str(body.title)?.slice(0, 150),
-      });
-    }
-    if (req.method === 'POST' && parts[1] === 'file' && parts.length === 2) {
-      const body = await readJson(req);
-      const comment = typeof body.comment === 'string' ? body.comment : undefined;
-      return bridge.sendFile(token, { path: required(body.path, 'path'), comment });
-    }
-    if (req.method === 'POST' && parts[1] === 'permission' && parts.length === 2) {
-      // The input of a Write or Edit holds the whole file: a small cap would silently deny every large write.
-      const body = await readJson(req, PERMISSION_BODY_LIMIT);
-      const input =
-        typeof body.input === 'object' && body.input !== null ? (body.input as Record<string, unknown>) : {};
-      return bridge.askPermission(token, { tool_name: required(body.tool_name, 'tool_name'), input });
-    }
-    if (req.method === 'GET' && parts[1] === 'jobs' && parts.length === 2) {
-      return { jobs: bridge.listJobs(token) };
-    }
-    if (req.method === 'POST' && parts[1] === 'run-job' && parts.length === 2) {
-      const body = await readJson(req);
-      return bridge.runJob(token, required(body.id, 'id'));
-    }
-    if (req.method === 'POST' && parts[1] === 'item' && parts.length === 2) {
-      const body = await readJson(req, ITEM_BODY_LIMIT);
-      // A run may ask too; the host `autoApprove` rule and the project's server still decide.
-      return bridge.proposeItem(token, { ...itemInput(body), autoApprove: body.autoApprove === true });
-    }
-    if (req.method === 'GET' && parts[1] === 'items' && parts.length === 2) {
-      return {
-        items: bridge.listItems(token, {
-          status: url.searchParams.get('status') ?? undefined,
-          kind: url.searchParams.get('kind') ?? undefined,
-        }),
-      };
-    }
-    if (req.method === 'POST' && parts[1] === 'item-done' && parts.length === 2) {
-      const body = await readJson(req);
-      const status =
-        body.status === 'done' || body.status === 'failed' || body.status === 'later'
-          ? body.status
-          : undefined;
-      if (!status) throw new HttpError(400, '"status" must be done, failed or later');
-      const retryAt =
-        typeof body.retryAt === 'number'
-          ? body.retryAt
-          : typeof body.retryAt === 'string'
-            ? Date.parse(body.retryAt)
-            : undefined;
-      return bridge.finishItem(token, {
-        id: required(body.id, 'id'),
-        status,
-        result: typeof body.result === 'string' ? body.result : undefined,
-        ...(retryAt !== undefined && Number.isFinite(retryAt) && { retryAt }),
-      });
-    }
-    if (req.method === 'POST' && parts[1] === 'pr-start' && parts.length === 2) {
-      const body = await readJson(req);
-      return bridge.startPullRequest(token, { branch: required(body.branch, 'branch') });
-    }
-    if (req.method === 'POST' && parts[1] === 'ci-job' && parts.length === 2) {
-      const body = await readJson(req);
-      return bridge.readCiJob(token, { job: required(body.job, 'job') });
-    }
-    if (req.method === 'POST' && parts[1] === 'pr-open' && parts.length === 2) {
-      const body = await readJson(req, 70_000);
-      return bridge.openPullRequest(token, {
-        branch: required(body.branch, 'branch'),
-        title: required(body.title, 'title'),
-        body: typeof body.body === 'string' ? body.body.slice(0, 60_000) : undefined,
-      });
-    }
-    if (req.method === 'POST' && parts[1] === 'withdraw' && parts.length === 2) {
-      const body = await readJson(req);
-      return bridge.withdrawCard(token, { id: required(body.id, 'id'), reason: str(body.reason) });
-    }
-    if (req.method === 'POST' && parts[1] === 'reminder' && parts.length === 2) {
-      const body = await readJson(req);
-      return bridge.setReminder(token, {
-        text: str(body.text) ?? '',
-        cron: str(body.cron),
-        at: typeof body.at === 'number' ? body.at : str(body.at),
-        notify: body.notify === true,
-        task: body.task === true,
-        title: str(body.title),
-      });
-    }
-    if (req.method === 'GET' && parts[1] === 'reminders' && parts.length === 2) {
-      return { reminders: bridge.listReminders(token) };
-    }
-    if (req.method === 'POST' && parts[1] === 'reminder-cancel' && parts.length === 2) {
-      const body = await readJson(req);
-      return bridge.cancelReminder(token, required(body.id, 'id'));
-    }
-    if (req.method === 'GET' && parts[1] === 'permission' && parts.length === 3) {
-      const waitMs = Math.min(55, Math.max(0, Number(url.searchParams.get('wait')) || 0)) * 1000;
-      return { decision: (await bridge.waitPermission(token, parts[2] as string, waitMs)) ?? null };
-    }
-    throw new HttpError(404, 'Not found');
-  };
+  const api: Route<unknown>[] = [
+    ...systemRoutes(c),
+    ...jobRoutes(c),
+    ...sessionRoutes(c),
+    ...(options.approvals ? itemRoutes(c, options.approvals) : []),
+    ...(options.reminders ? reminderRoutes(c, options.reminders) : []),
+    ...(options.code ? codeRoutes(c, options.code) : []),
+  ];
+  const internal = options.bridge ? internalRoutes(options.bridge) : undefined;
+  const pages = pageRoutes(c);
 
   const allowed = options.allowFrom ? allowList(options.allowFrom) : () => true;
-
-  /** The context every page needs, with the sidebar badge counts. */
-  const pageContext = (): DashboardContext | undefined => {
-    const dash = options.dashboard;
-    if (!dash) return undefined;
-    return {
-      projects: dash.projects,
-      timeZone: dash.timeZone,
-      agentName: dash.agentName,
-      slackUrl: dash.slackUrl?.(),
-      hostName: dash.hostName,
-      // Notices only tell: they aren't waiting for a decision.
-      waiting: options.approvals
-        ? options.store.items({ statuses: ['pending'], limit: ITEMS_LIMIT }).filter((i) => !isNotice(i))
-            .length
-        : undefined,
-      failing: options.projects
-        .flatMap((p) => options.scheduler.list(p))
-        .filter((j) => jobState(j) === 'failing').length,
-      code: Boolean(options.code),
-      browsers: Boolean(options.browsers),
-      reminders: Boolean(options.reminders),
-      unhealthy: options.health ? redChecks().length : undefined,
-    };
-  };
-
-  /** Confirmed red Health checks. */
-  const redChecks = () =>
-    (options.health?.snapshot()?.checks ?? []).filter((c) => c.status === 'bad' && !c.unconfirmed);
-
-  /** Browser pages; undefined when this request should get JSON instead. */
-  const canDecide = (req: IncomingMessage) => {
-    try {
-      human(req);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  /** Repos whose uncommitted changes have waited a while (the Code page's readers, cached), for Home. */
-  const staleRepos = async (at: number): Promise<StaleRepo[]> => {
-    const readers = options.code?.readers ?? [];
-    const statuses = await Promise.all(readers.map((r) => r.status().catch(() => undefined)));
-    return readers.flatMap((r, i) => {
-      const s = statuses[i];
-      return s && staleWork(s, at) && s.head
-        ? [{ name: r.repo.name, title: r.repo.title, files: s.changes.length, lastCommit: s.head.at }]
-        : [];
-    });
-  };
-
-  /** A session's page: its transcript, live steps while it runs, its files and a reply box. */
-  const sessionView = (req: IncomingMessage, ctx: DashboardContext, id: string): string => {
-    const jobNames = () =>
-      new Map(
-        ctx.projects.flatMap((p) =>
-          options.scheduler.list(p.config.name).map((j) => [`${p.config.name}:${j.id}`, j.name] as const),
-        ),
-      );
-    const session = options.store.sessionsOverview({ sessionId: id, limit: 1 })[0];
-    // Its latest run, even when the session's thread was cleared (a silent job run).
-    const run = options.store.latestSessionRun(id) ?? session?.lastRun;
-    const project = session?.project ?? run?.project;
-    const dir = ctx.projects.find((p) => p.config.name === project)?.dir;
-    // Sessions whose thread was cleared are still on disk: look in every project.
-    const entries = transcript(id, dir);
-    // A job's first run is recorded when it ends: until then the live task names the job.
-    const task = liveTask(id);
-    const jobId = run?.jobId ?? task?.jobId;
-    const jobName = jobId ? jobNames().get(`${run?.project ?? task?.project}:${jobId}`) : undefined;
-    const running = task?.status === 'running';
-    const key = session?.threadKey;
-    const at = key?.indexOf(':') ?? -1;
-    const channel = key && at > 0 ? key.slice(0, at) : undefined;
-    const onDashboard = isWebChannel(channel);
-    const files =
-      key && onDashboard && options.web
-        ? options.web
-            .files(channel, key.slice(at + 1))
-            .map((f) => ({ id: f.id, name: f.name, comment: f.comment }))
-        : undefined;
-    const aliases = key && onDashboard ? options.store.aliasesOf(key) : [];
-    return sessionPage(ctx, session, id, entries, {
-      jobName,
-      run,
-      running,
-      canStop: running && canDecide(req),
-      canSay: session && options.continueThread ? canDecide(req) : undefined,
-      files,
-      // The newest summary that isn't a card's copy (the run's result).
-      slackSummary: aliases.filter((a) => !options.store.isMirror(a)).at(-1),
-    });
-  };
-
-  const page = (
-    req: IncomingMessage,
-    ctx: DashboardContext,
-    extra: { staleRepos?: StaleRepo[] } = {},
-  ): string | undefined => {
-    const url = new URL(req.url ?? '/', 'http://localhost');
-    const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
-    const names = ctx.projects.map((p) => p.config.name);
-    const jobNames = () =>
-      new Map(names.flatMap((n) => options.scheduler.list(n).map((j) => [`${n}:${j.id}`, j.name] as const)));
-    const projectParam = () => {
-      const p = url.searchParams.get('project') ?? undefined;
-      return p && names.includes(p) ? p : undefined;
-    };
-    // `/?project=…` and `/?kind=…` were the sessions list before it moved to /sessions.
-    const oldSessionsLink =
-      parts.length === 0 && (url.searchParams.has('project') || url.searchParams.has('kind'));
-    if (parts[0] === 'reminders' && parts.length === 1 && options.reminders) {
-      const reminders = options.reminders;
-      return remindersPage(ctx, { reminders: (p) => reminders.list(p), now: now() });
-    }
-    if ((parts[0] === 'sessions' && parts.length === 1) || oldSessionsLink) {
-      const project = url.searchParams.get('project') || undefined;
-      const kindParam = url.searchParams.get('kind');
-      const kind = kindParam === 'job' || kindParam === 'chat' ? kindParam : undefined;
-      const total = options.store.sessionsCount({ project, kind });
-      const pages = Math.max(1, Math.ceil(total / SESSIONS_PAGE));
-      const pageNo = Math.min(pages, Math.max(1, Math.floor(Number(url.searchParams.get('page')) || 1)));
-      // Threads with a run working in them, and the job when it is one (its run isn't recorded yet).
-      const runningThreads = new Map(
-        (options.activity?.tasks() ?? [])
-          .filter((t) => t.status === 'running' && t.thread)
-          .map((t) => [threadKey(t.thread?.channel ?? '', t.thread?.ts ?? ''), t.jobId] as const),
-      );
-      return sessionsPage(
-        ctx,
-        options.store.sessionsOverview({
-          project,
-          kind,
-          limit: SESSIONS_PAGE,
-          offset: (pageNo - 1) * SESSIONS_PAGE,
-        }),
-        jobNames(),
-        { project, kind },
-        { preview, runningThreads, now: now(), page: { at: pageNo, of: pages, total } },
-      );
-    }
-    const jobViews = (): JobView[] =>
-      names.flatMap((project) => {
-        const runBy = queueExecutors(project);
-        return options.scheduler.list(project).map((job) => ({
-          ...job,
-          project,
-          recent: options.store.jobRuns(project, job.id, RECENT_RUNS),
-          queues: runBy.get(job.id),
-        }));
-      });
-    if (parts[0] === 'health' && parts[1] === 'trends' && parts.length === 2 && options.observe) {
-      const days = [7, 14, 30].includes(Number(url.searchParams.get('days')))
-        ? Number(url.searchParams.get('days'))
-        : 14;
-      return trendsPage(ctx, options.observe.trends(days));
-    }
-    if (parts[0] === 'health' && parts.length === 1 && options.health) {
-      const health = options.health;
-      return healthPage(ctx, {
-        snapshot: health.snapshot(),
-        history: health.history(7),
-        label: (key) => health.label(key),
-        uptimeSeconds: Math.floor((now() - started) / 1000),
-        now: now(),
-      });
-    }
-    if (parts.length === 0) {
-      const at = now();
-      const runs = options.store.recentJobRuns(400);
-      // Jobs every half hour or more often: one line under "Coming up" instead of filling it.
-      const every = new Map<string, number>();
-      for (const p of names)
-        for (const { id, starts } of options.scheduler.plannedRuns(p, at, at + DAY_MS, 2)) {
-          const gap = (starts[1] ?? Infinity) - (starts[0] ?? 0);
-          if (gap <= FREQUENT_MS) every.set(`${p}:${id}`, gap);
-        }
-      const views = jobViews();
-      const live = options.activity
-        ?.tasks()
-        .filter((t) => t.status === 'running')
-        .map((t) => ({
-          kind: t.kind,
-          project: t.project,
-          title: t.title,
-          jobId: t.jobId,
-          // Its session; a job step (a session of its own, no thread) links to its job.
-          href: t.thread
-            ? `/t/${encodeURIComponent(t.thread.channel)}/${encodeURIComponent(t.thread.ts)}`
-            : t.jobId
-              ? `/jobs#${anchor({ project: t.project, id: t.jobId })}`
-              : undefined,
-        }));
-      return homePage(ctx, {
-        live,
-        quote: pickQuote(loadQuotes(ctx.projects.map((p) => p.dir))),
-        models: modelUses(ctx.projects, views, options.dashboard?.models),
-        effort: options.dashboard?.models?.effort,
-        jobs: views.map((j) => ({
-          ...j,
-          everyMs: every.get(`${j.project}:${j.id}`),
-          liveSessionId: j.startedAt ? liveJobSession(j.project, j.id, j.startedAt) : undefined,
-        })),
-        // Each job's latest run that did something, so a job that ran three times doesn't fill the list.
-        latest: runs
-          .filter((r) => r.status !== 'silent')
-          .filter((r, i, all) => all.findIndex((x) => x.project === r.project && x.jobId === r.jobId) === i)
-          .slice(0, 8),
-        quietRuns: runs.filter((r) => r.status === 'silent' && r.startedAt >= at - DAY_MS).length,
-        pending: options.approvals ? options.store.items({ statuses: ['pending'], limit: ITEMS_LIMIT }) : [],
-        usage: usageNow(at),
-        health: options.health
-          ? (() => {
-              const snap = options.health.snapshot();
-              const sources = new Map((snap?.sources ?? []).map((x) => [x.id, x.title]));
-              const where = (key: string) =>
-                [...sources.entries()].find(([id]) => key.startsWith(`${id}:`))?.[1] ?? '';
-              return {
-                problems: redChecks()
-                  .filter((c) => !c.key.startsWith('jobs:'))
-                  .map((c) => ({ name: c.name, where: where(c.key) })),
-                watch: (snap?.checks ?? []).filter((c) => c.status === 'warn').length,
-              };
-            })()
-          : undefined,
-        staleRepos: extra.staleRepos,
-        uptimeSeconds: Math.floor((at - started) / 1000),
-        now: at,
-      });
-    }
-    if ((parts[0] === 'approvals' || parts[0] === 'queue') && parts.length === 1 && options.approvals) {
-      const at = now();
-      const project = projectParam();
-      const configs = new Map<string, Record<string, QueueConfig>>();
-      const queues = (name: string) => {
-        if (!configs.has(name)) {
-          const p = ctx.projects.find((x) => x.config.name === name);
-          let q: Record<string, QueueConfig> = {};
-          try {
-            q = p ? (options.queueConfig ?? loadQueues)(p) : {};
-          } catch {}
-          configs.set(name, q);
-        }
-        return configs.get(name) ?? {};
-      };
-      if (parts[0] === 'queue')
-        return queuePage(ctx, {
-          project,
-          approved: options.store.items({ project, statuses: ['approved'], limit: 1000 }),
-          running: options.store.items({ project, statuses: ['running'], limit: 100 }),
-          pending: options.store.items({ project, statuses: ['pending'], limit: 500 }),
-          // What went out lately, for each queue's "last out".
-          finished: options.store.items({
-            project,
-            statuses: ['done', 'failed'],
-            since: at - 14 * DAY_MS,
-            limit: ITEMS_LIMIT,
-          }),
-          queues,
-          canDecide: canDecide(req),
-          now: at,
-        });
-      const tab: ApprovalsTab = url.searchParams.get('tab') === 'done' ? 'done' : 'waiting';
-      const STATUSES: Record<ApprovalsTab, ItemStatus[]> = {
-        waiting: ['pending'],
-        done: ['done', 'failed', 'rejected', 'expired', 'cancelled'],
-      };
-      const since = (t: ApprovalsTab) => (t === 'done' ? at - DONE_DAYS * 86_400_000 : undefined);
-      const list = (t: ApprovalsTab) =>
-        options.store.items({ project, statuses: STATUSES[t], since: since(t), limit: ITEMS_LIMIT });
-      const items = list(tab);
-      return approvalsPage(ctx, {
-        tab,
-        project,
-        kind: url.searchParams.get('kind') ?? undefined,
-        items,
-        // Live advice; a card whose message says otherwise by now is edited to match (Slack too).
-        advice:
-          tab === 'waiting' && approvals
-            ? new Map(items.map((i) => [i.id, approvals.syncAdvice(i).choice]))
-            : undefined,
-        counts: { waiting: list('waiting').filter((i) => !isNotice(i)).length, done: list('done').length },
-        jobNames: jobNames(),
-        queues,
-        canDecide: canDecide(req),
-        now: at,
-      });
-    }
-    if (parts[0] === 'unlock' && parts.length === 1) return unlockPage(ctx);
-    if (parts[0] === 'schedule' && parts.length === 1) {
-      const at = now();
-      const today = dayKey(at, timeZone);
-      const day = url.searchParams.get('day');
-      const project = projectParam();
-      const chosen = isDayKey(day) ? day : today;
-      // Running jobs, each with the session to watch it in; busy ones not started yet wait.
-      const running = new Map<string, string | undefined>();
-      const waiting = new Set<string>();
-      for (const p of names)
-        for (const j of options.scheduler.list(p))
-          if (j.waitingFor) waiting.add(`${p}:${j.id}`);
-          else if (j.running) running.set(`${p}:${j.id}`, liveJobSession(p, j.id, j.startedAt));
-      return schedulePage(ctx, dayPlan(chosen, project), {
-        day: chosen,
-        today,
-        project,
-        now: at,
-        running,
-        waiting,
-        projectsWithJobs: names.filter((p) => options.scheduler.list(p).length > 0),
-      });
-    }
-    // A dashboard thread's link (Slack summaries link here): its session's page.
-    if (parts[0] === 't' && parts.length === 3) {
-      const id = options.store.getSession(`${parts[1]}:${parts[2]}`)?.sessionId;
-      if (!id) return errorPage(ctx, 404, 'This run has no session yet, or it was cleared.');
-      return sessionView(req, ctx, id);
-    }
-    if (parts[0] === 'sessions' && parts.length === 2) return sessionView(req, ctx, parts[1] as string);
-    if (parts[0] === 'jobs' && parts.length === 1) {
-      const at = now();
-      const weeks = jobWeeks(options.store.runsSince(at - 7 * DAY_MS));
-      return jobsPage(
-        ctx,
-        jobViews().map((j) => ({ ...j, week: weeks.get(`${j.project}:${j.id}`) })),
-        at,
-        url.searchParams.get('view') === 'on-demand' ? 'ondemand' : 'list',
-      );
-    }
-    if (parts[0] === 'runs' && parts.length === 2) {
-      const run = options.store.getRun(Number(parts[1]));
-      if (!run) return errorPage(ctx, 404);
-      const job = run.jobId ? options.scheduler.list(run.project).find((j) => j.id === run.jobId) : undefined;
-      return runPage(ctx, run, job);
-    }
-    return undefined;
-  };
-
-  /** The Browsers page (reads transcripts and asks each Chrome, so it is async); undefined for other paths. */
-  const sites = new SiteScanner({ readAs: options.readAs, days: BROWSER_DAYS, now });
-  const browsersPageFor = async (
-    req: IncomingMessage,
-    ctx: DashboardContext,
-  ): Promise<string | undefined> => {
-    const url = new URL(req.url ?? '/', 'http://localhost');
-    if (url.pathname.replace(/\/$/, '') !== '/browsers' || !options.browsers) return undefined;
-    const at = now();
-    const scan = sites.scan(ctx.projects.map((p) => p.dir));
-    // The first scan reads every recent transcript: show what is read so far rather than wait long.
-    await Promise.race([scan, new Promise((r) => setTimeout(r, 4_000).unref())]);
-    const jobOf = options.store.sessionJobs(at - BROWSER_DAYS * DAY_MS);
-    const jobNames = new Map<string, string>();
-    for (const p of options.projects)
-      for (const j of options.scheduler.list(p)) jobNames.set(`${p}:${j.id}`, j.name);
-    return browsersPage(ctx, {
-      browsers: await Promise.all(options.browsers.map(probeBrowser)),
-      needs: projectNeeds(
-        ctx.projects,
-        (p) => sites.sessions(p.dir),
-        (sid) => jobOf.get(sid),
-        (p) => options.scheduler.list(p),
-        undefined,
-        options.browsers,
-      ),
-      jobNames,
-      scanning: sites.scanning,
-      days: BROWSER_DAYS,
-      now: at,
-    });
-  };
-
-  /** The Code pages (they read git, so they are async); undefined for other paths. */
-  const codePage = async (req: IncomingMessage, ctx: DashboardContext): Promise<string | undefined> => {
-    const url = new URL(req.url ?? '/', 'http://localhost');
-    const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
-    if (parts[0] !== 'code' || !options.code) return undefined;
-    const at = now();
-    const query = url.searchParams.get('q')?.trim();
-    if (parts.length === 1 && query) return codeSearchPage(ctx, query, await searchAll(query));
-    if (parts.length === 1)
-      return codeHomePage(
-        ctx,
-        await Promise.all(
-          options.code.readers.map(async (r) => ({ repo: r.repo, status: await r.status() })),
-        ),
-        at,
-      );
-    const reader = codeReader(parts[1]);
-    const file = url.searchParams.get('path') ?? '';
-    if (parts.length === 2 && query)
-      return codeSearchPage(
-        ctx,
-        query,
-        [{ repo: reader.repo, result: await reader.search(query) }],
-        reader.repo,
-      );
-    if (parts.length === 2) return codeRepoPage(ctx, reader.repo, await reader.status(), at, canDecide(req));
-    const changes = parts.length === 3 ? (await reader.status()).changes : [];
-    if (parts[2] === 'diff') {
-      const diff = await reader.diff(file);
-      const change = changes.find((c) => c.path === file);
-      return change && codeDiffPage(ctx, reader.repo, change, diff, canDecide(req));
-    }
-    if (parts[2] === 'file') {
-      const view = await reader.read(file);
-      return codeFilePage(
-        ctx,
-        reader.repo,
-        file,
-        view,
-        changes.find((c) => c.path === file),
-        canDecide(req),
-        url.searchParams.get('view') === 'source' ? 'source' : 'formatted',
-      );
-    }
-    if (parts[2] === 'files') return codeTreePage(ctx, reader.repo, file, await reader.tree(file), changes);
-    return undefined;
-  };
-
-  const sendHtml = (res: ServerResponse, status: number, html: string) => {
-    res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-    res.end(html);
-  };
-
   const fallback = options.fallback ? new URL(options.fallback) : undefined;
-  /**
-   * Streams a request to another service (the fallback, or a project's app) and its answer back. `path`
-   * is resolved against `base`'s origin only: a path like `//evil.com/x` or an absolute URL would
-   * otherwise point the proxy at another host, serving its pages on the dashboard's origin.
-   */
-  const passThrough = (
+  const proxy = (
     req: IncomingMessage,
     res: ServerResponse,
     base: URL,
-    path: string,
-    extraHeaders: Record<string, string> = {},
-    /** A script put into every uncompressed HTML page of the answer (the app tab's location reporter). */
+    to: string,
+    extraHeaders?: Record<string, string>,
     inject?: string,
-  ) => {
-    let target: URL | undefined;
-    try {
-      if (path.startsWith('/')) target = new URL(base.origin + path);
-    } catch {}
-    if (!target || target.origin !== base.origin) {
-      res.writeHead(400, { 'content-type': 'text/plain' });
-      res.end('Bad path');
-      return;
-    }
-    // tara-agent's own keys never leave it: its bearer token, admin and run headers, and its cookies.
-    const headers: Record<string, string | string[] | undefined> = { ...req.headers };
-    delete headers['x-tara-admin'];
-    delete headers['x-tara-run'];
-    if (options.token && headers.authorization === `Bearer ${options.token}`) delete headers.authorization;
-    const cookies = (req.headers.cookie ?? '')
-      .split(/;\s*/)
-      .filter((c) => c && !c.startsWith(`${TOKEN_COOKIE}=`) && !c.startsWith(`${ADMIN_COOKIE}=`))
-      .join('; ');
-    if (cookies) headers.cookie = cookies;
-    else delete headers.cookie;
-    const upstream = httpRequest(
-      target,
-      {
-        method: req.method,
-        headers: {
-          ...headers,
-          host: target.host,
-          'x-forwarded-for': req.socket.remoteAddress ?? '',
-          'x-forwarded-host': req.headers.host ?? '',
-          ...extraHeaders,
-        },
-      },
-      (answer) => {
-        const html =
-          inject &&
-          /^text\/html/i.test(String(answer.headers['content-type'] ?? '')) &&
-          !answer.headers['content-encoding'];
-        if (!html) {
-          res.writeHead(answer.statusCode ?? 502, answer.headers);
-          answer.pipe(res);
-          return;
-        }
-        const chunks: Buffer[] = [];
-        answer.on('data', (c: Buffer) => chunks.push(c));
-        answer.on('end', () => {
-          const page = Buffer.concat(chunks).toString('utf8');
-          const tag = `<script>${inject}</script>`;
-          const at = page.search(/<head[^>]*>/i);
-          const out = at === -1 ? tag + page : page.replace(/<head[^>]*>/i, (head) => head + tag);
-          const headers = { ...answer.headers };
-          delete headers['content-length'];
-          res.writeHead(answer.statusCode ?? 502, headers);
-          res.end(out);
-        });
-      },
-    );
-    upstream.on('error', (err) => {
-      options.log.warn(`proxy ${req.method} ${req.url} → ${target.origin}: ${err.message}`);
-      if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
-      res.end(`${target.origin} is unreachable: ${err.message}`);
-    });
-    req.pipe(upstream);
-  };
+  ) => passThrough({ token: options.token, log: options.log }, req, res, base, to, extraHeaders, inject);
 
   /** Bearer header, or (for browsers) the cookie set by opening any page once with `?token=…`. */
   const tokenHolder = (req: IncomingMessage) => {
     if (!options.token) return true;
     if (req.headers.authorization === `Bearer ${options.token}`) return true;
-    const cookie = (req.headers.cookie ?? '').split(/;\s*/).find((c) => c.startsWith(`${TOKEN_COOKIE}=`));
-    return cookie?.slice(TOKEN_COOKIE.length + 1) === options.token;
+    const held = (req.headers.cookie ?? '').split(/;\s*/).find((x) => x.startsWith(`${TOKEN_COOKIE}=`));
+    return held?.slice(TOKEN_COOKIE.length + 1) === options.token;
   };
-  const sendJson = (res: ServerResponse, status: number, body: unknown) => {
-    res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-    res.end(JSON.stringify(body));
-  };
+  const NEEDS_TOKEN = 'Open the dashboard once with ?token=<TARA_HTTP_TOKEN> added to the address.';
 
-  /** `GET /glance` (http/glance.ts): JSON for desk panels; returns false for other paths. */
-  const glanceRoute = async (req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> => {
-    if (url.pathname.replace(/\/$/, '') !== '/glance') return false;
-    if (!tokenHolder(req)) sendJson(res, 401, { error: 'Missing or wrong bearer token' });
-    else if (req.method !== 'GET' && req.method !== 'HEAD') sendJson(res, 405, { error: 'Use GET' });
-    else sendJson(res, 200, await glance.read());
+  /** Who may connect at all: the allowed networks, and no cross-site requests. False: refused. */
+  const admitted = (req: IncomingMessage, res: ServerResponse, logRefusal: boolean) => {
+    if (!allowed(req.socket.remoteAddress)) {
+      sendText(res, 403, 'Forbidden: not on the allowed networks');
+      return false;
+    }
+    const refused = crossSite(req, options.bind, options.hosts);
+    if (refused) {
+      if (logRefusal) options.log.warn(`refused ${req.method} ${req.url}: ${refused}`);
+      sendText(res, 403, `Forbidden: ${refused}`);
+      return false;
+    }
     return true;
   };
 
@@ -1809,42 +249,20 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     };
   };
 
-  /** Told to the app tab's parent page on every navigation, so its address and tab follow the app. */
-  const locationReporter = (parent: string) =>
-    `(()=>{if(window.parent===window)return;const post=()=>window.parent.postMessage({type:'tara:location',path:location.pathname,search:location.search,hash:location.hash,title:document.title},${JSON.stringify(parent)});for(const m of['pushState','replaceState']){const o=history[m];history[m]=function(...a){const r=o.apply(this,a);post();return r}}addEventListener('popstate',post);addEventListener('hashchange',post);addEventListener('load',post);post()})()`;
-
   /**
    * The app port: only `/app/<name>/…` of tabbed projects, proxied like on the dashboard's port, with the
    * location reporter in each page. Anything else goes to the dashboard. Nothing of tara-agent's own API
    * is served here, and its cookies never reach the app.
    */
   const handleApp = (req: IncomingMessage, res: ServerResponse) => {
-    if (!allowed(req.socket.remoteAddress)) {
-      res.writeHead(403, { 'content-type': 'text/plain' });
-      res.end('Forbidden: not on the allowed networks');
-      return;
-    }
-    const refused = crossSite(req, options.bind, options.hosts);
-    if (refused) {
-      res.writeHead(403, { 'content-type': 'text/plain' });
-      res.end(`Forbidden: ${refused}`);
-      return;
-    }
+    if (!admitted(req, res, false)) return;
     const url = new URL(req.url ?? '/', 'http://localhost');
     const { main } = origins(req);
     const tab = /^\/app\/([a-z0-9][a-z0-9-]*)(\/.*)?$/.exec(url.pathname);
-    const project = tab && tabbed(options.dashboard?.projects ?? []).find((p) => p.config.name === tab[1]);
-    if (!tab || !project) {
-      res.writeHead(302, { location: main + url.pathname + url.search });
-      res.end();
-      return;
-    }
-    if (!tokenHolder(req)) {
-      res.writeHead(401, { 'content-type': 'text/plain' });
-      res.end('Open the dashboard once with ?token=<TARA_HTTP_TOKEN> added to the address.');
-      return;
-    }
-    passThrough(
+    const project = tab && c.tabProject(tab[1] as string);
+    if (!tab || !project) return redirect(res, 302, main + url.pathname + url.search);
+    if (!tokenHolder(req)) return sendText(res, 401, NEEDS_TOKEN);
+    proxy(
       req,
       res,
       new URL(project.config.dashboardUrl as string),
@@ -1854,24 +272,91 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     );
   };
 
+  /**
+   * A project's app, shown in a tab: `/app/<name>/<rest>` is proxied to `<dashboardUrl>/<rest>`, and
+   * `/p/<name>/<rest>` is the dashboard page that frames it. False: not a tab path.
+   */
+  const tabRoute = (req: IncomingMessage, res: ServerResponse, url: URL): boolean => {
+    const tab = /^\/(app|p)\/([a-z0-9][a-z0-9-]*)(\/.*)?$/.exec(url.pathname);
+    const project = tab && c.tabProject(tab[2] as string);
+    if (!tab || !project) return false;
+    const name = project.config.name;
+    const rest = tab[3] ?? '';
+    if (!tokenHolder(req)) {
+      sendText(res, 401, NEEDS_TOKEN);
+      return true;
+    }
+    const appOrigin = origins(req).app;
+    if (tab[1] === 'app') {
+      // With an app port the app lives there, on another origin (old links are sent on).
+      if (appOrigin) redirect(res, 302, appOrigin + url.pathname + url.search);
+      // The app gets its own cookies, never tara-agent's keys (passThrough strips them).
+      else
+        proxy(req, res, new URL(project.config.dashboardUrl as string), (rest || '/') + url.search, {
+          'x-tara-prefix': `/app/${name}`,
+        });
+      return true;
+    }
+    if (!rest || rest === '/') {
+      redirect(res, 302, `/p/${name}${project.config.tabs?.[0]?.path ?? '/'}`);
+      return true;
+    }
+    const ctx = c.pageContext();
+    if (req.method !== 'GET' || !ctx) return false;
+    sendHtml(res, 200, tabPage(ctx, project, rest + url.search, appOrigin));
+    return true;
+  };
+
+  /** `POST /unlock`: the admin key typed into the Unlock page becomes this browser's decisions cookie. */
+  const unlock = async (req: IncomingMessage, res: ServerResponse, ctx: DashboardContext) => {
+    const form = new URLSearchParams(await readBody(req, 2_000).catch(() => ''));
+    const given = form.get('token') ?? '';
+    if (!options.adminToken)
+      return sendHtml(
+        res,
+        403,
+        unlockPage(ctx, 'Deciding on the dashboard is off: TARA_ADMIN_TOKEN is not set.'),
+      );
+    if (!options.decisionsFromLocal && localAddress(req.socket.remoteAddress))
+      return sendHtml(
+        res,
+        403,
+        unlockPage(ctx, 'Unlock from your own phone or computer, not from this machine.'),
+      );
+    if (!given || !sameSecret(given, options.adminToken)) {
+      options.log.warn(`unlock with a wrong key from ${req.socket.remoteAddress}`);
+      return sendHtml(res, 403, unlockPage(ctx, 'That key is not right.'));
+    }
+    res.writeHead(303, {
+      location: '/approvals',
+      'set-cookie': `${ADMIN_COOKIE}=${adminCookieValue(options.adminToken)}; ${ADMIN_COOKIE_ATTRS}`,
+    });
+    res.end();
+  };
+
+  /** A file a dashboard run sent (`send_file`), from its session page. */
+  const webFile = async (req: IncomingMessage, res: ServerResponse, id: number) => {
+    const m = tokenHolder(req) ? options.store.webMessageById(id) : undefined;
+    const file = m?.kind === 'file' ? (m.data as { name: string; path: string }) : undefined;
+    if (!options.web || !file?.path?.startsWith(options.web.filesDir + path.sep))
+      return sendText(res, 404, 'No such file');
+    try {
+      const data = await readFile(file.path);
+      res.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(file.name)}`,
+        'cache-control': 'no-store',
+      });
+      res.end(data);
+    } catch {
+      sendText(res, 410, 'The file is gone (deleted after the retention period)');
+    }
+  };
+
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
-    if (!allowed(req.socket.remoteAddress)) {
-      res.writeHead(403, { 'content-type': 'text/plain' });
-      res.end('Forbidden: not on the allowed networks');
-      return;
-    }
-    const refused = crossSite(req, options.bind, options.hosts);
-    if (refused) {
-      options.log.warn(`refused ${req.method} ${req.url}: ${refused}`);
-      res.writeHead(403, { 'content-type': 'text/plain' });
-      res.end(`Forbidden: ${refused}`);
-      return;
-    }
+    if (!admitted(req, res, true)) return;
     const url = new URL(req.url ?? '/', 'http://localhost');
-    if (fallback && !OWN_PATH.test(url.pathname)) {
-      passThrough(req, res, fallback, req.url ?? '/');
-      return;
-    }
+    if (fallback && !OWN_PATH.test(url.pathname)) return proxy(req, res, fallback, req.url ?? '/');
     const internalPath = url.pathname.startsWith('/internal/');
     // A browser still holding the raw admin token in its cookie gets the derived key instead.
     const adminCookie = cookie(req, ADMIN_COOKIE);
@@ -1889,69 +374,17 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       res.end();
       return;
     }
-    if (await glanceRoute(req, res, url)) return;
-    // A project's app, shown in a tab: `/app/<name>/<rest>` is proxied to `<dashboardUrl>/<rest>`, and
-    // `/p/<name>/<rest>` is the dashboard page that frames it.
-    const tab = /^\/(app|p)\/([a-z0-9][a-z0-9-]*)(\/.*)?$/.exec(url.pathname);
-    const tabProject = tab && tabbed(options.dashboard?.projects ?? []).find((p) => p.config.name === tab[2]);
-    if (tab && tabProject) {
-      const name = tabProject.config.name;
-      const rest = tab[3] ?? '';
-      if (!tokenHolder(req)) {
-        res.writeHead(401, { 'content-type': 'text/plain' });
-        res.end('Open the dashboard once with ?token=<TARA_HTTP_TOKEN> added to the address.');
-        return;
-      }
-      const appOrigin = origins(req).app;
-      if (tab[1] === 'app') {
-        // With an app port the app lives there, on another origin (old links are sent on).
-        if (appOrigin) {
-          res.writeHead(302, { location: appOrigin + url.pathname + url.search });
-          res.end();
-          return;
-        }
-        // The app gets its own cookies, never tara-agent's keys (passThrough strips them).
-        passThrough(req, res, new URL(tabProject.config.dashboardUrl as string), (rest || '/') + url.search, {
-          'x-tara-prefix': `/app/${name}`,
-        });
-        return;
-      }
-      if (!rest || rest === '/') {
-        const first = tabProject.config.tabs?.[0]?.path ?? '/';
-        res.writeHead(302, { location: `/p/${name}${first}` });
-        res.end();
-        return;
-      }
-      const ctxTab = pageContext();
-      if (req.method === 'GET' && ctxTab)
-        return sendHtml(res, 200, tabPage(ctxTab, tabProject, rest + url.search, appOrigin));
-    }
-    if (req.method === 'POST' && url.pathname === '/unlock' && options.dashboard && tokenHolder(req)) {
-      const ctxUnlock = pageContext() as DashboardContext;
-      const form = new URLSearchParams(await readBody(req, 2_000).catch(() => ''));
-      const given = form.get('token') ?? '';
-      if (!options.adminToken)
-        return sendHtml(
-          res,
-          403,
-          unlockPage(ctxUnlock, 'Deciding on the dashboard is off: TARA_ADMIN_TOKEN is not set.'),
-        );
-      if (!options.decisionsFromLocal && localAddress(req.socket.remoteAddress))
-        return sendHtml(
-          res,
-          403,
-          unlockPage(ctxUnlock, 'Unlock from your own phone or computer, not from this machine.'),
-        );
-      if (!given || !sameSecret(given, options.adminToken)) {
-        options.log.warn(`unlock with a wrong key from ${req.socket.remoteAddress}`);
-        return sendHtml(res, 403, unlockPage(ctxUnlock, 'That key is not right.'));
-      }
-      res.writeHead(303, {
-        location: '/approvals',
-        'set-cookie': `${ADMIN_COOKIE}=${adminCookieValue(options.adminToken)}; ${ADMIN_COOKIE_ATTRS}`,
-      });
-      res.end();
+    // `GET /glance` (http/glance.ts): JSON for desk panels.
+    if (url.pathname.replace(/\/$/, '') === '/glance') {
+      if (!tokenHolder(req)) sendJson(res, 401, { error: 'Missing or wrong bearer token' });
+      else if (req.method !== 'GET' && req.method !== 'HEAD') sendJson(res, 405, { error: 'Use GET' });
+      else sendJson(res, 200, await glance.read());
       return;
+    }
+    if (tabRoute(req, res, url)) return;
+    if (req.method === 'POST' && url.pathname === '/unlock' && tokenHolder(req)) {
+      const ctx = c.pageContext();
+      if (ctx) return unlock(req, res, ctx);
     }
     // Approved items moved from the Approvals page's Scheduled tab to the Queue page.
     if (
@@ -1960,11 +393,9 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       url.searchParams.get('tab') === 'scheduled'
     ) {
       const project = url.searchParams.get('project');
-      res.writeHead(301, { location: `/queue${project ? `?project=${encodeURIComponent(project)}` : ''}` });
-      res.end();
-      return;
+      return redirect(res, 301, `/queue${project ? `?project=${encodeURIComponent(project)}` : ''}`);
     }
-    const ctx = pageContext();
+    const ctx = c.pageContext();
     const wantsHtml =
       Boolean(ctx) && req.method === 'GET' && (req.headers.accept ?? '').includes('text/html');
     if (wantsHtml && ctx && !tokenHolder(req) && !internalPath)
@@ -1975,17 +406,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
       );
     if (wantsHtml && ctx) {
       try {
-        const home = new URL(req.url ?? '/', 'http://localhost').pathname === '/';
-        const logsPath =
-          new URL(req.url ?? '/', 'http://localhost').pathname.replace(/\/$/, '') === '/health/logs';
-        const hours = Number(new URL(req.url ?? '/', 'http://localhost').searchParams.get('hours'));
-        const html =
-          (logsPath && options.observe
-            ? logsPage(ctx, await options.observe.logs([1, 24, 168].includes(hours) ? hours : 24))
-            : undefined) ??
-          (await codePage(req, ctx)) ??
-          (await browsersPageFor(req, ctx)) ??
-          page(req, ctx, home ? { staleRepos: await staleRepos(now()) } : {});
+        const html = (await dispatch(pages, req, url, ctx)).value;
         if (html) return sendHtml(res, 200, html);
       } catch (err) {
         if (err instanceof CodeError || err instanceof HttpError)
@@ -1994,36 +415,10 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
         return sendHtml(res, 500, errorPage(ctx, 500));
       }
     }
-    // A file a dashboard run sent (`send_file`), from its session page.
     const fileId = /^\/web-files\/(\d+)$/.exec(url.pathname)?.[1];
-    if (req.method === 'GET' && fileId && options.web) {
-      const m = tokenHolder(req) ? options.store.webMessageById(Number(fileId)) : undefined;
-      const file = m?.kind === 'file' ? (m.data as { name: string; path: string }) : undefined;
-      if (!file?.path?.startsWith(options.web.filesDir + path.sep)) {
-        res.writeHead(404, { 'content-type': 'text/plain' });
-        res.end('No such file');
-        return;
-      }
-      try {
-        const data = await readFile(file.path);
-        res.writeHead(200, {
-          'content-type': 'application/octet-stream',
-          'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(file.name)}`,
-          'cache-control': 'no-store',
-        });
-        res.end(data);
-      } catch {
-        res.writeHead(410, { 'content-type': 'text/plain' });
-        res.end('The file is gone (deleted after the retention period)');
-      }
-      return;
-    }
+    if (req.method === 'GET' && fileId && options.web) return webFile(req, res, Number(fileId));
     if (req.method === 'GET' && url.pathname === '/metrics' && options.observe) {
-      if (!tokenHolder(req)) {
-        res.writeHead(401, { 'content-type': 'text/plain' });
-        res.end('Missing or wrong bearer token');
-        return;
-      }
+      if (!tokenHolder(req)) return sendText(res, 401, 'Missing or wrong bearer token');
       res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' });
       res.end(options.observe.metrics());
       return;
@@ -2031,21 +426,14 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     let status = 200;
     let payload: unknown;
     try {
-      if (internalPath) {
-        payload = await internal(req);
-      } else {
-        if (!tokenHolder(req)) throw new HttpError(401, 'Missing or wrong bearer token');
-        payload = await route(req);
-      }
+      // `/internal/*` is for runs: the bridge checks their run token instead of the HTTP token.
+      if (internalPath && !internal) throw new HttpError(404, 'MCP bridge is not enabled');
+      if (!internalPath && !tokenHolder(req)) throw new HttpError(401, 'Missing or wrong bearer token');
+      const result = await dispatch((internalPath && internal) || api, req, url, undefined);
+      if (!result.found) throw new HttpError(404, 'Not found');
+      payload = result.value;
     } catch (err) {
-      status =
-        err instanceof HttpError ||
-        err instanceof BridgeError ||
-        err instanceof ApprovalError ||
-        err instanceof ReminderError ||
-        err instanceof CodeError
-          ? err.status
-          : 500;
+      status = statusOf(err);
       payload = { error: (err as Error).message };
       if (status === 500) options.log.error(`http ${req.method} ${req.url}: ${(err as Error).stack ?? err}`);
     }

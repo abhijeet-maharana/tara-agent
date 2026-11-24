@@ -22,6 +22,7 @@ tara-agent is one Node process per host. It never calls the Anthropic API: every
 
 | Path | Responsibility |
 |---|---|
+| `src/index.ts`, `src/agent.ts` | The CLI (`validate`, `rename-jobs`, serve; signals and exit) and `startAgent`, which wires and starts everything and returns `stop()` (tested with a fake Slack in `test/agent.test.ts`) |
 | `src/config/` | Host config (YAML), project config and jobs files (JSON), all validated with zod |
 | `src/runner/` | Builds CLI arguments, strips credentials from the environment, spawns the CLI, parses its stream, kills the process group on timeout or stop. `run.ts` is Claude Code; `agy.ts` is the Antigravity CLI harness for `harness: "agy"` jobs (stream-json in and out, tara's MCP tools through a per-run plugin) |
 | `src/sessions/manager.ts` | Slack thread ↔ Claude session, chat concurrency cap, live status message, "stop" and "run <job name>" |
@@ -30,7 +31,7 @@ tara-agent is one Node process per host. It never calls the Anthropic API: every
 | `src/bridge/bridge.ts` | Per-run MCP config and token, approval buttons, permission prompts, file uploads |
 | `src/mcp/server.ts` | The stdio MCP server Claude starts: `request_approval`, `request_privileged`, `send_file`, `permission`, items, jobs and reminders |
 | `src/privileged/` | Root actions through the root-owned helper `deploy/tara-priv.mjs` (list, plan, run) |
-| `src/http/server.ts` | Local API for other tools, plus `/internal/*` for the MCP server |
+| `src/http/server.ts`, `src/http/routes/` | The HTTP front door (`server.ts`: allowed networks, tokens and cookies, fallback and project-app proxies) and its route tables, one file per area, each listing its paths: `system` (health, drain, metrics), `jobs` (jobs, runs, queues, schedule), `sessions`, `items` (approval cards), `reminders`, `code`, `internal` (`/internal/*` for the MCP server) and `pages` (the dashboard's HTML). `context.ts` holds the lookups they share, `router.ts` the matcher |
 | `src/code/repo.ts`, `src/http/code.ts` | The Code page: read-only git status, diffs and files of each repo, through a private index copy ([code-view.md](code-view.md)) |
 | `src/health/`, `src/http/health.ts`, `src/http/observe.ts` | The Health page. Now: checks of tara-agent, each project's jobs and each project's `healthUrl`, with red-twice-in-a-row alerts and recoveries in the day's `Run Health Alert` thread. Trends: runs, cost, usage, job lengths, uptime and machine samples over days. Logs: tara-agent's own warnings and errors plus `logUnits` from the journal, grouped. `GET /metrics` for Prometheus |
 | `src/web/` | Dashboard threads (`WebChat`), the Slack/dashboard router (`RoutedChat`) and Slack result summaries ([Dashboard runs](#dashboard-runs)) |

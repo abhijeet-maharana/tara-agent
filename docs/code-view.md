@@ -60,5 +60,5 @@ A repo that is a project takes its name and title from `.tara/config.json`; othe
 
 - `src/code/repo.ts`: `RepoReader` (status, files, tree, read, diff, search with `git grep --untracked`), path checks, `codeReaders()` from the host config
 - `src/http/code.ts`: the pages
-- `src/http/server.ts`: routes, and `POST /code/<repo>/ask`; `src/index.ts` wires Ask to Slack and the session manager
+- `src/http/routes/code.ts`: the API, and `POST /code/<repo>/ask`; `src/http/routes/pages.ts`: the page routes; `src/agent.ts` wires Ask to Slack and the session manager
 - Tests: `test/code.test.ts` (a real temp repo: every change kind, ignored and excluded files, traversal, a symlink out, a copied git dir left untouched, search, pages, Ask)
