@@ -221,7 +221,16 @@ export async function signIn(page: VaultPage, o: SignInOptions): Promise<SignInR
           return form;
         }
         if (now() >= until) return form;
-      } else if (now() >= until) return { user: false, pass: false, code: false, codeBoxes: 0, captcha: false, frames: false, title: '' };
+      } else if (now() >= until)
+        return {
+          user: false,
+          pass: false,
+          code: false,
+          codeBoxes: 0,
+          captcha: false,
+          frames: false,
+          title: '',
+        };
       await sleep(POLL_MS);
     }
   };
@@ -231,7 +240,8 @@ export async function signIn(page: VaultPage, o: SignInOptions): Promise<SignInR
   };
 
   await page.navigate(o.url);
-  if (!o.allowed(await page.url())) return done('wrong-site', 'The sign-in page went to an address this login is not saved for.');
+  if (!o.allowed(await page.url()))
+    return done('wrong-site', 'The sign-in page went to an address this login is not saved for.');
   let form = await settle(10_000);
   let typedPassword = false;
   let typedCode = false;
@@ -239,22 +249,39 @@ export async function signIn(page: VaultPage, o: SignInOptions): Promise<SignInR
   for (let round = 0; round < ROUNDS; round++) {
     const url = await page.url();
     if (!o.allowed(url))
-      return done('wrong-site', `The page moved to ${new URL(url).host}, which this login is not saved for (add it to its sites if it belongs).`);
+      return done(
+        'wrong-site',
+        `The page moved to ${new URL(url).host}, which this login is not saved for (add it to its sites if it belongs).`,
+      );
     if (form.captcha) return done('captcha', 'The site shows a captcha: a person must sign in.');
     if (!form.user && !form.pass && !form.code) {
       if (round === 0)
         return form.frames
-          ? done('failed', 'No sign-in fields on the page itself (the form may be inside a frame, which the vault does not fill).')
-          : done('already-signed-in', 'The sign-in page shows no sign-in form: the browser seems to be signed in already.');
+          ? done(
+              'failed',
+              'No sign-in fields on the page itself (the form may be inside a frame, which the vault does not fill).',
+            )
+          : done(
+              'already-signed-in',
+              'The sign-in page shows no sign-in form: the browser seems to be signed in already.',
+            );
       return done('signed-in', 'Signed in: the page no longer asks for anything.');
     }
     // A field asked for again after it was typed: the site said no. Never type it twice.
     if ((form.pass && typedPassword) || (form.code && typedCode))
-      return done('failed', `The site asked again after the ${form.pass ? 'password' : 'code'} was typed${form.error ? `: "${form.error}"` : ''}. Not retried (a second wrong try can lock the account); a person should check the login.`);
+      return done(
+        'failed',
+        `The site asked again after the ${form.pass ? 'password' : 'code'} was typed${form.error ? `: "${form.error}"` : ''}. Not retried (a second wrong try can lock the account); a person should check the login.`,
+      );
     let last = '';
     if (form.user && !(form.pass && form.userValue && form.userValue === secrets.account)) {
-      if (!secrets.account) return done('failed', 'The site asks for an account, and the saved login has none.');
-      if (typedAccount && !form.pass) return done('failed', `The site asked for the account again${form.error ? `: "${form.error}"` : ''}.`);
+      if (!secrets.account)
+        return done('failed', 'The site asks for an account, and the saved login has none.');
+      if (typedAccount && !form.pass)
+        return done(
+          'failed',
+          `The site asked for the account again${form.error ? `: "${form.error}"` : ''}.`,
+        );
       if (form.userValue !== secrets.account) await type('user', secrets.account);
       typedAccount = true;
       last = 'user';
@@ -264,12 +291,15 @@ export async function signIn(page: VaultPage, o: SignInOptions): Promise<SignInR
       typedPassword = true;
       last = 'pass';
     } else if (form.code) {
-      if (!secrets.totp) return done('needs-code', 'The site asks for a verification code, and this login has no authenticator key saved (an SMS or email code needs a person).');
+      if (!secrets.totp)
+        return done(
+          'needs-code',
+          'The site asks for a verification code, and this login has no authenticator key saved (an SMS or email code needs a person).',
+        );
       // A code about to change may expire on the way: wait for the next one.
       if (secondsLeft(secrets.totp, now()) < 4) await sleep(secondsLeft(secrets.totp, now()) * 1000 + 500);
       const code = totpCode(secrets.totp, now());
-      if (form.codeBoxes)
-        for (let n = 0; n < form.codeBoxes; n++) await type(`code-${n}`, code[n] ?? '');
+      if (form.codeBoxes) for (let n = 0; n < form.codeBoxes; n++) await type(`code-${n}`, code[n] ?? '');
       else await type('code', code);
       typedCode = true;
       last = form.codeBoxes ? `code-${form.codeBoxes - 1}` : 'code';

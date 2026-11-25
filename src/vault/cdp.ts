@@ -36,7 +36,10 @@ export class CdpPage implements VaultPage {
 
   /** Opens a blank tab in the Chrome at `cdpUrl` (e.g. http://127.0.0.1:9222). */
   static async open(cdpUrl: string, timeoutMs = 15_000): Promise<CdpPage> {
-    const res = await fetch(`${cdpUrl}/json/new?about:blank`, { method: 'PUT', signal: AbortSignal.timeout(5_000) });
+    const res = await fetch(`${cdpUrl}/json/new?about:blank`, {
+      method: 'PUT',
+      signal: AbortSignal.timeout(5_000),
+    });
     if (!res.ok) throw new Error(`The browser did not open a tab (${res.status})`);
     const target = (await res.json()) as { id: string; webSocketDebuggerUrl?: string };
     if (!target.webSocketDebuggerUrl) throw new Error('The browser gave no DevTools address for the tab');
@@ -123,8 +126,20 @@ export class CdpPage implements VaultPage {
 
   async click(x: number, y: number): Promise<void> {
     await this.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
-    await this.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
-    await this.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+    await this.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x,
+      y,
+      button: 'left',
+      clickCount: 1,
+    });
+    await this.send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x,
+      y,
+      button: 'left',
+      clickCount: 1,
+    });
   }
 
   async pressEnter(): Promise<void> {

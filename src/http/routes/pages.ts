@@ -36,9 +36,9 @@ import { logsPage, trendsPage } from '../observe.js';
 import { queuePage } from '../queue.js';
 import { loadQuotes, pickQuote } from '../quotes.js';
 import { remindersPage } from '../reminders-page.js';
-import { vaultPage } from '../vault-page.js';
 import { makeRoute, type Route, type RouteRequest } from '../router.js';
 import { isDayKey, schedulePage } from '../schedule.js';
+import { vaultPage } from '../vault-page.js';
 
 /** A dashboard page: its HTML, or undefined to fall through to the JSON API of the same path. */
 export type PageRoute = Route<string | undefined, DashboardContext>;
@@ -397,7 +397,9 @@ export function pageRoutes(c: ServerContext): PageRoute[] {
       ? [
           route('GET /vault', ({ req }, ctx) => {
             const saved = vault.list();
-            const known = new Set(saved.map((l) => `${l.service.toLowerCase()}|${(l.account ?? '').toLowerCase()}`));
+            const known = new Set(
+              saved.map((l) => `${l.service.toLowerCase()}|${(l.account ?? '').toLowerCase()}`),
+            );
             const suggestions = ctx.projects.flatMap((p) => {
               const file = loadLogins(p.dir);
               if (!file || 'error' in file) return [];

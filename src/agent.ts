@@ -255,6 +255,7 @@ export async function startAgent(opts: AgentOptions): Promise<Agent> {
     threadUrl,
     approvalsUrl: dashboardUrl ? `${dashboardUrl}/approvals` : undefined,
     gate: gateRunner(runAs),
+    unfinished: (u) => approvals.unfinished(u),
   });
   manager = new SessionManager({
     projects,

@@ -101,6 +101,17 @@ Runs have no sudo, yet some failures need root: a file a sync wrote with a tight
 - **Everything is recorded**: each root action is a card that ends done or failed with its exit code and output, and sudo logs every call.
 - Without `privileged`, `request_privileged` still works with a `command`: a card asks a person to run it, and **I ran it, continue** resumes the run.
 
+## Vault (saved logins)
+
+Runs sign in to websites with saved logins without ever seeing a secret (src/vault/):
+
+- **Where secrets live.** `vault_logins` in tara.db, the password and authenticator key encrypted with AES-256-GCM under `TARA_VAULT_KEY` (root-only env file, stripped from every run's environment). Each value is bound to its login id, so a ciphertext copied to another row won't open. The key's fingerprint is stored once: with a different key the vault stops (nothing read or written) instead of overwriting. Without the key the vault, its page and its tools are off. **Back the key up**: saved logins can't be read without it.
+- **How a run signs in.** `vault_sign_in` asks tara-agent, which opens **its own tab** in the project's Chrome over DevTools, types the account, password and current authenticator code there, submits, empties the fields it typed and closes the tab. The run gets back only a status and the page's address and title (with any echo of the password removed). The tab-ownership hook keeps runs off tabs they didn't open, so a run can't read that tab or plant a script in it.
+- **Where a login may be typed.** Only on https pages (http only on this machine) whose host is one of the login's `sites`, checked from the browser's own address of the tab after every step, so a redirect elsewhere stops it (`wrong-site`). Fields inside frames are not filled.
+- **No retries.** A field the site asks for again after it was typed (a wrong password) ends the sign-in. After a failure the login waits 30 minutes for a person (saving a new password lifts that); more than 4 sign-ins in an hour are refused. Captchas and SMS or email codes are left to a person.
+- **People only for secrets.** Adding, changing, deleting and showing a login need the unlocked browser from another device, like decisions; `GET /vault` and the page show no secret. Every sign-in, reveal and change is logged with who did it (Vault page, kept a year).
+- **Limits.** The run still drives the signed-in session afterwards (that is the point), and anything a person types into a card reply (an OTP) still reaches the model.
+
 ## Code page
 
 The Code page (`/code`) shows source code, so it is only as private as the dashboard: keep `http.allowFrom` to your own network and set `TARA_HTTP_TOKEN`. It serves only files git lists (never ignored ones), never `.git`, paths outside the repo or symlinks out of it, and hides `code.exclude` globs (`.env*`, keys) even when tracked. Git runs read-only (no optional locks, a private index copy, no hooks, external diff or textconv). Asking about a file starts a Claude run, so it needs the unlock cookie from another device. See [code-view.md](code-view.md).

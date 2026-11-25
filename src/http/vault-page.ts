@@ -1,7 +1,16 @@
 import type { VaultUse } from '../store/store.js';
 import type { VaultLogin } from '../vault/vault.js';
 import type { Login } from './browser-usage.js';
-import { type DashboardContext, esc, layout, pageHead, projectTitle, relative, section, when } from './dashboard.js';
+import {
+  type DashboardContext,
+  esc,
+  layout,
+  pageHead,
+  projectTitle,
+  relative,
+  section,
+  when,
+} from './dashboard.js';
 
 /**
  * The Vault page: saved website logins (never their secrets), adding and changing them, revealing one,
@@ -110,7 +119,12 @@ const STATUS_TAG: Record<string, string> = {
   'wrong-site': 'bad',
 };
 
-function loginRow(ctx: DashboardContext, l: VaultLogin, last: VaultUse | undefined, d: VaultPageData): string {
+function loginRow(
+  ctx: DashboardContext,
+  l: VaultLogin,
+  last: VaultUse | undefined,
+  d: VaultPageData,
+): string {
   const edit = {
     id: l.id,
     service: l.service,
@@ -169,7 +183,7 @@ function formHtml(ctx: DashboardContext): string {
 export function vaultPage(ctx: DashboardContext, d: VaultPageData): string {
   const head = pageHead(
     'Vault',
-    'Website logins runs sign in with without ever seeing them: a run calls vault_sign_in, and tara-agent types the account, password and authenticator code into its own tab of the project\'s Chrome, then tells the run only how it went. Passwords are encrypted with TARA_VAULT_KEY.',
+    "Website logins runs sign in with without ever seeing them: a run calls vault_sign_in, and tara-agent types the account, password and authenticator code into its own tab of the project's Chrome, then tells the run only how it went. Passwords are encrypted with TARA_VAULT_KEY.",
   );
   if (!d.on)
     return layout(
@@ -179,7 +193,8 @@ export function vaultPage(ctx: DashboardContext, d: VaultPageData): string {
       `${STYLE}${head}<div class="card bad"><b>${esc(d.problem ?? 'The vault is off')}</b><p class="dim">To turn it on, add <code>TARA_VAULT_KEY=$(openssl rand -hex 32)</code> to tara-agent's root-only env file, keep a copy of it somewhere safe (saved logins can't be read without it), and restart tara-agent.</p></div>`,
     );
   const lastSignIn = new Map<string, VaultUse>();
-  for (const u of d.uses) if (u.action === 'sign-in' && !lastSignIn.has(u.loginId)) lastSignIn.set(u.loginId, u);
+  for (const u of d.uses)
+    if (u.action === 'sign-in' && !lastSignIn.has(u.loginId)) lastSignIn.set(u.loginId, u);
   const list = d.logins.length
     ? `<div class="vault-list">${d.logins.map((l) => loginRow(ctx, l, lastSignIn.get(l.id), d)).join('')}</div>`
     : '<p class="empty">No saved logins yet.</p>';
@@ -188,10 +203,11 @@ export function vaultPage(ctx: DashboardContext, d: VaultPageData): string {
     : '<div class="card warn">Adding, changing and showing logins needs this browser <a href="/unlock">unlocked</a>, from a device other than the server.</div>';
   const sugg = d.suggestions.length
     ? section(
-        'From the projects\' logins lists',
+        "From the projects' logins lists",
         `<p class="dim">Named in a project's <code>.tara/logins.json</code> but not saved here. Tap one to fill the form, then add the password.</p><div class="sugg">${d.suggestions
           .map(({ project, login }) => {
-            const site = login.sites.find((s) => !s.startsWith('*.')) ?? login.sites[0]?.replace(/^\*\./, '') ?? '';
+            const site =
+              login.sites.find((s) => !s.startsWith('*.')) ?? login.sites[0]?.replace(/^\*\./, '') ?? '';
             const fillWith = {
               id: login.service
                 .toLowerCase()

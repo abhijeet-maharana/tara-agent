@@ -137,6 +137,15 @@ export interface JobRunnerDeps {
   gate?: GateRunner;
   /** Whether a `requires` URL answers (tests). */
   probe?: (url: string) => Promise<boolean>;
+  /** A run acting on an approved card stopped before it finished: fail the card, raise "Not finished". */
+  unfinished?: (input: {
+    project: string;
+    jobId: string;
+    card: DecidedCard;
+    reason: string;
+    thread: { channel: string; threadTs: string };
+    link?: string;
+  }) => Promise<void>;
 }
 
 /** What a run waits for: its thread (a chat turn working in it), a free job slot, or its locks. */
@@ -484,7 +493,7 @@ export async function runJob(
      * A dashboard run's result in Slack: one message with its headline (or why it didn't finish), its
      * files in that message's thread. A run with nothing to report, or one a person stopped, posts nothing.
      */
-    const summarize = async (text: string, meta?: string) => {
+    const summarize = async (text: string, meta?: string, alert = false) => {
       if (!onDashboard || !web) return;
       const cards = cardsLeft();
       // Asked for in a thread: the answer goes back there, whatever it is. The result of your decision
@@ -493,7 +502,8 @@ export async function runJob(
       const followUp = !askedIn && text.trim().startsWith('✅') && !cards ? followUpOf() : undefined;
       // That summary may be days old, and a reply under a bot message notifies no one who doesn't follow
       // its thread: mention the person who decided (or the owner). A reply where they asked notifies them.
-      const mention = followUp ? streamRecipient(trigger, project.config.owner) : undefined;
+      // A run that timed out or failed (`alert`) mentions them too: it must never go unnoticed.
+      const mention = followUp || alert ? streamRecipient(trigger, project.config.owner) : undefined;
       await postSummary({
         chat,
         store,
@@ -529,6 +539,25 @@ export async function runJob(
           if (at) return at;
         }
       return undefined;
+    };
+    /**
+     * Acting on an approved card and stopped before it finished: the card turns failed and a "Not
+     * finished" card goes in this thread, so the summary below counts it and copies it to Slack.
+     */
+    const approvedCard =
+      (trigger.kind === 'decision' || trigger.kind === 'resume') && trigger.card && !trigger.card.declined
+        ? trigger.card
+        : undefined;
+    const raiseUnfinished = async (reason: string) => {
+      if (!approvedCard || !deps.unfinished) return;
+      await deps.unfinished({
+        project: project.config.name,
+        jobId: job.id,
+        card: approvedCard,
+        reason,
+        thread: { channel, threadTs: rootTs },
+        link: deps.threadUrl?.(channel, rootTs),
+      });
     };
     /** Cards this run left waiting on the Approvals page (approvals and drafts). */
     const cardsLeft = () =>
@@ -847,13 +876,22 @@ export async function runJob(
       if (!live && outcome.text.trim()) await postMarkdown(chat, channel, rootTs, outcome.text);
       // A run a person stopped needs no message; anything else that broke does ("⌛ Timed out after 30m").
       // A usage limit or a lost login hits every run at once: one message for all of them.
+      if (outcome.status !== 'aborted') await raiseUnfinished(reason.replace(/^\S+\s+/, ''));
       const incident = onDashboard && deps.incidents ? incidentOf(outcome, harness) : undefined;
       if (incident) await deps.incidents?.report(slackChannel, incident, job.name);
-      else if (outcome.status !== 'aborted')
+      else if (outcome.status !== 'aborted') {
         await summarize(
           reason.replace(/^(\S+ )(\p{Ll})/u, (_, icon: string, c: string) => icon + c.toUpperCase()),
           formatDuration(outcome.durationMs),
+          true,
         );
+        // A Slack-thread run has no summary: the edited status line notifies no one, so say it to them.
+        const who = streamRecipient(trigger, project.config.owner);
+        if (!onDashboard && who && SLACK_USER.test(who))
+          await chat
+            .post(channel, rootTs, `<@${who}> ${title} · ${reason}`)
+            .catch((err: Error) => log.warn(`could not mention the failure: ${err.message}`));
+      }
       learnIf(undefined, rootTs);
       return record(outcome.status, { ...usage, error: outcome.error, output: outcome.text });
     }
@@ -904,8 +942,9 @@ export async function runJob(
       await postMarkdown(chat, channel, rootTs, outcome.text);
     }
     await deps.incidents?.resolve(harness);
+    if (failure) await raiseUnfinished(`it reported a failure: ${failure.split('\n')[0]?.slice(0, 300)}`);
     // Slack gets the time only: steps and model are on the dashboard.
-    await summarize(outcome.text, formatDuration(outcome.durationMs));
+    await summarize(outcome.text, formatDuration(outcome.durationMs), Boolean(failure));
     learnIf(failure, rootTs);
     return record(failure ? 'failed' : 'ok', { ...usage, error: failure, output: outcome.text });
   } catch (err) {

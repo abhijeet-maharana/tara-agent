@@ -2099,3 +2099,71 @@ describe('acting on a decision as the job', () => {
     );
   });
 });
+
+describe('a run acting on an approved card that does not finish', () => {
+  it('turns the card failed and raises a "Not finished" card in the run thread with the handoff', async () => {
+    const { project, store, approvals } = setup();
+    const cards: Array<{ itemId?: string; kind?: string }> = [];
+    approvals.onJobDecision = async (_p, _j, r) => void cards.push(r.card);
+    approvals.onJob = async (_p, _j, r) => void cards.push(r.card ?? {});
+    const { id } = await approvals.requestDecision(
+      { project, channel: 'C1', threadTs: '90.1', jobId: 'sender' },
+      {
+        title: 'Swap offers',
+        details: 'Opt in to A, opt out of B',
+        kind: 'offers',
+        handoff: 'Steps: A then B',
+        options: ['Apply all', 'Skip'],
+      },
+    );
+    await approvals.decide(id, { option: 'Apply all', by: 'U1', via: 'slack' });
+    await approvals.settled();
+    expect(store.getItem(id)?.status).toBe('done');
+    expect(cards[0]).toMatchObject({ itemId: id, kind: 'offers' });
+
+    await approvals.unfinished({
+      project: 'shop',
+      jobId: 'sender',
+      card: {
+        title: 'Swap offers',
+        body: 'Opt in to A, opt out of B',
+        declined: false,
+        itemId: id,
+        kind: 'offers',
+      },
+      reason: 'timed out after 40m',
+      thread: { channel: 'C1', threadTs: '95.1' },
+      link: 'https://dash/t/95.1',
+    });
+    expect(store.getItem(id)).toMatchObject({
+      status: 'failed',
+      result: 'Not finished: timed out after 40m',
+    });
+    const next = store.items({ project: 'shop', statuses: ['pending'] }).find((i) => i.id !== id);
+    expect(next).toMatchObject({
+      title: 'Not finished: Swap offers',
+      kind: 'offers',
+      jobId: 'sender',
+      threadTs: '95.1',
+      mode: 'resume',
+      options: ['Continue it', 'Skip'],
+    });
+    expect(next?.body).toContain('timed out after 40m');
+    expect(next?.handoff).toContain('do only what is not done yet');
+    expect(next?.handoff).toContain('Steps: A then B');
+
+    // Stopping again does not stack the prefix.
+    store.decideItem(next?.id as string, { status: 'done', decision: 'Continue it', by: 'U1' });
+    await approvals.unfinished({
+      project: 'shop',
+      jobId: 'sender',
+      card: { title: 'Not finished: Swap offers', body: '', declined: false, itemId: next?.id },
+      reason: 'timed out after 40m',
+      thread: { channel: 'C1', threadTs: '96.1' },
+    });
+    expect(store.getItem(next?.id as string)?.status).toBe('failed');
+    expect(store.items({ project: 'shop', statuses: ['pending'] }).map((i) => i.title)).toEqual([
+      'Not finished: Swap offers',
+    ]);
+  });
+});

@@ -189,19 +189,26 @@ export class Vault {
   save(input: LoginInput, by: string): VaultLogin {
     const key = this.needKey();
     const id = input.id.trim().toLowerCase();
-    if (!ID.test(id)) throw new VaultError(400, 'Id: 1–40 lowercase letters, digits and dashes, e.g. "meesho"');
+    if (!ID.test(id))
+      throw new VaultError(400, 'Id: 1–40 lowercase letters, digits and dashes, e.g. "meesho"');
     const service = input.service.trim();
     if (!service) throw new VaultError(400, 'Service is required, e.g. "Meesho Supplier Panel"');
     let loginUrl: URL;
     try {
       loginUrl = new URL(input.loginUrl.trim());
     } catch {
-      throw new VaultError(400, 'Sign-in page: a full address, e.g. https://supplier.meesho.com/panel/v3/new/root/login');
+      throw new VaultError(
+        400,
+        'Sign-in page: a full address, e.g. https://supplier.meesho.com/panel/v3/new/root/login',
+      );
     }
     const sites = [...new Set((input.sites ?? []).map(cleanSite).filter(Boolean))];
     if (!sites.length) sites.push(loginUrl.hostname.toLowerCase());
     if (!allowedUrl(sites, loginUrl.href))
-      throw new VaultError(400, `The sign-in page must be https and on one of the sites (${sites.join(', ')})`);
+      throw new VaultError(
+        400,
+        `The sign-in page must be https and on one of the sites (${sites.join(', ')})`,
+      );
     const projects = [...new Set(input.projects.map((p) => p.trim()).filter(Boolean))];
     if (!projects.length) throw new VaultError(400, 'Pick at least one project that may use it');
     const old = this.deps.store.vaultLogin(id);
@@ -213,7 +220,11 @@ export class Vault {
         previous = undefined;
       }
     const password = input.password ?? '';
-    if (!password && !previous) throw new VaultError(400, old ? 'The saved password can\'t be opened: enter it again' : 'Password is required');
+    if (!password && !previous)
+      throw new VaultError(
+        400,
+        old ? "The saved password can't be opened: enter it again" : 'Password is required',
+      );
     let totp = input.clearTotp ? undefined : previous?.totp;
     if (input.totp?.trim()) {
       try {
@@ -238,7 +249,12 @@ export class Vault {
       createdAt: old?.createdAt ?? at,
       updatedAt: at,
     });
-    const changed = [old ? 'changed' : 'added', password && old && 'new password', input.totp?.trim() && 'authenticator key', input.clearTotp && 'authenticator key removed']
+    const changed = [
+      old ? 'changed' : 'added',
+      password && old && 'new password',
+      input.totp?.trim() && 'authenticator key',
+      input.clearTotp && 'authenticator key removed',
+    ]
       .filter(Boolean)
       .join(', ');
     this.logUse({ loginId: id, action: 'saved', status: 'ok', detail: changed, by });
@@ -275,7 +291,13 @@ export class Vault {
    * Signs a project's Chrome in with a saved login (a run's `vault_sign_in`). `login` is the id or the
    * service name; `url`, a page to open instead of the saved sign-in page (must be on its sites).
    */
-  async signIn(o: { project: string; by: string; login: string; url?: string; cdpUrl?: string }): Promise<SignInResult> {
+  async signIn(o: {
+    project: string;
+    by: string;
+    login: string;
+    url?: string;
+    cdpUrl?: string;
+  }): Promise<SignInResult> {
     this.needKey();
     const wanted = o.login.trim().toLowerCase();
     const mine = this.deps.store.vaultLogins().filter((r) => r.projects.includes(o.project));
@@ -286,10 +308,20 @@ export class Vault {
         `No saved login "${o.login}" for this project. ${mine.length ? `Saved: ${mine.map((r) => `${r.id} (${r.service})`).join(', ')}.` : 'It has none.'} Raise a login card for a person instead.`,
       );
     const refuse = (message: string): never => {
-      this.logUse({ loginId: row.id, project: o.project, action: 'sign-in', status: 'refused', detail: message, by: o.by });
+      this.logUse({
+        loginId: row.id,
+        project: o.project,
+        action: 'sign-in',
+        status: 'refused',
+        detail: message,
+        by: o.by,
+      });
       throw new VaultError(409, message);
     };
-    if (!o.cdpUrl) refuse('This project has no shared Chrome (its .mcp.json --browserUrl), so the vault has nowhere to sign in.');
+    if (!o.cdpUrl)
+      refuse(
+        'This project has no shared Chrome (its .mcp.json --browserUrl), so the vault has nowhere to sign in.',
+      );
     const url = o.url?.trim() || row.loginUrl;
     if (!allowedUrl(row.sites, url)) refuse(`${url} is not on this login's sites (${row.sites.join(', ')}).`);
     if (this.busy.has(row.id)) refuse('A sign-in with this login is already running.');
@@ -297,13 +329,21 @@ export class Vault {
       .vaultUses({ loginId: row.id, since: this.now() - 3_600_000, limit: 50 })
       .filter((u) => u.action === 'sign-in' && u.status !== 'refused');
     const lastFailed = recent.find((u) => u.status === 'failed');
-    const lastSaved = this.deps.store.vaultUses({ loginId: row.id, limit: 20 }).find((u) => u.action === 'saved');
-    if (lastFailed && this.now() - lastFailed.at < AFTER_FAILURE_MS && !(lastSaved && lastSaved.at > lastFailed.at))
+    const lastSaved = this.deps.store
+      .vaultUses({ loginId: row.id, limit: 20 })
+      .find((u) => u.action === 'saved');
+    if (
+      lastFailed &&
+      this.now() - lastFailed.at < AFTER_FAILURE_MS &&
+      !(lastSaved && lastSaved.at > lastFailed.at)
+    )
       refuse(
         'The last sign-in with this login failed less than 30 minutes ago. It is not retried (a second wrong try can lock the account): raise a login card for a person.',
       );
     if (recent.length >= MAX_PER_HOUR)
-      refuse(`${recent.length} sign-ins with this login in the last hour: something keeps signing it out. Raise a card for a person.`);
+      refuse(
+        `${recent.length} sign-ins with this login in the last hour: something keeps signing it out. Raise a card for a person.`,
+      );
     let secret: Secret;
     try {
       secret = this.secretOf(row);
@@ -318,7 +358,11 @@ export class Vault {
       const run = signIn(opened, {
         url,
         allowed: (u) => allowedUrl(row.sites, u),
-        secrets: { account: row.account, password: secret.password, totp: secret.totp ? parseTotp(secret.totp) : undefined },
+        secrets: {
+          account: row.account,
+          password: secret.password,
+          totp: secret.totp ? parseTotp(secret.totp) : undefined,
+        },
         now: this.now,
         sleep: this.deps.sleep,
       });
@@ -327,7 +371,11 @@ export class Vault {
         run,
         new Promise<SignInResult>((resolve) => {
           timer = setTimeout(
-            () => resolve({ status: 'failed', message: 'The sign-in took too long and was stopped; it may or may not have gone through.' }),
+            () =>
+              resolve({
+                status: 'failed',
+                message: 'The sign-in took too long and was stopped; it may or may not have gone through.',
+              }),
             SIGN_IN_TIMEOUT_MS,
           );
         }),
@@ -344,7 +392,14 @@ export class Vault {
       return result;
     } catch (err) {
       const message = `The sign-in stopped: ${(err as Error).message}`;
-      this.logUse({ loginId: row.id, project: o.project, action: 'sign-in', status: 'failed', detail: message, by: o.by });
+      this.logUse({
+        loginId: row.id,
+        project: o.project,
+        action: 'sign-in',
+        status: 'failed',
+        detail: message,
+        by: o.by,
+      });
       this.deps.log.warn(`vault: ${row.id} sign-in for ${o.by}: ${message}`);
       return { status: 'failed', message };
     } finally {

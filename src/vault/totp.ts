@@ -15,7 +15,8 @@ const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
 export function base32Decode(text: string): Buffer {
   const clean = text.toUpperCase().replace(/[\s-]/g, '').replace(/=+$/, '');
-  if (!clean || /[^A-Z2-7]/.test(clean)) throw new Error('The authenticator key is not valid base32 (A–Z, 2–7)');
+  if (!clean || /[^A-Z2-7]/.test(clean))
+    throw new Error('The authenticator key is not valid base32 (A–Z, 2–7)');
   let bits = 0;
   let value = 0;
   const out: number[] = [];
@@ -33,21 +34,24 @@ export function base32Decode(text: string): Buffer {
 /** A setup key or `otpauth://` link; throws with what to fix. */
 export function parseTotp(input: string): Totp {
   const text = input.trim();
-  if (!text.toLowerCase().startsWith('otpauth://')) return { secret: base32Decode(text), algorithm: 'sha1', digits: 6, period: 30 };
+  if (!text.toLowerCase().startsWith('otpauth://'))
+    return { secret: base32Decode(text), algorithm: 'sha1', digits: 6, period: 30 };
   let url: URL;
   try {
     url = new URL(text);
   } catch {
     throw new Error('The otpauth:// link is not valid');
   }
-  if (url.host.toLowerCase() !== 'totp') throw new Error('Only time-based (otpauth://totp/) keys are supported');
+  if (url.host.toLowerCase() !== 'totp')
+    throw new Error('Only time-based (otpauth://totp/) keys are supported');
   const algorithm = (url.searchParams.get('algorithm') ?? 'SHA1').toLowerCase();
   if (algorithm !== 'sha1' && algorithm !== 'sha256' && algorithm !== 'sha512')
     throw new Error(`Unknown algorithm "${algorithm}"`);
   const digits = Number(url.searchParams.get('digits') ?? 6);
   const period = Number(url.searchParams.get('period') ?? 30);
   if (![6, 7, 8].includes(digits)) throw new Error('digits must be 6, 7 or 8');
-  if (!Number.isInteger(period) || period < 10 || period > 300) throw new Error('period must be 10–300 seconds');
+  if (!Number.isInteger(period) || period < 10 || period > 300)
+    throw new Error('period must be 10–300 seconds');
   return { secret: base32Decode(url.searchParams.get('secret') ?? ''), algorithm, digits, period };
 }
 

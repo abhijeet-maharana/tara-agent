@@ -173,7 +173,8 @@ export async function postSummary(input: SummaryInput): Promise<string | undefin
     : shown.body === (text || '_(no reply)_')
       ? { header: `${shown.header} · ${waiting}`, body: '' }
       : { header: shown.header, body: '' };
-  const who = input.replyIn && input.mention ? `<@${input.mention}> ` : '';
+  // A follow-up under an old summary, or a run that timed out or failed: mention who must see it.
+  const who = input.mention ? `<@${input.mention}> ` : '';
   const blocks: SlackBlock[] = [
     // A section, not a markdown block, which would read the name's `*…*` as italics.
     { type: 'section', text: { type: 'mrkdwn', text: `${who}${header}` } },

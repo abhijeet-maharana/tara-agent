@@ -583,6 +583,56 @@ export class Approvals {
     this.notify(item, 'finished');
   }
 
+  /**
+   * A run acting on an approved card timed out or failed before it finished: the card turns `failed`
+   * (not `done`), and a "Not finished" card goes in that run's thread. "Continue it" resumes the run's
+   * session, which knows how far it got; a new session gets the original handoff notes plus what
+   * happened. Never throws: the run has already ended.
+   */
+  async unfinished(input: {
+    project: string;
+    jobId: string;
+    card: DecidedCard;
+    reason: string;
+    thread: { channel: string; threadTs: string };
+    link?: string;
+  }): Promise<void> {
+    const { store, log } = this.deps;
+    try {
+      const project = this.project(input.project);
+      const original = input.card.itemId ? store.getItem(input.card.itemId) : undefined;
+      const failed = input.card.itemId
+        ? store.failDecidedItem(input.card.itemId, `Not finished: ${input.reason}`)
+        : undefined;
+      if (failed) this.notify(failed, 'finished');
+      const title = input.card.title.replace(/^Not finished: /, '');
+      const where = input.link ? ` (<${input.link}|the run>)` : '';
+      const details = [
+        `The run acting on your decision stopped before it finished: ${input.reason}${where}.`,
+        'Part of it may be done. "Continue it" picks up from where it stopped; it checks what is already done first and does only the rest.',
+        `## The approved card\n${input.card.body.trim() || '(no details)'}`,
+      ].join('\n\n');
+      const handoff = [
+        `A run already acted on this approved card and stopped before it finished (${input.reason})${input.link ? `; its thread: ${input.link}` : ''}. Check the current state first and do only what is not done yet; never repeat a step that already took effect.`,
+        input.card.handoff?.trim() ?? original?.handoff?.trim() ?? '',
+      ]
+        .filter(Boolean)
+        .join('\n\n');
+      await this.requestDecision(
+        { project, channel: input.thread.channel, threadTs: input.thread.threadTs, jobId: input.jobId },
+        {
+          title: `Not finished: ${title}`,
+          details,
+          options: ['Continue it', 'Skip'],
+          kind: input.card.kind ?? original?.kind,
+          handoff,
+        },
+      );
+    } catch (err) {
+      log.warn(`[${input.project}] could not raise the not-finished card: ${(err as Error).message}`);
+    }
+  }
+
   private postInThread(item: Item, text: string): void {
     void this.deps.chat
       .post(item.channel as string, item.threadTs, toSlackMrkdwn(text).slice(0, 2_000))
@@ -723,6 +773,8 @@ export class Approvals {
         body: decided.body ?? '',
         declined: negative,
         handoff: decided.handoff,
+        itemId: decided.id,
+        kind: decided.kind,
       };
       const visible = (who: string) =>
         `*From ${who} on the Approvals page:* ${negative ? '❌' : '✅'} ${d.option} on "${decided.title}"${d.reply?.trim() ? `\n${d.reply.trim()}` : ''}`;

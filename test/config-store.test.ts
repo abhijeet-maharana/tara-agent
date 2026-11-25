@@ -335,13 +335,13 @@ describe('Store', () => {
     const db = new DatabaseSync(file);
     const { user_version: v } = db.prepare('PRAGMA user_version').get() as { user_version: number };
     // The database as it was before the upgrade: totals in cost_usd, no session_cost_usd.
-    // (twenty migrations back: the cost one, day_threads, the health tables, samples and logs, item priority, reminders,
+    // (twenty-one migrations back: the cost one, day_threads, the health tables, samples and logs, item priority, reminders,
     // reminder tasks, item handoff notes, phone devices, phone battery, dashboard threads, VM host samples, dropping the
-    // phone tables, the capacity columns, card chats, decided keys, item run starts, heartbeat, context size and session choice (which drops the card chats again), the chat inbox; dropping the reminders table undoes reminders and reminder tasks, dropping the
+    // phone tables, the capacity columns, card chats, decided keys, item run starts, heartbeat, context size and session choice (which drops the card chats again), the chat inbox, the vault; dropping the reminders table undoes reminders and reminder tasks, dropping the
     // sample tables undoes the capacity columns, and the phone tables are gone already)
     db.exec(
       `DROP TABLE vmhost_samples; DROP TABLE thread_aliases; DROP TABLE web_mirrors; DROP TABLE web_messages; ALTER TABLE items DROP COLUMN handoff; DROP TABLE reminders; ALTER TABLE items DROP COLUMN priority; DROP TABLE log_events; DROP TABLE host_samples; DROP TABLE health_events;
-       DROP TABLE health_state; DROP TABLE day_threads; ALTER TABLE runs DROP COLUMN session_cost_usd; DROP TABLE IF EXISTS item_chat; DROP TRIGGER items_decided_key; DROP TABLE decided_keys; ALTER TABLE items DROP COLUMN run_started_at; DROP TABLE heartbeat; ALTER TABLE runs DROP COLUMN context_tokens; ALTER TABLE items DROP COLUMN session_mode; DROP TABLE inbox; PRAGMA user_version = ${v - 20};`,
+       DROP TABLE health_state; DROP TABLE day_threads; ALTER TABLE runs DROP COLUMN session_cost_usd; DROP TABLE IF EXISTS item_chat; DROP TRIGGER items_decided_key; DROP TABLE decided_keys; ALTER TABLE items DROP COLUMN run_started_at; DROP TABLE heartbeat; ALTER TABLE runs DROP COLUMN context_tokens; ALTER TABLE items DROP COLUMN session_mode; DROP TABLE inbox; DROP TABLE vault_logins; DROP TABLE vault_uses; DROP TABLE vault_meta; PRAGMA user_version = ${v - 21};`,
     );
     const add = db.prepare(
       `INSERT INTO runs (kind, project, session_id, started_at, ended_at, status, cost_usd) VALUES ('chat', 'p', ?, ?, ?, 'ok', ?)`,

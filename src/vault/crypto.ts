@@ -29,18 +29,23 @@ export function seal(key: Buffer, purpose: string, plain: string): string {
   const cipher = createCipheriv('aes-256-gcm', key, iv);
   cipher.setAAD(Buffer.from(`tara-vault:${VERSION}:${purpose}`));
   const data = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
-  return [VERSION, iv, cipher.getAuthTag(), data].map((p) => (typeof p === 'string' ? p : p.toString('base64url'))).join('.');
+  return [VERSION, iv, cipher.getAuthTag(), data]
+    .map((p) => (typeof p === 'string' ? p : p.toString('base64url')))
+    .join('.');
 }
 
 /** The plain text, or throws when the key, the purpose or the data don't match. */
 export function open(key: Buffer, purpose: string, sealed: string): string {
   const [version, iv, tag, data] = sealed.split('.');
-  if (version !== VERSION || !iv || !tag || data === undefined) throw new VaultKeyError('Unknown vault value format');
+  if (version !== VERSION || !iv || !tag || data === undefined)
+    throw new VaultKeyError('Unknown vault value format');
   try {
     const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(iv, 'base64url'));
     decipher.setAAD(Buffer.from(`tara-vault:${VERSION}:${purpose}`));
     decipher.setAuthTag(Buffer.from(tag, 'base64url'));
-    return Buffer.concat([decipher.update(Buffer.from(data, 'base64url')), decipher.final()]).toString('utf8');
+    return Buffer.concat([decipher.update(Buffer.from(data, 'base64url')), decipher.final()]).toString(
+      'utf8',
+    );
   } catch {
     throw new VaultKeyError("This value can't be opened with the current TARA_VAULT_KEY");
   }

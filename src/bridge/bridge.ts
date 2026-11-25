@@ -456,7 +456,10 @@ export class Bridge {
   }
 
   /** Signs the project's Chrome in with a saved login (`vault_sign_in`); the run gets only how it went. */
-  async vaultSignIn(token: string | undefined, input: { login: string; url?: string }): Promise<SignInResult> {
+  async vaultSignIn(
+    token: string | undefined,
+    input: { login: string; url?: string },
+  ): Promise<SignInResult> {
     const ctx = this.run(token);
     const vault = this.deps.vault;
     if (!vault?.on) throw new BridgeError(404, vault?.problem ?? 'The vault is off');

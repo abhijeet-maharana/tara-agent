@@ -89,7 +89,10 @@ class FakePage implements VaultPage {
   }
   async evaluate<T>(expression: string): Promise<T> {
     if (expression === 'document.title') return 'Shop' as T;
-    if (expression.includes("document.querySelectorAll('[data-tara-vault]')") && expression.includes('captcha')) {
+    if (
+      expression.includes("document.querySelectorAll('[data-tara-vault]')") &&
+      expression.includes('captcha')
+    ) {
       const s = this.step;
       return {
         user: Boolean(s.user),
@@ -158,11 +161,19 @@ describe('signIn', () => {
 
   it('follows account → password → authenticator code', async () => {
     const totp = parseTotp('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ');
-    const page = new FakePage([{ user: true }, { pass: true, userValue: 'me@shop.com' }, { codeBoxes: 6 }, {}]);
+    const page = new FakePage([
+      { user: true },
+      { pass: true, userValue: 'me@shop.com' },
+      { codeBoxes: 6 },
+      {},
+    ]);
     clock = 1_000_010_000;
     const r = await signIn(page, opts({ secrets: { account: 'me@shop.com', password: 'hunter2', totp } }));
     expect(r.status).toBe('signed-in');
-    const code = page.typed.filter(([m]) => m.startsWith('code-')).map(([, d]) => d).join('');
+    const code = page.typed
+      .filter(([m]) => m.startsWith('code-'))
+      .map(([, d]) => d)
+      .join('');
     expect(code).toBe(totpCode(totp, clock));
     expect(page.typed.filter(([m]) => m === 'user')).toHaveLength(1);
   });
@@ -181,8 +192,15 @@ describe('signIn', () => {
       'needs-code',
     );
     expect(
-      (await signIn(new FakePage([{ user: true, pass: true }, { user: true, url: 'https://evil.com/x' }]), opts()))
-        .status,
+      (
+        await signIn(
+          new FakePage([
+            { user: true, pass: true },
+            { user: true, url: 'https://evil.com/x' },
+          ]),
+          opts(),
+        )
+      ).status,
     ).toBe('wrong-site');
     expect((await signIn(new FakePage([{}]), opts())).status).toBe('already-signed-in');
   });
@@ -215,7 +233,11 @@ describe('Vault', () => {
     v.save({ ...input, totp: 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ' }, 'dashboard');
     v.save({ ...input, password: '', account: 'other@shop.com' }, 'dashboard');
     expect(JSON.stringify(v.list())).not.toContain('hunter2');
-    expect(v.list()[0]).toMatchObject({ account: 'other@shop.com', hasTotp: true, sites: ['shop.example.com'] });
+    expect(v.list()[0]).toMatchObject({
+      account: 'other@shop.com',
+      hasTotp: true,
+      sites: ['shop.example.com'],
+    });
     const shown = v.reveal('shop', 'dashboard');
     expect(shown.password).toBe('hunter2');
     expect(shown.code).toMatch(/^\d{6}$/);
@@ -244,7 +266,8 @@ describe('Vault', () => {
       },
     });
     v.save(input, 'dashboard');
-    const sign = () => v.signIn({ project: 'shop', by: 'shop/orders', login: 'Shop admin', cdpUrl: 'http://c' });
+    const sign = () =>
+      v.signIn({ project: 'shop', by: 'shop/orders', login: 'Shop admin', cdpUrl: 'http://c' });
     await expect(v.signIn({ project: 'other', by: 'x', login: 'shop', cdpUrl: 'http://c' })).rejects.toThrow(
       /No saved login/,
     );
@@ -272,14 +295,22 @@ describe('vault keys and routes', () => {
   });
 
   it('never hands the key to a run', () => {
-    expect(buildChildEnv({ TARA_VAULT_KEY: KEY, PATH: '/bin' }, undefined).TARA_VAULT_KEY).toBeUndefined();
+    expect(
+      buildChildEnv({ TARA_VAULT_KEY: KEY, PATH: '/bin' }, 'subscription').TARA_VAULT_KEY,
+    ).toBeUndefined();
   });
 
   it('lists without secrets and refuses changes from this machine', async () => {
     const store = new Store(':memory:');
     const vault = new Vault({ store, key: KEY, log: silent });
     vault.save(
-      { id: 'shop', projects: ['shop'], service: 'Shop', loginUrl: 'https://shop.example.com/', password: 'hunter2' },
+      {
+        id: 'shop',
+        projects: ['shop'],
+        service: 'Shop',
+        loginUrl: 'https://shop.example.com/',
+        password: 'hunter2',
+      },
       'dashboard',
     );
     const server = await startHttpServer({

@@ -807,7 +807,9 @@ if (VAULT_TOOLS) {
         const ok = r.status === 'signed-in' || r.status === 'already-signed-in';
         return text(
           `${r.status}: ${r.message}${r.url ? `\nThe tab ended at ${r.url}${r.title ? ` ("${r.title}")` : ''}.` : ''}` +
-            (ok ? '\nNow reload your own tab.' : '\nRaise a login card for a person (request_approval, no handoff).'),
+            (ok
+              ? '\nNow reload your own tab.'
+              : '\nRaise a login card for a person (request_approval, no handoff).'),
           !ok,
         );
       } catch (err) {

@@ -1021,7 +1021,9 @@ export class Store {
     const month = Math.max(before, this.now() - 31 * 86_400_000);
     this.db.prepare('DELETE FROM log_events WHERE at < ?').run(month);
     // The vault's log answers "who used this login": tiny, kept a year.
-    this.db.prepare('DELETE FROM vault_uses WHERE at < ?').run(Math.min(before, this.now() - 365 * 86_400_000));
+    this.db
+      .prepare('DELETE FROM vault_uses WHERE at < ?')
+      .run(Math.min(before, this.now() - 365 * 86_400_000));
     return { runs: Number(runs), claims: Number(claims), sessions: Number(sessions) };
   }
 
@@ -1784,6 +1786,20 @@ export class Store {
     return r.changes > 0 ? this.getItem(id) : undefined;
   }
 
+  /**
+   * A paused run's card is `done` once decided; when the run acting on it then times out or fails, it
+   * becomes `failed`, so the Approvals page never shows an unfinished action as done.
+   */
+  failDecidedItem(id: string, result: string): Item | undefined {
+    const t = this.now();
+    const r = this.db
+      .prepare(
+        "UPDATE items SET status = 'failed', result = ?, finished_at = ?, updated_at = ? WHERE id = ? AND status = 'done'",
+      )
+      .run(result.slice(0, 4_000), t, t, id);
+    return r.changes > 0 ? this.getItem(id) : undefined;
+  }
+
   /** A status line on an approved or running item ("comment posted; the note goes out Wednesday"), or why it was withdrawn. */
   noteItem(id: string, result: string | undefined): Item | undefined {
     this.db
@@ -2169,18 +2185,22 @@ export class Store {
 
   setVaultMeta(key: string, value: string): void {
     this.db
-      .prepare('INSERT INTO vault_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .prepare(
+        'INSERT INTO vault_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+      )
       .run(key, value);
   }
 
   vaultLogins(): VaultRow[] {
-    return (this.db.prepare('SELECT * FROM vault_logins ORDER BY service, id').all() as Record<string, unknown>[]).map(
-      vaultRow,
-    );
+    return (
+      this.db.prepare('SELECT * FROM vault_logins ORDER BY service, id').all() as Record<string, unknown>[]
+    ).map(vaultRow);
   }
 
   vaultLogin(id: string): VaultRow | undefined {
-    const r = this.db.prepare('SELECT * FROM vault_logins WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    const r = this.db.prepare('SELECT * FROM vault_logins WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
     return r ? vaultRow(r) : undefined;
   }
 
@@ -2216,7 +2236,9 @@ export class Store {
 
   addVaultUse(u: Omit<VaultUse, 'id'>): void {
     this.db
-      .prepare('INSERT INTO vault_uses (login_id, project, action, status, detail, by, at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .prepare(
+        'INSERT INTO vault_uses (login_id, project, action, status, detail, by, at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      )
       .run(u.loginId, u.project ?? null, u.action, u.status, u.detail ?? null, u.by ?? null, u.at);
   }
 
@@ -2226,7 +2248,10 @@ export class Store {
       .prepare(
         `SELECT * FROM vault_uses WHERE (? IS NULL OR login_id = ?) AND at >= ? ORDER BY at DESC, id DESC LIMIT ?`,
       )
-      .all(opts.loginId ?? null, opts.loginId ?? null, opts.since ?? 0, opts.limit ?? 100) as Record<string, unknown>[];
+      .all(opts.loginId ?? null, opts.loginId ?? null, opts.since ?? 0, opts.limit ?? 100) as Record<
+      string,
+      unknown
+    >[];
     return rows.map((r) => ({
       id: r.id as number,
       loginId: r.login_id as string,

@@ -20,7 +20,7 @@ import type { Item, Store } from '../store/store.js';
 import { Locks, Semaphore } from '../util/concurrency.js';
 import { type Delivery, deliveryOf, webOf } from '../web/chat.js';
 import type { GateRunner } from './gate.js';
-import { type JobStatus, type JobTrigger, type JobWait, runJob } from './job-runner.js';
+import { type JobRunnerDeps, type JobStatus, type JobTrigger, type JobWait, runJob } from './job-runner.js';
 import { HELD_RETRY_MS, LimitHolds } from './limits.js';
 import type { DecidedCard } from './prompt.js';
 import { runName, SCHEDULE_BY, type ScheduledKind, scheduledRunText } from './slack-trigger.js';
@@ -112,6 +112,8 @@ export interface SchedulerDeps {
   gate?: GateRunner;
   /** Whether a job's `requires` URL answers (tests). */
   probe?: (url: string) => Promise<boolean>;
+  /** A run acting on an approved card stopped before it finished (`Approvals.unfinished`). */
+  unfinished?: JobRunnerDeps['unfinished'];
 }
 
 interface Entry {
@@ -686,6 +688,7 @@ export class Scheduler implements JobControl {
         cancelWait: cancelWait.signal,
         gate: this.deps.gate,
         probe: this.deps.probe,
+        unfinished: this.deps.unfinished,
         onWait: (waitingFor) => this.stages.set(key, waitingFor ? { waitingFor } : { startedAt: this.now() }),
       },
       named,

@@ -77,6 +77,7 @@ function setup(opts: {
   store?: Store;
   now?: () => number;
   stateDir?: string;
+  unfinished?: (u: { reason: string; card: object; thread: object }) => Promise<void>;
 }) {
   const store = opts.store ?? new Store(':memory:');
   const { slack, web, chat } = routed(store);
@@ -93,6 +94,7 @@ function setup(opts: {
     newSessionId: () => 'sid',
     now: opts.now,
     threadUrl: (channel, ts) => `https://dash.example/t/${channel}/${ts}`,
+    unfinished: opts.unfinished,
     run: async (o) => {
       calls.push(o);
       o.onEvent?.({ kind: 'init', sessionId: 'sid', model: 'claude-haiku-5-5' });
@@ -372,15 +374,54 @@ describe('dashboard delivery', () => {
     failed.scheduler.start();
     failed.scheduler.trigger('shop', 'prime', 'dashboard');
     await failed.scheduler.idle();
-    expect(failed.slack.blockPosts[0]?.text).toBe('Prime Check: ❌ Login expired');
+    // It mentions the owner: a failed or timed-out run must never go unnoticed.
+    expect(failed.slack.blockPosts[0]?.text).toBe('<@U1> Prime Check: ❌ Login expired');
     await failed.scheduler.stop();
 
     const late = setup({ status: 'timeout' });
     late.scheduler.start();
     late.scheduler.trigger('shop', 'prime', 'dashboard');
     await late.scheduler.idle();
-    expect(late.slack.blockPosts[0]?.text).toMatch(/^Prime Check: ⌛ Timed out after/);
+    expect(late.slack.blockPosts[0]?.text).toMatch(/^<@U1> Prime Check: ⌛ Timed out after/);
     await late.scheduler.stop();
+  });
+
+  it('raises "Not finished" when a run acting on an approved card times out or fails', async () => {
+    const stopped: Array<{ reason: string; card: object; thread: object }> = [];
+    const unfinished = async (u: { reason: string; card: object; thread: object }) => void stopped.push(u);
+    const card = { title: 'Swap offers', body: 'A then B', declined: false, itemId: 'i1', handoff: 'A, B' };
+    const from = { channel: webChannel('shop'), threadTs: '1.0' };
+
+    const late = setup({ status: 'timeout', unfinished });
+    late.scheduler.start();
+    await late.scheduler.decided('shop', 'prime', { by: 'U1', text: 'USER DECISION', card, from });
+    expect(stopped).toEqual([
+      expect.objectContaining({ reason: expect.stringMatching(/^timed out after/), card }),
+    ]);
+    expect(late.slack.blockPosts.at(-1)?.text).toMatch(/^<@U1> Prime Check: ⌛ Timed out after/);
+    await late.scheduler.stop();
+
+    const failed = setup({ replies: ['❌ Seller Hub asked for a login'], unfinished });
+    failed.scheduler.start();
+    await failed.scheduler.decided('shop', 'prime', { by: 'U1', text: 'USER DECISION', card, from });
+    expect(stopped[1]).toMatchObject({ reason: 'it reported a failure: Seller Hub asked for a login' });
+    await failed.scheduler.stop();
+
+    // A declined card, or a run that finished, raises nothing.
+    const fine = setup({ unfinished });
+    fine.scheduler.start();
+    await fine.scheduler.decided('shop', 'prime', { by: 'U1', text: 'USER DECISION', card, from });
+    const no = setup({ status: 'timeout', unfinished });
+    no.scheduler.start();
+    await no.scheduler.decided('shop', 'prime', {
+      by: 'U1',
+      text: 'USER DECISION',
+      card: { ...card, declined: true },
+      from,
+    });
+    expect(stopped).toHaveLength(2);
+    await fine.scheduler.stop();
+    await no.scheduler.stop();
   });
 
   it('keeps a job on `delivery: thread` in its Slack thread', async () => {

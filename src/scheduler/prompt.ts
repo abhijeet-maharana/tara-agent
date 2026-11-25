@@ -162,6 +162,9 @@ export interface DecidedCard {
   declined: boolean;
   /** The run's handoff notes for whoever acts on the decision (`request_approval` `handoff`). */
   handoff?: string;
+  /** The card's item id: a run acting on it that doesn't finish marks it failed (`unfinished`). */
+  itemId?: string;
+  kind?: string;
 }
 
 const cardSection = (card: DecidedCard) =>
