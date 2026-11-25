@@ -5,7 +5,7 @@ import type { ItemStatus } from '../../store/store.js';
 import { dayKey } from '../../util/time.js';
 import { isWebChannel } from '../../web/chat.js';
 import { type ApprovalsTab, approvalsPage, ITEMS_LIMIT, isNotice, unlockPage } from '../approvals.js';
-import { probeBrowser, projectNeeds, SiteScanner } from '../browser-usage.js';
+import { loadLogins, probeBrowser, projectNeeds, SiteScanner } from '../browser-usage.js';
 import { browsersPage } from '../browsers.js';
 import {
   codeDiffPage,
@@ -36,6 +36,7 @@ import { logsPage, trendsPage } from '../observe.js';
 import { queuePage } from '../queue.js';
 import { loadQuotes, pickQuote } from '../quotes.js';
 import { remindersPage } from '../reminders-page.js';
+import { vaultPage } from '../vault-page.js';
 import { makeRoute, type Route, type RouteRequest } from '../router.js';
 import { isDayKey, schedulePage } from '../schedule.js';
 
@@ -57,7 +58,7 @@ const BROWSER_DAYS = 30;
 export function pageRoutes(c: ServerContext): PageRoute[] {
   const { options, now, timeZone } = c;
   const { store, scheduler } = options;
-  const { reminders, health, observe, approvals, browsers, code } = options;
+  const { reminders, health, observe, approvals, browsers, code, vault } = options;
   const namesOf = (ctx: DashboardContext) => ctx.projects.map((p) => p.config.name);
   /** `?project=` when it is one of the dashboard's projects. */
   const projectParam = (url: URL, ctx: DashboardContext) => {
@@ -392,6 +393,30 @@ export function pageRoutes(c: ServerContext): PageRoute[] {
     route('GET /schedule', schedule),
     route('GET /unlock', (_r, ctx) => unlockPage(ctx)),
     ...(approvals ? [route('GET /approvals', approvalsList), route('GET /queue', queueList)] : []),
+    ...(vault
+      ? [
+          route('GET /vault', ({ req }, ctx) => {
+            const saved = vault.list();
+            const known = new Set(saved.map((l) => `${l.service.toLowerCase()}|${(l.account ?? '').toLowerCase()}`));
+            const suggestions = ctx.projects.flatMap((p) => {
+              const file = loadLogins(p.dir);
+              if (!file || 'error' in file) return [];
+              return file.logins
+                .filter((l) => !known.has(`${l.service.toLowerCase()}|${(l.account ?? '').toLowerCase()}`))
+                .map((login) => ({ project: p.config.name, login }));
+            });
+            return vaultPage(ctx, {
+              on: vault.on,
+              problem: vault.problem,
+              logins: saved,
+              uses: vault.uses({ limit: 100 }),
+              suggestions,
+              canEdit: c.canDecide(req),
+              now: now(),
+            });
+          }),
+        ]
+      : []),
     ...(reminders
       ? [
           route('GET /reminders', (_r, ctx) =>

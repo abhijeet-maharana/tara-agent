@@ -252,7 +252,7 @@ describe('Code pages and API', () => {
 describe('Code pages: folders, old work and asking about a repo', () => {
   const NOW = Date.parse('2026-11-10T05:00:00Z');
   const ctx = { projects: [], timeZone: 'UTC', agentName: 'Jarvis' } as unknown as DashboardContext;
-  const repo = { name: 'jobs', title: 'Job Search', dir: '/r/jobs', askIn: 'jobs' } as unknown as CodeRepo;
+  const repo = { name: 'jobs', title: 'Support', dir: '/r/jobs', askIn: 'jobs' } as unknown as CodeRepo;
   const change = (path: string, added = 1): Change =>
     ({ path, state: 'modified', added, removed: 0 }) as Change;
   const many = Array.from({ length: 31 }, (_, i) => change(`.agents/memory/m${i}.md`, 2));

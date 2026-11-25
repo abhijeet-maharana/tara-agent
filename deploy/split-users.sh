@@ -73,7 +73,7 @@ if [[ ! -f $STATE/tara.db && -f $OLD_STATE/tara.db ]]; then
   cp -a "$OLD_STATE/." "$STATE/"
   chown -R "$AGENT_USER:$AGENT_USER" "$STATE"
 fi
-cp "$CHECKOUT/deploy/systemd/tara-agent-split-users.service" "$UNIT"
+sed "s#^WorkingDirectory=.*#WorkingDirectory=$CHECKOUT#" "$CHECKOUT/deploy/systemd/tara-agent-split-users.service" >"$UNIT"
 systemctl daemon-reload && systemctl start tara-agent
 for _ in $(seq 20); do systemctl is-active --quiet tara-agent && break; sleep 1; done
 systemctl is-active tara-agent || { journalctl -u tara-agent -n 20 --no-pager; echo "not running: see above, or --rollback" >&2; }

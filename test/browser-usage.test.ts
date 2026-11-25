@@ -89,7 +89,7 @@ describe('SiteScanner and projectNeeds', () => {
     const projects = ['shop', 'jobs'].map((name) => {
       const dir = path.join(root, name);
       mkdirSync(dir);
-      return { dir, config: { name, title: name === 'shop' ? 'Shop' : 'Job Search' } } as unknown as Project;
+      return { dir, config: { name, title: name === 'shop' ? 'Shop' : 'Support' } } as unknown as Project;
     });
     const write = (p: Project, sid: string, lines: string[], mtime = NOW) => {
       const file = transcriptPath(p.dir, sid, config);
@@ -145,10 +145,10 @@ describe('SiteScanner and projectNeeds', () => {
       now: NOW,
     });
     expect(html).toContain('Logins Shop needs');
-    expect(html).toContain('Logins Job Search needs');
+    expect(html).toContain('Logins Support needs');
     expect(html).toContain('seller.flipkart.com');
     expect(html).toContain('Orders ×2');
-    expect(html).toContain('also Job Search');
+    expect(html).toContain('also Support');
     expect(html).toContain('Shop · 1 job');
     expect(html).toContain('No logins written down');
     expect(html).toContain('href="/browsers"');

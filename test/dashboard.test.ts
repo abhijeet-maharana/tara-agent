@@ -75,7 +75,7 @@ describe('access and rendering', () => {
     expect(ok('127.0.0.1')).toBe(true);
     expect(ok('::ffff:100.100.1.2')).toBe(true);
     expect(ok('fd7a:115c:a1e0::1')).toBe(true);
-    expect(ok('192.168.1.20')).toBe(false);
+    expect(ok('192.168.0.50')).toBe(false);
     expect(ok(undefined)).toBe(false);
     expect(() => allowList(['nope/8'])).toThrow(/Not an IP range/);
   });
@@ -593,7 +593,7 @@ describe('home page', () => {
   const ctx: DashboardContext = {
     projects: [
       { dir: '/r/shop', config: { name: 'shop', title: 'Shop' } },
-      { dir: '/r/jobs', config: { name: 'jobs', title: 'Job Search' } },
+      { dir: '/r/jobs', config: { name: 'jobs', title: 'Support' } },
     ] as unknown as Project[],
     timeZone: 'UTC',
     agentName: 'Jarvis',
@@ -637,8 +637,8 @@ describe('home page', () => {
     ],
     quietRuns: 12,
     pending: [
-      item('a', 'jobs', 'application', 'queue', 600),
-      item('b', 'jobs', 'application', 'queue', 30),
+      item('a', 'jobs', 'ticket', 'queue', 600),
+      item('b', 'jobs', 'ticket', 'queue', 30),
       item('c', 'jobs', 'email', 'queue', 20),
       { ...item('d', 'shop', 'decision', 'resume', 5), jobId: 'daily' },
       item('n1', 'jobs', 'notice', 'resume', 2),
@@ -705,9 +705,9 @@ describe('home page', () => {
 
   it('breaks waiting approvals down by project and kind, and lists the cards to start with', () => {
     expect(page).toContain(
-      'Job Search: 3 waiting</b><span class="meta"><span>2 applications · 1 email</span><span>oldest 10h</span>',
+      'Support: 3 waiting</b><span class="meta"><span>2 tickets · 1 email</span><span>oldest 10h</span>',
     );
-    expect(page.indexOf('Job Search: 3 waiting')).toBeLessThan(page.indexOf('Shop: 1 waiting'));
+    expect(page.indexOf('Support: 3 waiting')).toBeLessThan(page.indexOf('Shop: 1 waiting'));
     // A card a run waits on comes first, then the oldest.
     const first = page.slice(page.indexOf('Start with these'));
     expect(first.indexOf('#item-d')).toBeLessThan(first.indexOf('#item-a'));
@@ -832,11 +832,23 @@ describe('a running session', () => {
     stepCount: 1,
     text: 'Checking the portal',
   };
+  // A reply under a dashboard run's Slack summary: it runs in the dashboard thread's session, but its
+  // task names the Slack thread.
+  const WEB_SESSION = '33333333-3333-4333-8444-555555555555';
+  const reply = { ...task, id: 't2', kind: 'chat' as const, thread: { channel: 'C1', ts: '400.1' } };
   const stopped: string[] = [];
   let base = '';
   let close = () => {};
 
   beforeAll(async () => {
+    store.saveSession({
+      threadKey: 'web-shop:300.1',
+      project: 'shop',
+      sessionId: WEB_SESSION,
+      model: 'opus',
+      started: true,
+    });
+    store.saveThreadAlias('C1:400.1', 'web-shop:300.1');
     store.saveSession({
       threadKey: 'C1:200.1',
       project: 'shop',
@@ -854,7 +866,7 @@ describe('a running session', () => {
       adminToken: 'key',
       decisionsFromLocal: true,
       activity: {
-        tasks: () => [task],
+        tasks: () => [task, reply],
         usage: () => undefined,
         stop: (id: string) => {
           stopped.push(id);
@@ -908,6 +920,26 @@ describe('a running session', () => {
       headers: { cookie: 'tara_admin=key' },
     });
     expect(after.status).toBe(409);
+
+    // Idle now: the page watches for the next turn instead of staying still.
+    const idle = await fetch(`${base}/sessions/${SESSION}`, { headers: { accept: 'text/html' } }).then((r) =>
+      r.text(),
+    );
+    expect(idle).not.toContain('id="live"');
+    expect(idle).toContain("'/live'");
+  });
+
+  it('shows a reply from the Slack summary thread as running on the dashboard session', async () => {
+    const live = (await fetch(`${base}/sessions/${WEB_SESSION}/live`).then((r) => r.json())) as {
+      running: boolean;
+      task: { id: string };
+    };
+    expect(live.running).toBe(true);
+    expect(live.task.id).toBe('t2');
+    const page = await fetch(`${base}/t/web-shop/300.1`, { headers: { accept: 'text/html' } }).then((r) =>
+      r.text(),
+    );
+    expect(page).toContain(`id="live" data-session="${WEB_SESSION}"`);
   });
 });
 
@@ -916,7 +948,7 @@ describe('approvals page', () => {
   const ctx: DashboardContext = {
     projects: [
       { dir: '/r/shop', config: { name: 'shop', title: 'Shop', approvals: { expireDays: 7 } } },
-      { dir: '/r/jobs', config: { name: 'jobs', title: 'Job Search' } },
+      { dir: '/r/jobs', config: { name: 'jobs', title: 'Support' } },
     ] as unknown as Project[],
     timeZone: 'UTC',
     agentName: 'Jarvis',
@@ -949,8 +981,8 @@ describe('approvals page', () => {
     card('q-new', 'decision', 'resume', 1),
     card('q-run', 'login', 'resume', 2, { jobId: 'scout', source: 'scout' }),
     card('q-old', 'decision', 'resume', 150),
-    card('d1', 'application', 'queue', 5),
-    card('d2', 'application', 'queue', 6),
+    card('d1', 'ticket', 'queue', 5),
+    card('d2', 'ticket', 'queue', 6),
     card('d3', 'seo-code-change', 'queue', 7),
     card('n1', 'notice', 'resume', 3),
     card('n2', 'notice', 'resume', 4),
@@ -973,25 +1005,25 @@ describe('approvals page', () => {
     expect(at('id="item-q-run"')).toBeLessThan(at('id="item-q-old"'));
     expect(at('id="item-q-old"')).toBeLessThan(at('id="item-q-new"'));
     expect(page).toContain(
-      '<h3>Application</h3><span>2</span><button type="button" class="btn ghost more" data-bulk="Approve"',
+      '<h3>Ticket</h3><span>2</span><button type="button" class="btn ghost more" data-bulk="Approve"',
     );
     expect(page).toContain('data-bulk="Seen" data-notice data-label="Mark all seen"');
   });
 
   it('merges several drafts of one kind into one card, and says why an option is off', () => {
     expect(page).toContain(
-      '<div data-group class="card merged"><div class="sec-head sub-head"><h3>Application</h3>',
+      '<div data-group class="card merged"><div class="sec-head sub-head"><h3>Ticket</h3>',
     );
     // One draft of a kind stays a card of its own.
     expect(page).not.toContain('class="card merged"><div class="sec-head sub-head"><h3>SEO code change</h3>');
     const stuck = approvalsPage(ctx, {
       tab: 'waiting',
       items: [
-        card('b1', 'application', 'queue', 1, {
+        card('b1', 'ticket', 'queue', 1, {
           checks: [{ text: 'Role closed', blocking: true }],
           reply: 'Use the new link',
         }),
-        card('b2', 'application', 'queue', 2),
+        card('b2', 'ticket', 'queue', 2),
       ],
       counts: { waiting: 2, done: 0 },
       queues: () => ({}),
@@ -1020,7 +1052,7 @@ describe('approvals page', () => {
     expect(kindLabel('client-x-reply')).toBe('Client X reply');
     const more = page.slice(at('class="kinds-more"'));
     expect(more).toContain('More<small>');
-    expect(page.slice(0, at('class="kinds-more"'))).toContain('Application<small>2</small>');
+    expect(page.slice(0, at('class="kinds-more"'))).toContain('Ticket<small>2</small>');
   });
 });
 
@@ -1407,7 +1439,7 @@ describe('session titles', () => {
       '- LinkedIn on Tuesdays',
       '',
       '### Recent decisions on cards',
-      '22 Nov · application · "80 · CINC Systems · Staff Applied AI Engineer": Skip',
+      '22 Nov · ticket · "Refund for order 1042": Skip',
       '',
       '## Cards in this thread',
       '- Draft post (item 7, post, pending)',

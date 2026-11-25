@@ -167,7 +167,7 @@ describe('Conversations', () => {
   it('with the sweeper: a tab from turn 1 survives turn 3 an hour later', async () => {
     const chrome = await fakeChrome({
       a: 'chrome://new-tab-page/',
-      b: 'https://www.naukri.com/mnjuser/profile',
+      b: 'https://accounts.example.com/profile',
     });
     servers.push(chrome.server);
     let now = 0;

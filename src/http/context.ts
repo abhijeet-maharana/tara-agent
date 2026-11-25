@@ -224,13 +224,18 @@ export function serverContext(options: HttpOptions) {
       : undefined;
   };
 
-  /** The task working in a session's thread now, else the latest finished one there (newest first). */
+  /**
+   * The task working in a session's thread now, else the latest finished one there (newest first). A
+   * reply under a dashboard run's Slack summary (or a card's copy) runs in this session but its task names
+   * the Slack thread, so those aliases count as this session's thread too.
+   */
   const liveTask = (sessionId: string) => {
     const key = options.store.sessionsOverview({ sessionId, limit: 1 })[0]?.threadKey;
     if (!key) return undefined;
+    const keys = new Set([key, ...options.store.aliasesOf(key)]);
     return options.activity
       ?.tasks()
-      .find((t) => t.thread && threadKey(t.thread.channel, t.thread.ts) === key);
+      .find((t) => t.thread && keys.has(threadKey(t.thread.channel, t.thread.ts)));
   };
 
   /** The owner of an item's project: who a dashboard decision is recorded as. */
@@ -330,6 +335,7 @@ export function serverContext(options: HttpOptions) {
       code: Boolean(options.code),
       browsers: Boolean(options.browsers),
       reminders: Boolean(options.reminders),
+      vault: Boolean(options.vault),
       data: dash.projects.some((p) => p.config.dataUrl),
       unhealthy: options.health ? redChecks().length : undefined,
     };

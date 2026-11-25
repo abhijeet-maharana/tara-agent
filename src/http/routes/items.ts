@@ -7,7 +7,7 @@ import { type Route, route } from '../router.js';
 
 /** Approval items carry drafts (emails, posts), so they may be bigger than other requests. */
 export const ITEM_BODY_LIMIT = 200_000;
-/** Enough for a job application form: the note, every question and the resume. */
+/** Enough for an application form: the note, every question and the resume. */
 const MAX_FIELDS = 40;
 
 /** Checks a proposed item from the API or a run; returns the input or throws 400. */

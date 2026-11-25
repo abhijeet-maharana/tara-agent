@@ -36,6 +36,7 @@ import { createSlackGateway, type SlackGateway, type SlackOptions } from './slac
 import { backupDaily } from './store/backup.js';
 import { Store } from './store/store.js';
 import { zonedClock } from './util/time.js';
+import { Vault } from './vault/vault.js';
 import { deliveryOf, isWebChannel, RoutedChat, WebChat, webChannel, webProject } from './web/chat.js';
 
 export interface AgentOptions {
@@ -198,6 +199,10 @@ export async function startAgent(opts: AgentOptions): Promise<Agent> {
     threadUrl,
   });
   if (!env.APPROVAL_SEAL_KEY) log.warn('APPROVAL_SEAL_KEY is not set: approved items are not sealed');
+  // Saved website logins: runs sign in through tara-agent and never see a secret.
+  const vault = new Vault({ store, key: env.TARA_VAULT_KEY || undefined, log });
+  if (vault.on) log.info(`Vault: ${vault.list().length} saved logins`);
+  else if (env.TARA_VAULT_KEY) log.error(`Vault: ${vault.problem}`);
   // Pull requests: the token stays here, runs only get the tools.
   const githubToken = env.TARA_GITHUB_TOKEN || undefined;
   if (host.github.length && !githubToken)
@@ -227,6 +232,7 @@ export async function startAgent(opts: AgentOptions): Promise<Agent> {
       privileged,
       pullRequests: prRaiser,
       ciJobs,
+      vault,
       log,
       projects,
       timeZone: host.timezone,
@@ -446,6 +452,7 @@ export async function startAgent(opts: AgentOptions): Promise<Agent> {
         bridge,
         approvals,
         reminders,
+        vault,
         adminToken: env.TARA_ADMIN_TOKEN || undefined,
         readAs: runAs?.user,
         continueThread: (msg) => (manager as SessionManager).handle(msg),

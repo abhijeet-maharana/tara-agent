@@ -1,4 +1,0 @@
-[     552ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://jarvis:4000/favicon.ico:1
-[   22167ms] [ERROR] Access to fetch at 'http://jarvis:4000/items/nonexistent/decide' from origin 'http://jarvis:4010' has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present on the requested resource. @ http://jarvis:4010/app/remote-job/apply-by-hand:1
-[   22167ms] [ERROR] Failed to load resource: net::ERR_FAILED @ http://jarvis:4000/items/nonexistent/decide:1
-[   22270ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://jarvis:4000/items/nonexistent:1

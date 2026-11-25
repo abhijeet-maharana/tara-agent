@@ -78,6 +78,11 @@ export interface SummaryInput {
    * belongs under. It is then a reply there, not a new channel message.
    */
   replyIn?: string;
+  /**
+   * Who to mention in a `replyIn` follow-up (a Slack user id). A reply under an older bot message
+   * notifies nobody unless they follow that thread, so the person who decided is mentioned instead.
+   */
+  mention?: string;
 }
 
 /** A title's plain words: "*Prime Check* (catch-up)" → "Prime Check (catch-up)". */
@@ -168,16 +173,18 @@ export async function postSummary(input: SummaryInput): Promise<string | undefin
     : shown.body === (text || '_(no reply)_')
       ? { header: `${shown.header} · ${waiting}`, body: '' }
       : { header: shown.header, body: '' };
+  const who = input.replyIn && input.mention ? `<@${input.mention}> ` : '';
   const blocks: SlackBlock[] = [
     // A section, not a markdown block, which would read the name's `*…*` as italics.
-    { type: 'section', text: { type: 'mrkdwn', text: header } },
+    { type: 'section', text: { type: 'mrkdwn', text: `${who}${header}` } },
     ...(body ? [textBlock(body, SECTION_MAX + 200)] : []),
     ...(footer ? [{ type: 'context', elements: [{ type: 'mrkdwn', text: footer }] }] : []),
   ];
   // The phone's notification: "Prime Check: ✅ Prime is on again".
   const notice =
-    [plainTitle(input.title).replace(/\s*\(.*\)$/, ''), notificationLine(text)].filter(Boolean).join(': ') ||
-    'Run finished';
+    who +
+    ([plainTitle(input.title).replace(/\s*\(.*\)$/, ''), notificationLine(text)].filter(Boolean).join(': ') ||
+      'Run finished');
   let ts: string;
   try {
     ts = await sendWithFallback(blocks, (b) =>

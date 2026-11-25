@@ -254,19 +254,19 @@ describe('kit http', () => {
     expect(passes(tailnetOnly, req({ ip: '127.0.0.1' })).ok).toBe(true);
     expect(passes(tailnetOnly, req({ ip: '::ffff:100.64.0.1' })).ok).toBe(true);
     expect(passes(tailnetOnly, req({ ip: 'fd7a:115c:a1e0::5' })).ok).toBe(true);
-    expect(passes(tailnetOnly, req({ ip: '192.168.1.20' }))).toMatchObject({ ok: false, code: 403 });
+    expect(passes(tailnetOnly, req({ ip: '192.168.0.50' }))).toMatchObject({ ok: false, code: 403 });
     expect(passes(tailnetOnly, req({ ip: '100.128.0.1' })).ok).toBe(false); // outside 100.64/10
-    expect(passes(writeGuard, req({ method: 'GET', ip: '192.168.1.20' })).ok).toBe(true);
-    expect(passes(writeGuard, req({ method: 'DELETE', ip: '192.168.1.20' })).ok).toBe(false);
+    expect(passes(writeGuard, req({ method: 'GET', ip: '192.168.0.50' })).ok).toBe(true);
+    expect(passes(writeGuard, req({ method: 'DELETE', ip: '192.168.0.50' })).ok).toBe(false);
   });
 
   it("trusts the dashboard proxy's forwarded address only from loopback", () => {
     // Behind the proxy (loopback) the browser's address decides.
     const proxied = (ff: string) => req({ ip: '127.0.0.1', h: { 'x-forwarded-for': ff } });
     expect(passes(tailnetOnly, proxied('100.101.2.3')).ok).toBe(true);
-    expect(passes(tailnetOnly, proxied('192.168.1.20')).ok).toBe(false);
+    expect(passes(tailnetOnly, proxied('192.168.0.50')).ok).toBe(false);
     // A LAN client can't claim a tailnet address.
-    expect(passes(tailnetOnly, req({ ip: '192.168.1.20', h: { 'x-forwarded-for': '127.0.0.1' } })).ok).toBe(
+    expect(passes(tailnetOnly, req({ ip: '192.168.0.50', h: { 'x-forwarded-for': '127.0.0.1' } })).ok).toBe(
       false,
     );
     expect(uiPrefix(req({ ip: '127.0.0.1', h: { 'x-tara-prefix': '/app/shop' } }))).toBe('/app/shop');
@@ -312,7 +312,7 @@ describe('kit http', () => {
       body: { unlock: '/unlock' },
     });
     expect(
-      passes(admin.humanOnly, req({ ip: '192.168.1.20', h: { cookie: 'shop_admin=s3cret' } })).code,
+      passes(admin.humanOnly, req({ ip: '192.168.0.50', h: { cookie: 'shop_admin=s3cret' } })).code,
     ).toBe(403);
     expect(admin.matches('s3cret')).toBe(true);
     token = undefined;

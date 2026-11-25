@@ -14,6 +14,8 @@
  *   set_reminder, list_reminders, cancel_reminder   reminders posted in the channel (no run)
  *   data_tables, data_query, data_rows, data_get, data_upsert, data_patch   the project's own database
  *                     (projects with a `dataUrl`)
+ *   vault_logins, vault_sign_in   saved website logins: tara-agent signs the project's Chrome in itself,
+ *                     the run never sees a secret (TARA_VAULT_KEY set; src/vault/)
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -24,6 +26,7 @@ const TOKEN = process.env.TARA_RUN_TOKEN ?? '';
 const PERMISSION_PROMPTS = process.env.TARA_PERMISSION_PROMPTS === '1';
 const GITHUB_TOOLS = process.env.TARA_GITHUB_TOOLS === '1';
 const DATA_TOOLS = process.env.TARA_DATA_TOOLS === '1';
+const VAULT_TOOLS = process.env.TARA_VAULT_TOOLS === '1';
 /** A tool answer longer than this is cut (rows are summarised by count). */
 const DATA_MAX_CHARS = 60_000;
 /** Fetching or pushing a big repo can take minutes. */
@@ -751,6 +754,66 @@ if (DATA_TOOLS) {
       },
     },
     (args) => data({ action: 'patch', ...args }),
+  );
+}
+
+if (VAULT_TOOLS) {
+  server.registerTool(
+    'vault_logins',
+    {
+      title: 'List the saved logins',
+      description:
+        "Website logins saved in tara's vault for this project: id, service, the account, the sites each is " +
+        'for, and whether it holds an authenticator key. You never see a password; `vault_sign_in` uses them.',
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const { logins } = await api<{ logins: unknown[] }>('/internal/vault-logins');
+        return text(logins.length ? JSON.stringify(logins, null, 1) : 'No saved logins for this project.');
+      } catch (err) {
+        return text(`Could not list the saved logins: ${(err as Error).message}`, true);
+      }
+    },
+  );
+  server.registerTool(
+    'vault_sign_in',
+    {
+      title: 'Sign in with a saved login',
+      description:
+        "When a site in the project's Chrome asks you to sign in (or a page shows you signed out) and " +
+        '`vault_logins` has a login for it, call this BEFORE raising a login card. tara-agent opens its own tab, ' +
+        'types the account, password and authenticator code there, submits, closes that tab, and tells you how it ' +
+        'went; the session then holds in the shared Chrome. Afterwards reload your own tab (navigate_page to the ' +
+        'page you wanted). Statuses: signed-in / already-signed-in (go on), captcha / needs-code / failed / ' +
+        'wrong-site (raise a login card for a person with what it said). Never call it twice for the same login ' +
+        'after a failure: a second wrong try can lock the account.',
+      inputSchema: {
+        login: z.string().min(1).max(100).describe('The login id or service name from vault_logins'),
+        url: z
+          .string()
+          .url()
+          .optional()
+          .describe("A sign-in page to open instead of the saved one (must be on the login's sites)"),
+      },
+    },
+    async (args) => {
+      try {
+        const r = await api<{ status: string; message: string; url?: string; title?: string }>(
+          '/internal/vault-sign-in',
+          args,
+          130_000,
+        );
+        const ok = r.status === 'signed-in' || r.status === 'already-signed-in';
+        return text(
+          `${r.status}: ${r.message}${r.url ? `\nThe tab ended at ${r.url}${r.title ? ` ("${r.title}")` : ''}.` : ''}` +
+            (ok ? '\nNow reload your own tab.' : '\nRaise a login card for a person (request_approval, no handoff).'),
+          !ok,
+        );
+      } catch (err) {
+        return text(`Vault sign-in refused: ${(err as Error).message}`, true);
+      }
+    },
   );
 }
 

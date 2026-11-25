@@ -216,7 +216,7 @@ describe('dashboard delivery', () => {
         const key = o.env.TARA_THREAD as string;
         const at = key.indexOf(':');
         thread = key.slice(at + 1);
-        if (!o.args.includes('--resume')) {
+        if (!o.args.includes('--resume') && !o.prompt.includes('decided on an approval card')) {
           o.onEvent?.({ kind: 'init', sessionId: 'sid', model: 'm' });
           for (const n of [1, 2]) {
             const item = store.proposeItem({
@@ -291,12 +291,34 @@ describe('dashboard delivery', () => {
       }),
     ).toBe('ok');
     expect(slack.blockPosts).toHaveLength(4);
+    // It mentions the person who decided: a reply under an older bot message notifies no one otherwise.
     expect(slack.blockPosts[3]).toMatchObject({
       thread: summary?.ts,
-      text: 'Prime Check: ✅ Fixed UI issue 1, uncommitted',
+      text: '<@U1> Prime Check: ✅ Fixed UI issue 1, uncommitted',
+    });
+    expect(slack.blockPosts[3]?.blocks[0]).toMatchObject({
+      text: { text: expect.stringMatching(/^<@U1> ✅ /) },
     });
     // Its reply doesn't take over the job's Slack thread: replies there still reach the job's session.
     expect(store.aliasesOf(`${webChannel('shop')}:${thread}`)).toEqual([`C1:${summary?.ts}`]);
+
+    // A decision acted on in a fresh session (days later, from the Approvals page): its ✅ is also a reply
+    // under the job's summary, and mentions the person who decided so they hear it is done.
+    const before = slack.blockPosts.length;
+    expect(
+      await scheduler.decided('shop', 'prime', {
+        by: 'U1',
+        text: 'USER DECISION on "UI issue 2": Fix it',
+        card: { title: 'UI issue 2', body: '', declined: false, handoff: 'Swap the photo' },
+        from: { channel: webChannel('shop'), threadTs: thread },
+      }),
+    ).toBe('ok');
+    expect(slack.blockPosts.slice(before)).toEqual([
+      expect.objectContaining({
+        thread: summary?.ts,
+        text: expect.stringMatching(/^<@U1> Prime Check: ✅ /),
+      }),
+    ]);
     await scheduler.stop();
   });
 

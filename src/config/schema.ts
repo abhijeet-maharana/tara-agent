@@ -789,7 +789,7 @@ const jobsArraySchema = z.array(jobSchema).superRefine((jobs, ctx) => {
 
 /**
  * A skill's job name: its dash-separated words capitalised, or as `words` writes them
- * (`job-application-submitter` → "Job Application Submitter", `linkedin` → "LinkedIn" with that word).
+ * (`invoice-sender` → "Invoice Sender", `linkedin` → "LinkedIn" with that word).
  */
 export function skillJobName(skill: string, words: Record<string, string> = {}): string {
   return skill

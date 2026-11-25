@@ -95,6 +95,14 @@ export const skipReason = (r: GateResult) =>
     ? `✅ ${r.stdout.trim()}`
     : '✅ Nothing to do: the gate found no work, so no model session ran';
 
+/** What a run the gate let through keeps of it (the dashboard's "what the check before the run found"). */
+export function gateRecord(r: GateResult): string | undefined {
+  const parts = [r.stdout.trim()];
+  if (r.timedOut) parts.push('[the gate did not finish in time]');
+  else if (r.code !== 0) parts.push(`[the gate exited with code ${r.code}]`, r.stderr.trim().slice(-4000));
+  return parts.filter(Boolean).join('\n\n') || undefined;
+}
+
 /** The prompt section for a run the gate let through. */
 export function gateSection(command: string, r: GateResult): string {
   const how = r.timedOut

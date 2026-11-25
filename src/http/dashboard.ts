@@ -31,6 +31,8 @@ export interface DashboardContext {
   browsers?: boolean;
   /** The Reminders page is on. */
   reminders?: boolean;
+  /** The Vault page (saved website logins) is on. */
+  vault?: boolean;
   /** A project has a data API (`dataUrl`): the Data page is on. */
   data?: boolean;
   /** Red checks on the Health page, for its sidebar badge; undefined when the page is off. */
@@ -736,6 +738,7 @@ export type Page =
   | 'Reminders'
   | 'Code'
   | 'Browsers'
+  | 'Vault'
   | 'Data'
   | 'Health'
   | '';
@@ -780,6 +783,7 @@ export function layout(
       ...(ctx.reminders ? ([['/reminders', 'Reminders', '⏰', 0, '']] as const) : []),
       ...(ctx.code ? ([['/code', 'Code', '📝', 0, '']] as const) : []),
       ...(ctx.browsers ? ([['/browsers', 'Browsers', '🌐', 0, '']] as const) : []),
+      ...(ctx.vault ? ([['/vault', 'Vault', '🔐', 0, '']] as const) : []),
       ...(ctx.data ? ([['/data', 'Data', '🗄️', 0, '']] as const) : []),
       ...(ctx.unhealthy !== undefined
         ? ([['/health', 'Health', '❤️', ctx.unhealthy, 'health problems']] as const)
@@ -1571,7 +1575,7 @@ export function sessionPage(
           : ''
       }${
         run && !running ? `<a href="/runs/${run.id}">Run details</a>` : ''
-      }<span class="dim" title="${esc(sessionId)}">id ${esc(sessionId.slice(0, 8))}</span></div>`
+      }<span class="dim" title="${esc(sessionId)}" data-session="${esc(sessionId)}">id ${esc(sessionId.slice(0, 8))}</span></div>`
     : '';
   const error =
     !running && run?.error && FAILED.includes(run.status)
@@ -1618,7 +1622,9 @@ export function sessionPage(
     'Sessions',
     `${pageHead(title)}${head}${error}${live}${result}${files}${body}${say}`,
     {
-      script: [running ? LIVE_SCRIPT : '', opts.canSay ? SAY_SCRIPT : ''].join('') || undefined,
+      script:
+        [running ? LIVE_SCRIPT : session ? WATCH_SCRIPT : '', opts.canSay ? SAY_SCRIPT : ''].join('') ||
+        undefined,
     },
   );
 }
@@ -1646,6 +1652,31 @@ const SAY_SCRIPT = `
       setTimeout(() => location.reload(), 1500);
     } catch (err) { toast(err.message, { error: true }); button.disabled = false; }
   });
+})();
+`;
+
+/**
+ * An idle session's page: polls `/sessions/<id>/live` and reloads when a turn starts (a reply from Slack,
+ * a card decision, this page's own reply box), so the live card shows without a manual reload. It waits
+ * while the reply box holds a draft, so nothing typed is lost.
+ */
+const WATCH_SCRIPT = `
+(() => {
+  const id = document.querySelector('[data-session]')?.dataset.session;
+  if (!id) return;
+  const url = '/sessions/' + encodeURIComponent(id) + '/live';
+  let misses = 0;
+  async function poll() {
+    try {
+      const r = await fetch(url);
+      const j = await r.json();
+      const draft = document.getElementById('say-text');
+      if (j.running && !(draft && draft.value.trim())) return location.reload();
+      misses = 0;
+    } catch { if (++misses > 20) return; }
+    setTimeout(poll, document.hidden ? 15000 : 4000);
+  }
+  setTimeout(poll, 4000);
 })();
 `;
 

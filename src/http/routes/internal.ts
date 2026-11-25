@@ -26,6 +26,8 @@ const required = (v: unknown, name: string) => {
  *   POST /internal/reminder            {text, cron? | at?, notify?, task?, title?}; GET /internal/reminders;
  *   POST /internal/reminder-cancel     {id}
  *   POST /internal/data                {action: tables|sql|rows|get|upsert|patch, table?, key?, sql?, params?, row?, fields?, limit?, offset?}
+ *   GET  /internal/vault-logins        the project's saved logins (no secrets)
+ *   POST /internal/vault-sign-in       {login, url?} → {status, message, url?, title?}
  */
 export function internalRoutes(bridge: Bridge): Route<unknown>[] {
   const token = ({ req }: RouteRequest) => req.headers['x-tara-run'] as string | undefined;
@@ -145,6 +147,10 @@ export function internalRoutes(bridge: Bridge): Route<unknown>[] {
       }),
     ),
     route('GET /internal/reminders', (r) => ({ reminders: bridge.listReminders(token(r)) })),
+    route('GET /internal/vault-logins', (r) => bridge.vaultLogins(token(r))),
+    post('vault-sign-in', (body, t) =>
+      bridge.vaultSignIn(t, { login: required(body.login, 'login'), url: str(body.url) }),
+    ),
     post('reminder-cancel', (body, t) => bridge.cancelReminder(t, required(body.id, 'id'))),
     post(
       'data',

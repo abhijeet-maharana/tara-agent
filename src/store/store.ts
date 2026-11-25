@@ -484,7 +484,68 @@ const MIGRATIONS = [
      received_at INTEGER NOT NULL,
      started_at  INTEGER
    );`,
+  // The vault (src/vault/): website logins whose secrets tara-agent types in itself, encrypted with
+  // TARA_VAULT_KEY; every use, reveal and change; and the key's fingerprint, so a wrong key is noticed.
+  `CREATE TABLE vault_logins (
+     id         TEXT PRIMARY KEY,
+     projects   TEXT NOT NULL,
+     service    TEXT NOT NULL,
+     account    TEXT,
+     sites      TEXT NOT NULL,
+     login_url  TEXT NOT NULL,
+     secret     TEXT NOT NULL,
+     has_totp   INTEGER NOT NULL DEFAULT 0,
+     note       TEXT,
+     created_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL
+   );
+   CREATE TABLE vault_uses (
+     id       INTEGER PRIMARY KEY AUTOINCREMENT,
+     login_id TEXT NOT NULL,
+     project  TEXT,
+     action   TEXT NOT NULL,
+     status   TEXT NOT NULL,
+     detail   TEXT,
+     by       TEXT,
+     at       INTEGER NOT NULL
+   );
+   CREATE INDEX vault_uses_login ON vault_uses(login_id, at);
+   CREATE TABLE vault_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);`,
 ];
+
+/** A saved login as stored (`secret` is sealed; see vault/crypto.ts). */
+export interface VaultRow {
+  /** Short fixed name, e.g. "meesho"; part of the encryption's bound data, so it never changes. */
+  id: string;
+  /** Projects whose runs may sign in with it. */
+  projects: string[];
+  service: string;
+  account?: string;
+  /** Hosts it may be typed into; `*.example.com` covers example.com and its subdomains. */
+  sites: string[];
+  /** The sign-in page tara-agent opens. */
+  loginUrl: string;
+  secret: string;
+  hasTotp: boolean;
+  note?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** One line of the vault's log. */
+export interface VaultUse {
+  id: number;
+  loginId: string;
+  project?: string;
+  /** sign-in, reveal, saved, deleted. */
+  action: string;
+  /** e.g. signed-in, failed, captcha, needs-code, refused, ok. */
+  status: string;
+  detail?: string;
+  /** Who: `<project>/<job>` or `<project>/chat` for runs, `dashboard` for a person. */
+  by?: string;
+  at: number;
+}
 
 /** One message of a dashboard thread (src/web/). */
 export interface WebMessage {
@@ -959,6 +1020,8 @@ export class Store {
     this.db.prepare('DELETE FROM vmhost_samples WHERE at < ?').run(before);
     const month = Math.max(before, this.now() - 31 * 86_400_000);
     this.db.prepare('DELETE FROM log_events WHERE at < ?').run(month);
+    // The vault's log answers "who used this login": tiny, kept a year.
+    this.db.prepare('DELETE FROM vault_uses WHERE at < ?').run(Math.min(before, this.now() - 365 * 86_400_000));
     return { runs: Number(runs), claims: Number(claims), sessions: Number(sessions) };
   }
 
@@ -2097,9 +2160,112 @@ export class Store {
     }
   }
 
+  vaultMeta(key: string): string | undefined {
+    const row = this.db.prepare('SELECT value FROM vault_meta WHERE key = ?').get(key) as
+      | { value: string }
+      | undefined;
+    return row?.value;
+  }
+
+  setVaultMeta(key: string, value: string): void {
+    this.db
+      .prepare('INSERT INTO vault_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .run(key, value);
+  }
+
+  vaultLogins(): VaultRow[] {
+    return (this.db.prepare('SELECT * FROM vault_logins ORDER BY service, id').all() as Record<string, unknown>[]).map(
+      vaultRow,
+    );
+  }
+
+  vaultLogin(id: string): VaultRow | undefined {
+    const r = this.db.prepare('SELECT * FROM vault_logins WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return r ? vaultRow(r) : undefined;
+  }
+
+  /** Adds or replaces a login (created_at kept). */
+  saveVaultLogin(r: VaultRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO vault_logins (id, projects, service, account, sites, login_url, secret, has_totp, note, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET projects = excluded.projects, service = excluded.service,
+           account = excluded.account, sites = excluded.sites, login_url = excluded.login_url,
+           secret = excluded.secret, has_totp = excluded.has_totp, note = excluded.note,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        r.id,
+        JSON.stringify(r.projects),
+        r.service,
+        r.account ?? null,
+        JSON.stringify(r.sites),
+        r.loginUrl,
+        r.secret,
+        r.hasTotp ? 1 : 0,
+        r.note ?? null,
+        r.createdAt,
+        r.updatedAt,
+      );
+  }
+
+  deleteVaultLogin(id: string): boolean {
+    return Number(this.db.prepare('DELETE FROM vault_logins WHERE id = ?').run(id).changes) === 1;
+  }
+
+  addVaultUse(u: Omit<VaultUse, 'id'>): void {
+    this.db
+      .prepare('INSERT INTO vault_uses (login_id, project, action, status, detail, by, at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(u.loginId, u.project ?? null, u.action, u.status, u.detail ?? null, u.by ?? null, u.at);
+  }
+
+  /** Newest first; one login's, or all. */
+  vaultUses(opts: { loginId?: string; since?: number; limit?: number } = {}): VaultUse[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM vault_uses WHERE (? IS NULL OR login_id = ?) AND at >= ? ORDER BY at DESC, id DESC LIMIT ?`,
+      )
+      .all(opts.loginId ?? null, opts.loginId ?? null, opts.since ?? 0, opts.limit ?? 100) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      id: r.id as number,
+      loginId: r.login_id as string,
+      project: (r.project as string | null) ?? undefined,
+      action: r.action as string,
+      status: r.status as string,
+      detail: (r.detail as string | null) ?? undefined,
+      by: (r.by as string | null) ?? undefined,
+      at: r.at as number,
+    }));
+  }
+
   close(): void {
     this.db.close();
   }
+}
+
+function vaultRow(r: Record<string, unknown>): VaultRow {
+  const list = (v: unknown) => {
+    try {
+      const parsed = JSON.parse(v as string);
+      return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : [];
+    } catch {
+      return [];
+    }
+  };
+  return {
+    id: r.id as string,
+    projects: list(r.projects),
+    service: r.service as string,
+    account: (r.account as string | null) ?? undefined,
+    sites: list(r.sites),
+    loginUrl: r.login_url as string,
+    secret: r.secret as string,
+    hasTotp: r.has_totp === 1,
+    note: (r.note as string | null) ?? undefined,
+    createdAt: r.created_at as number,
+    updatedAt: r.updated_at as number,
+  };
 }
 
 function webMessageRow(r: Record<string, unknown>): WebMessage {

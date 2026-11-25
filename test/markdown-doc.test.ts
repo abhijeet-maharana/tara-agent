@@ -100,7 +100,7 @@ describe('Markdown files as documents (Code page)', () => {
 
 describe('Code page file view', () => {
   const ctx = { projects: [], timeZone: 'UTC', agentName: 'Jarvis' } as unknown as DashboardContext;
-  const repo = { name: 'jobs', title: 'Job Search', dir: '/r/jobs' } as unknown as CodeRepo;
+  const repo = { name: 'jobs', title: 'Support', dir: '/r/jobs' } as unknown as CodeRepo;
   const file = '.agents/skills/li/SKILL.md';
   const view = { text: SKILL, size: SKILL.length };
 

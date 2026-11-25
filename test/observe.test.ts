@@ -138,8 +138,8 @@ describe('trends', () => {
   });
 
   it('groups log lines that differ only in numbers, ids and times', () => {
-    expect(logPattern('[abtara:daily-sync] trigger not posted: slot 1794583735108 "C0C56T18287"')).toBe(
-      '[abtara:daily-sync] trigger not posted: slot # "…"',
+    expect(logPattern('[shop:daily-sync] trigger not posted: slot 1794583735108 "C0123456789"')).toBe(
+      '[shop:daily-sync] trigger not posted: slot # "…"',
     );
     const groups = groupLogs([
       { at: 1, level: 'warn', message: 'Tab sweep: closed 3 tabs in 9222' },
@@ -166,7 +166,7 @@ describe('trends', () => {
 describe('readJournal', () => {
   it('keeps problem lines with their unit, level and blanked secrets', async () => {
     const line = (o: Record<string, unknown>) => JSON.stringify(o);
-    const logs = await readJournal(['abtara-dashboard', 'remote-job-board'], 0, async (cmd, args) => {
+    const logs = await readJournal(['shop-dashboard', 'helpdesk-board'], 0, async (cmd, args) => {
       expect(cmd).toBe('journalctl');
       expect(args).toContain('--unit');
       return {
@@ -175,25 +175,25 @@ describe('readJournal', () => {
             MESSAGE: 'Listening on 4001',
             PRIORITY: '6',
             __REALTIME_TIMESTAMP: '1000000',
-            _SYSTEMD_UNIT: 'abtara-dashboard.service',
+            _SYSTEMD_UNIT: 'shop-dashboard.service',
           }),
           line({
             MESSAGE: 'Upload failed: token=sk-ant-api03-SECRETSECRETSECRET',
             PRIORITY: '6',
             __REALTIME_TIMESTAMP: '2000000',
-            _SYSTEMD_UNIT: 'abtara-dashboard.service',
+            _SYSTEMD_UNIT: 'shop-dashboard.service',
           }),
           line({
             MESSAGE: 'GET https://x.io/a.pdf?X-Goog-Signature=abc123&b=1 timed out',
             PRIORITY: '6',
             __REALTIME_TIMESTAMP: '2500000',
-            _SYSTEMD_UNIT: 'abtara-dashboard.service',
+            _SYSTEMD_UNIT: 'shop-dashboard.service',
           }),
           line({
             MESSAGE: 'slow answer',
             PRIORITY: '3',
             __REALTIME_TIMESTAMP: '3000000',
-            _SYSTEMD_UNIT: 'remote-job-board.service',
+            _SYSTEMD_UNIT: 'helpdesk-board.service',
           }),
           line({ MESSAGE: [1, 2], PRIORITY: '3' }),
           'not json',
@@ -203,9 +203,9 @@ describe('readJournal', () => {
     });
     expect(logs.error).toBeUndefined();
     expect(logs.lines.map((l) => [l.unit, l.level, l.at])).toEqual([
-      ['abtara-dashboard', 'error', 2000],
-      ['abtara-dashboard', 'warn', 2500],
-      ['remote-job-board', 'error', 3000],
+      ['shop-dashboard', 'error', 2000],
+      ['shop-dashboard', 'warn', 2500],
+      ['helpdesk-board', 'error', 3000],
     ]);
     expect(logs.lines[1]?.message).toBe('GET https://x.io/a.pdf?X-Goog-Signature=…&b=1 timed out');
     expect(logs.lines[0]?.message).not.toContain('SECRETSECRET');
@@ -311,11 +311,11 @@ describe('Trends, Logs and /metrics in the dashboard', () => {
       usage: () => 0.5,
       agentName: 'Jarvis',
       timeZone: 'UTC',
-      logUnits: ['abtara-dashboard'],
+      logUnits: ['shop-dashboard'],
       started: Date.now() - 1000,
       journal: async () => ({
         lines: [
-          { unit: 'abtara-dashboard', at: Date.now() - 1000, level: 'warn', message: 'WAHA slow: 5000ms' },
+          { unit: 'shop-dashboard', at: Date.now() - 1000, level: 'warn', message: 'WAHA slow: 5000ms' },
         ],
       }),
     });

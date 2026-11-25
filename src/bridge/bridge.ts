@@ -29,6 +29,7 @@ import {
   type PullRequests,
   type StartedPullRequest,
 } from '../github/pull-requests.js';
+import { projectBrowser } from '../http/browser-usage.js';
 import { dataCall } from '../http/data.js';
 import type { Privileged } from '../privileged/privileged.js';
 import { ReminderError, type ReminderInput, type Reminders } from '../reminders/reminders.js';
@@ -37,6 +38,8 @@ import type { JobControl } from '../scheduler/scheduler.js';
 import type { ChatPort, IncomingMessage, Logger, SlackBlock } from '../sessions/manager.js';
 import type { ButtonTap } from '../slack/app.js';
 import { ITEM_STATUSES, type ItemStatus, type Store } from '../store/store.js';
+import type { SignInResult } from '../vault/sign-in.js';
+import { type Vault, VaultError } from '../vault/vault.js';
 
 /** One Claude run that may call tara's MCP tools: where its thread is and what it may ask for. */
 export interface RunContext {
@@ -123,6 +126,9 @@ export const BRIDGE_PROMPT = `Slack tools (tara MCP server):
 - Close a waiting card yourself with \`withdraw_card\` (its id from \`list_items\`, and why) whenever it no longer needs the person: they did it themselves, the role or post is gone, it is a duplicate, or a newer card replaces it. No approval is needed to close a card. Never ask them to tap a button just to clear it, and never leave a card they cannot act on.
 - To share a screenshot, PDF, CSV or image, save it inside the project (e.g. .scratch/) and call \`send_file\`.`;
 
+/** Appended when the vault is on (TARA_VAULT_KEY set). */
+export const VAULT_PROMPT = `Saved logins (tara MCP server): when a site in the shared Chrome asks you to sign in, check \`vault_logins\` and, if one fits, call \`vault_sign_in\` before raising a login card; then reload your own tab. Raise the card only when it reports captcha, needs-code, failed or wrong-site, or no login fits. Never ask a person for a password, and never type one yourself.`;
+
 /** Without root actions on the host: a run can still ask a person to run a command for it. */
 export const PRIVILEGED_MANUAL_PROMPT = `Root access (you have no sudo): when something needs root or fails with Permission denied outside your reach, call \`request_privileged\` with \`command\` (the exact shell command a person should run) and end your turn; you continue once they have run it.`;
 
@@ -145,6 +151,8 @@ export interface BridgeDeps {
   pullRequests?: PullRequests;
   /** Reading CI jobs (host `github`, read-only); same projects as pull requests. */
   ciJobs?: CiJobs;
+  /** Saved website logins (`vault_logins`, `vault_sign_in`); the tools are on when it has its key. */
+  vault?: Vault;
   log: Logger;
   projects: Project[];
   timeZone: string;
@@ -208,6 +216,7 @@ export class Bridge {
             TARA_REMINDER_TOOLS: this.reminders ? '1' : '0',
             TARA_GITHUB_TOOLS: this.deps.pullRequests?.has(ctx.project.config.name) ? '1' : '0',
             TARA_DATA_TOOLS: ctx.project.config.dataUrl ? '1' : '0',
+            TARA_VAULT_TOOLS: this.deps.vault?.on ? '1' : '0',
           },
         },
       },
@@ -231,6 +240,7 @@ export class Bridge {
   prompt(): string {
     return [
       BRIDGE_PROMPT,
+      this.deps.vault?.on && VAULT_PROMPT,
       this.reminders && REMINDER_TOOLS_PROMPT,
       this.deps.privileged?.prompt() || PRIVILEGED_MANUAL_PROMPT,
     ]
@@ -424,6 +434,44 @@ export class Bridge {
       input.comment?.slice(0, 2_000),
     );
     return { name: path.basename(real) };
+  }
+
+  /** The run's project's saved logins (`vault_logins`): never a secret. */
+  vaultLogins(token: string | undefined): { logins: unknown[] } {
+    const ctx = this.run(token);
+    const vault = this.deps.vault;
+    if (!vault?.on) throw new BridgeError(404, vault?.problem ?? 'The vault is off');
+    return {
+      logins: vault.list(ctx.project.config.name).map((l) => ({
+        id: l.id,
+        service: l.service,
+        account: l.account,
+        sites: l.sites,
+        loginUrl: l.loginUrl,
+        authenticator: l.hasTotp,
+        ...(l.note && { note: l.note }),
+        ...(l.unreadable && { unreadable: true }),
+      })),
+    };
+  }
+
+  /** Signs the project's Chrome in with a saved login (`vault_sign_in`); the run gets only how it went. */
+  async vaultSignIn(token: string | undefined, input: { login: string; url?: string }): Promise<SignInResult> {
+    const ctx = this.run(token);
+    const vault = this.deps.vault;
+    if (!vault?.on) throw new BridgeError(404, vault?.problem ?? 'The vault is off');
+    const name = ctx.project.config.name;
+    return vault
+      .signIn({
+        project: name,
+        by: `${name}/${ctx.jobId ?? ctx.kind}`,
+        login: input.login,
+        url: input.url,
+        cdpUrl: projectBrowser(ctx.project.dir).cdpUrl,
+      })
+      .catch((err) => {
+        throw err instanceof VaultError ? new BridgeError(err.status, err.message) : err;
+      });
   }
 
   /** A workspace for a pull request (`start_pull_request`). */

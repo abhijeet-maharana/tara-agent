@@ -13,16 +13,16 @@ const NOON = Date.UTC(2026, 10, 17, 12, 0);
 const MIN = 60_000;
 
 const failing = (job: string): AttentionItem => ({
-  key: `job-failing:abtara/${job}:1`,
+  key: `job-failing:shop/${job}:1`,
   tier: 'urgent',
   kind: 'job-failing',
-  project: 'abtara',
+  project: 'shop',
   title: `${job} failed`,
 });
 
 const task = (over: Partial<Task> = {}): Task => ({
   id: 't1',
-  project: 'abtara',
+  project: 'shop',
   kind: 'job',
   title: 'Blog post',
   startedAt: NOON - 5 * MIN,
@@ -47,7 +47,7 @@ function setup(over: Partial<GlanceOptions> = {}) {
     tasks: () => tasks,
     next: () => [],
     usage: () => undefined,
-    projectTitle: (name) => (name === 'abtara' ? 'Abtara' : name),
+    projectTitle: (name) => (name === 'shop' ? 'Shop' : name),
     timeZone: 'UTC',
     now: () => clock.now,
     ...over,
@@ -72,8 +72,8 @@ describe('quiet hours', () => {
 describe('Glance', () => {
   it('builds needs, approvals per project, running and recent', async () => {
     const items = [
-      { id: 'a', project: 'abtara', title: 'Post A', createdAt: NOON - 3 * 3_600_000 },
-      { id: 'b', project: 'abtara', title: 'Post B', createdAt: NOON - MIN },
+      { id: 'a', project: 'shop', title: 'Post A', createdAt: NOON - 3 * 3_600_000 },
+      { id: 'b', project: 'shop', title: 'Post B', createdAt: NOON - MIN },
       { id: 'c', project: 'personal', title: 'Reply', createdAt: NOON - 10 * MIN },
     ] as Item[];
     const { glance, attention, tasks } = setup({ pending: () => items });
@@ -82,7 +82,7 @@ describe('Glance', () => {
         key: 'approval:a',
         tier: 'waiting',
         kind: 'approval',
-        project: 'abtara',
+        project: 'shop',
         title: 'Approval waiting: Post A',
       },
       { key: 'h', tier: 'waiting', kind: 'health', title: 'Disk has a problem' },
@@ -97,11 +97,11 @@ describe('Glance', () => {
     expect(s.needs.top.map((i) => i.title)).toEqual(['Disk has a problem', 'payments failed']);
     expect(s.approvals.total).toBe(3);
     expect(s.approvals.projects).toEqual([
-      { project: 'Abtara', count: 2, oldestAt: NOON - 3 * 3_600_000, title: 'Post A' },
+      { project: 'Shop', count: 2, oldestAt: NOON - 3 * 3_600_000, title: 'Post A' },
       { project: 'personal', count: 1, oldestAt: NOON - 10 * MIN, title: 'Reply' },
     ]);
     expect(s.running).toEqual([
-      expect.objectContaining({ id: 't1', project: 'Abtara', step: 'Reading src/blog.ts', stepCount: 1 }),
+      expect.objectContaining({ id: 't1', project: 'Shop', step: 'Reading src/blog.ts', stepCount: 1 }),
     ]);
     expect(s.recent.map((t) => t.title)).toEqual(['Quote']);
   });

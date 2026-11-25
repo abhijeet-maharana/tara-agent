@@ -894,7 +894,7 @@ describe('Scheduler', () => {
   });
 
   it("gives the model the gate's output, and a failing gate's error to fix or report", async () => {
-    const { calls, scheduler } = setup({
+    const { calls, scheduler, store } = setup({
       jobs: [{ ...baseJob, gate: 'echo "2 new leads"; echo "lead-a"' }],
     });
     scheduler.start();
@@ -907,6 +907,8 @@ describe('Scheduler', () => {
     expect(prompt).toContain('2 new leads\nlead-a');
     // Before the job's own instructions.
     expect(prompt.indexOf('## Gate output')).toBeLessThan(prompt.indexOf('Run the job'));
+    // Kept on the run, for the dashboard.
+    expect(store.lastJobRun('shop', 'sla')?.scriptOutput).toBe('2 new leads\nlead-a');
 
     const broken = setup({ jobs: [{ ...baseJob, gate: 'echo nope >&2; exit 3' }] });
     broken.scheduler.start();
@@ -914,6 +916,9 @@ describe('Scheduler', () => {
     await broken.scheduler.idle();
     expect(broken.calls[0]?.prompt).toContain('exited with code 3');
     expect(broken.calls[0]?.prompt).toContain('nope');
+    expect(broken.store.lastJobRun('shop', 'sla')?.scriptOutput).toBe(
+      '[the gate exited with code 3]\n\nnope',
+    );
     await scheduler.stop();
     await broken.scheduler.stop();
   });

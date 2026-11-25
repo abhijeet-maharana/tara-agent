@@ -14,6 +14,7 @@ import type { Activity } from '../runner/activity.js';
 import type { Scheduler } from '../scheduler/scheduler.js';
 import type { IncomingMessage as ChatMessage, Logger } from '../sessions/manager.js';
 import type { Store } from '../store/store.js';
+import { type Vault, VaultError } from '../vault/vault.js';
 import type { WebChat } from '../web/chat.js';
 import { allowList } from './access.js';
 import { unlockPage } from './approvals.js';
@@ -43,6 +44,7 @@ import { pageRoutes } from './routes/pages.js';
 import { reminderRoutes } from './routes/reminders.js';
 import { sessionRoutes } from './routes/sessions.js';
 import { systemRoutes } from './routes/system.js';
+import { vaultRoutes } from './routes/vault.js';
 
 export interface HttpOptions {
   bind: string;
@@ -74,6 +76,8 @@ export interface HttpOptions {
   approvals?: Approvals;
   /** Reminders and their API. */
   reminders?: Reminders;
+  /** Saved website logins: the Vault page and its API (`/vault`). */
+  vault?: Vault;
   /**
    * TARA_ADMIN_TOKEN: the key a browser presents (as a cookie, set on /unlock) to decide approvals.
    * Unset = dashboard decisions are off (Slack buttons still work).
@@ -139,7 +143,7 @@ export interface HttpOptions {
  */
 /** Paths tara-agent serves itself; with a fallback, everything else is passed through. */
 const OWN_PATH =
-  /^\/(?:$|(?:health|metrics|reload|drain|attention|jobs|runs|sessions|schedule|approvals|queue|items|reminders|unlock|code|internal|p|app|glance)(?:\/|$))/;
+  /^\/(?:$|(?:health|metrics|reload|drain|attention|jobs|runs|sessions|schedule|approvals|queue|items|reminders|vault|unlock|code|internal|p|app|glance)(?:\/|$))/;
 
 // Kept importable from here (tests and older callers).
 export { adminCookieValue, crossSite, trustedHost } from './guards.js';
@@ -151,6 +155,7 @@ const statusOf = (err: unknown) =>
   err instanceof BridgeError ||
   err instanceof ApprovalError ||
   err instanceof ReminderError ||
+  err instanceof VaultError ||
   err instanceof CodeError
     ? err.status
     : 500;
@@ -193,6 +198,7 @@ export async function startHttpServer(options: HttpOptions): Promise<Server> {
     ...(options.approvals ? itemRoutes(c, options.approvals) : []),
     ...(options.reminders ? reminderRoutes(c, options.reminders) : []),
     ...(options.code ? codeRoutes(c, options.code) : []),
+    ...(options.vault ? vaultRoutes(c, options.vault) : []),
   ];
   const internal = options.bridge ? internalRoutes(options.bridge) : undefined;
   const pages = pageRoutes(c);

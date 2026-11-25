@@ -19,6 +19,7 @@ import { deliveryOf, isWebChannel, streamFor, webChannel, webOf } from '../web/c
 import { postSummary, slackSummaryOf } from '../web/summary.js';
 import {
   type GateRunner,
+  gateRecord,
   gateRunner,
   gateSaysSkip,
   gateSection,
@@ -277,6 +278,8 @@ export async function runJob(
   /** The main session's time: its own limit, within the run's deadline, but always 5 minutes to report. */
   const mainTimeoutMs = () => Math.min(timeoutMs, Math.max(5 * 60_000, deadline - now()));
   const lessons: LearnRequest[] = [];
+  /** What the job's gate printed, when it let the run through: kept on the run. */
+  let gateOutput: string | undefined;
   const record = (status: JobStatus, extra: Partial<RunRecord> = {}) => {
     store.recordRun({
       kind: 'job',
@@ -285,6 +288,7 @@ export async function runJob(
       startedAt,
       endedAt: now(),
       status,
+      scriptOutput: gateOutput,
       ...extra,
     });
     log.info(`[${project.config.name}] job ${job.id} ${status} in ${formatDuration(now() - startedAt)}`);
@@ -381,6 +385,7 @@ export async function runJob(
         return record('skipped', { output: said, costUsd: 0 });
       }
       gateText = gateSection(job.gate, result);
+      gateOutput = gateRecord(result);
     }
 
     // The status line (⏳ with the current step → ✅ / ❌) is the first reply in the run's thread.
@@ -482,6 +487,13 @@ export async function runJob(
     const summarize = async (text: string, meta?: string) => {
       if (!onDashboard || !web) return;
       const cards = cardsLeft();
+      // Asked for in a thread: the answer goes back there, whatever it is. The result of your decision
+      // belongs with the job: a reply under its summary when it went fine. A problem, a failure or new
+      // cards get a message of their own, so they notify.
+      const followUp = !askedIn && text.trim().startsWith('✅') && !cards ? followUpOf() : undefined;
+      // That summary may be days old, and a reply under a bot message notifies no one who doesn't follow
+      // its thread: mention the person who decided (or the owner). A reply where they asked notifies them.
+      const mention = followUp ? streamRecipient(trigger, project.config.owner) : undefined;
       await postSummary({
         chat,
         store,
@@ -496,10 +508,8 @@ export async function runJob(
         since: startedAt,
         cards,
         approvalsUrl: deps.approvalsUrl,
-        // Asked for in a thread: the answer goes back there, whatever it is. The result of your decision
-        // belongs with the job: a reply under its summary when it went fine. A problem, a failure or new
-        // cards get a message of their own, so they notify.
-        replyIn: askedIn ?? (text.trim().startsWith('✅') && !cards ? followUpOf() : undefined),
+        replyIn: askedIn ?? followUp,
+        mention: mention && SLACK_USER.test(mention) ? mention : undefined,
       });
     };
     /**
